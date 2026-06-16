@@ -48,7 +48,13 @@ fi
 
 BRIDGE_HOME="$(mktemp -d -t agb-341-smoke.XXXXXX)"
 export BRIDGE_HOME
-trap 'rm -rf "$BRIDGE_HOME"' EXIT
+# Issue #1738: pin BRIDGE_STATE_DIR under the isolated home so the wrapper's
+# config-caller-binding lookup does not leak to an ambient live BRIDGE_STATE_DIR.
+export BRIDGE_STATE_DIR="$BRIDGE_HOME/state"
+# Restore any non-writable config-caller bindings dir (#1738 r2 makes it 0555 to
+# simulate the controller-owned store) before the recursive rm so cleanup is not
+# blocked by the dropped write bit.
+trap 'chmod -R u+w "$BRIDGE_HOME" 2>/dev/null || true; rm -rf "$BRIDGE_HOME"' EXIT
 
 ADMIN_AGENT="patch"
 NON_ADMIN_AGENT="huchu"
@@ -58,6 +64,35 @@ AUDIT_LOG="$BRIDGE_HOME/logs/audit.jsonl"
 
 mkdir -p "$BRIDGE_HOME/agents/$ADMIN_AGENT/.discord"
 mkdir -p "$BRIDGE_HOME/logs"
+
+# Issue #1738 r3: the wrapper authorizes a `set` from a controller pane binding
+# matched against the wrapper's process ancestry (NOT env identity). An
+# authorized `set` (scenario 2) and an ancestry-matched non-admin deny
+# (scenario 3) require the wrapper to run INSIDE a REAL tmux pane (the env-stub
+# liveness seam was REMOVED, FIX 2) with the bound session LIVE; the admin
+# POSITIVE write additionally needs a store the caller does NOT own (FIX 1:
+# ownership, not chmod — a caller-owned store is always forgeable). We reuse the
+# shared smoke lib helpers to start a real session + make the store foreign-owned
+# (sudo); the auth-dependent scenarios SKIP (logged) where a real tmux session
+# (or, for the positive write, passwordless sudo) is unavailable. No-binding /
+# read-only scenarios run as a direct subprocess regardless.
+# shellcheck source=scripts/smoke/lib.sh
+source "$REPO_ROOT/scripts/smoke/lib.sh"
+SMOKE_NAME="system-config-gating"
+SMOKE_TMP_ROOT="$BRIDGE_HOME"
+export SMOKE_TMP_ROOT
+trap 'smoke_config_caller_stop_live_session; chmod -R u+w "$BRIDGE_HOME" 2>/dev/null || true; if [[ "${SMOKE_CONFIG_CALLER_ISO_OK:-0}" == "1" ]] && command -v sudo >/dev/null 2>&1; then sudo -n chown -R "$(id -u):$(id -g)" "$BRIDGE_HOME" 2>/dev/null || true; fi; rm -rf "$BRIDGE_HOME"' EXIT
+
+CC_BINDINGS_DIR="$BRIDGE_HOME/state/config-caller-bindings"
+mkdir -p "$CC_BINDINGS_DIR"
+smoke_config_caller_start_live_session || true
+CC_LIVE_SESSION="${SMOKE_LIVE_SESSION:-sess-live}"
+
+# True iff the iso positive WRITE path (scenario 2) is exercisable here.
+config_caller_positive_available() {
+  [[ "${SMOKE_CONFIG_CALLER_LIVE_OK:-0}" == "1" ]] || return 1
+  command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null
+}
 cat >"$ACCESS_PATH" <<'JSON'
 {
   "version": 1,
@@ -208,90 +243,119 @@ else
 fi
 
 # --- Scenario 2: wrapper happy path -------------------------------------
-# Operator at a TTY → BRIDGE_CALLER_SOURCE=operator-tui. caller agent
-# must be the admin id (codex r1 #341 CP5: anonymous caller is denied).
-before_sha="$("$PYTHON" -c "import hashlib,sys; sys.stdout.write(hashlib.sha256(open('$ACCESS_PATH','rb').read()).hexdigest())")"
-sce2_out="$(BRIDGE_HOME="$BRIDGE_HOME" \
-  BRIDGE_AUDIT_LOG="$AUDIT_LOG" \
-  BRIDGE_CALLER_SOURCE="operator-tui" \
-  BRIDGE_ADMIN_AGENT_ID="$ADMIN_AGENT" \
-  BRIDGE_AGENT_ID="$ADMIN_AGENT" \
-  "$PYTHON" "$REPO_ROOT/bridge-config.py" set \
-    --path "$ACCESS_PATH" \
-    --change "groups.append=12345" 2>&1 || true)"
-after_sha="$("$PYTHON" -c "import hashlib,sys; sys.stdout.write(hashlib.sha256(open('$ACCESS_PATH','rb').read()).hexdigest())")"
-if [[ "$sce2_out" == applied:* ]] && [[ "$before_sha" != "$after_sha" ]]; then
-  pass "scenario 2: wrapper applied groups.append=12345"
-else
-  fail "scenario 2: wrapper did not apply — output: $sce2_out / before=$before_sha after=$after_sha"
-fi
+# Authorized admin write: run the wrapper IN the live pane against a
+# foreign-owned store (the iso admin positive path). Skipped (logged) where a
+# real tmux session + passwordless sudo are unavailable.
+if config_caller_positive_available; then
+  smoke_clear_config_caller_bindings "$CC_BINDINGS_DIR"
+  smoke_seed_trusted_admin_binding "$CC_BINDINGS_DIR" "$ADMIN_AGENT" "$ADMIN_AGENT"
+  smoke_config_caller_make_store_foreign "$CC_BINDINGS_DIR"
+  before_sha="$("$PYTHON" -c "import hashlib,sys; sys.stdout.write(hashlib.sha256(open('$ACCESS_PATH','rb').read()).hexdigest())")"
+  SMOKE_CC_ENV=(
+    "BRIDGE_HOME=$BRIDGE_HOME"
+    "BRIDGE_STATE_DIR=$BRIDGE_STATE_DIR"
+    "BRIDGE_AUDIT_LOG=$AUDIT_LOG"
+    "BRIDGE_ADMIN_AGENT_ID=$ADMIN_AGENT"
+    "BRIDGE_AGENT_ID=$ADMIN_AGENT"
+  )
+  smoke_config_caller_run_in_pane "$REPO_ROOT/bridge-config.py" set \
+    --path "$ACCESS_PATH" --change "groups.append=12345" --from "$ADMIN_AGENT" >/dev/null
+  sce2_out="$(cat "$SMOKE_TMP_ROOT/wrap.out" "$SMOKE_TMP_ROOT/wrap.err" 2>/dev/null || true)"
+  after_sha="$("$PYTHON" -c "import hashlib,sys; sys.stdout.write(hashlib.sha256(open('$ACCESS_PATH','rb').read()).hexdigest())")"
+  if [[ "$sce2_out" == applied:* ]] && [[ "$before_sha" != "$after_sha" ]]; then
+    pass "scenario 2: wrapper applied groups.append=12345"
+  else
+    fail "scenario 2: wrapper did not apply — output: $sce2_out / before=$before_sha after=$after_sha"
+  fi
 
-if "$PYTHON" -c "
+  if "$PYTHON" -c "
 import json,sys
 data=json.load(open('$ACCESS_PATH'))
 sys.exit(0 if data.get('groups')==[12345] else 1)
 "; then
-  pass "scenario 2: groups list now [12345]"
+    pass "scenario 2: groups list now [12345]"
+  else
+    fail "scenario 2: groups list did not become [12345]"
+  fi
+
+  if sce2_shape_err="$(audit_row_shape_check "wrapper-apply" "$ACCESS_PATH" 1 2>&1)"; then
+    pass "scenario 2: wrapper-apply audit row shape valid (after_sha256 present)"
+  else
+    fail "scenario 2: wrapper-apply audit row shape invalid — $sce2_shape_err"
+  fi
+  smoke_clear_config_caller_bindings "$CC_BINDINGS_DIR"
 else
-  fail "scenario 2: groups list did not become [12345]"
+  printf '[smoke][skip] scenario 2: wrapper happy-path WRITE (no real tmux live session + passwordless sudo)\n'
 fi
 
-if sce2_shape_err="$(audit_row_shape_check "wrapper-apply" "$ACCESS_PATH" 1 2>&1)"; then
-  pass "scenario 2: wrapper-apply audit row shape valid (after_sha256 present)"
-else
-  fail "scenario 2: wrapper-apply audit row shape invalid — $sce2_shape_err"
-fi
+# --- Scenario 3: wrapper denial — non-admin pane binding ----------------
+# A NON-admin agent whose pane binding matches the caller ancestry is denied
+# even if env/--from claims admin. We seed a non-admin binding for the LIVE
+# session (real pane_pid) and run IN the live pane so the wrapper matches it on
+# ancestry + liveness and denies as agent-direct (the meaningful #1738 negative).
+# A non-admin binding denies regardless of store ownership, so this needs the
+# real session but NOT sudo. Skipped (logged) where no real tmux session exists.
+if [[ "${SMOKE_CONFIG_CALLER_LIVE_OK:-0}" == "1" ]]; then
+  smoke_clear_config_caller_bindings "$CC_BINDINGS_DIR"
+  smoke_seed_trusted_admin_binding "$CC_BINDINGS_DIR" "$NON_ADMIN_AGENT" "$ADMIN_AGENT"
+  SMOKE_CC_ENV=(
+    "BRIDGE_HOME=$BRIDGE_HOME"
+    "BRIDGE_STATE_DIR=$BRIDGE_STATE_DIR"
+    "BRIDGE_AUDIT_LOG=$AUDIT_LOG"
+    "BRIDGE_ADMIN_AGENT_ID=$ADMIN_AGENT"
+    "BRIDGE_AGENT_ID=$NON_ADMIN_AGENT"
+  )
+  smoke_config_caller_run_in_pane "$REPO_ROOT/bridge-config.py" set \
+    --path "$ACCESS_PATH" --change "groups.append=99999" >/dev/null
+  sce3_out="$(cat "$SMOKE_TMP_ROOT/wrap.out" "$SMOKE_TMP_ROOT/wrap.err" 2>/dev/null || true)"
+  if [[ "$sce3_out" == *"deny:"* ]] && [[ "$sce3_out" == *"agent-direct"* ]]; then
+    pass "scenario 3: wrapper rejected non-admin pane binding (env-spoof ignored)"
+  else
+    fail "scenario 3: wrapper did not reject non-admin binding — output: $sce3_out"
+  fi
 
-# --- Scenario 3: wrapper denial — non-admin caller ----------------------
-sce3_out="$(BRIDGE_HOME="$BRIDGE_HOME" \
-  BRIDGE_AUDIT_LOG="$AUDIT_LOG" \
-  BRIDGE_CALLER_SOURCE="operator-tui" \
-  BRIDGE_ADMIN_AGENT_ID="$ADMIN_AGENT" \
-  BRIDGE_AGENT_ID="$NON_ADMIN_AGENT" \
-  "$PYTHON" "$REPO_ROOT/bridge-config.py" set \
-    --path "$ACCESS_PATH" \
-    --change "groups.append=99999" 2>&1 || true)"
-if [[ "$sce3_out" == *"deny:"* ]] && [[ "$sce3_out" == *"not the admin"* ]]; then
-  pass "scenario 3: wrapper rejected non-admin caller"
-else
-  fail "scenario 3: wrapper did not reject non-admin — output: $sce3_out"
-fi
+  if sce3_shape_err="$(audit_row_shape_check "wrapper-deny" "$ACCESS_PATH" 0 2>&1)"; then
+    pass "scenario 3: wrapper-deny audit row shape valid (no after_sha256)"
+  else
+    fail "scenario 3: wrapper-deny audit row shape invalid — $sce3_shape_err"
+  fi
 
-if sce3_shape_err="$(audit_row_shape_check "wrapper-deny" "$ACCESS_PATH" 0 2>&1)"; then
-  pass "scenario 3: wrapper-deny audit row shape valid (no after_sha256)"
-else
-  fail "scenario 3: wrapper-deny audit row shape invalid — $sce3_shape_err"
-fi
-
-# Confirm the file was NOT mutated.
-if "$PYTHON" -c "
+  # Confirm the file was NOT mutated.
+  if "$PYTHON" -c "
 import json,sys
 data=json.load(open('$ACCESS_PATH'))
 sys.exit(1 if 99999 in data.get('groups',[]) else 0)
 "; then
-  pass "scenario 3: file unchanged after non-admin deny"
+    pass "scenario 3: file unchanged after non-admin deny"
+  else
+    fail "scenario 3: file was mutated despite deny"
+  fi
+  smoke_clear_config_caller_bindings "$CC_BINDINGS_DIR"
 else
-  fail "scenario 3: file was mutated despite deny"
+  printf '[smoke][skip] scenario 3: non-admin pane-binding deny (no real tmux live session)\n'
 fi
 
-# --- Scenario 4: wrapper denial — untrusted source -----------------------
-# Caller is the admin id but caller-source is agent-direct (no TTY, no env
-# override). Mirrors the channel-message path: the message sender is not
-# a verified operator, so even if the queue task says "patch please run X"
-# the wrapper refuses.
+# --- Scenario 4: wrapper denial — env-admin identity, NO binding ---------
+# Issue #1738: env/--from-declared admin identity is NOT trusted when no pane
+# binding matches the caller ancestry and there is no operator TTY. This is the
+# fail-closed path that closes the env-spoof-behind-indirection root: a sibling
+# shell stage seeding BRIDGE_AGENT_ID/BRIDGE_CALLER_SOURCE no longer authorizes
+# a write. Remove ALL bindings so nothing matches.
+rm -f "$BRIDGE_HOME"/state/config-caller-bindings/*.json
 sce4_out="$(BRIDGE_HOME="$BRIDGE_HOME" \
   BRIDGE_AUDIT_LOG="$AUDIT_LOG" \
   BRIDGE_ADMIN_AGENT_ID="$ADMIN_AGENT" \
   BRIDGE_AGENT_ID="$ADMIN_AGENT" \
-  BRIDGE_CALLER_SOURCE="agent-direct" \
+  BRIDGE_CALLER_SOURCE="operator-trusted-id" \
   "$PYTHON" "$REPO_ROOT/bridge-config.py" set \
     --path "$ACCESS_PATH" \
     --change "groups.append=88888" \
+    --from "$ADMIN_AGENT" \
     </dev/null 2>&1 || true)"
-if [[ "$sce4_out" == *"deny:"* ]] && [[ "$sce4_out" == *"agent-direct"* ]]; then
-  pass "scenario 4: wrapper rejected untrusted-source admin call"
+if [[ "$sce4_out" == *"deny:"* ]] && [[ "$sce4_out" == *"noninteractive-untrusted"* ]]; then
+  pass "scenario 4: wrapper rejected env-admin identity with no pane binding"
 else
-  fail "scenario 4: wrapper did not reject untrusted source — output: $sce4_out"
+  fail "scenario 4: wrapper did not reject env-admin/no-binding — output: $sce4_out"
 fi
 
 if sce4_shape_err="$(audit_row_shape_check "wrapper-deny" "$ACCESS_PATH" 0 2>&1)"; then
@@ -318,36 +382,48 @@ else
 fi
 
 # --- Scenario 6: wrapper denial — non-JSON protected path ---------------
-# agent-roster.local.sh is a shell file in PROTECTED_GLOBS. Wrapper must
-# refuse with a wrapper-deny row + a manual-flow message; the operator
-# uses the queued admin task to edit the shell file by hand. Codex r1
-# #341 CP10 surfaced this gap — the path was implemented but never
-# exercised by smoke.
-sce6_out="$(BRIDGE_HOME="$BRIDGE_HOME" \
-  BRIDGE_AUDIT_LOG="$AUDIT_LOG" \
-  BRIDGE_CALLER_SOURCE="operator-tui" \
-  BRIDGE_ADMIN_AGENT_ID="$ADMIN_AGENT" \
-  BRIDGE_AGENT_ID="$ADMIN_AGENT" \
-  "$PYTHON" "$REPO_ROOT/bridge-config.py" set \
-    --path "$ROSTER_PATH" \
-    --change "BRIDGE_AGENT_CHANNELS_patch=discord:other" 2>&1 || true)"
-if [[ "$sce6_out" == *"deny:"* ]] && [[ "$sce6_out" == *"not yet wrapper-mutable"* ]]; then
-  pass "scenario 6: wrapper rejected non-JSON protected path (agent-roster.local.sh)"
-else
-  fail "scenario 6: wrapper did not reject non-JSON path — output: $sce6_out"
-fi
+# agent-roster.local.sh is a shell file in PROTECTED_GLOBS. Wrapper must refuse
+# with a wrapper-deny row + a manual-flow message; the operator uses the queued
+# admin task to edit the shell file by hand. Codex r1 #341 CP10 surfaced this
+# gap. The non-JSON-suffix deny fires only AFTER the #1738 trust gate passes, so
+# this needs the in-pane + foreign-store admin positive path (scenario 2's
+# preconditions); skipped (logged) where unavailable.
+if config_caller_positive_available; then
+  smoke_clear_config_caller_bindings "$CC_BINDINGS_DIR"
+  smoke_seed_trusted_admin_binding "$CC_BINDINGS_DIR" "$ADMIN_AGENT" "$ADMIN_AGENT"
+  smoke_config_caller_make_store_foreign "$CC_BINDINGS_DIR"
+  SMOKE_CC_ENV=(
+    "BRIDGE_HOME=$BRIDGE_HOME"
+    "BRIDGE_STATE_DIR=$BRIDGE_STATE_DIR"
+    "BRIDGE_AUDIT_LOG=$AUDIT_LOG"
+    "BRIDGE_ADMIN_AGENT_ID=$ADMIN_AGENT"
+    "BRIDGE_AGENT_ID=$ADMIN_AGENT"
+  )
+  smoke_config_caller_run_in_pane "$REPO_ROOT/bridge-config.py" set \
+    --path "$ROSTER_PATH" --change "BRIDGE_AGENT_CHANNELS_patch=discord:other" \
+    --from "$ADMIN_AGENT" >/dev/null
+  sce6_out="$(cat "$SMOKE_TMP_ROOT/wrap.out" "$SMOKE_TMP_ROOT/wrap.err" 2>/dev/null || true)"
+  if [[ "$sce6_out" == *"deny:"* ]] && [[ "$sce6_out" == *"not yet wrapper-mutable"* ]]; then
+    pass "scenario 6: wrapper rejected non-JSON protected path (agent-roster.local.sh)"
+  else
+    fail "scenario 6: wrapper did not reject non-JSON path — output: $sce6_out"
+  fi
 
-if sce6_shape_err="$(audit_row_shape_check "wrapper-deny" "$ROSTER_PATH" 0 2>&1)"; then
-  pass "scenario 6: non-JSON wrapper-deny audit row shape valid (no after_sha256)"
-else
-  fail "scenario 6: non-JSON wrapper-deny audit row shape invalid — $sce6_shape_err"
-fi
+  if sce6_shape_err="$(audit_row_shape_check "wrapper-deny" "$ROSTER_PATH" 0 2>&1)"; then
+    pass "scenario 6: non-JSON wrapper-deny audit row shape valid (no after_sha256)"
+  else
+    fail "scenario 6: non-JSON wrapper-deny audit row shape invalid — $sce6_shape_err"
+  fi
 
-# Confirm the roster file was NOT mutated by the failed call.
-if grep -q "discord:fixture" "$ROSTER_PATH" && ! grep -q "discord:other" "$ROSTER_PATH"; then
-  pass "scenario 6: agent-roster.local.sh contents unchanged after deny"
+  # Confirm the roster file was NOT mutated by the failed call.
+  if grep -q "discord:fixture" "$ROSTER_PATH" && ! grep -q "discord:other" "$ROSTER_PATH"; then
+    pass "scenario 6: agent-roster.local.sh contents unchanged after deny"
+  else
+    fail "scenario 6: roster file was mutated despite deny"
+  fi
+  smoke_clear_config_caller_bindings "$CC_BINDINGS_DIR"
 else
-  fail "scenario 6: roster file was mutated despite deny"
+  printf '[smoke][skip] scenario 6: non-JSON protected-path deny (no real tmux live session + passwordless sudo)\n'
 fi
 
 # --- Scenario 7: tool-policy false positive on .agents/ runtime dir ------

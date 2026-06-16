@@ -24,12 +24,17 @@ Both before-sha256 and after-sha256 are recorded in the audit row so the
 operator can compare a wrapper-apply event against the file's at-rest
 hash on disk.
 
-Trust model recap (from the issue's "신뢰 경계 정의" table):
+Trust model (issue #1738 — process-ancestry binding, NOT env identity):
 
-    operator-tui          interactive shell (stdin+stdout are TTYs)
-    operator-trusted-id   set explicitly by a verified channel handler
-                          via BRIDGE_CALLER_SOURCE env
-    agent-direct          everything else — denied
+    The `set` / `set-env` mutation gate authorizes from a controller-published
+    per-agent tmux pane-pid binding matched against THIS wrapper's process
+    ancestry (a shell cannot set its own parent pid), or a real operator TTY
+    passing `--from <canonical-admin>` when no agent binding matches.
+    `BRIDGE_AGENT_ID` / `BRIDGE_ADMIN_AGENT_ID` / `BRIDGE_CALLER_SOURCE` no
+    longer drive any positive authorization (they were spoofable by a sibling
+    shell stage behind eval / bash -c / sh -c / $var indirection). See
+    `resolve_config_caller` for the full decision table. The `operator-tui` /
+    `operator-trusted-id` / `agent-direct` labels remain only as audit buckets.
 
 This file is invoked through `bridge-config.sh`, which is in turn dispatched
 by the `agent-bridge config …` subcommand.
@@ -64,17 +69,12 @@ from system_config_paths import (  # noqa: E402
 )
 
 
+# Caller-source audit buckets. These are the LABELS the audit row records for
+# the resolved caller (issue #1738 `resolve_config_caller`); they are no longer
+# read from process env for an authorization decision.
 CALLER_SOURCE_OPERATOR_TUI = "operator-tui"
 CALLER_SOURCE_OPERATOR_TRUSTED_ID = "operator-trusted-id"
 CALLER_SOURCE_AGENT_DIRECT = "agent-direct"
-
-# Caller sources allowed to mutate. The operator can extend this set via
-# the env var below at deploy time, but the default set is deliberately
-# narrow — issue #341 §"권한 모델이 코드에 없고 가이드 텍스트에만 있음" is
-# the failure mode we are correcting.
-ALLOWED_CALLER_SOURCES = frozenset(
-    {CALLER_SOURCE_OPERATOR_TUI, CALLER_SOURCE_OPERATOR_TRUSTED_ID}
-)
 
 
 # ---------------------------------------------------------------------------
@@ -202,64 +202,796 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
-def detect_caller_source() -> str:
-    """Resolve which trust bucket the current process belongs to.
-
-    `BRIDGE_CALLER_SOURCE` is the explicit override a verified channel
-    handler uses to declare it has already validated the operator's
-    user_id against the canonical roster (issue #341 §B). When unset,
-    we fall back to TTY detection: an interactive shell invoking
-    `agent-bridge config set` is treated as operator-tui. Any
-    non-interactive non-overridden caller is `agent-direct` and the
-    wrapper denies the mutation.
-    """
-    explicit = os.environ.get("BRIDGE_CALLER_SOURCE", "").strip().lower()
-    if explicit in {CALLER_SOURCE_OPERATOR_TUI, CALLER_SOURCE_OPERATOR_TRUSTED_ID}:
-        return explicit
-    if explicit:
-        return CALLER_SOURCE_AGENT_DIRECT
-    try:
-        if sys.stdin.isatty() and sys.stdout.isatty():
-            return CALLER_SOURCE_OPERATOR_TUI
-    except (OSError, ValueError):
-        pass
-    return CALLER_SOURCE_AGENT_DIRECT
-
-
 def admin_agent_id() -> str:
+    """Return the configured canonical admin agent id.
+
+    Read from `BRIDGE_ADMIN_AGENT_ID` (the controller exports this into the
+    launch env). NOTE (issue #1738): this is the CANONICAL admin NAME, not a
+    trust signal — `resolve_config_caller` authorizes by process-ancestry vs
+    the controller-published binding (or a real operator TTY), never by this
+    env value alone. An agent that re-exports a different value cannot thereby
+    authorize a write: the binding's `admin_agent_id` is what the agent-pane
+    path keys on, and the operator-TTY fallback still requires a real TTY.
+    """
     return os.environ.get("BRIDGE_ADMIN_AGENT_ID", "").strip()
 
 
-def caller_agent_id(args: argparse.Namespace) -> str:
-    explicit = getattr(args, "from_agent", None)
+# ---------------------------------------------------------------------------
+# Issue #1738 (SECURITY) — process-ancestry config-caller resolution.
+#
+# The pre-#1738 mutation gate (`detect_caller_source` / `caller_is_admin`)
+# derived admin/operator trust ENTIRELY from process env
+# (`BRIDGE_AGENT_ID`, `BRIDGE_ADMIN_AGENT_ID`, `BRIDGE_CALLER_SOURCE`). A
+# sibling shell stage in the SAME agent-issued Bash command can seed exactly
+# those vars and then hide the real invocation behind `eval` / `bash -c` /
+# `sh -c` / `$var` indirection that the static `tool-policy.py` hook cannot
+# resolve — so a non-admin agent spoofed admin and performed protected writes.
+#
+# The durable, unspoofable signal: A SHELL CANNOT SET ITS OWN PARENT PID. The
+# controller (`bridge-start.sh`) publishes a per-agent binding record under
+# `$BRIDGE_STATE_DIR/config-caller-bindings/<agent>.json` carrying the tmux
+# `pane_pid` of the launched session right after `tmux new-session`. This
+# wrapper walks ITS OWN process ancestry (via an absolute `/bin/ps`, falling
+# back to /proc) and matches the parent chain against the published
+# `pane_pid`. We deliberately do NOT trust `$TMUX`, a `$PATH` `tmux`, or
+# env-provided identity — only ancestry vs the controller-published binding.
+#
+# TRUST BOUNDARY (issue #1738 r2):
+#   * linux-user isolation — the binding lives under the controller-owned
+#     `state/` tree (0711 dir / 0644 file), which an iso agent UID can neither
+#     list nor overwrite. There the ancestry+ownership form is a REAL boundary:
+#     an agent-pane admin binding authorizes a config mutation without a TTY.
+#   * shared-UID (e.g. macOS without linux-user isolation) — the agent runs as
+#     the same OS user that owns the bindings store, so it could forge
+#     `<admin>.json` (agent_id == admin, pane_pid == one of its own ancestors)
+#     and the ancestry match alone would not prove anything. We therefore FAIL
+#     CLOSED on a self-writable store (`resolve_config_caller` /
+#     `_binding_store_is_caller_writable`): an agent-pane admin binding is NOT
+#     trusted when this caller could have written the store, so on shared-UID a
+#     config mutation requires a real operator TTY with `--from <admin>`. A
+#     "trust an agent pane on shared-UID too" model would need a
+#     controller-verifiable signature / IPC the agent cannot forge — a separate
+#     design, explicitly NOT attempted here.
+# Either way, BRIDGE_AGENT_ID / BRIDGE_ADMIN_AGENT_ID / BRIDGE_CALLER_SOURCE
+# never drive a positive decision; the verified env-spoof / indirection path is
+# closed on both install shapes.
+#
+# Match-time liveness (issue #1738 r2 BLOCKER 2): a bare `pane_pid in ancestry`
+# match is not sufficient — after the bound pane exits, its pid can be reused
+# (iso shares the host PID space; there is no PID namespace), and a non-admin
+# process that camps the freed pid would match an orphan binding. So at match
+# time we re-resolve the LIVE `#{pane_pid}` of the recorded tmux `session` (via
+# an absolute tmux, same discipline as the absolute ps — NO `$PATH`/`$TMUX`/env
+# override in normal operation) and require it to equal the bound `pane_pid`; a
+# dead session / mismatch / no-tmux is stale and is skipped (fail-closed). This
+# is defense-in-depth with two other layers that shrink the orphan window
+# directly: the orderly session-kill GC (fires even on the dead-session early
+# return now) and a daemon reconcile prune that deletes bindings whose session
+# is gone (covering crash / reboot / kill-server / SIGKILL).
+#   No env seam (#1738 r3 FIX 2): `_resolve_tmux_bin` resolves tmux ONLY from a
+#   fixed absolute candidate list, never from any env var — an agent owns its env
+#   when it execs the wrapper, so an env-selectable tmux would be a
+#   caller-controlled liveness oracle. The smoke drives liveness against a REAL
+#   tmux session (real `#{pane_pid}`), not a stub.
+
+CONFIG_CALLER_CONTEXT_AGENT_PANE = "agent-pane"
+CONFIG_CALLER_CONTEXT_OPERATOR_TTY = "operator-tty"
+CONFIG_CALLER_CONTEXT_UNKNOWN = "unknown"
+
+# Walk at most this many ancestry hops. A real pane→engine→shell→wrapper chain
+# is a handful deep; the bound stops a corrupted ppid loop (e.g. a ppid that
+# points back into the chain) from spinning.
+_ANCESTRY_MAX_HOPS = 64
+
+# Absolute paths to the system ps. We refuse a `$PATH` ps so an agent cannot
+# shadow it with a binary that lies about ppids. If neither absolute path
+# exists we fall back to /proc (Linux) and finally fail closed.
+_PS_ABSOLUTE_CANDIDATES = ("/bin/ps", "/usr/bin/ps")
+
+# Absolute paths to tmux for the match-time liveness check (issue #1738 r2,
+# BLOCKER 2). We refuse a `$PATH` / `$TMUX`-derived tmux for the same reason we
+# refuse a `$PATH` ps: an agent controls its own process env, so any env- or
+# PATH-resolved tmux could be a stub that lies about `#{pane_pid}` and re-opens
+# the orphan-binding match. There is DELIBERATELY no env override for the tmux
+# binary — the liveness check resolves only from this fixed absolute list, and
+# tests exercise it against a REAL tmux server (a process running inside a tmux
+# pane genuinely has the pane_pid in its ancestry, so the smoke seeds the real
+# session + real pane_pid). If none of these exist, the check fails closed.
+_TMUX_ABSOLUTE_CANDIDATES = (
+    "/opt/homebrew/bin/tmux",
+    "/usr/local/bin/tmux",
+    "/usr/bin/tmux",
+    "/bin/tmux",
+)
+
+# tmux env vars that select WHICH tmux server the absolute binary talks to. They
+# are STRIPPED from the liveness probe's child env (#1738 r3 FIX 1) so a caller
+# cannot redirect the probe at a private server carrying a forged pane_pid:
+#   - TMUX / TMUX_PANE: set by tmux inside a pane; identify the *current* server
+#     + pane. With them present, an absolute `tmux display-message` (no `-S`)
+#     attaches to whatever server they name.
+#   - TMUX_TMPDIR: the PARENT of tmux's default socket dir. tmux derives its
+#     default socket path from it, so a caller-set TMUX_TMPDIR points a no-`-S`
+#     `tmux` command at a private default server under a dir the agent controls
+#     (codex r3 proof: `_live_with_TMUX_TMPDIR=44062`, `_live_without=None`).
+# This tuple is the SINGLE SOURCE OF TRUTH for the strip list, mirrored by the
+# daemon prune's subshell `unset TMUX TMUX_PANE TMUX_TMPDIR` guard in
+# bridge-daemon.sh (`bridge_daemon_prune_orphan_config_caller_bindings`). Keep
+# the two in sync.
+_TMUX_SOCKET_SELECTION_ENV = ("TMUX", "TMUX_PANE", "TMUX_TMPDIR")
+
+# #1738 r5 FIX B (env injection, HIGH): every probe subprocess (the absolute
+# tmux liveness probe, the absolute ps ancestry walk, the absolute ps/owner
+# lookup) runs with a STRICT ALLOWLIST env, NOT a denylist. The r3/r4 code
+# stripped only the tmux socket-selection vars (`_TMUX_SOCKET_SELECTION_ENV`) but
+# PASSED THROUGH everything else — including the dynamic-linker preload hooks
+# `DYLD_INSERT_LIBRARIES` / `DYLD_*` (macOS) and `LD_PRELOAD` / `LD_*` (Linux).
+# An agent owns its own env when it execs the wrapper, so it could preload a
+# `connect()`-interpose library into the ABSOLUTE tmux/ps binary (homebrew tmux
+# is adhoc-signed and honors DYLD_INSERT_LIBRARIES; `/usr/bin/tmux` honors
+# LD_PRELOAD), redirecting tmux's socket connection to a private server that
+# returns a forged `#{pane_pid}` — re-opening the orphan-binding match the
+# absolute-binary + socket-strip discipline was meant to close (empirically
+# confirmed on this host: forged 96506 vs real 89557). A denylist can never
+# enumerate every injection seam; an allowlist passes ONLY the few vars the
+# probes legitimately need and drops everything else (DYLD_*, LD_*, TMUX*, and
+# any future loader/preload var) by construction.
+#
+# What stays: HOME (ps/tmux may read it), USER/LOGNAME (cosmetic), and the
+# locale vars (LANG/LANGUAGE/LC_*) so ps/tmux output is not garbled. PATH is
+# DELIBERATELY omitted — every probe execs an ABSOLUTE binary, so PATH is unused
+# and a caller-controlled PATH is one less seam. TZ is dropped (irrelevant to
+# pid/owner). The DEFAULT is exclude: an env name only survives if it is in
+# `_PROBE_ENV_ALLOW` or matches `_PROBE_ENV_ALLOW_LC_PREFIX`.
+_PROBE_ENV_ALLOW = ("HOME", "USER", "LOGNAME", "LANG", "LANGUAGE")
+# Locale vars are an open-ended family (LC_ALL, LC_CTYPE, LC_MESSAGES, …). Allow
+# the whole `LC_` namespace by prefix — none of them is a loader/preload seam.
+_PROBE_ENV_ALLOW_LC_PREFIX = "LC_"
+
+
+def _clean_probe_env() -> dict[str, str]:
+    """Build the STRICT ALLOWLIST env for a #1738 probe subprocess (r5 FIX B).
+
+    Returns a fresh dict containing ONLY the vars in `_PROBE_ENV_ALLOW` (when
+    present in the current environment) plus any `LC_*` locale var. Every other
+    var — crucially the dynamic-linker preload hooks (`DYLD_*`, `LD_*`) AND the
+    tmux socket-selection vars (`TMUX`, `TMUX_PANE`, `TMUX_TMPDIR`) — is dropped
+    by construction. This is the SINGLE place probe child env is built: the
+    wrapper liveness probe, the ancestry `ps`, and the owner-UID lookup all use
+    it, so there is exactly one allowlist to audit and keep correct.
+    """
+    env: dict[str, str] = {}
+    for key, value in os.environ.items():
+        if key in _PROBE_ENV_ALLOW or key.startswith(_PROBE_ENV_ALLOW_LC_PREFIX):
+            env[key] = value
+    return env
+
+
+class ConfigCaller:
+    """Resolved, authorization-relevant identity of a `set`/`set-env` call.
+
+    Carries the EFFECTIVE agent/admin derived from the unspoofable binding
+    (or the raw-operator-TTY fallback), the trust ``source`` bucket the audit
+    row records, the ``context`` the decision came from, an ``allowed`` flag,
+    and a ``reason`` string (a denial reason when ``allowed`` is False, or the
+    allow rationale when True). Env identity is NEVER the basis of a positive
+    decision.
+    """
+
+    __slots__ = (
+        "agent_id",
+        "admin_agent_id",
+        "source",
+        "context",
+        "allowed",
+        "reason",
+    )
+
+    def __init__(
+        self,
+        *,
+        agent_id: str,
+        admin_agent_id: str,
+        source: str,
+        context: str,
+        allowed: bool,
+        reason: str,
+    ) -> None:
+        self.agent_id = agent_id
+        self.admin_agent_id = admin_agent_id
+        self.source = source
+        self.context = context
+        self.allowed = allowed
+        self.reason = reason
+
+
+def config_caller_bindings_dir() -> Path:
+    """Directory the controller publishes per-agent binding records into.
+
+    `BRIDGE_STATE_DIR` is the canonical state root (the shell default is
+    `$BRIDGE_HOME/state`). The binding writer in `lib/bridge-state.sh` and this
+    reader MUST agree on this path. On iso this directory is controller-owned so
+    the binding cannot be forged; on shared-UID it is best-effort (see caveat).
+    """
+    explicit = os.environ.get("BRIDGE_STATE_DIR", "").strip()  # noqa: raw-pathlib-controller-only
     if explicit:
-        return str(explicit).strip()
-    return os.environ.get("BRIDGE_AGENT_ID", "").strip()
+        return Path(explicit).expanduser() / "config-caller-bindings"
+    return bridge_home_dir() / "state" / "config-caller-bindings"
 
 
-def caller_is_admin(agent: str) -> bool:
-    """Return True only when the caller has explicitly identified as the
-    admin agent.
+def _ps_ppid(pid: int) -> int | None:
+    """Return the parent pid of *pid* via an ABSOLUTE ps, or None.
 
-    Strict identity check (codex r1 #341 CP5): the caller must pass
-    ``--from <admin>`` *or* run with ``BRIDGE_AGENT_ID=<admin>`` set.
-    A missing caller agent is rejected even from operator-TUI — the
-    wrapper does not accept "operator at a TTY" as an implicit admin
-    bypass. Bridge-managed TUI sessions already export
-    ``BRIDGE_AGENT_ID``; operators running from a raw shell must pass
-    ``--from`` explicitly.
+    Uses `<abs-ps> -o ppid= -p <pid>` (no `$PATH` lookup, no shell). On a
+    platform without an absolute ps but with /proc (Linux), parses
+    `/proc/<pid>/stat` field 4. Any failure returns None (the caller treats a
+    broken hop as end-of-chain — fail-closed for matching).
+    """
+    for ps_bin in _PS_ABSOLUTE_CANDIDATES:
+        if not os.path.exists(ps_bin):  # noqa: raw-pathlib-controller-only
+            continue
+        try:
+            out = subprocess.run(
+                [ps_bin, "-o", "ppid=", "-p", str(pid)],
+                capture_output=True,
+                text=True,
+                check=False,
+                # #1738 r5 FIX B: strict allowlist env so a caller-injected
+                # DYLD_*/LD_* preload cannot interpose this absolute ps (which
+                # walks the ancestry the whole authorization rests on).
+                env=_clean_probe_env(),
+            )
+        except OSError:
+            return None
+        text = out.stdout.strip()
+        if not text:
+            return None
+        try:
+            return int(text.split()[0])
+        except (ValueError, IndexError):
+            return None
+    # /proc fallback (Linux without an absolute ps on the probed paths).
+    stat_path = Path("/proc") / str(pid) / "stat"  # noqa: raw-pathlib-controller-only
+    try:
+        raw = stat_path.read_text(encoding="utf-8", errors="replace")  # noqa: raw-pathlib-controller-only
+    except OSError:
+        return None
+    # Field 2 (comm) is parenthesized and may contain spaces/parens — split on
+    # the LAST ')' so field indexing after it is stable. ppid is field 4 (0-idx
+    # 1 after the close-paren split).
+    close = raw.rfind(")")
+    if close == -1:
+        return None
+    tail = raw[close + 1:].split()
+    if len(tail) < 2:
+        return None
+    try:
+        return int(tail[1])
+    except ValueError:
+        return None
 
-    The check is intentionally stricter than the hook's
-    ``is_admin_agent`` — the hook gates by session-type files that an
-    agent could in theory plant; the wrapper requires an env- or
-    flag-declared admin id and refuses anonymous callers.
+
+def process_ancestry_pids(start_pid: int) -> list[int]:
+    """Return the chain of ancestor pids of *start_pid* (excluding itself).
+
+    Walks ppid links until pid 1 / 0, a broken hop, a repeat (cycle guard), or
+    the hop bound. The returned list is what we match the controller-published
+    `pane_pid` against — the shell cannot forge any entry because it cannot set
+    its own ppid.
+    """
+    chain: list[int] = []
+    seen: set[int] = {start_pid}
+    cur = start_pid
+    for _ in range(_ANCESTRY_MAX_HOPS):
+        ppid = _ps_ppid(cur)
+        if ppid is None or ppid <= 1 or ppid in seen:
+            break
+        chain.append(ppid)
+        seen.add(ppid)
+        cur = ppid
+    return chain
+
+
+def _load_binding_record(path: Path) -> dict[str, Any] | None:
+    """Parse one binding JSON record; return None on any read/parse problem."""
+    try:
+        raw = path.read_text(encoding="utf-8")  # noqa: raw-pathlib-controller-only
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def _candidate_binding_paths(bindings_dir: Path) -> list[Path]:
+    """Return the binding files to consider.
+
+    Primary path: glob the bindings dir. On a shared-UID install this lists
+    every agent's binding, so a match is found regardless of which agent the
+    caller is. On linux-user isolation the controller publishes the dir at
+    `state/` `dir_only_traverse` mode (0711) — an iso UID can NOT list it — so
+    the glob returns nothing. Fallback: read the single per-agent record at the
+    exact path `<dir>/<BRIDGE_AGENT_ID>.json` (0644, reachable by exact path
+    even without dir-list). Using `BRIDGE_AGENT_ID` only SELECTS a candidate
+    file; it is NOT trusted for authorization — the candidate's `pane_pid`
+    still has to be in the caller's process ancestry, which an agent lying
+    about its id cannot forge.
+    """
+    candidates: list[Path] = []
+    try:
+        listed = sorted(bindings_dir.glob("*.json"))  # noqa: raw-pathlib-controller-only
+    except OSError:
+        listed = []
+    if listed:
+        return listed
+    env_agent = os.environ.get("BRIDGE_AGENT_ID", "").strip()
+    # Restrict to a single path component so the candidate cannot escape the
+    # bindings dir via a crafted BRIDGE_AGENT_ID (e.g. `../../etc/x`).
+    if env_agent and "/" not in env_agent and env_agent not in (".", ".."):
+        per_agent = bindings_dir / f"{env_agent}.json"
+        if per_agent.is_file():  # noqa: raw-pathlib-controller-only
+            candidates.append(per_agent)
+    return candidates
+
+
+def _bindings_matching_ancestry(ancestry: set[int]) -> list[dict[str, Any]]:
+    """Return binding records whose integer `pane_pid` is in *ancestry*.
+
+    A record with a missing / non-integer `pane_pid` is STALE and never
+    matches (deny-side of the decision table). Multiple matches are returned so
+    the caller can deny on ambiguity. Each returned record carries the absolute
+    path it was read from under the private `_source_path` key so the caller can
+    apply the per-file store-writability gate (#1738 r2 BLOCKER 1).
+    """
+    bindings_dir = config_caller_bindings_dir()
+    matched: list[dict[str, Any]] = []
+    for entry in _candidate_binding_paths(bindings_dir):
+        record = _load_binding_record(entry)
+        if record is None:
+            continue
+        pane_pid = record.get("pane_pid")
+        # bool is a subclass of int — exclude it explicitly so a JSON `true`
+        # cannot masquerade as pid 1.
+        if not isinstance(pane_pid, int) or isinstance(pane_pid, bool):
+            # Stale / malformed binding — never matches (fail-closed).
+            continue
+        if pane_pid in ancestry:
+            record["_source_path"] = str(entry)
+            matched.append(record)
+    return matched
+
+
+def _path_is_caller_forgeable(path: str) -> bool:
+    """True iff THIS euid could write/replace *path* (#1738 r3 B1, ownership).
+
+    OWNERSHIP is the test, not the current mode bits. `os.access(W_OK)` only
+    reflects the mode at probe time, which the OWNER can flip: a same-UID
+    attacker can forge the record, then `chmod 0444`/`0555` it before invoking
+    the wrapper so `os.access` reports non-writable — yet the owner can re-chmod
+    and rewrite at will, so the record is still forgeable (r2 B1 bypass,
+    reproduced by both reviewers). So we treat a path as forgeable when ANY of:
+
+      * the caller OWNS it (`st_uid == os.geteuid()`) — the owner can always
+        re-chmod and overwrite, regardless of the current 0444/0555 camouflage;
+      * it is group-writable or other-writable (a non-owner in the group, or
+        anyone, could write it directly).
+
+    Only a path owned by a DIFFERENT uid AND not group/other-writable is
+    non-forgeable by this caller — exactly the linux-user-isolation shape
+    (controller-owned 0711 dir / 0644 file under a different uid). Any
+    `os.stat` failure (missing / unreadable) is treated as forgeable
+    (fail-closed): we never open the authorization on an inconclusive probe.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return True
+    if st.st_uid == os.geteuid():
+        return True
+    # Group-writable (S_IWGRP 0o020) or other-writable (S_IWOTH 0o002): a
+    # non-owner could still create/overwrite the record.
+    if st.st_mode & 0o022:
+        return True
+    return False
+
+
+def _binding_store_is_caller_writable(record: dict[str, Any]) -> bool:
+    """True iff THIS process could forge the matched binding (#1738 r3 B1).
+
+    The binding record is unsigned. On a shared-UID install the agent runs as
+    the same OS user that owns the bindings store, so it can create or replace
+    `<admin>.json` with `agent_id == admin` and a `pane_pid` of one of its own
+    ancestors — turning the "pane-bound admin" positive path into a forgeable
+    primitive (the env-spoof hole moved, not closed). We fail closed: an
+    agent-pane admin binding only authorizes when the caller could NOT have
+    written it.
+
+    Forgeable (via `_path_is_caller_forgeable`, OWNERSHIP-based — r2's
+    `os.access(W_OK)` was chmod-camouflage-bypassable) means the caller could
+    write EITHER the bindings directory (create / replace a record) OR the
+    matched record file (overwrite it in place). On linux-user isolation the
+    controller owns the store under a different uid (0711 dir / 0644 file) and
+    the agent UID owns neither → returns False → trusted (the real boundary). On
+    shared-UID the caller owns both → True → fail-closed, regardless of any
+    `chmod 0444`/`0555` the owner applied. We default to "writable" (fail-closed)
+    if a probe raises, so an unexpected OS error never opens the authorization.
+    """
+    try:
+        bindings_dir = str(config_caller_bindings_dir())
+    except OSError:
+        return True
+    if _path_is_caller_forgeable(bindings_dir):
+        return True
+    source = record.get("_source_path")
+    if isinstance(source, str) and source:
+        if _path_is_caller_forgeable(source):
+            return True
+    return False
+
+
+def _resolve_tmux_bin() -> str | None:
+    """Return an ABSOLUTE tmux path for the liveness probe, or None.
+
+    Mirrors `_PS_ABSOLUTE_CANDIDATES`: tmux resolves ONLY from the fixed absolute
+    candidate list — never through `$PATH`, `$TMUX`, or ANY env override. There is
+    DELIBERATELY no env seam (#1738 r3 FIX 2): an agent owns its own env when it
+    execs the wrapper, so any env-selectable tmux is a caller-controlled security
+    oracle — it could point liveness at a stub that lies about `#{pane_pid}` and
+    re-open the orphan-binding match (the r2 `BRIDGE_CONFIG_ALLOW_TEST_TMUX` seam
+    did exactly this; both reviewers rejected it). Bridge requires tmux, so this
+    list resolves in production; the smoke drives liveness against a REAL tmux
+    session. None makes the liveness check fail closed.
+    """
+    for candidate in _TMUX_ABSOLUTE_CANDIDATES:
+        if os.path.exists(candidate):  # noqa: raw-pathlib-controller-only
+            return candidate
+    return None
+
+
+def _live_pane_pid_for_session(session: str) -> int | None:
+    """Return the LIVE `#{pane_pid}` of tmux *session*, or None if unresolvable.
+
+    Uses an absolute tmux (`<abs-tmux> display-message -t <session> -p
+    '#{pane_pid}'`, no `$PATH`, no shell). None means the session is gone, tmux
+    is unavailable, or the output is not an integer — every such case is treated
+    by the caller as "binding is stale → skip" (fail-closed).
+
+    The child env is built by `_clean_probe_env` — a STRICT ALLOWLIST (#1738 r5
+    FIX B) that drops, by construction, ALL tmux socket-selection env (`TMUX`,
+    `TMUX_PANE`, `TMUX_TMPDIR` — `_TMUX_SOCKET_SELECTION_ENV`, the r3 FIX 1
+    closure) AND the dynamic-linker preload hooks (`DYLD_*`, `LD_*`). The
+    controller publishes the binding's session on the DEFAULT tmux server, so
+    liveness must query that server. An agent owns its own env when it execs the
+    wrapper and could otherwise point this probe at a private server — via
+    `$TMUX`/`$TMUX_PANE`, via `$TMUX_TMPDIR` (the parent of the default socket
+    dir), OR via a `connect()`-interpose library preloaded into the absolute
+    tmux through `$DYLD_INSERT_LIBRARIES`/`$LD_PRELOAD` — carrying a same-named
+    session with a forged pane_pid, re-opening the orphan-binding match the
+    absolute-binary discipline closes. The allowlist passes only the few
+    benign vars tmux needs and drops every redirection seam.
+    """
+    if not session:
+        return None
+    tmux_bin = _resolve_tmux_bin()
+    if tmux_bin is None:
+        return None
+    try:
+        out = subprocess.run(
+            [tmux_bin, "display-message", "-t", session, "-p", "#{pane_pid}"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=_clean_probe_env(),
+        )
+    except OSError:
+        return None
+    if out.returncode != 0:
+        return None
+    text = out.stdout.strip()
+    if not text:
+        return None
+    try:
+        return int(text.split()[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def _pid_owner_uid(pid: int) -> int | None:
+    """Return the OS owner UID of process *pid*, or None if unresolvable.
+
+    Used by `_binding_session_is_live` for the #1738 r5 FIX C owner check.
+    Linux: `os.stat("/proc/<pid>").st_uid` — the kernel's authoritative owner,
+    not forgeable by the process. Otherwise (macOS / no /proc): the ABSOLUTE
+    `/bin/ps -o uid= -p <pid>` under the FIX B clean env, so a preloaded
+    interpose library cannot lie about the owner. Any failure / non-integer
+    output returns None, which the caller treats as "owner unverifiable →
+    not-live" (fail-closed).
+    """
+    if pid <= 0:
+        return None
+    proc_path = f"/proc/{pid}"
+    if os.path.isdir(proc_path):  # noqa: raw-pathlib-controller-only
+        try:
+            return os.stat(proc_path).st_uid  # noqa: raw-pathlib-controller-only
+        except OSError:
+            return None
+    for ps_bin in _PS_ABSOLUTE_CANDIDATES:
+        if not os.path.exists(ps_bin):  # noqa: raw-pathlib-controller-only
+            continue
+        try:
+            out = subprocess.run(
+                [ps_bin, "-o", "uid=", "-p", str(pid)],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=_clean_probe_env(),
+            )
+        except OSError:
+            return None
+        text = out.stdout.strip()
+        if not text:
+            return None
+        try:
+            return int(text.split()[0])
+        except (ValueError, IndexError):
+            return None
+    return None
+
+
+def _expected_pane_owner_uid(record: dict[str, Any]) -> int | None:
+    """Expected OS owner UID of the bound pane process (#1738 r5 FIX C).
+
+    The controller records `owner_uid` at publish time
+    (`bridge_publish_config_caller_binding`) — the UID of the bound agent's OS
+    user (on linux-user isolation, `agent-bridge-<agent>`; on shared-UID, the
+    controller UID). The record lives in the controller-owned store, so on iso
+    an attacking agent cannot forge `owner_uid` (it owns neither the dir nor the
+    file). We require an explicit integer `owner_uid`.
+
+    MISSING / malformed `owner_uid` (a legacy pre-r5 record, or a corrupt one)
+    must FAIL CLOSED on iso (codex r5 BLOCKER): the only safe non-explicit value
+    is the caller's own euid, and on iso the caller IS the attacker, so a
+    geteuid() fallback would let an attacker park a PID THEY own on the recorded
+    `pane_pid` slot and pass the owner check (their pid's owner == their euid).
+    We therefore allow the geteuid() fallback ONLY when the bindings store is
+    caller-WRITABLE — i.e. shared-UID, where the pane and caller are the same OS
+    user anyway AND the admin-pane path is already operator-TTY-only via
+    `_binding_store_is_caller_writable`. On a foreign-owned (iso) store with no
+    explicit `owner_uid`, we return None → the binding is treated as NOT live
+    (fail-closed). Iso records are (re)published WITH `owner_uid` by the daemon
+    self-heal, so this denies only a transient legacy/corrupt record, never a
+    healthy one.
+    """
+    owner_uid = record.get("owner_uid")
+    if isinstance(owner_uid, bool):
+        owner_uid = None
+    if isinstance(owner_uid, int):
+        return owner_uid
+    if isinstance(owner_uid, str) and owner_uid.strip().lstrip("-").isdigit():
+        try:
+            return int(owner_uid.strip())
+        except ValueError:
+            pass
+    # No explicit owner_uid: fall back to the caller's euid ONLY on a
+    # caller-writable (shared-UID) store; fail closed on a foreign-owned (iso)
+    # store where geteuid() would be the attacker's own UID.
+    if not _binding_store_is_caller_writable(record):
+        return None
+    try:
+        return os.geteuid()
+    except AttributeError:  # pragma: no cover - non-POSIX
+        return None
+
+
+def _binding_session_is_live(record: dict[str, Any]) -> bool:
+    """True iff the matched binding's pane is still the LIVE, admin-OWNED pane.
+
+    Two checks, both must hold (#1738 r2 B2 liveness + r5 FIX C ownership):
+
+    1. LIVENESS (r2 B2): the ancestry match alone authorizes purely on
+       `pane_pid in ancestry`, which a non-admin agent can satisfy after the
+       admin pane exits by PID-camping the freed `pane_pid` (iso shares the host
+       PID space — no PID namespace). We re-resolve the live `#{pane_pid}` of the
+       recorded tmux `session` and require it to equal the bound `pane_pid`.
+
+    2. OWNERSHIP (r5 FIX C): even with the socket-strip + absolute-binary
+       discipline, on iso the liveness probe derives tmux's default socket from
+       the PROBE process's EUID — the attacker's own iso UID — so it queries a
+       server the ATTACKER controls and could be fed a forged `#{pane_pid}` that
+       matches the bound pane_pid (camp the pid, or have the private server
+       report it). We close this at the kernel boundary: the live pane PID's
+       process OWNER UID must equal the admin agent's expected OS UID
+       (`owner_uid`, recorded by the controller). An attacker runs as a
+       DIFFERENT OS user and physically cannot own a process as the admin UID,
+       so a forged/camped pid owned by anyone but the admin is rejected. On
+       shared-UID the expected owner is the caller's own UID (a trivial pass)
+       and the admin-pane path is already fail-closed by the ownership gate.
+
+    Any mismatch / dead session / unresolvable owner is stale → False (skip the
+    binding, fail-closed).
+    """
+    session = str(record.get("session", "") or "").strip()
+    pane_pid = record.get("pane_pid")
+    if not isinstance(pane_pid, int) or isinstance(pane_pid, bool):
+        return False
+    live = _live_pane_pid_for_session(session)
+    if live is None:
+        return False
+    if live != pane_pid:
+        return False
+    # r5 FIX C: the live pane PID must be OWNED by the admin's expected OS UID.
+    expected_uid = _expected_pane_owner_uid(record)
+    if expected_uid is None:
+        return False
+    actual_uid = _pid_owner_uid(live)
+    if actual_uid is None or actual_uid != expected_uid:
+        return False
+    return True
+
+
+def resolve_config_caller(args: argparse.Namespace) -> ConfigCaller:
+    """Resolve the authoritative caller for a `set`/`set-env` mutation.
+
+    Implements the #1738 decision table. The ONLY positive authorization
+    inputs are (a) a binding record whose `pane_pid` is in this wrapper's
+    process ancestry, or (b) a real operator TTY with `--from <canonical
+    admin>` when NO binding matches. `BRIDGE_AGENT_ID` /
+    `BRIDGE_ADMIN_AGENT_ID` / `BRIDGE_CALLER_SOURCE` never drive a positive
+    decision.
     """
     admin = admin_agent_id()
-    if not admin:
-        return False
-    if not agent:
-        return False
-    return agent == admin
+    from_agent = getattr(args, "from_agent", None)
+    from_agent = str(from_agent).strip() if from_agent else ""
+
+    # Resolved once: a real interactive operator TTY explicitly passing
+    # `--from <canonical admin>` is the only authorization that survives the
+    # shared-UID fail-closed path below (and the no-binding fallback).
+    try:
+        is_tty = sys.stdin.isatty() and sys.stdout.isatty()
+    except (OSError, ValueError):
+        is_tty = False
+    operator_tty_admin = bool(is_tty and from_agent and admin and from_agent == admin)
+
+    def operator_tty_caller() -> ConfigCaller:
+        return ConfigCaller(
+            agent_id=from_agent,
+            admin_agent_id=admin,
+            source=CALLER_SOURCE_OPERATOR_TUI,
+            context=CONFIG_CALLER_CONTEXT_OPERATOR_TTY,
+            allowed=True,
+            reason="operator-tty-from-admin",
+        )
+
+    ancestry = set(process_ancestry_pids(os.getpid()))
+    matches = _bindings_matching_ancestry(ancestry)
+
+    # #1738 r2 BLOCKER 2 (match-time liveness): a `pane_pid in ancestry` match is
+    # not enough — after the bound pane exits, a different process can reuse the
+    # freed pid (iso shares the host PID space) and ride the orphan binding. Drop
+    # any matched binding whose recorded tmux session no longer resolves to the
+    # bound pane_pid (dead session / pid-reuse / no tmux), so a stale binding can
+    # never authorize. A binding that survives is genuinely the live pane's.
+    matches = [m for m in matches if _binding_session_is_live(m)]
+
+    if len(matches) > 1:
+        return ConfigCaller(
+            agent_id="",
+            admin_agent_id=admin,
+            source=CALLER_SOURCE_AGENT_DIRECT,
+            context=CONFIG_CALLER_CONTEXT_AGENT_PANE,
+            allowed=False,
+            reason=(
+                "agent-binding-ambiguous: multiple controller bindings match "
+                "this process ancestry — stale or corrupt state, refusing"
+            ),
+        )
+
+    if len(matches) == 1:
+        record = matches[0]
+        bound_agent = str(record.get("agent_id", "") or "").strip()
+        bound_admin = str(record.get("admin_agent_id", "") or "").strip()
+        # `--from` must agree with the bound identity — a mismatch is an
+        # explicit identity spoof (env / flag claiming a different agent than
+        # the one the pane is actually bound to).
+        if from_agent and from_agent != bound_agent:
+            return ConfigCaller(
+                agent_id=bound_agent,
+                admin_agent_id=bound_admin,
+                source=CALLER_SOURCE_AGENT_DIRECT,
+                context=CONFIG_CALLER_CONTEXT_AGENT_PANE,
+                allowed=False,
+                reason=(
+                    f"identity-spoof: --from {from_agent} does not match the "
+                    f"pane-bound agent {bound_agent}"
+                ),
+            )
+        # Binding agent == binding admin → would be a legitimate admin-agent
+        # call. The ancestry match is the proof of the launch-injected admin
+        # identity (not BRIDGE_AGENT_ID) — BUT the binding record is unsigned, so
+        # before we trust it we must rule out that THIS caller forged it.
+        if bound_admin and bound_agent == bound_admin:
+            # #1738 r3 BLOCKER 1 (fail-closed on a caller-OWNED store): on a
+            # shared-UID install the agent owns the bindings store, so it can
+            # write `<admin>.json` itself (and re-chmod it at will — the r2
+            # `os.access(W_OK)` mode check was chmod-camouflage-bypassable), so
+            # an ancestry-matched admin binding is forgeable → do NOT authorize
+            # from it. The only thing that still authorizes here is a real
+            # operator TTY with `--from` admin (an interactive operator, not an
+            # agent shell); anything else is denied. On linux-user isolation the
+            # controller owns the store under a DIFFERENT uid and the agent UID
+            # owns neither → not forgeable → trust the binding (the real
+            # boundary).
+            if _binding_store_is_caller_writable(record):
+                if operator_tty_admin:
+                    return operator_tty_caller()
+                return ConfigCaller(
+                    agent_id=bound_agent,
+                    admin_agent_id=bound_admin,
+                    source=CALLER_SOURCE_AGENT_DIRECT,
+                    context=CONFIG_CALLER_CONTEXT_AGENT_PANE,
+                    allowed=False,
+                    reason=(
+                        "agent-binding-store-writable: the config-caller "
+                        "bindings store is owned by this UID (shared-UID) — the "
+                        "owner can forge/re-chmod an agent-pane admin binding, so "
+                        "it is not trusted here; run this from an operator TTY"
+                    ),
+                )
+            return ConfigCaller(
+                agent_id=bound_agent,
+                admin_agent_id=bound_admin,
+                source=CALLER_SOURCE_OPERATOR_TRUSTED_ID,
+                context=CONFIG_CALLER_CONTEXT_AGENT_PANE,
+                allowed=True,
+                reason="agent-pane-binding",
+            )
+        # Binding matches a NON-admin agent → deny, regardless of what env or
+        # `--from` claims.
+        return ConfigCaller(
+            agent_id=bound_agent,
+            admin_agent_id=bound_admin,
+            source=CALLER_SOURCE_AGENT_DIRECT,
+            context=CONFIG_CALLER_CONTEXT_AGENT_PANE,
+            allowed=False,
+            reason=(
+                f"agent-direct: pane-bound agent {bound_agent or '<unknown>'} "
+                "is not the admin agent — refusing system-config mutation"
+            ),
+        )
+
+    # No (live, non-forgeable) binding matched this process ancestry.
+    if operator_tty_admin:
+        # Raw-operator fallback: a real interactive TTY explicitly passing
+        # `--from <canonical admin>`, with NO matching agent binding. This is
+        # the only allowed path when ancestry yields nothing.
+        return operator_tty_caller()
+
+    # Everything else with no binding is fail-closed. Crucially this includes
+    # the historical env-trust path (ambient BRIDGE_AGENT_ID / CALLER_SOURCE in
+    # a non-TTY context): it no longer authorizes anything.
+    if from_agent and admin and from_agent == admin:
+        reason = (
+            "noninteractive-untrusted: no pane binding matches this process "
+            "and there is no operator TTY — env/--from-declared admin identity "
+            "is not trusted for a config mutation (issue #1738)"
+        )
+    else:
+        reason = (
+            "agent-binding-missing: no controller pane binding matches this "
+            "process ancestry and no operator-TTY admin fallback applies"
+        )
+    return ConfigCaller(
+        agent_id=from_agent,
+        admin_agent_id=admin,
+        source=CALLER_SOURCE_AGENT_DIRECT,
+        context=CONFIG_CALLER_CONTEXT_UNKNOWN,
+        allowed=False,
+        reason=reason,
+    )
 
 
 def write_audit(detail: dict[str, Any]) -> Path:
@@ -668,31 +1400,20 @@ def cmd_get(args: argparse.Namespace) -> int:
 
 def cmd_set(args: argparse.Namespace) -> int:
     path = Path(args.path).expanduser()
-    caller_agent = caller_agent_id(args)
-    caller_source = detect_caller_source()
+    # Issue #1738: derive the caller from the unspoofable controller pane-pid
+    # binding + process ancestry, NOT from env identity. `resolve_config_caller`
+    # implements the full decision table; env (BRIDGE_AGENT_ID /
+    # BRIDGE_ADMIN_AGENT_ID / BRIDGE_CALLER_SOURCE) never drives a positive
+    # authorization.
+    caller = resolve_config_caller(args)
+    caller_agent = caller.agent_id
+    caller_source = caller.source
 
     deny_reason: str | None = None
     if not is_protected_path(path):
         deny_reason = "path not in system-config protected list"
-    elif not caller_agent:
-        # Strict admin check (codex r1 #341 CP5): the caller must
-        # explicitly identify via --from or BRIDGE_AGENT_ID. Anonymous
-        # callers (raw shell with neither set) cannot satisfy the
-        # admin requirement, even from operator-TUI.
-        deny_reason = (
-            "caller_agent unspecified — pass `--from <admin-agent>` or set "
-            "BRIDGE_AGENT_ID before invoking `agent-bridge config set`"
-        )
-    elif not caller_is_admin(caller_agent):
-        deny_reason = (
-            f"caller agent {caller_agent} is not the admin "
-            "agent — refusing system-config mutation"
-        )
-    elif caller_source not in ALLOWED_CALLER_SOURCES:
-        deny_reason = (
-            f"caller source {caller_source} is not allowed to mutate "
-            "system config (need operator-tui or operator-trusted-id)"
-        )
+    elif not caller.allowed:
+        deny_reason = caller.reason
 
     actor_label = caller_agent or (
         "operator" if caller_source == CALLER_SOURCE_OPERATOR_TUI else "unknown"
@@ -826,8 +1547,11 @@ def cmd_set_env(args: argparse.Namespace) -> int:
     `system_config_mutation` audit row with before/after file hashes.
     """
     path = agent_env_local_path()
-    caller_agent = caller_agent_id(args)
-    caller_source = detect_caller_source()
+    # Issue #1738: same unspoofable resolver as cmd_set. The set-env write gate
+    # no longer trusts env-declared identity/source.
+    caller = resolve_config_caller(args)
+    caller_agent = caller.agent_id
+    caller_source = caller.source
     actor_label = caller_agent or (
         "operator" if caller_source == CALLER_SOURCE_OPERATOR_TUI else "unknown"
     )
@@ -855,27 +1579,12 @@ def cmd_set_env(args: argparse.Namespace) -> int:
         print(f"deny: {reason}", file=sys.stderr)
         return code
 
-    # Trust gate FIRST — identical shape to cmd_set (codex r1 #341 CP5):
-    # explicit admin identity AND an operator caller-source. A non-admin or
-    # non-operator-TTY caller is denied before we even consider the key.
-    if not caller_agent:
-        return deny(
-            "caller_agent unspecified — pass `--from <admin-agent>` or set "
-            "BRIDGE_AGENT_ID before invoking `agent-bridge config set-env`",
-            3,
-        )
-    if not caller_is_admin(caller_agent):
-        return deny(
-            f"caller agent {caller_agent} is not the admin agent — refusing "
-            "set-env",
-            3,
-        )
-    if caller_source not in ALLOWED_CALLER_SOURCES:
-        return deny(
-            f"caller source {caller_source} is not allowed to set env "
-            "(need operator-tui or operator-trusted-id)",
-            3,
-        )
+    # Trust gate FIRST (issue #1738): the resolver's decision is the boundary.
+    # A non-admin pane binding, an identity spoof, a stale/ambiguous binding, or
+    # a noninteractive caller with no binding is denied before we consider the
+    # key.
+    if not caller.allowed:
+        return deny(caller.reason, 3)
 
     # Key screen: explicit deny BEFORE allowlist (fail-closed), then allowlist.
     forbidden = env_key_deny_reason(key)

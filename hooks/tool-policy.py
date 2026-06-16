@@ -5597,6 +5597,236 @@ def _config_set_env_check(
     return True, None
 
 
+# Issue #1738 — interim defense-in-depth indirection gate for BOTH config
+# mutation verbs (`config set` / `config set-env`).
+#
+# This gate is DEFENSE-IN-DEPTH, NOT the close criterion. The durable fix is
+# wrapper-side (bridge-config.py derives identity from process ancestry vs the
+# controller-published pane binding, never from env). But a static hook can
+# still cheaply deny the indirection shapes the literal-spelling recognizers
+# (`_is_config_set_wrapper`, `_config_set_env_attempt_present`) cannot resolve:
+# a mutation verb hidden behind `eval` / `bash -c` / `sh -c`, or behind an
+# unresolved command-position `$var` around the verb. We DENY those uniformly.
+#
+# We deliberately ACCEPT false denials for legitimately-scripted `bash -c`
+# config mutation — privileged config writes should use the direct wrapper
+# shape, not a nested shell. We do NOT add brace-normalization: the issue's own
+# analysis (PR #1736 r6) shows brace forms are non-exploitable against argparse
+# and are closed naturally by the wrapper identity fix.
+_INDIRECTION_SHELL_LEAVES = frozenset({"eval", "bash", "sh"})
+
+# The direct config-CLI command leaves. The unresolved-`$` indirection branch
+# below only fires when the stage's actual command IS one of these (a config
+# verb/path/assignment hidden behind a `$var` ARGUMENT, e.g. `agb config $V
+# K=V`) OR the command word itself is an unresolved `$var` (the CLI hidden, e.g.
+# `$C config set …`). Without this gate the branch false-positives on ANY
+# command whose argument text merely contains the substring "config" plus a "$"
+# — e.g. a pure read `awk '{print $1}' lib/system_config_paths.py` (the filename
+# carries "config", the awk program carries "$1"). The durable wrapper-side
+# identity fix covers a verb reached through other interpreters (`python3 -c …`);
+# this static hook stays scoped to the shell-indirection + direct-CLI shapes.
+# (#1738 r6 — closes the 1690-tasksdb-read-carveout smoke false-positive.)
+_CONFIG_CLI_LEAVES = frozenset({"agb", "agent-bridge"})
+
+# A command-position `$var` / `${var}` / `$(...)` that expands to (part of) the
+# verb. We flag an UNRESOLVED `$` adjacent to the config-mutation surface
+# (`config` / `set` / `set-env` / `--path` / the assignment) so a
+# `V=set-env; agb config $V K=V` or `P=<roster>; agb config set --path $P …`
+# cannot hide the real argv from the literal recognizers.
+_CONFIG_VERB_TOKENS = ("config", "set", "set-env")
+
+# Transparent command prefixes that exec the FOLLOWING argv with no shape change
+# of their own (`env FOO=1 <cmd>`, `command <cmd>`, `exec <cmd>`, `nice <cmd>`,
+# `nohup <cmd>`, `stdbuf -oL <cmd>`). The real command is whatever follows the
+# prefix (plus the prefix's own flags / env-assignments). A recognizer that keys
+# off the leaf command word must resolve THROUGH a stack of these or the prefix
+# masquerades as the leaf — `env agb config $V K=V` reads as leaf `env`, not
+# `agb` (#1738 r7 bypass).
+#
+# The value goes to a PER-PREFIX table of options that consume the NEXT token as
+# their separate value: if such a flag is skipped but not its argument, the
+# argument is mistaken for the real command leaf and re-opens the bypass (codex
+# #1738 r7 — `stdbuf -o L agb …`, `nice --adjustment 5 agb …`). These tool option
+# sets are small and bounded (not open shell grammar), so an exact per-prefix
+# map closes the class without whack-a-mole. Attached forms (`-oL`, `-n5`,
+# `--adjustment=5`) carry their value in the same token and need no lookahead.
+# Anything not listed is a value-less flag.
+_TRANSPARENT_PREFIX_ARG_OPTS: dict[str, frozenset[str]] = {
+    # `env -u NAME`, `env -C DIR` (the `=`-attached signal flags carry their own
+    # value; `env -S`/`--split-string` is dissolved by `_expand_env_split_string`
+    # before this resolver runs, so it never reaches the table).
+    "env": frozenset({"-u", "--unset", "-C", "--chdir"}),
+    # `command -p`/`-v`/`-V` take no separate value.
+    "command": frozenset(),
+    # `exec -a NAME`; `-c`/`-l` take no value.
+    "exec": frozenset({"-a"}),
+    # `nice -n N` / `nice --adjustment N`.
+    "nice": frozenset({"-n", "--adjustment"}),
+    # `nohup` takes no options.
+    "nohup": frozenset(),
+    # `stdbuf -i/-o/-e MODE` (and the long forms) each take a MODE value.
+    "stdbuf": frozenset({"-i", "--input", "-o", "--output", "-e", "--error"}),
+}
+_TRANSPARENT_COMMAND_PREFIXES = frozenset(_TRANSPARENT_PREFIX_ARG_OPTS)
+
+
+def _skip_transparent_command_prefixes(tokens: list[str], start: int = 0) -> int:
+    """Return the index of the REAL command leaf in *tokens* (from *start*), after
+    stripping leading `VAR=value` env-assignments and a stack of transparent
+    prefix commands (`env`/`command`/`exec`/`nice`/`nohup`/`stdbuf`) plus each
+    prefix's own flags and value-taking options.
+
+    The caller is expected to have run `_expand_env_split_string` first so an
+    `env -S '<packed cmd>'` payload is already inlined as tokens (the resolver
+    does not re-expand it). Loops so stacked prefixes (`env command exec agb …`)
+    all resolve. Shared by `_is_bash_wrapper_receive` and the #1738
+    config-mutation indirection gate so the two recognizers see the same leaf for
+    the same prefix shapes (codex #1738 r6/r7 — `env`/`command`/`exec`/`nice`/
+    `stdbuf` were bypassing the indirection gate because the leaf was the prefix,
+    not the config CLI).
+    """
+    idx = start
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if _LEADING_ENV_ASSIGN_RE.match(tok + " "):
+            idx += 1
+            continue
+        base = tok.rsplit("/", 1)[-1]
+        if base not in _TRANSPARENT_COMMAND_PREFIXES:
+            break
+        arg_opts = _TRANSPARENT_PREFIX_ARG_OPTS[base]
+        idx += 1
+        # Consume this prefix's own flags + `env`-style `VAR=value`. A bare `-`
+        # (env's "clear environment" marker, equivalent to `-i`) is a value-less
+        # option that still precedes the real command, so it is consumed too. A
+        # separate-value option (`-o MODE`, `-n N`, `--adjustment N`) also
+        # consumes the following token so its value is not read as the leaf.
+        while idx < len(tokens):
+            a = tokens[idx]
+            if _LEADING_ENV_ASSIGN_RE.match(a + " "):
+                idx += 1
+                continue
+            if a.startswith("-"):
+                # `--opt=value` / `-oMODE` carry their value in-token already.
+                consumes_arg = "=" not in a and a in arg_opts
+                idx += 1
+                if consumes_arg and idx < len(tokens):
+                    idx += 1
+                continue
+            break
+    return idx
+
+
+def _stage_reaches_config_mutation(stage: str) -> bool:
+    """True iff *stage* mentions a config-mutation verb surface (literal or var).
+
+    Substring recognition over the quote/escape-stripped stage — broad on
+    purpose so the indirection gate fails closed. The mutation surface is
+    `config` PLUS any of: the `set` / `set-env` subcommand spelling, the
+    `--path` write flag, OR an unresolved `$` (a var that could expand to the
+    subcommand, e.g. `config $V K=V` where `V=set-env`). The bare `agb config`
+    read verbs (`get` / `list-protected`) without `set`/`--path`/`$` are NOT
+    flagged.
+    """
+    flat = _SHELL_QUOTE_ESCAPE_RE.sub("", stage)
+    if "config" not in flat:
+        return False
+    return ("set" in flat) or ("--path" in flat) or ("$" in flat)
+
+
+def _config_mutation_via_indirection(text: str) -> str | None:
+    """Return an indirection reason iff a config mutation is hidden behind
+    `eval` / `bash -c` / `sh -c`, or an unresolved command-position `$var`
+    around the verb — else None.
+
+    Recognizes per separator-split stage. A stage whose FIRST token (after a
+    leading `VAR=` env-assignment strip) is `eval` / `bash` / `sh` AND whose
+    remaining argument text reaches the config-mutation surface is an
+    indirection attempt. Separately, a stage that reaches the config-mutation
+    surface AND carries an unresolved `$` immediately around the verb / path /
+    assignment is also flagged (a `$var` the static hook cannot expand).
+    """
+    joined = text.replace("\\\r\n", "").replace("\\\n", "")
+    for stage in _COMMAND_OPERATOR_RE.split(joined):
+        scan = _SAFE_REDIRECT_RE.sub(" ", stage)
+        try:
+            toks = shlex.split(scan, posix=True, comments=False)
+        except ValueError:
+            # Unparseable stage that mentions the mutation surface — fail closed.
+            if _stage_reaches_config_mutation(stage):
+                return "unparseable_config_mutation_stage"
+            continue
+        # Dissolve any `env -S '<packed cmd>'` / `--split-string=` payload into
+        # its component tokens (mirrors `_config_set_env_attempt_present`) so a
+        # `env -S 'agb config ${V} K=V'` cannot hide the verb in a single token.
+        toks = _expand_env_split_string(toks)
+        # Resolve THROUGH leading `VAR=value` env-assignments AND transparent
+        # prefix commands (`env`/`command`/`exec`/`nice`/`nohup`/`stdbuf`, plus
+        # their flags + value-taking options) so the REAL command leaf is
+        # examined. Without this, a `V=set-env; env agb config $V K=V` reads as
+        # leaf `env` (not `agb`) and the config-CLI gate below misses it
+        # (#1738 r7 bypass).
+        idx = _skip_transparent_command_prefixes(toks)
+        toks = toks[idx:]
+        if not toks:
+            continue
+        leaf = toks[0].rsplit("/", 1)[-1]
+        if leaf in _INDIRECTION_SHELL_LEAVES:
+            # `eval '<payload>'` / `bash -c '<payload>'` / `sh -c '<payload>'`.
+            # The payload is a later token; if ANY token in the stage reaches
+            # the config-mutation surface, the verb is being run through a
+            # nested interpreter → deny.
+            payload = " ".join(toks[1:])
+            if _stage_reaches_config_mutation(payload) or _stage_reaches_config_mutation(stage):
+                return f"config_mutation_via_{leaf}"
+        # Unresolved command-position `$var` around the verb surface. `$` only
+        # survives shlex when it was inside single quotes or escaped; a bare
+        # `$V` would already have been (not) expanded by shlex into the literal
+        # `$V` token. Either way an unexpanded `$` next to the config verb means
+        # the real argv is hidden from the literal recognizers.
+        if (
+            (leaf in _CONFIG_CLI_LEAVES or "$" in toks[0])
+            and _stage_reaches_config_mutation(stage)
+            and "$" in scan
+        ):
+            # Flag ONLY when the command is the config CLI itself (`agb` /
+            # `agent-bridge`, with a `$var` hiding the verb / path / assignment)
+            # OR the command word is itself an unresolved `$var` (the CLI hidden,
+            # e.g. `$C config set …`). A `$` elsewhere in a NON-config command
+            # (e.g. `awk '{print $1}' lib/system_config_paths.py` — "config" in
+            # the filename, `$1` in the awk program) is NOT indirection. The
+            # `$`-adjacency stays conservative: any `$` in such a config-CLI
+            # stage is treated as indirection (privileged writes must use literal
+            # argv). Accepts a false deny for `agb config set --change x=$(date)`.
+            return "config_mutation_via_unresolved_var"
+    return None
+
+
+def _emit_config_mutation_via_indirection_audit(
+    agent: str,
+    *,
+    text: str,
+    tool_input: dict[str, Any] | None,
+    reason: str,
+) -> None:
+    """Audit row for a config mutation denied at the interim indirection gate."""
+    detail: dict[str, Any] = {
+        "tool": "Bash",
+        "verb": "config set/set-env",
+        "reason": reason,
+        "sample": _redact_credential_token_values(truncate_text(text, 240)),
+    }
+    if tool_input is not None:
+        detail["summary"] = _redact_credential_summary(
+            tool_input_summary("Bash", tool_input)
+        )
+    write_audit(
+        "tool_policy_config_mutation_indirection_denied",
+        agent or "unknown",
+        detail,
+    )
+
+
 def _emit_config_set_env_allowed_audit(
     agent: str,
     *,
@@ -6257,9 +6487,6 @@ SEALED_RECEIVE_BASH_DENY_REASON = (
 )
 
 
-_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-
-
 def _is_bash_wrapper_receive(text: str) -> bool:
     """True iff *text* invokes `bash <…>/bridge-auth.sh claude-token receive …`.
 
@@ -6286,6 +6513,9 @@ def _is_bash_wrapper_receive(text: str) -> bool:
         # Unbalanced quotes etc. (a smuggling attempt) but the command
         # still names the wrapper receive — deny rather than fall through.
         return "receive" in stripped
+    # Dissolve any `env -S '<packed cmd>'` payload before the shared resolver,
+    # which expects it pre-expanded (mirrors the indirection gate's call order).
+    tokens = _expand_env_split_string(tokens)
     # See through leading `VAR=value` env-assignments AND `env`/`command`
     # /`/usr/bin/env` command-prefix wrappers (with their own flags +
     # `env`'s VAR=value / `-u NAME` args), then bash options — codex #1367
@@ -6302,30 +6532,11 @@ def _is_bash_wrapper_receive(text: str) -> bool:
     # agent that bypasses both layers can only store ITS OWN token, outside
     # that threat model. We deny the common spellings here for a clean early
     # signal + audit.
-    idx = 0
-    while idx < len(tokens):
-        tok = tokens[idx]
-        if _ENV_ASSIGN_RE.match(tok):
-            idx += 1
-            continue
-        base = tok.rsplit("/", 1)[-1]
-        if base in ("env", "command", "nice", "nohup", "stdbuf"):
-            idx += 1
-            # Consume the wrapper's own flags + `env` VAR=value / `-u NAME`.
-            while idx < len(tokens):
-                a = tokens[idx]
-                if _ENV_ASSIGN_RE.match(a):
-                    idx += 1
-                    continue
-                if a.startswith("-"):
-                    consumes_arg = a == "-u"
-                    idx += 1
-                    if consumes_arg and idx < len(tokens):
-                        idx += 1
-                    continue
-                break
-            continue
-        break
+    # See through leading `VAR=value` env-assignments + transparent prefix
+    # commands (`env`/`command`/`exec`/`nice`/`nohup`/`stdbuf`) and their flags,
+    # via the shared resolver the #1738 indirection gate also uses so the two
+    # recognizers agree on the same leaf for the same prefix shapes.
+    idx = _skip_transparent_command_prefixes(tokens)
     # tokens[idx] must now be the bash interpreter.
     if idx >= len(tokens) or tokens[idx].rsplit("/", 1)[-1] != "bash":
         return False
@@ -7849,6 +8060,22 @@ def protected_alias_reason(
     # they just tried to call. Letting the wrapper through here only
     # delegates audit responsibility to the wrapper itself; non-operator
     # callers still get rejected at bridge-config.py.
+    # Issue #1738 (defense-in-depth): deny a config mutation hidden behind
+    # `eval` / `bash -c` / `sh -c` or an unresolved command-position `$var`
+    # around the verb. Runs BEFORE the `_is_config_set_wrapper` carve-out so an
+    # indirection shape can never be mistaken for the sanctioned literal wrapper
+    # invocation. The durable boundary is wrapper-side (bridge-config.py process
+    # ancestry); this only narrows the static-hook window.
+    indirection_reason = _config_mutation_via_indirection(text)
+    if indirection_reason is not None:
+        _emit_config_mutation_via_indirection_audit(
+            agent, text=text, tool_input=tool_input, reason=indirection_reason
+        )
+        return (
+            "agent-bridge config set / set-env reached through eval / bash -c / "
+            "sh -c / unresolved $var indirection is not allowed — run the "
+            "wrapper directly with literal argv (issue #1738)"
+        )
     if _is_config_set_wrapper(text):
         return None
     # Issue #1734: the `config set-env` exact-shape, admin-only, anti-spoof

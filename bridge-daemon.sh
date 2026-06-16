@@ -6930,6 +6930,237 @@ bridge_daemon_sweep_orphan_autostart_state() {
   return "$changed"
 }
 
+# #1738 r5 FIX B (env injection, HIGH): unset every dynamic-linker preload hook
+# (`DYLD_*` macOS / `LD_*` Linux) AND the tmux socket-selection vars from the
+# CURRENT shell, so a tmux/ps invocation that follows resolves the controller's
+# real default server and cannot be interposed by a caller-injected `connect()`
+# shim. Mirrors bridge-config.py's `_clean_probe_env` allowlist (there the
+# child env is rebuilt; here we scrub the inherited env in a subshell because
+# the prune drives a SHELL FUNCTION `tmux` the smoke shadows, so `env -i` /
+# rebuild would bypass the shim). Enumerate names with `compgen -v` (no glob on
+# env var NAMES otherwise) and unset the loader/tmux family. Call ONLY inside a
+# `( ... )` subshell so the daemon's own env is untouched.
+bridge_daemon_scrub_probe_env() {
+  local _v=""
+  unset TMUX TMUX_PANE TMUX_TMPDIR 2>/dev/null || true
+  for _v in $(compgen -v 2>/dev/null); do
+    case "$_v" in
+      DYLD_*|LD_*) unset "$_v" 2>/dev/null || true ;;
+    esac
+  done
+}
+
+# Issue #1738 r2 (BLOCKER 2, daemon reconcile prune): remove config-caller
+# bindings whose recorded tmux session is gone. The orderly session-kill GC
+# (lib/bridge-agents.sh) only runs on a clean stop; crash / OOM / reboot /
+# `tmux kill-server` / external SIGKILL leave an orphan binding behind. With no
+# periodic prune, a non-admin process that PID-camps the freed admin pane_pid
+# (iso shares the host PID space) could ride the orphan record. This sweep, plus
+# bridge-config.py's match-time liveness re-check, closes that lifecycle path.
+# Returns 0 if it removed/republished anything (so cmd_sync_cycle records a
+# change), 1 if it made no change.
+#
+# Issue #1738 r3 (FIX 3, false-delete / fleet self-DoS): `tmux has-session` exits
+# 1 BOTH when the session is gone AND when the tmux server is momentarily
+# unreachable (socket EAGAIN / `tmux kill-server` / server bounce). A per-binding
+# `has-session` during a transient server outage would delete EVERY live agent's
+# binding fleet-wide in a single tick — and publish happens only once at session
+# start (bridge-start.sh), so there is no recovery until a full restart. We mirror
+# the fail-safe `reap_idle_orphan_sessions` pattern instead:
+#   1. PRECONDITION GUARD: probe server reachability ONCE via
+#      `tmux list-sessions`; if it fails, the server is unreachable -> SKIP the
+#      whole pass (prune nothing, the conservative choice on an inconclusive
+#      query).
+#   2. Materialize the live-session SET from that successful listing and check
+#      each binding against the SET (membership), never per-binding has-session.
+#      A binding is pruned ONLY when tmux is provably up AND its session is
+#      provably absent — never on an inconclusive query.
+#   3. SELF-HEAL: re-publish the binding for any roster agent whose session IS
+#      live but whose binding file is missing, so the single-point-of-publish
+#      fragility (and any mistaken delete) self-repairs on the next tick.
+bridge_daemon_prune_orphan_config_caller_bindings() {
+  local dir="" changed=1 agent="" session="" rows="" sessions=""
+  local -A live_sessions=()
+  local name="" _heal_pane_pid="" _heal_engine="" _heal_admin="" _heal_owner_uid=""
+  local _rec_fields="" _rec_pane_pid="" _rec_agent_id="" _rec_admin_id="" _rec_owner_uid=""
+  local _verify_fields="" _verify_pane_pid="" _verify_agent_id="" _verify_admin_id="" _verify_owner_uid=""
+
+  if ! command -v bridge_config_caller_bindings_dir >/dev/null 2>&1; then
+    return "$changed"
+  fi
+  dir="$(bridge_config_caller_bindings_dir)"
+  [[ -n "$dir" && -d "$dir" ]] || return "$changed"
+
+  # (1) PRECONDITION GUARD: probe the tmux server ONCE. `list-sessions` to a temp
+  # file (no process substitution / pipe — lint-heredoc-ban H3 + #1813 SIGPIPE).
+  # A non-zero rc means the server is unreachable (or bouncing) -> skip the pass
+  # entirely so a transient outage prunes nothing. An empty-but-OK listing (rc=0,
+  # genuinely no sessions) is a valid live set and proceeds.
+  sessions="$(mktemp "${TMPDIR:-/tmp}/agb-cblive.XXXXXX")" || return "$changed"
+  # Strip ALL tmux socket-selection env (TMUX / TMUX_PANE / TMUX_TMPDIR) AND the
+  # dynamic-linker preload hooks (DYLD_* / LD_*) before the probe (#1738 r3 FIX 1
+  # + r5 FIX B — mirrors bridge-config.py's `_TMUX_SOCKET_SELECTION_ENV` +
+  # `_clean_probe_env`). TMUX_TMPDIR is the parent of tmux's default socket dir,
+  # so a stray value (inherited from a caller's launch env or an operator shell)
+  # would aim `list-sessions` at a private server and let a same-named session
+  # there mask a genuine orphan; a DYLD_*/LD_* preload could interpose tmux's
+  # connect() and redirect it the same way. We scrub the vars in a SUBSHELL (not
+  # `env -u …`, which would exec the external binary and bypass a shell-function
+  # `tmux` the smoke uses to drive this path) so the probe runs on the
+  # controller's real default server.
+  if ! ( bridge_daemon_scrub_probe_env; tmux list-sessions -F '#{session_name}' ) >"$sessions" 2>/dev/null; then
+    rm -f "$sessions" 2>/dev/null || true
+    daemon_info "config-caller binding prune skipped: tmux server unreachable (no prune this tick)"
+    return "$changed"
+  fi
+
+  # (2) Materialize the live-session SET from the successful listing.
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    live_sessions["$name"]=1
+  done <"$sessions"
+  rm -f "$sessions" 2>/dev/null || true
+
+  # Materialize the `<agent>\t<session>` rows from the file-as-argv helper to a
+  # temp file, then loop over it with a plain `< file` redirect (same no-process-
+  # substitution / no-pipe discipline as the listing above).
+  rows="$(mktemp "${TMPDIR:-/tmp}/agb-cbprune.XXXXXX")" || return "$changed"
+  bridge_daemon_helper_python config-binding-list "$dir" >"$rows" 2>/dev/null || true
+
+  # IFS scoped to the read so only TAB splits the columns (the helper strips any
+  # stray tabs/newlines from each field).
+  while IFS=$'\t' read -r agent session; do
+    [[ -n "$agent" ]] || continue
+    # Provable life: a non-empty session that IS in the live set survives. Only a
+    # binding with no session, or a session provably absent from the live set,
+    # is an orphan (the server is provably up — guarded above).
+    if [[ -n "$session" && -n "${live_sessions[$session]:-}" ]]; then
+      continue
+    fi
+    if command -v bridge_remove_config_caller_binding >/dev/null 2>&1; then
+      bridge_remove_config_caller_binding "$agent" >/dev/null 2>&1 || true
+    else
+      rm -f "$dir/$agent.json" 2>/dev/null || true
+    fi
+    bridge_audit_log daemon config_caller_binding_orphan_pruned "$agent" \
+      --detail session="${session:-<none>}" 2>/dev/null || true
+    daemon_info "config-caller binding pruned for ${agent} (session ${session:-<none>} gone)"
+    changed=0
+  done <"$rows"
+
+  rm -f "$rows" 2>/dev/null || true
+
+  # (3) SELF-HEAL: re-publish the binding for any roster agent whose session is
+  # live but whose binding file is MISSING *or* PRESENT-BUT-STALE
+  # (single-point-of-publish fragility + recovery from a mistaken delete). The
+  # r3 pass only repaired a missing record (`[[ -f ]] && continue`), so a present
+  # record left over after a session restart — wrong `pane_pid`, or a stale
+  # bound-agent / admin identity — never got corrected and could keep
+  # authorizing against a recycled pane_pid (#1738 r3 FIX 3). We now validate the
+  # present record against the LIVE pane_pid + the bound agent + the current
+  # admin id and republish on any mismatch; only a present record that matches
+  # all three is left untouched. Best-effort and idempotent.
+  if command -v bridge_publish_config_caller_binding >/dev/null 2>&1 \
+     && [[ "${#BRIDGE_AGENT_IDS[@]}" -gt 0 ]]; then
+    _heal_admin="$(bridge_admin_agent_id 2>/dev/null || true)"
+    for agent in "${BRIDGE_AGENT_IDS[@]}"; do
+      [[ -n "$agent" ]] || continue
+      session="$(bridge_agent_session "$agent" 2>/dev/null || true)"
+      [[ -n "$session" && -n "${live_sessions[$session]:-}" ]] || continue
+      # Resolve the LIVE pane_pid under the SAME env scrub as the list-sessions
+      # probe (#1738 r3 FIX 1 + r5 FIX B). bridge_tmux_session_pane_pid shells
+      # `tmux display-message` with no scrub, so a stray TMUX/TMUX_PANE/TMUX_TMPDIR
+      # OR a DYLD_*/LD_* preload in the daemon env would resolve the pid from a
+      # caller-pointed/interposed private server — letting a same-named private
+      # session feed this validator a forged pid that falsely matches a stale
+      # record and SKIPS the repair (codex r4 BLOCKER). Scrub in a subshell forces
+      # the real default server.
+      _heal_pane_pid="$( ( bridge_daemon_scrub_probe_env; bridge_tmux_session_pane_pid "$session" ) 2>/dev/null || true)"
+      [[ "$_heal_pane_pid" =~ ^[0-9]+$ ]] || continue
+      # #1738 r5 FIX C: resolve the EXPECTED pane-owner UID for this agent (same
+      # helper the publisher records into the binding). A present record whose
+      # owner_uid is MISSING or differs from this is treated as stale and
+      # republished, so a legacy / pre-r5 record (no owner_uid — which the
+      # wrapper fails closed on, on iso) is BACKFILLED on the next live tick
+      # rather than staying denied indefinitely (codex r5 r2 finding).
+      _heal_owner_uid="$(bridge_config_caller_pane_owner_uid "$agent" 2>/dev/null || true)"
+      if [[ -f "$dir/$agent.json" ]]; then
+        # Present record: read its stale-check fields (pane_pid / agent_id /
+        # admin_agent_id / owner_uid) and skip ONLY when every field matches the
+        # live truth. An unreadable / malformed record yields empty fields →
+        # falls through to republish (fail-toward-repair). The agent name (file
+        # stem) is already the loop key, so `_rec_agent_id` must equal `$agent`.
+        _rec_fields="$(bridge_daemon_helper_python config-binding-record "$dir/$agent.json" 2>/dev/null || true)"
+        # Split the `<pane_pid>\t<agent_id>\t<admin_agent_id>\t<owner_uid>` row by
+        # hand (pure parameter expansion — no here-string / process substitution,
+        # matching the no-procsub discipline above). field1 = leading token,
+        # field4 = trailing token; fields 2/3 are peeled off the middle. A
+        # leading-empty pane_pid (unreadable record) leaves _rec_pane_pid empty so
+        # the match below fails → republish.
+        _rec_fields="${_rec_fields%$'\n'}"
+        _rec_pane_pid="${_rec_fields%%$'\t'*}"
+        _rec_owner_uid="${_rec_fields##*$'\t'}"
+        _rec_agent_id="${_rec_fields#*$'\t'}"        # drop pane_pid
+        _rec_agent_id="${_rec_agent_id%%$'\t'*}"     # take agent_id
+        _rec_admin_id="${_rec_fields#*$'\t'}"        # drop pane_pid
+        _rec_admin_id="${_rec_admin_id#*$'\t'}"      # drop agent_id
+        _rec_admin_id="${_rec_admin_id%%$'\t'*}"     # take admin_agent_id
+        if [[ "$_rec_pane_pid" == "$_heal_pane_pid" \
+              && "$_rec_agent_id" == "$agent" \
+              && "$_rec_admin_id" == "$_heal_admin" \
+              && "$_rec_owner_uid" == "$_heal_owner_uid" \
+              && -n "$_rec_owner_uid" ]]; then
+          continue
+        fi
+      fi
+      _heal_engine="$(bridge_agent_engine "$agent" 2>/dev/null || true)"
+      bridge_publish_config_caller_binding "$agent" "$_heal_pane_pid" "$_heal_engine" \
+        >/dev/null 2>&1 || true
+      # #1738 r5 FIX A (codex r4 BLOCKER): a bare `[[ -f ]]` after publish treats
+      # a stale-PRESENT record whose publish was a NO-OP (or failed) as healed —
+      # the pre-existing file still satisfies `-f`, so the daemon emits a
+      # `config_caller_binding_self_healed` audit row while the record is STILL
+      # stale (codex reproduced: seed pane_pid:99999, publish writes nothing,
+      # false `self_healed`). Self-heal must VERIFY the heal: re-read the record
+      # and require pane_pid == live pane AND agent_id == agent AND
+      # admin_agent_id == current admin AND owner_uid == expected (#1738 r5 FIX C
+      # backfill) BEFORE counting it healed. Anything else is a publish FAILURE —
+      # log it (so a persistent failure is visible) but do NOT emit a
+      # `self_healed` success or count a change.
+      if [[ ! -f "$dir/$agent.json" ]]; then
+        bridge_audit_log daemon config_caller_binding_self_heal_failed "$agent" \
+          --detail session="$session" --detail reason=missing-after-publish 2>/dev/null || true
+        daemon_info "config-caller binding self-heal FAILED for ${agent} (publish wrote no record; session ${session})"
+        continue
+      fi
+      _verify_fields="$(bridge_daemon_helper_python config-binding-record "$dir/$agent.json" 2>/dev/null || true)"
+      _verify_fields="${_verify_fields%$'\n'}"
+      _verify_pane_pid="${_verify_fields%%$'\t'*}"
+      _verify_owner_uid="${_verify_fields##*$'\t'}"
+      _verify_agent_id="${_verify_fields#*$'\t'}"        # drop pane_pid
+      _verify_agent_id="${_verify_agent_id%%$'\t'*}"     # take agent_id
+      _verify_admin_id="${_verify_fields#*$'\t'}"        # drop pane_pid
+      _verify_admin_id="${_verify_admin_id#*$'\t'}"      # drop agent_id
+      _verify_admin_id="${_verify_admin_id%%$'\t'*}"     # take admin_agent_id
+      if [[ "$_verify_pane_pid" != "$_heal_pane_pid" \
+            || "$_verify_agent_id" != "$agent" \
+            || "$_verify_admin_id" != "$_heal_admin" \
+            || "$_verify_owner_uid" != "$_heal_owner_uid" ]]; then
+        bridge_audit_log daemon config_caller_binding_self_heal_failed "$agent" \
+          --detail session="$session" --detail reason=still-stale-after-publish 2>/dev/null || true
+        daemon_info "config-caller binding self-heal FAILED for ${agent} (record still stale after publish: pane_pid=${_verify_pane_pid:-<none>} agent=${_verify_agent_id:-<none>} admin=${_verify_admin_id:-<none>} owner_uid=${_verify_owner_uid:-<none>}; expected pane_pid=${_heal_pane_pid} agent=${agent} admin=${_heal_admin} owner_uid=${_heal_owner_uid:-<none>})"
+        continue
+      fi
+      bridge_audit_log daemon config_caller_binding_self_healed "$agent" \
+        --detail session="$session" 2>/dev/null || true
+      daemon_info "config-caller binding self-healed for ${agent} (live session ${session}, binding missing or stale)"
+      changed=0
+    done
+  fi
+
+  return "$changed"
+}
+
 bridge_dashboard_post_if_changed() {
   local summary_output="$1"
   local summary_file
@@ -13797,6 +14028,18 @@ cmd_sync_cycle() {
   # a new backoff row on the same tick.
   BRIDGE_DAEMON_LAST_STEP="autostart_state_sweep"
   if bridge_daemon_sweep_orphan_autostart_state; then
+    changed=0
+  fi
+  # Issue #1738 r2/r3 (BLOCKER 2 + FIX 3): prune config-caller bindings whose
+  # tmux session is provably gone. Orderly stops GC their own binding
+  # (lib/bridge-agents.sh); this catches the crash/reboot/kill-server/SIGKILL
+  # orphans that never run the orderly path, so a PID-reuse forger cannot ride a
+  # stale admin binding. r3: a precondition server-reachability guard + a
+  # materialized live-session set make a transient tmux outage prune NOTHING
+  # (instead of every live binding fleet-wide), and live-but-missing bindings
+  # self-heal next tick.
+  BRIDGE_DAEMON_LAST_STEP="config_caller_binding_prune"
+  if bridge_daemon_prune_orphan_config_caller_bindings; then
     changed=0
   fi
   BRIDGE_DAEMON_LAST_STEP="on_demand_agents"
