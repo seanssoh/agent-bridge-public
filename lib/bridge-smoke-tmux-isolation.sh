@@ -39,15 +39,28 @@ if [[ -z "${TMUX_TMPDIR:-}" ]]; then
   printf '[smoke] tmux socket isolated: TMUX_TMPDIR=%s (fleet-down guard)\n' "$TMUX_TMPDIR" >&2
 else
   # A socket dir was supplied — refuse it if it can resolve to a shared/live
-  # tmux server dir. `${TMUX_TMPDIR%/}` strips a trailing slash; exact-match the
-  # known shared roots and the `/tmp/tmux-*` default-server family.
-  case "${TMUX_TMPDIR%/}" in
+  # tmux server dir. CANONICALIZE first (resolve symlinks to the physical path):
+  # tmux derives its socket from the real dir, so a symlink whose target is a
+  # shared root (e.g. `…/link -> /tmp`) must NOT slip the literal match. Fail
+  # closed if the dir does not resolve to a real directory at all.
+  _smoke_tmux_resolved="$(cd -P -- "$TMUX_TMPDIR" 2>/dev/null && pwd -P)" || _smoke_tmux_resolved=""
+  if [[ -z "$_smoke_tmux_resolved" ]]; then
+    printf '[smoke][error] refusing to run: TMUX_TMPDIR=%s does not resolve to a real directory (cannot prove it is private).\n' "$TMUX_TMPDIR" >&2
+    exit 1
+  fi
+  case "$_smoke_tmux_resolved" in
     /tmp | /private/tmp | /var/folders | /private/var/folders | \
     /tmp/tmux-* | /private/tmp/tmux-*)
-      printf '[smoke][error] refusing to run: TMUX_TMPDIR=%s can resolve to the shared/live tmux socket.\n' "$TMUX_TMPDIR" >&2
+      printf '[smoke][error] refusing to run: TMUX_TMPDIR=%s resolves to a shared/live tmux socket root (%s).\n' "$TMUX_TMPDIR" "$_smoke_tmux_resolved" >&2
       printf '[smoke][error] this harness kills tmux sessions; on the default socket that downs live bridge agents (2026-06-16 fleet-down incident).\n' >&2
       printf '[smoke][error] unset TMUX_TMPDIR (the guard will mktemp a private dir) or point it at a private mktemp dir.\n' >&2
       exit 1
       ;;
   esac
+  unset _smoke_tmux_resolved
+  # The caller pre-set a private dir as a (possibly non-exported) shell var.
+  # EXPORT it so child `tmux` actually uses it — a value that is set but not
+  # exported is invisible to subprocesses, which would fall back to the default
+  # socket root (the very hole this guard exists to close).
+  export TMUX_TMPDIR
 fi
