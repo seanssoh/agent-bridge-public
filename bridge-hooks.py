@@ -422,8 +422,116 @@ def shell_command(program: str, path_str: str, *extra: str) -> str:
     return " ".join(parts)
 
 
+# Issue #1934: hook COMMAND paths written into live agent settings (and the
+# _template scaffold) must point at a hooks directory that survives /tmp
+# reaping. A render run with a transient/test BRIDGE_HOME (e.g. an acceptance
+# root `/tmp/agb-iso-test-<token>`) used to compute `$BRIDGE_HOME/hooks/<hook>`
+# and persist those /tmp paths; when the OS reaped /tmp the hook files vanished
+# and every agent went fail-closed-deaf (UserPromptSubmit) + tool-deadlocked
+# (PreToolUse `*`), with no self-recovery — this bricked a production farm.
+#
+# `_stable_hooks_dir` is the single chokepoint both hook-command builders
+# (cmd_ensure_* via *_hook_command) and the render rewrite
+# (_normalize_bridge_hook_paths) route through. It keeps the resolved
+# `<bridge_home>/hooks` UNLESS that path is provably unsafe — a transient root
+# whose hooks dir does not survive — in which case it falls back to the
+# canonical install hooks dir (`~/.agent-bridge/hooks`), which a shared-mode
+# install always deploys and which iso v2 agents reach through their per-home
+# `~/.agent-bridge -> $BRIDGE_HOME` symlink. (The isolated renderer stages its
+# OUTPUT through a controller temp dir but always derives `bridge_home` from the
+# real `--base-settings-file` under $BRIDGE_HOME, so legitimate iso renders are
+# never fenced.)
+#
+# Precedence when `<bridge_home>/hooks` is under a transient root (`/tmp`,
+# `/private/tmp`, `/var/folders`, or $TMPDIR):
+#   1. If a canonical install hooks dir (`~/.agent-bridge/hooks`) EXISTS, use it
+#      — ALWAYS, even if the transient tree happens to be populated right now.
+#      A transient tree that is populated at render time is still reaped later
+#      (exactly the production incident), so a path into it must never be
+#      persisted when a reaping-survivable install is available. (codex r1: a
+#      "self-contained but transient" tree is NOT safe to persist if a canonical
+#      install exists.)
+#   2. Otherwise (no canonical install on this host — a genuinely self-contained
+#      isolated-BRIDGE_HOME test render with nothing else to point at), keep the
+#      transient `<bridge_home>/hooks` rather than fabricating an absent path.
+#      This is the only case where a transient path survives, and it is benign:
+#      there is no live/canonical home to pollute, and the render is internally
+#      consistent with its own temp tree.
+# macOS resolves /tmp -> /private/tmp and $TMPDIR (/var/folders/...) ->
+# /private/var/folders/..., so the `/private`-prefixed forms must be matched
+# too (the live install paths the renderer sees are already realpath-resolved).
+_TRANSIENT_HOOK_ROOT_PREFIXES = (
+    "/tmp/",
+    "/private/tmp/",
+    "/var/folders/",
+    "/private/var/folders/",
+)
+
+
+def _looks_transient(path: Path) -> bool:
+    """Best-effort: does `path` live under an OS-reapable temp root?"""
+    try:
+        texts = {str(path)}
+        # Also test the realpath so a /tmp symlink to /private/tmp (macOS) or
+        # any other temp-root indirection is caught regardless of which form the
+        # caller passed.
+        try:
+            texts.add(os.path.realpath(str(path)))
+        except (OSError, ValueError):
+            pass
+    except (TypeError, ValueError):
+        return False
+    prefixes = list(_TRANSIENT_HOOK_ROOT_PREFIXES)
+    tmpdir = os.environ.get("TMPDIR", "").strip()
+    if tmpdir:
+        tmpdir_norm = tmpdir.rstrip("/") + "/"
+        prefixes.append(tmpdir_norm)
+        try:
+            prefixes.append(os.path.realpath(tmpdir).rstrip("/") + "/")
+        except (OSError, ValueError):
+            pass
+    return any(
+        text.startswith(prefix) for text in texts for prefix in prefixes
+    )
+
+
+def _canonical_install_hooks_dir() -> Path | None:
+    """The stable, reaping-survivable hooks dir of the real install.
+
+    `~/.agent-bridge/hooks` is the canonical shared-mode location (the literal
+    the tracked base settings encode, and the symlink target iso agents resolve
+    through). Returned only when it exists on disk so the fence never
+    substitutes a path that is itself absent.
+    """
+    candidate = Path("~/.agent-bridge/hooks").expanduser()
+    try:
+        if candidate.is_dir():  # noqa: raw-pathlib-controller-only — controller-side canonical-install probe
+            return candidate
+    except (OSError, PermissionError):
+        return None
+    return None
+
+
+def _stable_hooks_dir(bridge_home: Path) -> Path:
+    """Resolve `<bridge_home>/hooks`, fencing transient roots (#1934).
+
+    Non-transient `<bridge_home>/hooks` is returned unchanged. A transient
+    `<bridge_home>/hooks` is replaced by the canonical install hooks dir when one
+    exists (ALWAYS — a populated-but-transient tree is still reaped later), and
+    only kept when no canonical install exists (a self-contained test render
+    with nothing reaping-survivable to point at). See the module note above.
+    """
+    resolved = bridge_home / "hooks"
+    if not _looks_transient(resolved):
+        return resolved
+    canonical = _canonical_install_hooks_dir()
+    if canonical is not None:
+        return canonical
+    return resolved
+
+
 def stop_hook_command(bridge_home: Path, bash_bin: str) -> str:
-    hook_path = bridge_home / "hooks" / "mark-idle.sh"
+    hook_path = _stable_hooks_dir(bridge_home) / "mark-idle.sh"
     return shell_command(bash_bin, shell_path(hook_path))
 
 
@@ -436,48 +544,48 @@ def stop_hook_command(bridge_home: Path, bash_bin: str) -> str:
 # Claude agent. Helpers below let the ensure path register the missing pair
 # in addition to mark-idle.sh.
 def surface_reply_enforce_hook_command(bridge_home: Path, python_bin: str) -> str:
-    hook_path = bridge_home / "hooks" / "surface-reply-enforce.py"
+    hook_path = _stable_hooks_dir(bridge_home) / "surface-reply-enforce.py"
     return shell_command(python_bin, shell_path(hook_path))
 
 
 def session_stop_hook_command(bridge_home: Path, python_bin: str) -> str:
-    hook_path = bridge_home / "hooks" / "session-stop.py"
+    hook_path = _stable_hooks_dir(bridge_home) / "session-stop.py"
     return shell_command(python_bin, shell_path(hook_path))
 
 
 def inbox_drain_hook_command(bridge_home: Path, python_bin: str) -> str:
     # #9780: Stop inbox-drain auto-continue. Wired AFTER surface-reply-enforce
     # (so it never shadows the channel-reply block) and BEFORE session-stop.
-    hook_path = bridge_home / "hooks" / "inbox-auto-drain.py"
+    hook_path = _stable_hooks_dir(bridge_home) / "inbox-auto-drain.py"
     return shell_command(python_bin, shell_path(hook_path))
 
 
 def session_start_hook_command(bridge_home: Path, python_bin: str, fmt: str = "text") -> str:
-    hook_path = bridge_home / "hooks" / "session-start.py"
+    hook_path = _stable_hooks_dir(bridge_home) / "session-start.py"
     if fmt != "text":
         return shell_command(python_bin, shell_path(hook_path), "--format", fmt)
     return shell_command(python_bin, shell_path(hook_path))
 
 
 def prompt_hook_command(bridge_home: Path, bash_bin: str) -> str:
-    hook_path = bridge_home / "hooks" / "clear-idle.sh"
+    hook_path = _stable_hooks_dir(bridge_home) / "clear-idle.sh"
     return shell_command(bash_bin, shell_path(hook_path))
 
 
 def prompt_timestamp_hook_command(bridge_home: Path, python_bin: str, fmt: str = "text") -> str:
-    hook_path = bridge_home / "hooks" / "prompt_timestamp.py"
+    hook_path = _stable_hooks_dir(bridge_home) / "prompt_timestamp.py"
     if fmt != "text":
         return shell_command(python_bin, shell_path(hook_path), "--format", fmt)
     return shell_command(python_bin, shell_path(hook_path))
 
 
 def prompt_guard_hook_command(bridge_home: Path, python_bin: str) -> str:
-    hook_path = bridge_home / "hooks" / "prompt-guard.py"
+    hook_path = _stable_hooks_dir(bridge_home) / "prompt-guard.py"
     return shell_command(python_bin, shell_path(hook_path))
 
 
 def tool_policy_hook_command(bridge_home: Path, python_bin: str) -> str:
-    hook_path = bridge_home / "hooks" / "tool-policy.py"
+    hook_path = _stable_hooks_dir(bridge_home) / "tool-policy.py"
     return shell_command(python_bin, shell_path(hook_path))
 
 
@@ -491,27 +599,27 @@ ASKUSERQUESTION_SCOPED_DENY = "AskUserQuestion(*)"
 
 
 def askuserquestion_ban_hook_command(bridge_home: Path, python_bin: str) -> str:
-    hook_path = bridge_home / "hooks" / "askuserquestion-ban.py"
+    hook_path = _stable_hooks_dir(bridge_home) / "askuserquestion-ban.py"
     return shell_command(python_bin, shell_path(hook_path))
 
 
 def pre_compact_hook_command(bridge_home: Path, python_bin: str) -> str:
-    hook_path = bridge_home / "hooks" / "pre-compact.py"
+    hook_path = _stable_hooks_dir(bridge_home) / "pre-compact.py"
     return shell_command(python_bin, shell_path(hook_path))
 
 
 def codex_stop_hook_command(bridge_home: Path, python_bin: str) -> str:
-    hook_path = bridge_home / "hooks" / "check-inbox.py"
+    hook_path = _stable_hooks_dir(bridge_home) / "check-inbox.py"
     return shell_command(python_bin, shell_path(hook_path), "--format", "codex")
 
 
 def codex_task_mode_policy_hook_command(bridge_home: Path, python_bin: str) -> str:
-    hook_path = bridge_home / "hooks" / "codex-task-mode-policy.py"
+    hook_path = _stable_hooks_dir(bridge_home) / "codex-task-mode-policy.py"
     return shell_command(python_bin, shell_path(hook_path))
 
 
 def codex_review_output_shape_hook_command(bridge_home: Path, python_bin: str) -> str:
-    hook_path = bridge_home / "hooks" / "codex-review-output-shape.py"
+    hook_path = _stable_hooks_dir(bridge_home) / "codex-review-output-shape.py"
     return shell_command(python_bin, shell_path(hook_path))
 
 
@@ -519,27 +627,27 @@ def codex_review_output_shape_hook_command(bridge_home: Path, python_bin: str) -
 # SubagentStart/SubagentStop/PermissionRequest). All audit-only by default;
 # any enforcement is env-gated inside the hook scripts themselves.
 def codex_pre_compact_hook_command(bridge_home: Path, python_bin: str) -> str:
-    hook_path = bridge_home / "hooks" / "codex-pre-compact.py"
+    hook_path = _stable_hooks_dir(bridge_home) / "codex-pre-compact.py"
     return shell_command(python_bin, shell_path(hook_path))
 
 
 def codex_post_compact_hook_command(bridge_home: Path, python_bin: str) -> str:
-    hook_path = bridge_home / "hooks" / "codex-post-compact.py"
+    hook_path = _stable_hooks_dir(bridge_home) / "codex-post-compact.py"
     return shell_command(python_bin, shell_path(hook_path))
 
 
 def codex_subagent_start_hook_command(bridge_home: Path, python_bin: str) -> str:
-    hook_path = bridge_home / "hooks" / "codex-subagent-start.py"
+    hook_path = _stable_hooks_dir(bridge_home) / "codex-subagent-start.py"
     return shell_command(python_bin, shell_path(hook_path))
 
 
 def codex_subagent_stop_hook_command(bridge_home: Path, python_bin: str) -> str:
-    hook_path = bridge_home / "hooks" / "codex-subagent-stop.py"
+    hook_path = _stable_hooks_dir(bridge_home) / "codex-subagent-stop.py"
     return shell_command(python_bin, shell_path(hook_path))
 
 
 def codex_permission_request_hook_command(bridge_home: Path, python_bin: str) -> str:
-    hook_path = bridge_home / "hooks" / "codex-permission-request.py"
+    hook_path = _stable_hooks_dir(bridge_home) / "codex-permission-request.py"
     return shell_command(python_bin, shell_path(hook_path))
 
 
@@ -2094,7 +2202,10 @@ def _normalize_bridge_hook_paths(settings: dict[str, Any], bridge_home: Path | N
     if not isinstance(hooks, dict):
         return
     old_prefix = "~/.agent-bridge/hooks/"
-    new_prefix = f"{bridge_home}/hooks/"
+    # #1934: route through the stable-hooks-dir chokepoint so a render run with
+    # a transient/test BRIDGE_HOME never persists `/tmp/.../hooks/` paths into
+    # the live effective settings / _template scaffold.
+    new_prefix = f"{_stable_hooks_dir(bridge_home)}/"
     for groups in hooks.values():
         if not isinstance(groups, list):
             continue

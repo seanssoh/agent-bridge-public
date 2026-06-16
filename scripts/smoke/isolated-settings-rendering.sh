@@ -61,6 +61,16 @@ build_fixture() {
     "$FIXTURE_BRIDGE_HOME/agents/.claude" \
     "$FIXTURE_ISOLATED_HOME/.claude"
 
+  # #1934: the stable-hooks-dir resolver fences a transient FIXTURE_BRIDGE_HOME
+  # to the host's canonical `~/.agent-bridge/hooks` when one EXISTS. This smoke
+  # asserts the temp-BRIDGE_HOME absolute-path rewrite, so point HOME at an empty
+  # temp dir (no `.agent-bridge/hooks`) — there is then no canonical install to
+  # fence to, the resolver keeps this temp bridge_home's own hooks path, and the
+  # smoke stays hermetic + host-independent.
+  HOME="$SMOKE_TMP_ROOT/fake-home"
+  export HOME
+  mkdir -p "$HOME"
+
   # Seed the shared base settings the renderer pulls in. Use a copy of
   # the real source so the smoke catches a future regression where the
   # base loses one of the managed hook entries.
@@ -152,6 +162,12 @@ assert_hook_entries_present() {
   # shellcheck disable=SC2088  # literal tilde regression assertion — must not expand
   smoke_assert_not_contains "$content" "~/.agent-bridge/hooks" \
     "rendered hook commands do not depend on runtime HOME"
+  # #1934: with a populated `<bridge_home>/hooks/` the stable-hooks-dir resolver
+  # keeps THIS self-contained bridge_home's own hooks dir (hermetic) — proving
+  # the temp-BRIDGE_HOME rewrite still works and never silently fences to the
+  # host's canonical install when the fixture is internally consistent.
+  smoke_assert_contains "$content" "$FIXTURE_BRIDGE_HOME/hooks/tool-policy.py" \
+    "rendered hook commands point at this bridge_home's own hooks dir"
 }
 
 assert_settings_is_symlink() {
