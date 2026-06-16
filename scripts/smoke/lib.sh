@@ -358,7 +358,14 @@ smoke_config_caller_make_store_foreign() {
     return 1
   fi
   sudo -n chmod 0711 "$dir" 2>/dev/null || true
-  sudo -n chmod 0644 "$dir"/*.json 2>/dev/null || true
+  # #1738 cm-prod finding: chmod the binding files via a ROOT shell so the glob
+  # expands as root. The caller is now a non-owner of the 0711 dir and can no
+  # longer LIST it, so a caller-shell glob (`"$dir"/*.json`) would not expand —
+  # the file chmod would silently no-op (|| true), leaving the binding at the
+  # seed umask 0600 → controller-unreadable → a false `noninteractive-untrusted`
+  # deny on passwordless-sudo hosts (cm-prod), green-by-skip elsewhere. A real
+  # iso store publishes binding files 0644 (controller-readable); match that.
+  sudo -n sh -c 'chmod 0644 "$1"/*.json 2>/dev/null || true' _ "$dir" 2>/dev/null || true
   export SMOKE_CONFIG_CALLER_ISO_OK=1
   return 0
 }
