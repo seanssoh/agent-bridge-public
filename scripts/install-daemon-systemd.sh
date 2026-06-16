@@ -509,6 +509,31 @@ printf '%s\n' "$UNIT_CONTENT" >"$SERVICE_PATH"
 # log lines on stdout poison bridge-bootstrap.sh's JSON parser. Same
 # convention as the bridge_info → stderr fix (#1273) for lib/bridge-core.sh.
 echo "[info] wrote systemd user unit: $SERVICE_PATH" >&2
+# cm-prod F1 (#1934-rescue fallout): a systemd `--user` daemon is bound to the
+# invoking login session unless lingering is enabled. A single session churn
+# (e.g. a `--replace` agent restart) makes systemd leave default.target /
+# timers.target and STOP both the always-on daemon AND its liveness backstop
+# timer (WantedBy=timers.target), which then never re-arms — a silent,
+# indefinite outage (observed: 27h reconcile-daemon down + token auto-rotate
+# frozen). Enable lingering whenever we apply the unit (NOT only on --enable:
+# `agb upgrade` re-applies WITHOUT --enable, so the linger guarantee must live
+# on the --apply path to reach existing installs). Best-effort with a sudo
+# fallback and a LOUD warn so an operator who cannot enable it is told the
+# daemon will not survive a logout.
+if command -v loginctl >/dev/null 2>&1; then
+  _linger_user="${CONTROLLER_USER:-}"
+  [[ -n "$_linger_user" ]] || _linger_user="$(id -un 2>/dev/null || printf '%s' "${USER:-}")"
+  if [[ -n "$_linger_user" ]]; then
+    if loginctl show-user "$_linger_user" --property=Linger 2>/dev/null | grep -q '^Linger=yes$'; then
+      echo "[info] linger already enabled for $_linger_user (user daemon persists across logout)" >&2
+    elif loginctl enable-linger "$_linger_user" 2>/dev/null \
+      || sudo -n loginctl enable-linger "$_linger_user" 2>/dev/null; then
+      echo "[info] enabled linger for $_linger_user — the systemd --user daemon now persists across logout/session churn" >&2
+    else
+      echo "[warn] could NOT enable-linger for $_linger_user: the systemd --user daemon will be torn down on logout/session churn and NOT recover. Run: loginctl enable-linger $_linger_user" >&2
+    fi
+  fi
+fi
 if [[ $SUDO_SELF_ACTIVE -eq 1 ]]; then
   echo "[info] sudo-self ExecStart active (reason=${SUDO_SELF_REASON} user=${CONTROLLER_USER})" >&2
 else
