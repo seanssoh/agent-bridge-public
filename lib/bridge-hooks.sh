@@ -910,8 +910,14 @@ bridge_ensure_hud_usage_tap() {
   local workdir="$1"
   local launch_cmd="${2-}"
   local agent="${3-}"
+  # #1961 (display-only): pass the operator's system-global settings file so the
+  # Python empty-slot branch can compose `tap | <operator renderer>` instead of
+  # installing the blank standalone tap. Empty/missing => fail-safe standalone
+  # tap (pre-#1961). Same #11901 resolver the shared renderer uses.
+  local operator_global_file
+  operator_global_file="$(bridge_hook_operator_global_settings_file)"
   if [[ "$(bridge_claude_settings_mode "$workdir")" == "shared" ]]; then
-    bridge_hooks_python ensure-hud-usage-tap --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)" >/dev/null
+    bridge_hooks_python ensure-hud-usage-tap --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)" --operator-global-settings-file "$operator_global_file" >/dev/null
     bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd" "$agent"
     # bridge_link_claude_settings_to_shared skips linux-user isolated agents
     # (the mirror is under a foreign UID). Re-render the isolated home so the
@@ -921,7 +927,7 @@ bridge_ensure_hud_usage_tap() {
     fi
   else
     local -a _ta=(); bridge_claude_local_hook_target_args "$workdir" _ta "$agent" || return 1
-    bridge_hooks_python ensure-hud-usage-tap "${_ta[@]}" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)"
+    bridge_hooks_python ensure-hud-usage-tap "${_ta[@]}" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)" --operator-global-settings-file "$operator_global_file"
   fi
 }
 

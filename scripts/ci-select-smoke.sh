@@ -4026,7 +4026,16 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # .codex/hooks.json. 1934-hook-path-canonical-fence pins it; the
       # 1934-hook-file-self-heal smoke (daemon facet 2) rides along since the
       # renderer + the daemon re-render share the same builders.
-      add_required hooks upgrade-shared-settings-propagate managed-autocompact-window isolated-settings-rendering 1495-settings-invalid-hook-key 1453-channel-sticky-false-inbound per-agent-settings-rendering shared-settings-preserve-user-keys 1689-statusline-preserve-rerender 1756-settings-preserve-model-user-keys 11901-shared-global-settings-inherit 1759-selfref-global-loop-guard admin-hook-exemption 1067-codex-provisioning 1120-controller-ops-isolated 1139-link-shared-settings-perm 1672-link-shared-settings-idempotent 1145-ensure-dir-actually-sudo 1145-option1-deferral-guard 1151-step-a-helper 1165-track-c-hooks-and-dispatcher 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp 1205-hook-iso-fail-open 1212-bridge-hooks-marketplace 1213-iso-uid-predicate 1934-hook-path-canonical-fence 1934-hook-file-self-heal beta27-D-inject-timestamp-resolved beta27-E-hook-permission-fail-open-markers 1358-admin-credential-routine-exempt 1199-action-required-claimed-skip codex-precompact-hook codex-postcompact-hook codex-subagent-hooks codex-permission-request-hook 1890-dynamic-vanilla-claude 1899-dynamic-vanilla-codex
+      # Issue #1961 (display-only): bridge-hooks.py's `cmd_ensure_hud_usage_tap`
+      # empty-slot branch now composes `tap | <operator-global statusLine
+      # renderer>` (renderer-agnostic, no plugin-name hardcoding) instead of
+      # always installing the blank standalone tap, and lib/bridge-hooks.sh's
+      # `bridge_ensure_hud_usage_tap` passes --operator-global-settings-file.
+      # 1961-statusline-compose pins the renderer-agnostic compose, the blank
+      # standalone fallback, the no-double-tap edge, idempotency, and that a
+      # foreign per-agent statusLine is never clobbered. Pull on every
+      # bridge-hooks.py + bridge-hooks.sh move.
+      add_required hooks upgrade-shared-settings-propagate managed-autocompact-window isolated-settings-rendering 1495-settings-invalid-hook-key 1453-channel-sticky-false-inbound per-agent-settings-rendering shared-settings-preserve-user-keys 1689-statusline-preserve-rerender 1756-settings-preserve-model-user-keys 11901-shared-global-settings-inherit 1759-selfref-global-loop-guard 1961-statusline-compose admin-hook-exemption 1067-codex-provisioning 1120-controller-ops-isolated 1139-link-shared-settings-perm 1672-link-shared-settings-idempotent 1145-ensure-dir-actually-sudo 1145-option1-deferral-guard 1151-step-a-helper 1165-track-c-hooks-and-dispatcher 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp 1205-hook-iso-fail-open 1212-bridge-hooks-marketplace 1213-iso-uid-predicate 1934-hook-path-canonical-fence 1934-hook-file-self-heal beta27-D-inject-timestamp-resolved beta27-E-hook-permission-fail-open-markers 1358-admin-credential-routine-exempt 1199-action-required-claimed-skip codex-precompact-hook codex-postcompact-hook codex-subagent-hooks codex-permission-request-hook 1890-dynamic-vanilla-claude 1899-dynamic-vanilla-codex
       # Issue #1497 (P1): hooks/bridge_hook_common.py::agent_default_home now
       # reads BRIDGE_AGENT_HOME_RESOLVED first, is v2-aware, falls back to the
       # roster CLI (`agent show --json agent_home`), and no longer lets a stale

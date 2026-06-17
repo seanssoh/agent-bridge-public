@@ -3392,6 +3392,41 @@ def _patch_hud_command(cmd: str, tap_path: str) -> str:
     return tap_prefix + cmd
 
 
+def _operator_global_status_line_command(path_arg: Any) -> str:
+    """Return the operator-global `statusLine.command`, or "" when none.
+
+    Reads the operator's system-global `~/.claude/settings.json` (resolved in
+    the shell via `bridge_agent_operator_home_dir`, the SAME #11901 inheritance
+    resolver the shared renderer uses) and returns the renderer command string.
+    Renderer-agnostic: ANY non-empty `statusLine.command` is returned verbatim
+    (claude-hud, ccstatusline, a custom script — no plugin-name knowledge).
+
+    Defensive by contract (#1961): an empty/missing path, an unreadable or
+    malformed file, a non-dict payload, an absent/non-dict `statusLine`, or a
+    non-string/empty `command` all collapse to "" so the empty-slot caller
+    degrades to the headless standalone tap exactly as before.
+    """
+    if not isinstance(path_arg, str) or not path_arg.strip():
+        return ""
+    try:
+        # `expanduser()` can raise RuntimeError ("Can't determine home
+        # directory") / ValueError on a `~`-prefixed path with no resolvable
+        # home; load_json raises OSError / JSONDecodeError. Catch them all so a
+        # bad operator-global path always degrades to the standalone tap.
+        payload = load_json(Path(path_arg).expanduser())
+    except (OSError, json.JSONDecodeError, RuntimeError, ValueError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    sl = payload.get("statusLine")
+    if not isinstance(sl, dict):
+        return ""
+    cmd = sl.get("command", "")
+    if not isinstance(cmd, str) or not cmd.strip():
+        return ""
+    return cmd
+
+
 def cmd_ensure_hud_usage_tap(args: argparse.Namespace) -> int:
     """Patch a HUD statusLine command to pipe through hud-usage-tap.py.
 
@@ -3433,13 +3468,41 @@ def cmd_ensure_hud_usage_tap(args: argparse.Namespace) -> int:
             print("hud_usage_tap: present")
         return 0
 
-    # Empty statusLine slot (absent / {} / empty command): install the tap
-    # standalone. Only a genuinely EMPTY slot qualifies — a non-dict
-    # statusLine or a non-string command is unknown config we must not
+    # Empty statusLine slot (absent / {} / empty command): the agent has no
+    # per-agent renderer of its own. Only a genuinely EMPTY slot qualifies — a
+    # non-dict statusLine or a non-string command is unknown config we must not
     # clobber (handled by the no-hud branch below).
     if sl is None or (sl_is_dict and isinstance(raw_cmd, str) and not cmd.strip()):
         python_bin = getattr(args, "python_bin", None) or "python3"
-        installed = f"{python_bin} {shlex.quote(tap_path)} > /dev/null"
+        # #1961 (display-only): when the operator has a non-empty user-global
+        # statusLine renderer, compose `tap | <that renderer>` instead of the
+        # blank standalone tap, so an operator who installed a status display
+        # (claude-hud, ccstatusline, a custom script — renderer-agnostic, no
+        # plugin-name knowledge) actually sees it inside the agent pane while
+        # the bridge keeps its usage accounting. statusLine is display-only:
+        # worst case is a cosmetic status bar, and it runs the operator's own
+        # command in the operator's own agent. Behavior/security keys (hooks /
+        # permissions / env / credentials) stay out of scope (#1964, v0.17).
+        renderer_cmd = _operator_global_status_line_command(
+            getattr(args, "operator_global_settings_file", "")
+        )
+        if renderer_cmd:
+            # If the operator already hand-composed the tap into their global
+            # renderer, install it as-is (no double-prepend); otherwise insert
+            # the tap before the renderer's exec (or generically prepend).
+            if _hud_tap_present(renderer_cmd):
+                installed = renderer_cmd
+            else:
+                installed = _patch_hud_command(renderer_cmd, tap_path)
+            note = (
+                "hud_usage_tap: installed (statusLine was empty; tap composed "
+                "with operator-global renderer)"
+            )
+        else:
+            installed = f"{python_bin} {shlex.quote(tap_path)} > /dev/null"
+            note = (
+                "hud_usage_tap: installed (statusLine was empty; tap installed standalone)"
+            )
         settings["statusLine"] = {"type": "command", "command": installed}
         save_json(settings_path, settings)
         payload = {
@@ -3451,7 +3514,7 @@ def cmd_ensure_hud_usage_tap(args: argparse.Namespace) -> int:
         }
         print_payload(payload, args.format)
         if args.format != "shell":
-            print("hud_usage_tap: installed (statusLine was empty; tap installed standalone)")
+            print(note)
         return 0
 
     if not sl_is_dict or not isinstance(raw_cmd, str) or not _is_hud_status_line(cmd):
@@ -3869,6 +3932,11 @@ def build_parser() -> argparse.ArgumentParser:
     hud_tap_ensure_parser.add_argument("--settings-file")
     hud_tap_ensure_parser.add_argument("--bridge-home", required=True)
     hud_tap_ensure_parser.add_argument("--python-bin", required=True)
+    hud_tap_ensure_parser.add_argument(
+        "--operator-global-settings-file",
+        default="",
+        help="Operator's system-global ~/.claude/settings.json (resolved in the shell via bridge_agent_operator_home_dir, same #11901 resolver). #1961 display-only: when the per-agent statusLine slot is EMPTY and the operator set a non-empty global statusLine renderer, the tap is composed as `tap | <renderer>` instead of installed standalone, so an operator-installed status display (claude-hud / ccstatusline / custom — renderer-agnostic) renders in the agent pane. Empty / missing / unreadable / non-object / no statusLine => fail-safe blank standalone tap (pre-#1961 behavior).",
+    )
     hud_tap_ensure_parser.add_argument(
         "--format", choices=("text", "shell"), default="text"
     )
