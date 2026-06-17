@@ -182,6 +182,10 @@ WANTED_HELPERS=(
   bridge_daemon_nudge_state_file
   bridge_daemon_compute_nudge_fingerprint
   bridge_daemon_nudge_task_ts_var
+  # Issue #1973 Track B: should_skip / record_nudge depend on the new
+  # capped-exponential backoff helpers; extract them too.
+  bridge_daemon_nudge_task_field_var
+  bridge_daemon_nudge_backoff_delay
   bridge_daemon_nudge_dedup_load
   bridge_daemon_nudge_dedup_reset_scope
   bridge_daemon_should_skip_nudge
