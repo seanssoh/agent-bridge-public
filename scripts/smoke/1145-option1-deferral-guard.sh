@@ -317,6 +317,13 @@ fi
 if [[ $T1_LINK_CALLED -ne 0 ]]; then
   smoke_fail "T1 expected NO bridge_hooks_python:link-shared-settings call (deferral guard should short-circuit). calls: $(tr '\n' '|' <"$T1_CALL_LOG")"
 fi
+# #1945 F7 regression gate: the deferral guard must short-circuit BEFORE the
+# #1945 iso render escalation, not after. If render-shared-settings fires in a
+# deferral case, the guard ran too late (the pre-fix ordering). This FAILS
+# against the known-bad 82c9b1bd ordering and passes on the fixed e2c50b52.
+if grep -q '^bridge_hooks_python:render-shared-settings$' "$T1_CALL_LOG"; then
+  smoke_fail "T1 expected NO bridge_hooks_python:render-shared-settings call (deferral must gate BEFORE the #1945 render escalation). calls: $(tr '\n' '|' <"$T1_CALL_LOG")"
+fi
 grep -q '^RC=0$' "$T1_CALL_LOG" \
   || smoke_fail "T1 expected RC=0 (deferral returns 0). calls: $(tr '\n' '|' <"$T1_CALL_LOG")"
 smoke_log "T1 PASS: isolation-effective + workdir-missing → link-shared-settings deferred, return 0"
@@ -389,6 +396,10 @@ if grep -q '^bridge_hooks_python:link-shared-settings$' "$T2B_CALL_LOG"; then
 fi
 if [[ $T2B_LINK_CALLED -ne 0 ]]; then
   smoke_fail "T2b expected NO bridge_hooks_python:link-shared-settings call (workdir present but pre-Step-A, owner=controller — codex BLOCKING shape). calls: $(tr '\n' '|' <"$T2B_CALL_LOG"). NOTE: this test FAILS against the r1 existence-only guard by design."
+fi
+# #1945 F7 regression gate: deferral must gate BEFORE the #1945 render escalation.
+if grep -q '^bridge_hooks_python:render-shared-settings$' "$T2B_CALL_LOG"; then
+  smoke_fail "T2b expected NO bridge_hooks_python:render-shared-settings call (deferral must gate BEFORE the #1945 render escalation). calls: $(tr '\n' '|' <"$T2B_CALL_LOG")"
 fi
 grep -q '^RC=0$' "$T2B_CALL_LOG" \
   || smoke_fail "T2b expected RC=0 (deferral returns 0). calls: $(tr '\n' '|' <"$T2B_CALL_LOG")"
@@ -587,6 +598,10 @@ if grep -q '^bridge_hooks_python:link-shared-settings$' "$T5_CALL_LOG"; then
 fi
 if [[ $T5_LINK_CALLED -ne 0 ]]; then
   smoke_fail "T5 expected NO bridge_hooks_python:link-shared-settings call (stat returned no owner → guard must fail-closed). calls: $(tr '\n' '|' <"$T5_CALL_LOG")"
+fi
+# #1945 F7 regression gate: deferral must gate BEFORE the #1945 render escalation.
+if grep -q '^bridge_hooks_python:render-shared-settings$' "$T5_CALL_LOG"; then
+  smoke_fail "T5 expected NO bridge_hooks_python:render-shared-settings call (deferral must gate BEFORE the #1945 render escalation). calls: $(tr '\n' '|' <"$T5_CALL_LOG")"
 fi
 grep -q '^RC=0$' "$T5_CALL_LOG" \
   || smoke_fail "T5 expected RC=0 (deferral returns 0). calls: $(tr '\n' '|' <"$T5_CALL_LOG")"
