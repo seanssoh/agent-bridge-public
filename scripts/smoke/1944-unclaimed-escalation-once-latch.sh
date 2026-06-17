@@ -208,12 +208,18 @@ count_open_with_prefix() {
   python3 -c 'import json,sys; print(len(json.loads(sys.argv[1] or "[]")))' "$json"
 }
 
-# Backdate a task's created_ts so it crosses the age threshold without a sleep.
+# Backdate a task's created_ts AND updated_ts so it crosses the age threshold
+# without a sleep. Issue #1970: the unclaimed-task watchdog now ages a queued
+# task from max(created_ts, updated_ts), so a genuinely-stale unclaimed task
+# must be stale on BOTH stamps (a fresh updated_ts grants the post-requeue
+# grace window). Backdating created_ts alone would leave updated_ts at
+# creation time (~now) and the task would no longer qualify — which is the
+# intended new behavior, so the fixture ages both to model real staleness.
 backdate_task() {
   local task_id="$1" seconds_ago="${2:-600}"
   local cutoff
   cutoff="$(( $(date +%s) - seconds_ago ))"
-  sqlite3 "$DB" "UPDATE tasks SET created_ts=${cutoff} WHERE id=${task_id};"
+  sqlite3 "$DB" "UPDATE tasks SET created_ts=${cutoff}, updated_ts=${cutoff} WHERE id=${task_id};"
 }
 
 # Queue a task against TARGET and backdate it so it is an "old unclaimed" task.
@@ -371,8 +377,10 @@ smoke_run "D5 same-id handoff to a different agent re-escalates once" : ; {
   python3 "$QUEUE" handoff "$ho_id" --to "$TARGET2" --from "$TARGET" --note "reassign" >/dev/null
   status_after="$(python3 "$QUEUE" show "$ho_id" --format shell | sed -n 's/^TASK_STATUS=//p' | tr -d "'")"
   smoke_assert_eq queued "$status_after" "D5 handoff keeps the task queued (same id)"
-  # The backdated created_ts survives handoff (handoff only bumps updated_ts),
-  # so the task is still "old" — but re-confirm by backdating defensively.
+  # Handoff bumps updated_ts to now, so post-#1970 the max(created_ts,
+  # updated_ts) freshness check would grant the new assignee a grace window.
+  # Re-age both stamps so the re-assigned task models a genuinely-stale
+  # unclaimed task for the NEW assignee.
   backdate_task "$ho_id" 600
 
   # Re-tick: the latch is keyed by agent, so TARGET2 (no matching marker

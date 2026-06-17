@@ -60,7 +60,22 @@ def main() -> int:
             created_ts = int(r.get("created_ts", 0) or 0)
         except (TypeError, ValueError):
             created_ts = 0
-        age = now_ts - created_ts
+        # Issue #1970: age the queued task from the most recent of created_ts
+        # and updated_ts. A task that was just requeued (daemon stale-reclaim /
+        # lease-expiry) or `agb update`-touched carries a fresh updated_ts; if
+        # we aged only from created_ts, a long-lived task that cycled
+        # claim→requeue would escalate the instant it re-queued even though it
+        # is freshly available again. Grace it from the requeue/update point so
+        # a genuinely-unclaimed task still escalates `threshold`s later, and the
+        # caller's once-latch still emits at most one admin task. updated_ts is
+        # exported by `find-open --all`; default to created_ts when absent
+        # (bash↔python upgrade window) so behavior is unchanged for old rows.
+        try:
+            updated_ts = int(r.get("updated_ts", 0) or 0)
+        except (TypeError, ValueError):
+            updated_ts = 0
+        freshness_ts = max(created_ts, updated_ts)
+        age = now_ts - freshness_ts
         if age < threshold:
             continue
         task_id = r.get("id")
