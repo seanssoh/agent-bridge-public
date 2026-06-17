@@ -3674,6 +3674,13 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # scan as the iso UID and marshal it back to the controller. Re-run the
       # run-as-iso + marshal-back contract smoke whenever this file moves.
       add_required 1894-iso-transcript-harvest-run-as-iso
+      # Issue #1947 (cm-prod F5): cmd_rebuild_index / collect_index_documents
+      # now graceful-skip an unreadable iso 0700 tree (warn + continue, rc=0)
+      # instead of hard-failing the [upgrade-complete] bootstrap. The 1947
+      # smoke pins rc=0 + readable-docs-indexed + skip-warning on a partially
+      # unreadable tree AND a fully-unreadable home; re-run whenever the
+      # rebuild/collect read path moves.
+      add_required 1947-memory-rebuild-graceful-skip
       add_integration integration-minimal
       ;;
 
