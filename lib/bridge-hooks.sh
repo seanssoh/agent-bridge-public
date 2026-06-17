@@ -421,6 +421,77 @@ bridge_link_claude_settings_to_shared() {
       || ! bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
     operator_global_file="$(bridge_hook_operator_global_settings_file 2>/dev/null || true)"
   fi
+  # Issue #1945 (cm-prod F7) ORDERING: this #1145 deferral guard is lifted to run
+  # BEFORE the iso-UID render + #1766 group-publish below, where it previously sat
+  # AFTER both (gating only the link step). #1945 added a root-escalated iso-UID
+  # render; on a pre-Step-A workdir that escalation would write into a tree Step A
+  # is about to (re)materialize — the very race #1145 guards against — and in the
+  # controller-cannot-escalate shape it would `return 1` (fail-loud) exactly where
+  # the deferral contract expects a clean `return 0`. The deferral is the single
+  # gate for EVERY controller-side iso-tree mutation (render, #1766 publish, link);
+  # an unnormalized workdir defers all three and agent start re-triggers the hook
+  # after Step A, so each runs once the tree is owned correctly (NOT permanently
+  # skipped). The predicate and its full r1-r3 rationale are unchanged:
+  #
+  # Issue #1145: defer `cmd_link_shared_settings` under v2 isolation when the
+  # workdir hasn't been normalized yet by
+  # `bridge_linux_prepare_agent_isolation` (Step A). Step B (this controller-
+  # side hook, running as awfmanager) cannot `mkdir` into the isolated tree —
+  # it would race Step A and create the leaf with the wrong ownership
+  # (`awfmanager:awfmanager 0755` under an `agent-bridge-<a>:` workdir),
+  # cascading into PermissionErrors on every subsequent round. Agent start
+  # re-triggers this hook after Step A has materialized the tree, so the
+  # deferral here is correct (NOT permanently skipped). Guarded on `agent`
+  # being set so legacy callers (no agent arg → no v2 semantics) keep their
+  # current behavior.
+  #
+  # r2 (codex BLOCKING): Step-A completion is detected by workdir OWNERSHIP,
+  # not by existence. The default v2 fresh-create flow scaffolds workdir as
+  # the controller user (`_scaffold_v2_sibling` in `bridge-agent.sh:550-557`,
+  # pre-created at `:664-670` / `:675-678`) BEFORE
+  # `bridge_linux_prepare_agent_isolation` runs at `bridge-agent.sh:3277`. So
+  # at this hook site (which fires via the roster-reload path through
+  # `bridge_ensure_claude_shared_settings_for_managed_workdir` at `:3273`)
+  # the workdir directory already exists but ownership has NOT yet flipped
+  # to the agent's resolved OS user. The pre-r2 existence-only guard
+  # therefore did NOT fire in the canonical production shape — the race
+  # remained.
+  #
+  # r3 (codex BLOCKING): the prefix glob `agent-bridge-*` is both too loose
+  # AND too tight. False-positive: any workdir owned by some other
+  # `agent-bridge-<other>` user (e.g. a sibling agent's tree mounted into
+  # view) matches the prefix and is treated as Step-A-complete for THIS
+  # agent. False-negative: `bridge-agent.sh:111-113` documents `--os-user
+  # <user>` as a supported linux-user isolation option, parsed at
+  # `bridge-agent.sh:2791-2794` and retained for linux-user mode at
+  # `:3000-3001` / `:3036-3050`; Step A chowns the v2 subdirs to that exact
+  # value at `lib/bridge-agents.sh:3766-3770` and `:3802`. A valid agent
+  # created with `--os-user svc-foo` would be normalized to owner `svc-foo`
+  # by Step A, but the prefix glob would never match → defer forever.
+  #
+  # Fix: cross-check workdir ownership against `bridge_agent_os_user
+  # "$agent"` (the roster source of truth — the same value Step A passes to
+  # chown). Both fail-closed conditions: empty `_wd_owner` (stat unable to
+  # read), empty `_expected_owner` (roster lookup failed), or mismatch →
+  # defer. `stat -c %U` is GNU/Linux; `stat -f %Su` is BSD/macOS; the
+  # chained fallback keeps the guard portable. v2 isolation is Linux-only
+  # in practice, but this hook runs on every platform, so we still defend
+  # against missing `stat` flavors.
+  # Issue #1151 (v0.14.5-beta10): predicate lifted to
+  # `bridge_agent_workdir_step_a_complete` in `lib/bridge-agents.sh` so the
+  # same race-safe gate can be applied at every controller-side helper that
+  # mutates `$workdir/.claude/*` (4 more sites in addition to this one — see
+  # the issue body for the full list). Behavior here is unchanged: when v2
+  # isolation is effective for the agent AND the workdir hasn't been
+  # normalized to the agent's expected OS user yet, defer; otherwise proceed.
+  # The shared helper preserves all r1-r3 properties (existence check,
+  # stat-flavor fallback, exact-match against roster `os_user`).
+  if [[ -n "$agent" ]] \
+      && command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null \
+      && ! bridge_agent_workdir_step_a_complete "$agent" "$workdir"; then
+    return 0
+  fi
   # Issue #1945 (cm-prod F7): on a v2 linux-user-isolated install
   # `$effective_file` resolves to `$BRIDGE_AGENT_ROOT_V2/<agent>/home/.claude/
   # settings.effective.json`, and that `home/` tree is owned by the ISOLATED
@@ -558,65 +629,6 @@ bridge_link_claude_settings_to_shared() {
       bridge_isolation_v2_chgrp_file_iso_group "$agent" "$effective_file" 0640 \
         || bridge_warn "isolation v2 (#1766): could not group-publish the effective settings file '$effective_file' for '$agent' (non-fatal); the iso UID may EACCES on its own project settings until \`agent-bridge isolate $agent --reapply\`."
     fi
-  fi
-  # Issue #1145: defer `cmd_link_shared_settings` under v2 isolation when the
-  # workdir hasn't been normalized yet by
-  # `bridge_linux_prepare_agent_isolation` (Step A). Step B (this controller-
-  # side hook, running as awfmanager) cannot `mkdir` into the isolated tree —
-  # it would race Step A and create the leaf with the wrong ownership
-  # (`awfmanager:awfmanager 0755` under an `agent-bridge-<a>:` workdir),
-  # cascading into PermissionErrors on every subsequent round. Agent start
-  # re-triggers this hook after Step A has materialized the tree, so the
-  # deferral here is correct (NOT permanently skipped). Guarded on `agent`
-  # being set so legacy callers (no agent arg → no v2 semantics) keep their
-  # current behavior.
-  #
-  # r2 (codex BLOCKING): Step-A completion is detected by workdir OWNERSHIP,
-  # not by existence. The default v2 fresh-create flow scaffolds workdir as
-  # the controller user (`_scaffold_v2_sibling` in `bridge-agent.sh:550-557`,
-  # pre-created at `:664-670` / `:675-678`) BEFORE
-  # `bridge_linux_prepare_agent_isolation` runs at `bridge-agent.sh:3277`. So
-  # at this hook site (which fires via the roster-reload path through
-  # `bridge_ensure_claude_shared_settings_for_managed_workdir` at `:3273`)
-  # the workdir directory already exists but ownership has NOT yet flipped
-  # to the agent's resolved OS user. The pre-r2 existence-only guard
-  # therefore did NOT fire in the canonical production shape — the race
-  # remained.
-  #
-  # r3 (codex BLOCKING): the prefix glob `agent-bridge-*` is both too loose
-  # AND too tight. False-positive: any workdir owned by some other
-  # `agent-bridge-<other>` user (e.g. a sibling agent's tree mounted into
-  # view) matches the prefix and is treated as Step-A-complete for THIS
-  # agent. False-negative: `bridge-agent.sh:111-113` documents `--os-user
-  # <user>` as a supported linux-user isolation option, parsed at
-  # `bridge-agent.sh:2791-2794` and retained for linux-user mode at
-  # `:3000-3001` / `:3036-3050`; Step A chowns the v2 subdirs to that exact
-  # value at `lib/bridge-agents.sh:3766-3770` and `:3802`. A valid agent
-  # created with `--os-user svc-foo` would be normalized to owner `svc-foo`
-  # by Step A, but the prefix glob would never match → defer forever.
-  #
-  # Fix: cross-check workdir ownership against `bridge_agent_os_user
-  # "$agent"` (the roster source of truth — the same value Step A passes to
-  # chown). Both fail-closed conditions: empty `_wd_owner` (stat unable to
-  # read), empty `_expected_owner` (roster lookup failed), or mismatch →
-  # defer. `stat -c %U` is GNU/Linux; `stat -f %Su` is BSD/macOS; the
-  # chained fallback keeps the guard portable. v2 isolation is Linux-only
-  # in practice, but this hook runs on every platform, so we still defend
-  # against missing `stat` flavors.
-  # Issue #1151 (v0.14.5-beta10): predicate lifted to
-  # `bridge_agent_workdir_step_a_complete` in `lib/bridge-agents.sh` so the
-  # same race-safe gate can be applied at every controller-side helper that
-  # mutates `$workdir/.claude/*` (4 more sites in addition to this one — see
-  # the issue body for the full list). Behavior here is unchanged: when v2
-  # isolation is effective for the agent AND the workdir hasn't been
-  # normalized to the agent's expected OS user yet, defer; otherwise proceed.
-  # The shared helper preserves all r1-r3 properties (existence check,
-  # stat-flavor fallback, exact-match against roster `os_user`).
-  if [[ -n "$agent" ]] \
-      && command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
-      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null \
-      && ! bridge_agent_workdir_step_a_complete "$agent" "$workdir"; then
-    return 0
   fi
   # #1756 r2: thread the launched channel context so the adoption fold repairs
   # a sticky-false launched-channel enabledPlugins entry (#1453) instead of
