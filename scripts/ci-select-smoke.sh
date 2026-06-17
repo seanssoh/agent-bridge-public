@@ -4038,6 +4038,16 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # the walker accept/refuse contract + the picker catalog entry cannot
       # silently regress.
       add_required 1766-iso-settings-readable
+      # Issue #1945 (cm-prod F7): bridge_link_claude_settings_to_shared
+      # (lib/bridge-hooks.sh) now routes the iso v2 per-agent effective render
+      # through a controller-owned stage + bridge_linux_sudo_root install/mv
+      # (instead of a bare controller-UID save_json into the iso-owned
+      # $BRIDGE_AGENT_ROOT_V2/<a>/home/.claude tree, which EACCESed on
+      # `agent restart <iso-bot>` under stale supplementary groups). Pull
+      # 1945-iso-restart-settings-iso-uid on every hooks/* / bridge-hooks.*
+      # move so the staged-render routing + fail-loud-on-sudo-absent contract
+      # cannot silently regress back to a direct write.
+      add_required 1945-iso-restart-settings-iso-uid
       # Issue #1596: hooks/bridge_hook_common.py::drain_top_actionable now filters
       # daemon-owned `[cron-dispatch]` / `created_by=cron:` rows (with the
       # `[cron-followup]` carve-out) out of BOTH the queued and claimed paths via

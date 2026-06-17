@@ -421,45 +421,18 @@ bridge_link_claude_settings_to_shared() {
       || ! bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
     operator_global_file="$(bridge_hook_operator_global_settings_file 2>/dev/null || true)"
   fi
-  bridge_hooks_python render-shared-settings \
-    --base-settings-file "$(bridge_hook_shared_settings_base_file)" \
-    --overlay-settings-file "$(bridge_hook_shared_settings_overlay_file)" \
-    --effective-settings-file "$effective_file" \
-    --operator-global-settings-file "$operator_global_file" \
-    --launch-cmd "$launch_cmd" \
-    --agent-class "$agent_class" \
-    --channels-csv "$channels_csv" >/dev/null
-  # Issue #1766: the per-agent effective file just rendered (the link target
-  # the workdir `.claude/settings.json` symlink points at) is controller-owned
-  # mode 0600 — `bridge-hooks.py:save_json` writes it `os.chmod(... 0o600)`. On
-  # a v2 linux-user-isolated agent the iso UID `agent-bridge-<a>` is NOT the
-  # controller, so it cannot read its own `workdir/.claude/settings.json` target
-  # and Claude renders a blocking "Settings Error" picker on every (re)start.
-  # Publish the effective file group-readable to the agent's OWN group only:
-  # `chgrp ab-agent-<a>` + mode 0640 (group READ, no group write — the file
-  # stays controller-owned so the iso UID can never rewrite the hook contract,
-  # the same integrity boundary cmd_render_isolated_home_settings keeps), and
-  # the parent `.claude/` dir group-traversable at 0750. Never `ab-shared`,
-  # never world. Gated on v2 isolation being effective for this agent; on
-  # shared/macOS installs the enforce gate inside each helper makes this a
-  # no-op (byte-for-byte unchanged). The chgrp helpers are defined in
-  # lib/bridge-isolation-v2.sh (sourced after this module but available at
-  # runtime); command -v guards keep legacy/partial source-orders safe.
-  if [[ -n "$agent" ]] \
-      && command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
-      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null \
-      && command -v bridge_isolation_v2_chgrp_file_iso_group >/dev/null 2>&1; then
-    local _eff_dir="${effective_file%/*}"
-    if [[ -d "$_eff_dir" ]] \
-        && command -v bridge_isolation_v2_chgrp_dir_iso_group >/dev/null 2>&1; then
-      bridge_isolation_v2_chgrp_dir_iso_group "$agent" "$_eff_dir" 0750 \
-        || bridge_warn "isolation v2 (#1766): could not publish settings dir '$_eff_dir' to the agent group for '$agent' (non-fatal); the iso UID may EACCES on its own settings.json until \`agent-bridge isolate $agent --reapply\`."
-    fi
-    if [[ -f "$effective_file" ]]; then
-      bridge_isolation_v2_chgrp_file_iso_group "$agent" "$effective_file" 0640 \
-        || bridge_warn "isolation v2 (#1766): could not group-publish the effective settings file '$effective_file' for '$agent' (non-fatal); the iso UID may EACCES on its own project settings until \`agent-bridge isolate $agent --reapply\`."
-    fi
-  fi
+  # Issue #1945 (cm-prod F7) ORDERING: this #1145 deferral guard is lifted to run
+  # BEFORE the iso-UID render + #1766 group-publish below, where it previously sat
+  # AFTER both (gating only the link step). #1945 added a root-escalated iso-UID
+  # render; on a pre-Step-A workdir that escalation would write into a tree Step A
+  # is about to (re)materialize — the very race #1145 guards against — and in the
+  # controller-cannot-escalate shape it would `return 1` (fail-loud) exactly where
+  # the deferral contract expects a clean `return 0`. The deferral is the single
+  # gate for EVERY controller-side iso-tree mutation (render, #1766 publish, link);
+  # an unnormalized workdir defers all three and agent start re-triggers the hook
+  # after Step A, so each runs once the tree is owned correctly (NOT permanently
+  # skipped). The predicate and its full r1-r3 rationale are unchanged:
+  #
   # Issue #1145: defer `cmd_link_shared_settings` under v2 isolation when the
   # workdir hasn't been normalized yet by
   # `bridge_linux_prepare_agent_isolation` (Step A). Step B (this controller-
@@ -518,6 +491,144 @@ bridge_link_claude_settings_to_shared() {
       && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null \
       && ! bridge_agent_workdir_step_a_complete "$agent" "$workdir"; then
     return 0
+  fi
+  # Issue #1945 (cm-prod F7): on a v2 linux-user-isolated install
+  # `$effective_file` resolves to `$BRIDGE_AGENT_ROOT_V2/<agent>/home/.claude/
+  # settings.effective.json`, and that `home/` tree is owned by the ISOLATED
+  # UID per the prepare contract (lib/bridge-agents.sh — `home/` mode 2770
+  # owner=isolated). `render-shared-settings` (→ bridge-hooks.py save_json)
+  # is a bare controller-UID pathlib write (`parent.mkdir` + open `.tmp` +
+  # rename); when the controller is not the owner and lacks a LIVE
+  # supplementary-group cache for `ab-agent-<a>` (KNOWN_ISSUES §28 / #1207),
+  # that write raises `PermissionError [Errno 13]` on
+  # `settings.effective.json.tmp` — `agent restart <iso-bot>` then aborts the
+  # reseed. Mirror the existing controller→iso publish pattern used by
+  # `bridge_install_isolated_home_settings`: render into a controller-owned
+  # stage, then `bridge_linux_sudo_root install`/`mv` the result into the
+  # final path under root, matching `save_json`'s mode 0600 (the #1766
+  # group-publish below then makes it iso-readable). Fail loud — do NOT fall
+  # back to a controller-direct write that re-denies. Shared / non-isolated
+  # agents keep the direct render below (byte-for-byte unchanged).
+  if [[ -n "$agent" ]] \
+      && command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    if ! command -v bridge_linux_sudo_root >/dev/null 2>&1; then
+      bridge_warn "isolation v2 (#1945): bridge_linux_sudo_root unavailable; cannot render isolated effective settings for '$agent'"
+      return 1
+    fi
+    # Preflight escalation availability BEFORE staging (codex r2). On Linux as a
+    # non-root caller, `bridge_linux_sudo_root` `bridge_die`s (process `exit`)
+    # when the `sudo` binary is absent — and a process `exit` would skip the
+    # explicit stage cleanup below, leaking the temp dir. Refuse here (fail-loud
+    # `return 1`, never `exit`) so every post-mktemp escalation can only `return`,
+    # keeping each return path's `rm -rf "$_eff_stage_root"` reachable. Off-Linux
+    # / as root, `bridge_linux_sudo_root` runs direct and never dies — a no-op.
+    if [[ "$(uname -s 2>/dev/null)" == "Linux" ]] \
+        && [[ "$(id -u)" != "0" ]] \
+        && ! command -v sudo >/dev/null 2>&1; then
+      bridge_warn "isolation v2 (#1945): sudo unavailable; cannot escalate to render isolated effective settings for '$agent'"
+      return 1
+    fi
+    local _eff_dir_iso="${effective_file%/*}"
+    local _eff_tmp_iso="${effective_file}.tmp.$$"
+    local _eff_stage_root="" _eff_stage_file=""
+    _eff_stage_root="$(mktemp -d "${TMPDIR:-/tmp}/bridge-shared-settings.XXXXXX")" || {
+      bridge_warn "isolation v2 (#1945): mktemp failed staging shared settings for '$agent'"
+      return 1
+    }
+    _eff_stage_file="$_eff_stage_root/settings.effective.json"
+    # The controller-owned stage is removed on EVERY post-mktemp return path
+    # below via an explicit `rm -rf "$_eff_stage_root"`. A `trap … RETURN` was
+    # rejected (codex r3): it persists past this function into the caller's shell
+    # and would fire on later returns; and it would not fire on a `bridge_die`
+    # `exit` anyway — which the sudo preflight above now makes unreachable, so
+    # explicit per-path cleanup is both complete and leak-free.
+    # Symlink-redirect guard (codex review, #1945): the iso UID OWNS
+    # `$BRIDGE_AGENT_ROOT_V2/<agent>/home/` (mode 2770), so it can swap `.claude`
+    # or `settings.effective.json` for a symlink and aim the upcoming root-backed
+    # mkdir/install/mv at an arbitrary target (root would follow it). Refuse if
+    # either the target dir or the final file is a symlink. The probe is
+    # sudo-backed (`bridge_linux_sudo_root test -L`) so it has the SAME privilege
+    # as the write it guards — a stale controller group cache cannot mask an
+    # attacker-planted link. Mirrors the install-block / normalize-contract
+    # symlink anchoring (`bridge_install_isolated_home_settings`,
+    # `bridge_linux_normalize_isolated_home_contract`).
+    if bridge_linux_sudo_root test -L "$_eff_dir_iso" 2>/dev/null \
+        || bridge_linux_sudo_root test -L "$effective_file" 2>/dev/null; then
+      bridge_warn "isolation v2 (#1945): refusing root write — symlink at '$_eff_dir_iso' or '$effective_file' for '$agent' (iso-UID redirect attempt). Repair with \`agent-bridge isolate $agent --reapply\`."
+      rm -rf "$_eff_stage_root"
+      return 1
+    fi
+    if ! bridge_hooks_python render-shared-settings \
+        --base-settings-file "$(bridge_hook_shared_settings_base_file)" \
+        --overlay-settings-file "$(bridge_hook_shared_settings_overlay_file)" \
+        --effective-settings-file "$_eff_stage_file" \
+        --operator-global-settings-file "$operator_global_file" \
+        --launch-cmd "$launch_cmd" \
+        --agent-class "$agent_class" \
+        --channels-csv "$channels_csv" >/dev/null; then
+      bridge_warn "isolation v2 (#1945): shared settings render failed for '$agent'"
+      rm -rf "$_eff_stage_root"
+      return 1
+    fi
+    if ! bridge_linux_sudo_root mkdir -p "$_eff_dir_iso" 2>/dev/null; then
+      bridge_warn "isolation v2 (#1945): cannot ensure '$_eff_dir_iso' for '$agent'"
+      rm -rf "$_eff_stage_root"
+      return 1
+    fi
+    if ! bridge_linux_sudo_root install -m 0600 "$_eff_stage_file" "$_eff_tmp_iso" 2>/dev/null; then
+      bridge_warn "isolation v2 (#1945): staged install of effective settings failed for '$effective_file'"
+      bridge_linux_sudo_root rm -f "$_eff_tmp_iso" 2>/dev/null || true
+      rm -rf "$_eff_stage_root"
+      return 1
+    fi
+    if ! bridge_linux_sudo_root mv -f "$_eff_tmp_iso" "$effective_file" 2>/dev/null; then
+      bridge_warn "isolation v2 (#1945): atomic mv of effective settings failed for '$effective_file'"
+      bridge_linux_sudo_root rm -f "$_eff_tmp_iso" 2>/dev/null || true
+      rm -rf "$_eff_stage_root"
+      return 1
+    fi
+    rm -rf "$_eff_stage_root"
+  else
+    bridge_hooks_python render-shared-settings \
+      --base-settings-file "$(bridge_hook_shared_settings_base_file)" \
+      --overlay-settings-file "$(bridge_hook_shared_settings_overlay_file)" \
+      --effective-settings-file "$effective_file" \
+      --operator-global-settings-file "$operator_global_file" \
+      --launch-cmd "$launch_cmd" \
+      --agent-class "$agent_class" \
+      --channels-csv "$channels_csv" >/dev/null
+  fi
+  # Issue #1766: the per-agent effective file just rendered (the link target
+  # the workdir `.claude/settings.json` symlink points at) is controller-owned
+  # mode 0600 — `bridge-hooks.py:save_json` writes it `os.chmod(... 0o600)`. On
+  # a v2 linux-user-isolated agent the iso UID `agent-bridge-<a>` is NOT the
+  # controller, so it cannot read its own `workdir/.claude/settings.json` target
+  # and Claude renders a blocking "Settings Error" picker on every (re)start.
+  # Publish the effective file group-readable to the agent's OWN group only:
+  # `chgrp ab-agent-<a>` + mode 0640 (group READ, no group write — the file
+  # stays controller-owned so the iso UID can never rewrite the hook contract,
+  # the same integrity boundary cmd_render_isolated_home_settings keeps), and
+  # the parent `.claude/` dir group-traversable at 0750. Never `ab-shared`,
+  # never world. Gated on v2 isolation being effective for this agent; on
+  # shared/macOS installs the enforce gate inside each helper makes this a
+  # no-op (byte-for-byte unchanged). The chgrp helpers are defined in
+  # lib/bridge-isolation-v2.sh (sourced after this module but available at
+  # runtime); command -v guards keep legacy/partial source-orders safe.
+  if [[ -n "$agent" ]] \
+      && command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null \
+      && command -v bridge_isolation_v2_chgrp_file_iso_group >/dev/null 2>&1; then
+    local _eff_dir="${effective_file%/*}"
+    if [[ -d "$_eff_dir" ]] \
+        && command -v bridge_isolation_v2_chgrp_dir_iso_group >/dev/null 2>&1; then
+      bridge_isolation_v2_chgrp_dir_iso_group "$agent" "$_eff_dir" 0750 \
+        || bridge_warn "isolation v2 (#1766): could not publish settings dir '$_eff_dir' to the agent group for '$agent' (non-fatal); the iso UID may EACCES on its own settings.json until \`agent-bridge isolate $agent --reapply\`."
+    fi
+    if [[ -f "$effective_file" ]]; then
+      bridge_isolation_v2_chgrp_file_iso_group "$agent" "$effective_file" 0640 \
+        || bridge_warn "isolation v2 (#1766): could not group-publish the effective settings file '$effective_file' for '$agent' (non-fatal); the iso UID may EACCES on its own project settings until \`agent-bridge isolate $agent --reapply\`."
+    fi
   fi
   # #1756 r2: thread the launched channel context so the adoption fold repairs
   # a sticky-false launched-channel enabledPlugins entry (#1453) instead of

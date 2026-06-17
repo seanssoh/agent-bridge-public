@@ -220,8 +220,34 @@ write_common_stubs() {
   printf '%s\n' 'bridge_hooks_python() {' >>"$stubs"
   printf '%s\n' '  # Record the verb (first arg) — render-shared-settings vs link-shared-settings.' >>"$stubs"
   printf '%s\n' '  echo "bridge_hooks_python:$1" >>"$CALL_LOG"' >>"$stubs"
+  printf '%s\n' '  # Issue #1945: for the proceed (Step-A-complete) iso cases the function now' >>"$stubs"
+  printf '%s\n' '  # renders into a controller-owned STAGE and `bridge_linux_sudo_root install`s' >>"$stubs"
+  printf '%s\n' '  # it into the iso path. The staged install needs a real source file, so the' >>"$stubs"
+  printf '%s\n' '  # render stub writes the `--effective-settings-file` target (same behavior the' >>"$stubs"
+  printf '%s\n' '  # 1945 spy uses). The deferral cases short-circuit before the render, so this' >>"$stubs"
+  printf '%s\n' '  # is a no-op there.' >>"$stubs"
+  printf '%s\n' '  if [[ "$1" == "render-shared-settings" ]]; then' >>"$stubs"
+  printf '%s\n' '    local _eff="" _a=("$@") _i' >>"$stubs"
+  printf '%s\n' '    for ((_i = 0; _i < ${#_a[@]}; _i++)); do' >>"$stubs"
+  printf '%s\n' '      if [[ "${_a[$_i]}" == "--effective-settings-file" ]]; then' >>"$stubs"
+  printf '%s\n' '        _eff="${_a[$((_i + 1))]}"' >>"$stubs"
+  printf '%s\n' '      fi' >>"$stubs"
+  printf '%s\n' '    done' >>"$stubs"
+  printf '%s\n' '    if [[ -n "$_eff" ]]; then' >>"$stubs"
+  printf '%s\n' '      mkdir -p "${_eff%/*}" 2>/dev/null || true' >>"$stubs"
+  printf '%s\n' '      printf "{\\"_rendered\\":true}\\n" >"$_eff" 2>/dev/null || true' >>"$stubs"
+  printf '%s\n' '    fi' >>"$stubs"
+  printf '%s\n' '  fi' >>"$stubs"
   printf '%s\n' '  return 0' >>"$stubs"
   printf '%s\n' '}' >>"$stubs"
+  # Issue #1945: the proceed (Step-A-complete) iso cases now traverse the
+  # iso-UID render escalation that #1945 added to the post-Step-A path. Stub
+  # `bridge_linux_sudo_root` with the SAME direct fall-through the real helper
+  # takes off-Linux / as root (run the op as the test user), mirroring the 1945
+  # spy. The deferral cases (T1/T2b/T2d/T5) short-circuit before this is ever
+  # reached, so they remain a pure deferral-decision assertion with no
+  # escalation dependency.
+  printf '%s\n' 'bridge_linux_sudo_root() { "$@"; }' >>"$stubs"
   # r3: the guard cross-checks against bridge_agent_os_user "$agent" (the
   # roster source of truth, same value Step A passes to chown). The stub
   # reads $SMOKE_FAKE_OS_USER (default = agent-bridge-smoke-agent) so each
@@ -290,6 +316,13 @@ if grep -q '^bridge_hooks_python:link-shared-settings$' "$T1_CALL_LOG"; then
 fi
 if [[ $T1_LINK_CALLED -ne 0 ]]; then
   smoke_fail "T1 expected NO bridge_hooks_python:link-shared-settings call (deferral guard should short-circuit). calls: $(tr '\n' '|' <"$T1_CALL_LOG")"
+fi
+# #1945 F7 regression gate: the deferral guard must short-circuit BEFORE the
+# #1945 iso render escalation, not after. If render-shared-settings fires in a
+# deferral case, the guard ran too late (the pre-fix ordering). This FAILS
+# against the known-bad 82c9b1bd ordering and passes on the fixed e2c50b52.
+if grep -q '^bridge_hooks_python:render-shared-settings$' "$T1_CALL_LOG"; then
+  smoke_fail "T1 expected NO bridge_hooks_python:render-shared-settings call (deferral must gate BEFORE the #1945 render escalation). calls: $(tr '\n' '|' <"$T1_CALL_LOG")"
 fi
 grep -q '^RC=0$' "$T1_CALL_LOG" \
   || smoke_fail "T1 expected RC=0 (deferral returns 0). calls: $(tr '\n' '|' <"$T1_CALL_LOG")"
@@ -363,6 +396,10 @@ if grep -q '^bridge_hooks_python:link-shared-settings$' "$T2B_CALL_LOG"; then
 fi
 if [[ $T2B_LINK_CALLED -ne 0 ]]; then
   smoke_fail "T2b expected NO bridge_hooks_python:link-shared-settings call (workdir present but pre-Step-A, owner=controller — codex BLOCKING shape). calls: $(tr '\n' '|' <"$T2B_CALL_LOG"). NOTE: this test FAILS against the r1 existence-only guard by design."
+fi
+# #1945 F7 regression gate: deferral must gate BEFORE the #1945 render escalation.
+if grep -q '^bridge_hooks_python:render-shared-settings$' "$T2B_CALL_LOG"; then
+  smoke_fail "T2b expected NO bridge_hooks_python:render-shared-settings call (deferral must gate BEFORE the #1945 render escalation). calls: $(tr '\n' '|' <"$T2B_CALL_LOG")"
 fi
 grep -q '^RC=0$' "$T2B_CALL_LOG" \
   || smoke_fail "T2b expected RC=0 (deferral returns 0). calls: $(tr '\n' '|' <"$T2B_CALL_LOG")"
@@ -561,6 +598,10 @@ if grep -q '^bridge_hooks_python:link-shared-settings$' "$T5_CALL_LOG"; then
 fi
 if [[ $T5_LINK_CALLED -ne 0 ]]; then
   smoke_fail "T5 expected NO bridge_hooks_python:link-shared-settings call (stat returned no owner → guard must fail-closed). calls: $(tr '\n' '|' <"$T5_CALL_LOG")"
+fi
+# #1945 F7 regression gate: deferral must gate BEFORE the #1945 render escalation.
+if grep -q '^bridge_hooks_python:render-shared-settings$' "$T5_CALL_LOG"; then
+  smoke_fail "T5 expected NO bridge_hooks_python:render-shared-settings call (deferral must gate BEFORE the #1945 render escalation). calls: $(tr '\n' '|' <"$T5_CALL_LOG")"
 fi
 grep -q '^RC=0$' "$T5_CALL_LOG" \
   || smoke_fail "T5 expected RC=0 (deferral returns 0). calls: $(tr '\n' '|' <"$T5_CALL_LOG")"
