@@ -194,22 +194,51 @@ def samefiles_registered_agent(
 # --- Part B: generic resolved-symlink-target keep-set ----------------------
 
 # Real (non-symlink) subdirectory basenames the keep-set walk PRUNES — heavy
-# content trees inside an agent home that can never themselves contain a
-# bridge-managed keep-set symlink (Issue #1966). Every keep-set symlink the
-# bridge creates whose target resolves UNDER the home root lives at a SHALLOW
-# agent-home location (`agents/shared` -> `../shared`, `agents/<a>/<DOC>` ->
-# `../shared/<DOC>` via bridge-docs.py's AGENT_SHARED_LINKS) — never nested
-# inside these trees. The `.claude/skills/<skill>` links target the runtime
-# `.claude/` root or the source checkout (OUTSIDE the home root), so they were
-# never in the keep-set and `.claude/skills` is deliberately NOT pruned. The
-# scoped trees are pruned only at their FULL real Claude path (`.claude/projects`
-# transcripts, `.claude/plugins/cache` plugin cache) — anchored on the whole
-# parent-chain tail, NOT just the immediate parent basename, so an unrelated
-# user dir like `<agent>/x/plugins/cache` (whose parent is also `plugins` but
-# which is NOT `.claude/plugins/cache`) is still walked and its symlinks still
-# counted. Pruning changes only walk SPEED, not the keep-set RESULT (the 867k
-# islink on a long-lived host was dominated by plugin-cache node_modules +
-# transcripts).
+# content trees inside an agent home (Issue #1966). The scoped trees are pruned
+# only at their FULL real Claude path (`.claude/projects` transcripts,
+# `.claude/plugins/cache` plugin cache) — anchored on the whole parent-chain
+# tail, NOT just the immediate parent basename, so an unrelated user dir like
+# `<agent>/x/plugins/cache` (whose parent is also `plugins` but which is NOT
+# `.claude/plugins/cache`) is still walked and its symlinks still counted.
+#
+# INVARIANT: the prune is ORPHAN-CLASSIFICATION-PRESERVING for every BRIDGE
+# keep relationship and for the live fleet — NOT "keep-set RESULT byte-
+# identical." On real installs the keep-set is NOT byte-identical: npm /
+# plugin-install creates `.bin` shims (e.g. `<home>/.claude/plugins/cache/
+# <plugin>/.../node_modules/.bin/tsc -> ../typescript/bin/tsc`) INSIDE these
+# pruned trees whose realpath lands under the home root — the old unpruned walk
+# recorded them; the pruned walk drops them. Dropping such keep-set members is
+# SAFE for the following reasons:
+#   1. A dropped keep-set member only changes a VERDICT if some direct child of
+#      the home root was kept SOLELY because its realpath equalled (or contained)
+#      that member. The npm `.bin` shim case is the common one: its target lives
+#      inside the SAME registered home that holds the shim, so the direct child
+#      containing it short-circuits to KIND_REGISTERED (basename / samefile match
+#      in `_classify_child`) BEFORE the keep-set loop is reached — its verdict is
+#      unchanged regardless of the keep-set.
+#   2. The prune can only REMOVE keep-set members → it can only move a candidate
+#      kept -> orphan, never orphan -> kept → it can NEVER HIDE a real orphan,
+#      and never breaks a kept dir's protection in the orphan-GC-unsafe direction.
+#   3. The bridge's own keep-links whose target resolves under the home root are
+#      SHALLOW and NOT pruned (`agents/shared` -> `../shared`, `agents/<a>/<DOC>`
+#      -> `../shared/<DOC>` via bridge-docs.py's AGENT_SHARED_LINKS), so the
+#      generic `referenced-symlink-target` keep of `agents/shared` (and any
+#      future non-`shared`-named bridge target) is unaffected. `.claude/skills/
+#      <skill>` links target the runtime `.claude/` root or the source checkout
+#      (OUTSIDE the home root) so they were never keep-set members anyway, and
+#      `.claude/skills` is deliberately NOT pruned.
+# The ONE verdict that CAN change (codex review, #1966): an UNREGISTERED top-
+# level dir protected SOLELY by a non-bridge symlink nested inside ANY pruned
+# content tree (its own, OR another registered agent's `node_modules`/`.git`/
+# `.claude/plugins/cache` — e.g. a stray plugin artifact symlinking a sibling)
+# flips `referenced-symlink-target -> orphan`. This is INTENTIONAL and safe:
+# such protection is spurious (the keep-set exists to protect bridge doc-link
+# targets like `agents/shared`, not dirs a plugin's node_modules happens to
+# point at), the flip is strictly one-directional (kept -> orphan, never the
+# reverse, so it never hides a real orphan), and the affected child is then an
+# orphan-GC CANDIDATE only — the GC still keep+notifies on any indeterminacy.
+# No live instances exist. The 867k `os.path.islink` on a long-lived host was
+# dominated by plugin-cache node_modules + transcripts; pruning collapses it.
 _PRUNE_NAMES_ANYWHERE = frozenset({"node_modules", ".git"})
 # basename -> the required parent-directory chain (immediate parent first,
 # walking up) for the scoped prune. The dir is pruned only when its ancestor
@@ -253,11 +282,19 @@ def _enumerate_symlink_targets_under_root(
     symlink-ness from the cached `DirEntry.is_symlink()` (the directory read
     already stat'd the entry — no redundant per-entry `os.path.islink` lstat),
     and PRUNES the heavy non-symlink content trees (`node_modules`, `.git`,
-    `.claude/{projects,cache}`) that can never hold a bridge keep-set symlink.
-    A symlinked subdirectory is still RESOLVED as a target (matching the prior
-    `os.walk` behavior where symlinked dirs appeared in `dirs`) — it is just not
-    descended into; pruning only drops real (non-symlink) content dirs from
-    descent, so the keep-set RESULT is unchanged — only the walk cost shrinks.
+    `.claude/{projects,cache}`). A symlinked subdirectory is still RESOLVED as a
+    target (matching the prior `os.walk` behavior where symlinked dirs appeared
+    in `dirs`) — it is just not descended into.
+
+    Classification-preserving for every BRIDGE keep, not keep-set-byte-identical:
+    npm `.bin` shims buried in `node_modules` under a REGISTERED home ARE dropped
+    from the keep-set, but that changes no verdict (the registered child that
+    holds them short-circuits to KIND_REGISTERED before the keep-set is
+    consulted). The prune can only ever move a candidate kept -> orphan, never
+    orphan -> kept, so it never hides a real orphan; the only verdict it CAN flip
+    is an unregistered dir protected SOLELY by a non-bridge symlink nested inside
+    a pruned tree (intentional). See the `_PRUNE_*` constants block above for the
+    full safety argument.
 
     Best-effort: a symlink we cannot resolve safely contributes nothing (so
     the candidate it might have protected stays an orphan ONLY if no OTHER
