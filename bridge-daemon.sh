@@ -13294,20 +13294,80 @@ process_cron_staging_apply() {
 
 process_queue_gateway_requests() {
   local processed=0
+  local rc=0
+  local gw_root
+  gw_root="$(bridge_queue_gateway_root)"
 
   # Issue #265 proposal A: queue-gateway is mostly local (sqlite + filesystem),
   # but it shells out into bridge-queue.py per pending request — a stuck DB
   # lock or a runaway request batch would otherwise block the loop. Wrap the
-  # whole serve-once invocation under one ceiling.
-  processed="$(bridge_with_timeout "" queue_gateway_serve_once python3 "$SCRIPT_DIR/bridge-queue-gateway.py" serve-once \
-    --root "$(bridge_queue_gateway_root)" \
-    --queue-script "$SCRIPT_DIR/bridge-queue.py" \
-    --max-requests "${BRIDGE_QUEUE_GATEWAY_MAX_REQUESTS_PER_CYCLE:-100}" 2>/dev/null || printf '0')"
+  # whole serve-once invocation under one ceiling. #1973 Track A names that
+  # ceiling (BRIDGE_QUEUE_GATEWAY_SERVE_ONCE_TIMEOUT_SECONDS) so operators can
+  # tune the outer drain bound independently of the per-request bound the
+  # gateway enforces internally.
+  local serve_once_timeout="${BRIDGE_QUEUE_GATEWAY_SERVE_ONCE_TIMEOUT_SECONDS:-}"
+  local err_file
+  err_file="$(mktemp "${TMPDIR:-/tmp}/agb-queue-gateway-serve.XXXXXX" 2>/dev/null || printf '')"
+  # #1973 Track A: do NOT discard all gateway stderr — capture it so a drain
+  # failure is diagnosable. We still tolerate a missing temp file (mktemp can
+  # fail when $TMPDIR is full) by falling back to dropping stderr only then.
+  #
+  # Capture the rc via a `set +e` / `set -e` toggle (the PR #508 pattern at
+  # bridge_daily_backup): the daemon runs under `set -euo pipefail`, so a
+  # nonzero serve-once would otherwise abort this function at the assignment
+  # before we can read `$?` and emit the drain-failure audit (the whole point of
+  # this change). Removing the old `|| printf '0'` is what lets us see the real
+  # rc — the toggle keeps that safe.
+  set +e
+  if [[ -n "$err_file" ]]; then
+    processed="$(bridge_with_timeout "$serve_once_timeout" queue_gateway_serve_once python3 "$SCRIPT_DIR/bridge-queue-gateway.py" serve-once \
+      --root "$gw_root" \
+      --queue-script "$SCRIPT_DIR/bridge-queue.py" \
+      --max-requests "${BRIDGE_QUEUE_GATEWAY_MAX_REQUESTS_PER_CYCLE:-100}" 2>"$err_file")"
+    rc=$?
+  else
+    processed="$(bridge_with_timeout "$serve_once_timeout" queue_gateway_serve_once python3 "$SCRIPT_DIR/bridge-queue-gateway.py" serve-once \
+      --root "$gw_root" \
+      --queue-script "$SCRIPT_DIR/bridge-queue.py" \
+      --max-requests "${BRIDGE_QUEUE_GATEWAY_MAX_REQUESTS_PER_CYCLE:-100}" 2>/dev/null)"
+    rc=$?
+  fi
+  set -e
   [[ "$processed" =~ ^[0-9]+$ ]] || processed=0
-  if (( processed > 0 )); then
+
+  if (( rc == 0 )) && (( processed > 0 )); then
+    [[ -n "$err_file" ]] && rm -f "$err_file" 2>/dev/null
     bridge_audit_log daemon queue_gateway_processed daemon --detail count="$processed"
     return 0
   fi
+
+  if (( rc != 0 )); then
+    # #1973 Track A: the serve-once invocation FAILED (the outer ceiling killed
+    # it -> rc 124/137, or it exited nonzero). Instead of collapsing every
+    # failure to processed=0 and a silent `return 1`, capture the drain-queue
+    # snapshot (pending/working/oldest ages/last response) and a stderr tail so
+    # the next stall is diagnosable from the audit log rather than the 0-byte
+    # daemon log the issue reported.
+    local snapshot=""
+    snapshot="$(python3 "$SCRIPT_DIR/bridge-queue-gateway.py" status --root "$gw_root" --format json 2>/dev/null || printf '')"
+    local err_tail=""
+    if [[ -n "$err_file" && -s "$err_file" ]]; then
+      err_tail="$(tail -c 512 "$err_file" 2>/dev/null | tr '\n' ' ')"
+    fi
+    local event="queue_gateway_drain_stalled"
+    if (( rc == 124 || rc == 137 )); then
+      event="queue_gateway_drain_timeout"
+    fi
+    bridge_audit_log daemon "$event" daemon \
+      --detail rc="$rc" \
+      --detail snapshot="${snapshot:-unavailable}" \
+      --detail stderr_tail="${err_tail:-none}"
+    daemon_warn "[queue_gateway] drain $event rc=$rc snapshot=${snapshot:-unavailable}"
+    [[ -n "$err_file" ]] && rm -f "$err_file" 2>/dev/null
+    return 1
+  fi
+
+  [[ -n "$err_file" ]] && rm -f "$err_file" 2>/dev/null
   return 1
 }
 
