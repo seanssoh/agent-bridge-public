@@ -14751,6 +14751,83 @@ cmd_start() {
   bridge_die "bridge daemon start failed"
 }
 
+# Issue #1973 (Track C). One-shot recovery re-nudge. The liveness watcher writes
+# $BRIDGE_STATE_DIR/daemon-recovery-renudge.env before it restarts a stalled
+# daemon (heartbeat-stale OR gateway-stall). On the fresh daemon's startup we
+# consume that marker EXACTLY ONCE and arm Track B's BRIDGE_DAEMON_NUDGE_FORCE_
+# AGENTS seam for the agents that have queued (non-cron-dispatch) tasks, so the
+# first sync cycle's nudge fanout bypasses the per-task redelivery backoff once
+# and re-nudges agents the stall left silently stuck (the #1973 `notify=miss`
+# state). We do NOT raw-inject around the attached/busy gates — setting the
+# force-list only bypasses the redelivery dedup; nudge_agent_session still
+# honors the #1411 attached-session safety and the existing attached-followup
+# escalation. A recovery cooldown prevents a restart storm from re-arming the
+# pass every minute.
+#
+# Echoes the armed force-agents CSV on stdout (empty when nothing armed) so the
+# caller can export it for the first cmd_sync_cycle and clear it afterward.
+# Returns 0 when a marker was consumed (even if no agents had queued work — the
+# marker is still a once-latch), 1 when there was no marker.
+bridge_daemon_consume_recovery_marker_renudge() {
+  local marker="${BRIDGE_DAEMON_RECOVERY_RENUDGE_FILE:-$BRIDGE_STATE_DIR/daemon-recovery-renudge.env}"
+  [[ -f "$marker" ]] || return 1
+
+  # Once-latch: remove the marker first so a crash mid-pass cannot re-trigger
+  # the bypass on the next start.
+  local reason="" oldest_age="" prior_hb=""
+  # The marker is written with %q quoting; the reason is always a plain token
+  # (heartbeat_stale / gateway_stall), so sanitize to a safe charset rather than
+  # un-quote. The numeric fields are extracted digits-only.
+  reason="$(sed -n 's/^BRIDGE_RECOVERY_REASON=//p' "$marker" 2>/dev/null | head -n1 | tr -dc 'a-zA-Z0-9_-')"
+  oldest_age="$(sed -n 's/^BRIDGE_RECOVERY_OLDEST_REQUEST_AGE=//p' "$marker" 2>/dev/null | head -n1 | tr -dc '0-9')"
+  prior_hb="$(sed -n 's/^BRIDGE_RECOVERY_PRIOR_HEARTBEAT_AGE=//p' "$marker" 2>/dev/null | head -n1 | tr -dc '0-9')"
+  rm -f "$marker" 2>/dev/null || true
+
+  # Recovery cooldown — do not re-arm the pass if a recent recovery already did.
+  local cooldown="${BRIDGE_DAEMON_RECOVERY_RENUDGE_COOLDOWN_SECONDS:-300}"
+  [[ "$cooldown" =~ ^[0-9]+$ ]] || cooldown=300
+  local cd_file="${BRIDGE_DAEMON_RECOVERY_RENUDGE_COOLDOWN_FILE:-$BRIDGE_STATE_DIR/daemon-recovery-renudge-cooldown.ts}"
+  local now last_ts
+  now="$(date +%s)"
+  if [[ -f "$cd_file" ]]; then
+    last_ts="$(tr -dc '0-9' <"$cd_file" 2>/dev/null)"
+    if [[ "$last_ts" =~ ^[0-9]+$ ]] && (( last_ts <= now )) && (( now - last_ts < cooldown )); then
+      bridge_audit_log daemon daemon_recovery_renudge_skip_cooldown daemon \
+        --detail reason="${reason:-unknown}" \
+        --detail cooldown_seconds="$cooldown" 2>/dev/null || true
+      return 0
+    fi
+  fi
+  mkdir -p "$(dirname "$cd_file")" 2>/dev/null || true
+  printf '%s\n' "$now" 2>/dev/null >"$cd_file" || true
+
+  # Build the force-list: agents with queued NON-cron-dispatch work. The queue
+  # summary's `queued` column already excludes `[cron-dispatch]` rows
+  # (bridge-queue.py agent_summary_rows), so queued>0 == has a deliverable
+  # queued task. TSV columns: agent queued claimed blocked active idle ...
+  local summary_tsv="" force_csv="" agent queued _rest
+  summary_tsv="$(bridge_queue_cli summary --format tsv 2>/dev/null || true)"
+  while IFS=$'\t' read -r agent queued _rest; do
+    [[ -n "$agent" ]] || continue
+    [[ "$queued" =~ ^[0-9]+$ ]] || continue
+    (( queued > 0 )) || continue
+    if [[ -z "$force_csv" ]]; then
+      force_csv="$agent"
+    else
+      force_csv="$force_csv,$agent"
+    fi
+  done <<< "$summary_tsv"
+
+  bridge_audit_log daemon daemon_recovery_renudge_arm daemon \
+    --detail reason="${reason:-unknown}" \
+    --detail oldest_request_age_seconds="${oldest_age:-0}" \
+    --detail prior_heartbeat_age_seconds="${prior_hb:-0}" \
+    --detail force_agents="${force_csv:-none}" 2>/dev/null || true
+
+  printf '%s' "$force_csv"
+  return 0
+}
+
 cmd_run() {
   local cycle_status
 
@@ -14874,6 +14951,25 @@ cmd_run() {
     bridge_daemon_sd_notify READY=1
   fi
 
+  # Issue #1973 (Track C). One-shot recovery re-nudge. If the liveness watcher
+  # restarted us after a stall, it left a recovery marker; consume it ONCE and
+  # arm Track B's BRIDGE_DAEMON_NUDGE_FORCE_AGENTS seam (CSV of agents with
+  # queued non-cron-dispatch work) so the FIRST sync cycle's nudge fanout
+  # bypasses the per-task redelivery backoff once and re-nudges agents the
+  # stall left silently stuck. We export it so the supervised CHILD tick
+  # inherits it, and clear it after the first iteration so it is strictly
+  # one-shot. nudge_agent_session still honors the #1411 attached-session gates
+  # — the force-list only bypasses the redelivery dedup, not the safety rails.
+  local _recovery_renudge_armed=0
+  local _recovery_force_csv=""
+  if _recovery_force_csv="$(bridge_daemon_consume_recovery_marker_renudge)"; then
+    if [[ -n "$_recovery_force_csv" ]]; then
+      export BRIDGE_DAEMON_NUDGE_FORCE_AGENTS="$_recovery_force_csv"
+      _recovery_renudge_armed=1
+      daemon_info "recovery re-nudge armed for: $_recovery_force_csv (#1973)"
+    fi
+  fi
+
   while true; do
     BRIDGE_DAEMON_LAST_STEP="queue_gateway_socket_listener"
     if ! bridge_daemon_ensure_queue_gateway_socket_listener; then
@@ -14932,6 +15028,14 @@ cmd_run() {
         cycle_status=$?
         daemon_log_event "sync cycle failed with exit=$cycle_status"
       fi
+    fi
+    # Issue #1973 (Track C). The recovery re-nudge is ONE-SHOT: after the first
+    # sync cycle consumed the forced bypass, clear BRIDGE_DAEMON_NUDGE_FORCE_
+    # AGENTS so every subsequent tick returns to the normal per-task backoff.
+    if (( _recovery_renudge_armed == 1 )); then
+      unset BRIDGE_DAEMON_NUDGE_FORCE_AGENTS
+      _recovery_renudge_armed=0
+      bridge_audit_log daemon daemon_recovery_renudge_complete daemon 2>/dev/null || true
     fi
     now_ts="$(date +%s)"
     if (( heartbeat_interval > 0 )) && (( now_ts - last_heartbeat_ts >= heartbeat_interval )); then
@@ -15425,6 +15529,49 @@ cmd_supp_refresh_worker() {
   esac
 }
 
+# Issue #1973 (Track C). On `daemon ensure`, make sure the liveness backstop
+# timer exists + is active. The #1973 incident host had the daemon service but
+# NO `agent-bridge-daemon-liveness.timer` ("Unit not found"), so a stalled-but-
+# alive daemon had nothing to detect/recover it. `ensure` is the operator's
+# "make it right" verb, so it is the natural place to self-install a missing
+# timer. systemd-user only (the timer is a systemd unit); a no-op on macOS /
+# launchd (the LaunchAgent variant owns that platform). LOUD remediation when
+# the user bus is unreachable so the operator is not left with a silent gap.
+bridge_daemon_ensure_liveness_timer() {
+  # macOS uses the LaunchAgent liveness variant, not the systemd timer.
+  [[ "$(uname -s 2>/dev/null)" == "Linux" ]] || return 0
+  command -v systemctl >/dev/null 2>&1 || return 0
+
+  local timer="agent-bridge-daemon-liveness.timer"
+  # Probe the user bus. If it is unreachable (no session bus / linger gap),
+  # `systemctl --user` errors — emit a LOUD remediation rather than silently
+  # trying to install into a dead bus.
+  if ! systemctl --user show-environment >/dev/null 2>&1; then
+    daemon_warn "liveness backstop timer cannot be verified: systemd --user bus unreachable. A stalled-but-alive daemon will have no supervisor (#1973). Resolve the user bus (loginctl enable-linger \$USER; ensure XDG_RUNTIME_DIR), then run: $SCRIPT_DIR/scripts/install-daemon-liveness-systemd.sh --enable"
+    return 0
+  fi
+
+  # Already active → nothing to do.
+  if systemctl --user is-active --quiet "$timer" 2>/dev/null; then
+    return 0
+  fi
+
+  local installer="$SCRIPT_DIR/scripts/install-daemon-liveness-systemd.sh"
+  if [[ ! -f "$installer" ]]; then
+    daemon_warn "liveness backstop timer absent and installer not found at $installer (#1973)"
+    return 0
+  fi
+  daemon_info "liveness backstop timer ($timer) missing/inactive — installing (#1973)"
+  local rc=0
+  "${BRIDGE_BASH_BIN:-bash}" "$installer" --bridge-home "$BRIDGE_HOME" --enable >&2 || rc=$?
+  if (( rc == 0 )); then
+    daemon_info "installed + enabled liveness backstop timer ($timer)"
+  else
+    daemon_warn "liveness backstop timer install returned rc=$rc — re-run: $installer --bridge-home $BRIDGE_HOME --enable (#1973)"
+  fi
+  return 0
+}
+
 # matched `ensure)`, and called `cmd_start` unconditionally, starting
 # the daemon. Each verb now scans its remaining args for -h/--help/help
 # and prints usage instead of executing the cmd_*.
@@ -15465,6 +15612,9 @@ case "$CMD" in
       usage
       exit 0
     fi
+    # Issue #1973 (Track C): `ensure` self-installs a missing liveness backstop
+    # timer so a stalled-but-alive daemon always has an independent supervisor.
+    bridge_daemon_ensure_liveness_timer || true
     cmd_start
     ;;
   run)
