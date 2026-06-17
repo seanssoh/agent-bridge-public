@@ -2076,6 +2076,32 @@ For the developer-side rationale, see [CLAUDE.md](./CLAUDE.md) §
 "Working with isolated agents (iso v2)" and
 [docs/developer-handover.md](./docs/developer-handover.md) §3.1.
 
+#### Headless **shared-UID** admin cannot mutate config (#1946, cm-prod F4)
+
+On a **headless** host where the admin agent runs **shared-UID** (the daemon and
+the admin run as the *same* OS user — e.g. cm-prod's `patch` as `awfmanager`),
+`agb config set` / `set-env` is denied with `agent-binding-store-writable: …
+not trusted here`. This is **by design**, not a bug: a shared-UID admin OWNS its
+own `state/config-caller-bindings/` store, so it could forge/re-chmod its own
+agent-pane admin binding — `#1738` fail-closes because a self-owned store can't
+prove non-forgeability. A daemon-mediated "apply on the admin's behalf" path
+would be **security theater** (the daemon's UID == the admin's UID, so anything
+the daemon can sign the agent can forge), and `#1738`'s own design notes
+pre-reject it. There is **no** code fix that preserves the trust boundary.
+
+The two supported flows:
+
+1. **Attended operator session (one-time per change).** Run the mutation from a
+   real operator TTY with `--from <admin>` during an attended install/upgrade
+   window. Durable config persists, so a headless host rarely needs to change
+   config unattended.
+2. **Run the admin under linux-user isolation (iso-v2) — the clean answer for
+   *unattended* headless config.** Under iso-v2 the controller owns the binding
+   store under a **different** UID (`0711` dir / `0644` file), so the store is
+   not caller-writable and `#1738` authorizes the agent-pane binding **TTY-free**
+   — no operator session needed. Iso-v2 headless admins already have a working
+   config-mutation path; the gap is exclusively the shared-UID + headless combo.
+
 ## Migrating to layout v2
 
 The v2 layout (PR-A/B/C, shipped in v0.6.19) replaces named-ACL access on
