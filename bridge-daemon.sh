@@ -14751,6 +14751,90 @@ cmd_start() {
   bridge_die "bridge daemon start failed"
 }
 
+# Issue #1955: emit a one-line self-diagnosis WARN at daemon start when the
+# running daemon is either (a) unsupervised — daemonized to PPID=1 with no
+# launchd/systemd job owning it — or (b) running from a non-canonical source
+# root (a checkout other than the recorded source / $BRIDGE_HOME). A live
+# fleet daemon was found running detached from an operator's dev checkout
+# (an unreleased branch) with no KeepAlive auto-recovery — the structural
+# background of recurring "daemon keeps dying" instability. This is
+# diagnosis ONLY: it never auto-kills, never changes daemon behavior, and a
+# detection error degrades to no-warn (it must never fail the daemon start).
+#
+# Supervised signal: prefer the env markers the init system already injects
+# over fragile process-tree parsing — systemd sets INVOCATION_ID (and
+# NOTIFY_SOCKET for Type=notify, which the daemon already uses), launchd sets
+# XPC_SERVICE_NAME to the job label. We treat ANY of these as proof of
+# supervision so the warn fires only when we are confident the daemon is
+# orphaned, keeping false positives off this warn-only path.
+#
+# Canonical source root: the supervised daemon always runs
+# `$BRIDGE_HOME/bridge-daemon.sh run` (launchd plist / systemd ExecStart), so
+# $BRIDGE_HOME is canonical; the recorded source root
+# (AGENT_BRIDGE_SOURCE_DIR or state/upgrade/last-upgrade.json:source_root) is
+# also canonical for a `daemon run` invoked straight from a blessed checkout.
+bridge_daemon_self_diagnose() {
+  # Best-effort canonicalization; fall back to the raw value on any failure.
+  _bridge_daemon_canon_path() {
+    local p="$1"
+    [[ -n "$p" ]] || { printf '%s' ""; return 0; }
+    if [[ -d "$p" ]]; then
+      ( cd -P "$p" 2>/dev/null && pwd -P ) || printf '%s' "$p"
+    else
+      printf '%s' "$p"
+    fi
+  }
+
+  local script_root recorded_root bridge_root
+  script_root="$(_bridge_daemon_canon_path "$SCRIPT_DIR")"
+  bridge_root="$(_bridge_daemon_canon_path "${BRIDGE_HOME:-}")"
+
+  # Recorded source root: env override wins, else the last-upgrade record.
+  recorded_root=""
+  if [[ -n "${AGENT_BRIDGE_SOURCE_DIR:-}" ]]; then
+    recorded_root="$(_bridge_daemon_canon_path "$AGENT_BRIDGE_SOURCE_DIR")"
+  else
+    local last_upgrade="${BRIDGE_STATE_DIR:-}/upgrade/last-upgrade.json"
+    if [[ -n "${BRIDGE_STATE_DIR:-}" && -f "$last_upgrade" ]]; then
+      local recorded_raw=""
+      recorded_raw="$(python3 "$SCRIPT_DIR/lib/upgrade-helpers/recorded-source-root.py" "$last_upgrade" 2>/dev/null || true)"
+      [[ -n "$recorded_raw" ]] && recorded_root="$(_bridge_daemon_canon_path "$recorded_raw")"
+    fi
+  fi
+
+  # (b) Non-canonical source root: SCRIPT_DIR matches neither $BRIDGE_HOME nor
+  # the recorded source root. Only assert when we actually resolved a script
+  # root to compare against.
+  if [[ -n "$script_root" ]]; then
+    if [[ "$script_root" != "$bridge_root" \
+       && ( -z "$recorded_root" || "$script_root" != "$recorded_root" ) ]]; then
+      daemon_warn "[self-diagnose] daemon running from a NON-CANONICAL source root: source_root=${script_root} (expected \$BRIDGE_HOME=${bridge_root:-<unset>}${recorded_root:+ or recorded source_root=$recorded_root}). A daemon started from a dev/operator checkout runs unreleased code against the live install; restart via the supervised path ('agent-bridge daemon restart' or the launchd/systemd unit). Diagnosis only — daemon not modified."
+    fi
+  fi
+
+  # (a) Unsupervised: orphaned (PPID==1) with no launchd/systemd marker in the
+  # environment. PPID is reported for diagnostics; the supervisor-marker
+  # absence is the discriminator (a supervised main process is also re-parented
+  # to PID 1, so PPID alone cannot tell the two apart). BRIDGE_DAEMON_DIAG_PPID
+  # is a test seam (PPID is read-only in bash, so it cannot be assigned to
+  # exercise the branch); it defaults to the real PPID, so production behavior
+  # is unchanged.
+  local diag_ppid="${BRIDGE_DAEMON_DIAG_PPID:-$PPID}"
+  local supervised="no"
+  if [[ -n "${INVOCATION_ID:-}" || -n "${NOTIFY_SOCKET:-}" \
+     || -n "${BRIDGE_DAEMON_SYSTEMD_REFRESH_MODE:-}" ]]; then
+    supervised="yes"   # systemd-spawned
+  elif [[ "${XPC_SERVICE_NAME:-0}" == *agent-bridge* ]]; then
+    supervised="yes"   # launchd job (XPC_SERVICE_NAME == job label)
+  fi
+  if [[ "$supervised" == "no" && "$diag_ppid" == "1" ]]; then
+    daemon_warn "[self-diagnose] daemon is UNSUPERVISED: PPID=${diag_ppid} (orphaned) with no launchd/systemd job owning it — there is no KeepAlive/Restart auto-recovery, so a crash will NOT respawn it. Install supervision (scripts/install-daemon-launchagent.sh / scripts/install-daemon-systemd.sh) and restart via that path. Diagnosis only — daemon not modified."
+  fi
+
+  unset -f _bridge_daemon_canon_path 2>/dev/null || true
+  return 0
+}
+
 cmd_run() {
   local cycle_status
 
@@ -14801,6 +14885,13 @@ cmd_run() {
     echo "$$" >"$BRIDGE_DAEMON_PID_FILE"
   fi
   BRIDGE_DAEMON_LAST_STEP="startup"
+
+  # Issue #1955: one-line self-diagnosis WARN when this daemon is
+  # unsupervised (orphaned, no launchd/systemd job) or running from a
+  # non-canonical source root (a dev/operator checkout instead of the
+  # recorded source / $BRIDGE_HOME). Best-effort, warn-only; `|| true` so a
+  # detection error can never fail the daemon start.
+  bridge_daemon_self_diagnose || true
 
   # Issue #1178 (cycle 12, Deliverable C): emit a one-line warning when
   # the daemon's running supp-group set is stale vs the shadow DB. The
