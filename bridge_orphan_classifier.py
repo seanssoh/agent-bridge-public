@@ -193,12 +193,52 @@ def samefiles_registered_agent(
 
 # --- Part B: generic resolved-symlink-target keep-set ----------------------
 
+# Real (non-symlink) subdirectory basenames the keep-set walk PRUNES — heavy
+# content trees inside an agent home that can never themselves contain a
+# bridge-managed keep-set symlink (Issue #1966). Every keep-set symlink the
+# bridge creates whose target resolves UNDER the home root lives at a SHALLOW
+# agent-home location (`agents/shared` -> `../shared`, `agents/<a>/<DOC>` ->
+# `../shared/<DOC>` via bridge-docs.py's AGENT_SHARED_LINKS) — never nested
+# inside these trees. The `.claude/skills/<skill>` links target the runtime
+# `.claude/` root or the source checkout (OUTSIDE the home root), so they were
+# never in the keep-set and `.claude/skills` is deliberately NOT pruned. The
+# scoped trees are pruned only at their FULL real Claude path (`.claude/projects`
+# transcripts, `.claude/plugins/cache` plugin cache) — anchored on the whole
+# parent-chain tail, NOT just the immediate parent basename, so an unrelated
+# user dir like `<agent>/x/plugins/cache` (whose parent is also `plugins` but
+# which is NOT `.claude/plugins/cache`) is still walked and its symlinks still
+# counted. Pruning changes only walk SPEED, not the keep-set RESULT (the 867k
+# islink on a long-lived host was dominated by plugin-cache node_modules +
+# transcripts).
+_PRUNE_NAMES_ANYWHERE = frozenset({"node_modules", ".git"})
+# basename -> the required parent-directory chain (immediate parent first,
+# walking up) for the scoped prune. The dir is pruned only when its ancestor
+# basenames match this chain exactly, anchoring each tree at its real `.claude`
+# location.
+_PRUNE_SCOPED_PARENT_CHAINS = {
+    "projects": (".claude",),            # .claude/projects (Claude transcripts)
+    "cache": ("plugins", ".claude"),     # .claude/plugins/cache (plugin cache)
+}
+
 
 def _safe_realpath(path: Path) -> str | None:
     try:
         return os.path.realpath(path)
     except OSError:
         return None
+
+
+def _record_symlink_target(full: str, home_root_real: str, out: set[str]) -> None:
+    target_real = _safe_realpath(Path(full))
+    if target_real is None:
+        return
+    # Containment: only record targets that live UNDER the home root (a symlink
+    # pointing outside `agents/` is irrelevant to the keep-set — we only ever
+    # consider quarantining children of the home root).
+    if target_real == home_root_real or target_real.startswith(
+        home_root_real + os.sep
+    ):
+        out.add(target_real)
 
 
 def _enumerate_symlink_targets_under_root(
@@ -209,39 +249,76 @@ def _enumerate_symlink_targets_under_root(
     """Walk `tree`, resolve every symlink it contains, and record each
     resolved target whose realpath is under `home_root_real` into `out`.
 
+    Hand-rolled `os.scandir` recursion (Issue #1966): reads each entry's
+    symlink-ness from the cached `DirEntry.is_symlink()` (the directory read
+    already stat'd the entry — no redundant per-entry `os.path.islink` lstat),
+    and PRUNES the heavy non-symlink content trees (`node_modules`, `.git`,
+    `.claude/{projects,cache}`) that can never hold a bridge keep-set symlink.
+    A symlinked subdirectory is still RESOLVED as a target (matching the prior
+    `os.walk` behavior where symlinked dirs appeared in `dirs`) — it is just not
+    descended into; pruning only drops real (non-symlink) content dirs from
+    descent, so the keep-set RESULT is unchanged — only the walk cost shrinks.
+
     Best-effort: a symlink we cannot resolve safely contributes nothing (so
     the candidate it might have protected stays an orphan ONLY if no OTHER
     kept tree references it — and an unresolvable link is itself never acted
-    on because it is not a child of the home root we move). os.walk swallows
-    per-entry errors via `onerror`.
+    on because it is not a child of the home root we move). Every fs probe
+    swallows its own OSError so a single unreadable entry never aborts the walk.
     """
     if not tree.exists():
         return
+    _scan_dir_for_symlink_targets(str(tree), home_root_real, out)
+
+
+def _scan_dir_for_symlink_targets(
+    root: str,
+    home_root_real: str,
+    out: set[str],
+) -> None:
     try:
-        walker = os.walk(tree, followlinks=False, onerror=lambda _e: None)
+        scanner = os.scandir(root)
     except OSError:
         return
-    for root, dirs, files in walker:
-        # Symlinked subdirectories appear in `dirs` (os.walk does not descend
-        # into them when followlinks=False); resolve them as targets too.
-        for name in list(dirs) + list(files):
-            full = os.path.join(root, name)
+    with scanner:
+        for entry in scanner:
             try:
-                if not os.path.islink(full):
-                    continue
+                is_link = entry.is_symlink()
             except OSError:
                 continue
-            target_real = _safe_realpath(Path(full))
-            if target_real is None:
+            if is_link:
+                # Resolve the symlink (a file OR a symlinked subdir) as a
+                # target; do NOT descend into it (followlinks=False semantics).
+                _record_symlink_target(entry.path, home_root_real, out)
                 continue
-            # Containment: only record targets that live UNDER the home root
-            # (a symlink pointing outside `agents/` is irrelevant to the
-            # keep-set — we only ever consider quarantining children of the
-            # home root).
-            if target_real == home_root_real or target_real.startswith(
-                home_root_real + os.sep
-            ):
-                out.add(target_real)
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+            except OSError:
+                continue
+            if not is_dir:
+                continue
+            name = entry.name
+            if name in _PRUNE_NAMES_ANYWHERE:
+                continue
+            if _scoped_prune_matches(name, root):
+                continue
+            _scan_dir_for_symlink_targets(entry.path, home_root_real, out)
+
+
+def _scoped_prune_matches(name: str, parent_dir: str) -> bool:
+    """True if a dir named `name` whose parent is `parent_dir` is one of the
+    scoped prune trees, matched on the FULL parent chain (not just the immediate
+    parent basename). Anchors `cache` at `.claude/plugins/cache` and `projects`
+    at `.claude/projects` so an unrelated `*/plugins/cache` is NOT pruned.
+    """
+    chain = _PRUNE_SCOPED_PARENT_CHAINS.get(name)
+    if chain is None:
+        return False
+    cur = parent_dir
+    for expected in chain:
+        if os.path.basename(cur) != expected:
+            return False
+        cur = os.path.dirname(cur)
+    return True
 
 
 def referenced_symlink_target_realpaths(
