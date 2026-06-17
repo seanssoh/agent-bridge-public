@@ -938,7 +938,14 @@ def resolve_config_caller(args: argparse.Namespace) -> ConfigCaller:
                         "agent-binding-store-writable: the config-caller "
                         "bindings store is owned by this UID (shared-UID) — the "
                         "owner can forge/re-chmod an agent-pane admin binding, so "
-                        "it is not trusted here; run this from an operator TTY"
+                        "it is not trusted here. On a headless shared-UID host "
+                        "there is no operator TTY: run this mutation from an "
+                        "attended operator session (--from <admin> on a real "
+                        "TTY), or migrate this admin to linux-user isolation "
+                        "(iso-v2) for unattended headless config — the "
+                        "controller/agent UID boundary then makes the binding "
+                        "non-forgeable and authorizes it TTY-free. See "
+                        'OPERATIONS.md "Iso v2 agent troubleshooting" (#1946).'
                     ),
                 )
             return ConfigCaller(
