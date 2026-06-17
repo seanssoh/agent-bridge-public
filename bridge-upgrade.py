@@ -898,6 +898,52 @@ def collect_roster_engines(target_root: Path) -> dict[str, str]:
     return engines
 
 
+def collect_registry_engines(target_root: Path) -> dict[str, str]:
+    """Build the registry-published ``id -> engine`` map for the doc-backfill.
+
+    Issue #1956: a DYNAMIC agent (`agb-dev-codex`, `crm-dev-codex`: source=dynamic)
+    is not declared in the static roster shell files, so ``collect_roster_engines``
+    returns nothing for it and the fail-closed resolver (#1892) holds it forever —
+    even though its engine IS known authoritatively. The daemon publishes that
+    authority in ``state/active-roster.tsv``: the ``engine`` column (index 1) is
+    ``bridge_agent_engine``'s value, which for a dynamic agent is the engine
+    recorded from its ``--codex``/``--claude`` launch flag in the agent registry.
+
+    This is read as a strict FALLBACK below the static roster (the roster stays
+    the SoT for roster-registered agents; the registry only fills the gap for
+    dynamic agents the roster never declares). The lookup is exact per-id — no
+    substring/heuristic — so it cannot reintroduce the #1930 ``detect_engine``
+    false-positive: a dynamic agent whose registry engine is ``claude`` resolves
+    to ``claude`` and is never codex-backfilled (the #1928 / smoke-T3 guard).
+
+    Reads ``active-roster.tsv`` (live sessions, the authoritative engine column).
+    The header row (``agent\\tengine\\t...``) is skipped. Read-as-existence (the
+    OSError IS the probe) keeps the #1175 raw-pathlib audit ceiling. Dynamic
+    agents are NEVER written back into the static roster — this map exists only
+    in-memory for the duration of one backfill pass.
+    """
+    engines: dict[str, str] = {}
+    roster_tsv = target_root / "state" / "active-roster.tsv"
+    try:
+        text = roster_tsv.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return engines
+    for idx, line in enumerate(text.splitlines()):
+        if idx == 0 and line.startswith("agent\t"):
+            continue
+        cols = line.split("\t")
+        if len(cols) < 2:
+            continue
+        agent_id = cols[0].strip()
+        engine = cols[1].strip().lower()
+        # Only a positive, atomic engine token is authoritative. The runtime
+        # `unknown` sentinel (bridge_agent_engine's miss value) and any blank
+        # are declined so they fall through to the roster's fail-closed path.
+        if agent_id and engine and engine != "unknown":
+            engines[agent_id] = engine
+    return engines
+
+
 def collect_roster_ids(target_root: Path, admin_agent: str) -> tuple[set[str], list[str]]:
     """Build the set of roster agent ids for the migrate-agents filter.
 
@@ -1623,6 +1669,15 @@ def cmd_backfill_codex_entrypoints(args: argparse.Namespace) -> int:
     # statically from the roster shell files. Absence of a positive claude signal
     # must NEVER be inferred as codex (fail-closed) — see resolve_backfill_engine_decision.
     roster_engines = collect_roster_engines(target_root)
+    # #1956: a dynamic agent (source=dynamic) is never in the static roster, so
+    # the map above has no entry for it and #1892 would hold it forever. The
+    # daemon-published state/active-roster.tsv carries that agent's AUTHORITATIVE
+    # engine (the `--codex`/`--claude` launch flag, via bridge_agent_engine). Use
+    # it as a strict FALLBACK below the static roster: the roster wins for any id
+    # it declares (SoT preserved); the registry only fills the dynamic-agent gap.
+    # This is exact per-id (no heuristic), so a registry-claude dynamic agent
+    # still resolves to claude and is never codex-backfilled (#1928 / T3 guard).
+    registry_engines = collect_registry_engines(target_root)
 
     backfilled: list[str] = []
     refreshed: list[str] = []
@@ -1643,7 +1698,13 @@ def cmd_backfill_codex_entrypoints(args: argparse.Namespace) -> int:
         try:
             session_type = detect_session_type(path, admin_agent)
             detected_engine = detect_engine(path, session_type)
+            # Static roster is the SoT; the registry (active-roster.tsv) is a
+            # fallback that only supplies an engine for a dynamic agent the
+            # roster never declares (#1956). Never the other way round — a
+            # roster declaration always wins over the registry.
             roster_engine = roster_engines.get(path.name)
+            if roster_engine is None:
+                roster_engine = registry_engines.get(path.name)
             decision, hold_reason = resolve_backfill_engine_decision(
                 roster_engine, detected_engine,
             )
