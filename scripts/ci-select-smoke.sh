@@ -1866,7 +1866,19 @@ select_for_path() {
       # the test-only flag. 1728-test-bind-state-path-guard pins fail-closed
       # under the footgun, prod-path-unchanged, and the opt-in gating. Pull it
       # on every receiver/common move so the guard cannot regress.
-      add_required a2a-cross-bridge queue I-beta4-a2a-3-gaps J-beta4-workflow-docs beta5-2-lambda-a2a-robustness a2a-tailscale-identity-resolve a2a-daemon-selfheal-reconcile a2a-migrate-identity a2a-ip-change-announce 1405-handoffd-supervision 1679-1680-a2a-receiver-supervisor-robustness a2a-setup-wizard a2a-rooms-p1a a2a-rooms-p1b-acl a2a-rooms-1517-bootstrap 1398-a2a-inbound-stopped-target-force a2a-backpressure-openonly 1623-a2a-backpressure-failopen rooms-p4-1-cross-node-join rooms-p4-2-roster-broadcast rooms-p4-3-room-talk 1594-rooms-fanout rooms-p4-5-polish 1563-pr4-a2a-receiver-healthz 1563-pr5-fp-control-matrix 1563-pr8-a2a-diag-recovery 1575b-a2a-backoff-ceiling 1618-outbox-retry-resets-attempts 1628-a2a-deliver-per-row-guard 1595-cloudflare-warp-mesh 1758-trusted-routed-transport 1612-upgrade-restart-receiver 1630-a2a-fresh-arrival-nudge 1629-healthz-not-semaphore-gated 1701-warp-healthz-socket-held 1697-a2a-net-status 1685-receiver-staleness-selfheal v0165-l0-reconcile-skeleton v0165-l2-tunnel-health v0165-l1-stable-addr v0165-l3-peer-reachability v0165-l4-token-join v0165-l5-relay-roster v0165-l6-net-status-v2 v0166-la-tunnel-bounce-gate v0166-lb-transient-peers 1728-test-bind-state-path-guard
+      # Issue #1933: bridge-a2a.py's cmd_send resolves the sender ("from") id
+      # from --from then BRIDGE_AGENT_ID ONLY — the OS-username (os.environ
+      # ["USER"]) fallback is dropped. An OS login name is never a valid agent
+      # id, so a reply echoing it is rejected by the sender's OWN inbound
+      # allowlist (self-inflicted 403). When neither source resolves a non-empty
+      # id (subagents/cron/background bash without BRIDGE_AGENT_ID; or the
+      # --from "$UNSET" empty-string trap) cmd_send now fails fast with an
+      # actionable error instead of emitting an unroutable from-id.
+      # 1933-a2a-from-id pins: fail-fast on no-sender + empty --from, the
+      # OS username never leaking into the wire `from`, and the valid
+      # --from / BRIDGE_AGENT_ID paths stamping the real id unchanged. Pull on
+      # every bridge-a2a.py move so the USER fallback cannot regress.
+      add_required a2a-cross-bridge queue I-beta4-a2a-3-gaps J-beta4-workflow-docs beta5-2-lambda-a2a-robustness a2a-tailscale-identity-resolve a2a-daemon-selfheal-reconcile a2a-migrate-identity a2a-ip-change-announce 1405-handoffd-supervision 1679-1680-a2a-receiver-supervisor-robustness a2a-setup-wizard a2a-rooms-p1a a2a-rooms-p1b-acl a2a-rooms-1517-bootstrap 1398-a2a-inbound-stopped-target-force a2a-backpressure-openonly 1623-a2a-backpressure-failopen rooms-p4-1-cross-node-join rooms-p4-2-roster-broadcast rooms-p4-3-room-talk 1594-rooms-fanout rooms-p4-5-polish 1563-pr4-a2a-receiver-healthz 1563-pr5-fp-control-matrix 1563-pr8-a2a-diag-recovery 1575b-a2a-backoff-ceiling 1618-outbox-retry-resets-attempts 1628-a2a-deliver-per-row-guard 1595-cloudflare-warp-mesh 1758-trusted-routed-transport 1612-upgrade-restart-receiver 1630-a2a-fresh-arrival-nudge 1629-healthz-not-semaphore-gated 1701-warp-healthz-socket-held 1697-a2a-net-status 1685-receiver-staleness-selfheal v0165-l0-reconcile-skeleton v0165-l2-tunnel-health v0165-l1-stable-addr v0165-l3-peer-reachability v0165-l4-token-join v0165-l5-relay-roster v0165-l6-net-status-v2 v0166-la-tunnel-bounce-gate v0166-lb-transient-peers 1728-test-bind-state-path-guard 1933-a2a-from-id
       ;;
 
     bridge-daemon.sh|bridge-sync.sh|bridge-watchdog.sh|bridge-cron.sh|lib/bridge-cron.sh|lib/bridge-state.sh|lib/bridge-notify.sh)
