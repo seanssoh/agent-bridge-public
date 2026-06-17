@@ -2737,7 +2737,24 @@ select_for_path() {
       # runner/bridge-cron.py move so a future PR cannot drop the explicit
       # --model, regress the precedence order, or re-couple the child to the
       # interactive settings.json (the entitlement-drop 404 incident).
-      add_required cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner cron-runner-schema-openai-strict cron-path-augmentation-874 queue beta5-2-eta-cron-iso-uid-preflight 1359-cron-create-iso-staging 1379-iso-cron-staging-group 1383-iso-cron-result-json-group 8807-cron-backfill-coalesce 1459-cron-dispatch-recovery 1659-cron-status-walk-perf 1677-cron-summary-short-derive 1792-cron-scope-fence 1875-cron-prod-mutation-guard 1843-cron-consecutive-failure-escalation 1826-cron-at-naive-tz 1842-cron-tamper-iso-groupwrite 1880-cron-explicit-model
+      # Issue #1943 (cm-prod F3): the upgrade-time detector
+      # (lib/upgrade-helpers/cron-unmodeled-claude-warn.py) MIRRORS the runner's
+      # resolve_cron_child_model_effort precedence + interactive_settings model
+      # check to WARN (never auto-pin) about Claude crons the #1880 gate would
+      # silently refuse after upgrade. Pull 1943-cron-unmodeled-warn-on-upgrade
+      # on every runner move so a precedence/gate change can't drift the warning
+      # away from the gate it predicts.
+      add_required cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner cron-runner-schema-openai-strict cron-path-augmentation-874 queue beta5-2-eta-cron-iso-uid-preflight 1359-cron-create-iso-staging 1379-iso-cron-staging-group 1383-iso-cron-result-json-group 8807-cron-backfill-coalesce 1459-cron-dispatch-recovery 1659-cron-status-walk-perf 1677-cron-summary-short-derive 1792-cron-scope-fence 1875-cron-prod-mutation-guard 1843-cron-consecutive-failure-escalation 1826-cron-at-naive-tz 1842-cron-tamper-iso-groupwrite 1880-cron-explicit-model 1943-cron-unmodeled-warn-on-upgrade
+      add_integration integration-minimal
+      ;;
+
+    lib/upgrade-helpers/cron-unmodeled-claude-warn.py)
+      # Issue #1943 (cm-prod F3): the read-only upgrade-time detector that warns
+      # (never auto-pins) about Claude crons the #1880 gate would silently
+      # refuse. It imports bridge-cron-runner.py's resolve_cron_child_model_effort
+      # + interactive_settings model check so the warning never drifts from the
+      # gate; its own smoke pins the warn / no-warn matrix.
+      add_required 1943-cron-unmodeled-warn-on-upgrade
       add_integration integration-minimal
       ;;
 
@@ -4246,7 +4263,13 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # workdir copies must stay in the targeted backup set. Pull the focused
       # smoke on every upgrade-entry move so the state-vs-doc split, the
       # preserved_paths plumbing, and the backup-set coverage stay pinned.
-      add_required upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision telegram-relay-residue-cleanup upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering upgrade-isolated-agent-migrate 864-upgrade-perm-regressions cleanup-payload-empty-stdin-872 isolation-v2-marker-only-migrate 1067-codex-provisioning 1113-watchdog-legacy-backfill 1144-upgrade-complete-task phase2-install-tree-reconciler phase3-agent-home-contract α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-theta-upgrade-backfill-perms beta5-2-mu-cron-channel-creds codex-version-surface codex-doctor 1516-upgrade-downgrade-guard 1612-upgrade-restart-receiver upgrade-migrate-rematerialize-workdir 1602-dryrun-ref-fidelity 1601-conflicts-adopt-guard 1611-migrate-orphan-skip 1613-wiki-mention-fence-indent 1635-iso-backup-perm-skip 1638-settings-cosmetic-conflict 1636-rematerialize-scaffolding 1660-upgrade-emit-brokenpipe 1661-upgrade-singleton-lock 1662-upgrade-complete-marker 1670-rematerialize-dryrun-agent-preserved 1781-doc-migration-memory-preserve 1817-live-root-claude-stub lts-channel-sticky-resolver 1567-codex-orphan-upgrade-reaper 1675-1694-settings-homebrew-abspath-conflict 1786-tasksdb-doctor-verb 1809-agents-md-backfill 1892-doc-backfill-engine-fail-closed 1905-upgrade-systemd-quiesce-respawn 655-upgrade-launchd-quiesce-respawn 1855-keychain-free-backfill 1813-canon-links-resolve-v2
+      # Issue #1943 (cm-prod F3): bridge-upgrade.sh's [upgrade-complete] task
+      # body composer now appends a WARN block (read-only, never auto-pin) for
+      # Claude crons the #1880 gate would silently refuse after upgrade, via
+      # lib/upgrade-helpers/cron-unmodeled-claude-warn.py. Pull
+      # 1943-cron-unmodeled-warn-on-upgrade whenever the upgrade entry moves so
+      # the best-effort cron-scan invocation cannot silently regress.
+      add_required upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision telegram-relay-residue-cleanup upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering upgrade-isolated-agent-migrate 864-upgrade-perm-regressions cleanup-payload-empty-stdin-872 isolation-v2-marker-only-migrate 1067-codex-provisioning 1113-watchdog-legacy-backfill 1144-upgrade-complete-task phase2-install-tree-reconciler phase3-agent-home-contract α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-theta-upgrade-backfill-perms beta5-2-mu-cron-channel-creds codex-version-surface codex-doctor 1516-upgrade-downgrade-guard 1612-upgrade-restart-receiver upgrade-migrate-rematerialize-workdir 1602-dryrun-ref-fidelity 1601-conflicts-adopt-guard 1611-migrate-orphan-skip 1613-wiki-mention-fence-indent 1635-iso-backup-perm-skip 1638-settings-cosmetic-conflict 1636-rematerialize-scaffolding 1660-upgrade-emit-brokenpipe 1661-upgrade-singleton-lock 1662-upgrade-complete-marker 1670-rematerialize-dryrun-agent-preserved 1781-doc-migration-memory-preserve 1817-live-root-claude-stub lts-channel-sticky-resolver 1567-codex-orphan-upgrade-reaper 1675-1694-settings-homebrew-abspath-conflict 1786-tasksdb-doctor-verb 1809-agents-md-backfill 1892-doc-backfill-engine-fail-closed 1905-upgrade-systemd-quiesce-respawn 655-upgrade-launchd-quiesce-respawn 1855-keychain-free-backfill 1813-canon-links-resolve-v2 1943-cron-unmodeled-warn-on-upgrade
       # Issue #1906: bridge-upgrade.py's backfill-codex-entrypoints sweep gained
       # the REPORT-ONLY engine-mismatched-doc detector (a stale Codex-contract
       # AGENTS.md on a non-codex agent -> engine_mismatch_docs + non_clean).

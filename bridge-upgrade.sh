@@ -3846,6 +3846,25 @@ POST_EOF
       printf '\n'
       bridge_cleanup_render_verification_block "$TARGET_ROOT"
     } >>"$_post_body"
+    # Issue #1943 (cm-prod F3): the #1880 cron model-gate SILENTLY refuses
+    # Claude crons that resolve no stable model (per-job → cronDefaults →
+    # roster → BRIDGE_CRON_DEFAULT_MODEL) while the agent's interactive
+    # settings.json pins a model — the queue then floods with error
+    # followups and the operator has no warning. Detect those crons here and
+    # append a LOUD, actionable warning to the post-upgrade body. READ-ONLY:
+    # we never auto-pin a model (a usage/entitlement decision the operator
+    # must make). Best-effort: a cron-scan failure must NOT fail the upgrade,
+    # so the helper degrades to empty output and we swallow any error. The
+    # helper is invoked file-as-argv (footgun #11 — no heredoc-stdin).
+    _cron_warn_jobs_file="$TARGET_ROOT/cron/jobs.json"
+    if [[ -f "$_cron_warn_jobs_file" && -f "$TARGET_ROOT/lib/upgrade-helpers/cron-unmodeled-claude-warn.py" ]]; then
+      _cron_warn_out="$(bridge_upgrade_with_target_env "$TARGET_ROOT" python3 \
+        "$TARGET_ROOT/lib/upgrade-helpers/cron-unmodeled-claude-warn.py" \
+        "$_cron_warn_jobs_file" "$TARGET_ROOT" 2>/dev/null || true)"
+      if [[ -n "$_cron_warn_out" ]]; then
+        { printf '\n'; printf '%s\n' "$_cron_warn_out"; } >>"$_post_body"
+      fi
+    fi
     # Issue #980: when --restart-agents was requested but one or more
     # static agents were skipped because the operator's own tmux session
     # was attached, those agents are still running the OLD code. Append an
