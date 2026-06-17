@@ -799,6 +799,14 @@ select_for_path() {
         # every bridge-agent.sh move so a refactor cannot drop the create-time
         # seed call or reopen the abbreviated-HUD regression.
         add_required 1753-hud-config-seed
+        # Issue #1968: bridge-agent.sh's run_forget_session now enumerates the
+        # agent's own in-window transcripts and quarantines them (alongside
+        # clearing the persisted id) so the resolver's most-recent-.jsonl
+        # fallback (#1769) has nothing stale left to resume — a genuinely fresh
+        # next launch. Pull the smoke on every bridge-agent.sh move so a
+        # refactor cannot drop the quarantine loop and reopen the inert-forget
+        # bug (dry-run launch keeps `--resume <old-id>` after forget-session).
+        add_required 1968-forget-session-fresh
       fi
       ;;
     lib/bridge-cron.sh|lib/bridge-state.sh)
@@ -834,6 +842,14 @@ select_for_path() {
         # adversarial binding smoke on every bridge-state.sh move so a refactor
         # cannot rename/drop the writer or change the binding shape/path.
         add_required 1738-config-caller-binding
+        # Issue #1968: lib/bridge-state.sh hosts bridge_agent_list_resumable_
+        # transcripts (the forget-session enumeration helper) and the guarded
+        # bridge_agent_resume_quarantine_add the resolver fallback auto-excludes.
+        # Pull the smoke on every bridge-state.sh move so a refactor cannot drop
+        # the enumeration helper or weaken the foreign-transcript guard (which
+        # would either reopen the inert-forget bug or start quarantining the
+        # operator's own sessions).
+        add_required 1968-forget-session-fresh
         add_required 1378-iso-session-lock-fresh-start
         # Issue #9981 (sibling of #1378): lib/bridge-state.sh hosts the
         # pending-attention spool resolvers (bridge_agent_pending_attention_
@@ -4826,6 +4842,13 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # for any agent whose workdir path contains "_") or narrow the
       # back-compat slash-only / slash+dot candidates.
       add_required 1015-resume-claude-config-dir 981-restart-session-resume-snapshot Beta-beta5-session-id-detect-sudo beta5-1-session-id-detect-race 1769-restart-trusted-resume 1807-resume-slug-underscore
+      # Issue #1968: resolve-claude-resume-session-id.py gained the
+      # `--list-resumable` enumeration mode that forget-session uses to
+      # quarantine the agent's own in-window transcripts (so the most-recent-
+      # .jsonl fallback has nothing stale left to re-resume). Pull the smoke on
+      # every helper move so a refactor cannot drop/skew the enumeration (re-
+      # opening the inert-forget bug where the dry-run launch keeps `--resume`).
+      add_required 1968-forget-session-fresh
       add_integration integration-minimal
       ;;
 

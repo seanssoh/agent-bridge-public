@@ -2912,6 +2912,64 @@ print(",".join(ids), end="")
 PY
 }
 
+# bridge_agent_list_resumable_transcripts <agent> [workdir]
+#
+# Issue #1968: print every in-window project transcript session-id the resolver
+# fallback (bridge_resolve_resume_session_id / #1769) could re-select for
+# <agent>, one per line, newest first. This is the enumeration the explicit
+# `agb agent forget-session` path uses to quarantine the agent's OWN transcripts
+# so the most-recent-.jsonl fallback has nothing stale left to resume.
+#
+# It reuses the resolver's python helper in `--list-resumable` mode (so the slug
+# + eligibility + max-age logic stays single-sourced — no drift), and mirrors
+# the resolver's config-dir + iso-v2 sudo plumbing: iso-v2 agents keep their
+# transcripts under their own `<agent-home>/.claude/` at 0600, so the scan must
+# run as the iso UID. Empty output (no eligible transcript) is the normal,
+# nothing-to-quarantine case — rc is always 0 so callers treat it as a list.
+bridge_agent_list_resumable_transcripts() {
+  local agent="$1"
+  local workdir="${2:-}"
+  [[ -n "$agent" ]] || return 0
+
+  if [[ -z "$workdir" ]]; then
+    workdir="$(bridge_agent_workdir "$agent" 2>/dev/null || true)"
+  fi
+  [[ -n "$workdir" ]] || return 0
+
+  if ! bridge_resolve_script_dir_check; then
+    return 0
+  fi
+
+  local max_age_hours="${BRIDGE_RESUME_MAX_AGE_HOURS:-48}"
+
+  # Same config-dir resolution as bridge_resolve_resume_session_id: empty for
+  # non-isolated / unregistered agents (helper falls back to its env/HOME
+  # default), the agent's own `<agent-home>/.claude` for iso v2.
+  local claude_config_dir=""
+  claude_config_dir="$(bridge_resolve_agent_claude_config_dir "$agent" 2>/dev/null || true)"
+
+  local _list_py="$BRIDGE_SCRIPT_DIR/scripts/python-helpers/resolve-claude-resume-session-id.py"
+
+  # Same iso-v2 sudo-as-user drop the resolver uses so 0600 transcripts owned by
+  # the iso UID are readable during the scan.
+  local _iso_sudo_user=""
+  if command -v bridge_resolve_agent_iso_sudo_user >/dev/null 2>&1; then
+    _iso_sudo_user="$(bridge_resolve_agent_iso_sudo_user "$agent" 2>/dev/null || true)"
+  fi
+
+  if [[ -n "$_iso_sudo_user" ]] \
+      && command -v bridge_linux_sudo_as_user >/dev/null 2>&1; then
+    local _bash_bin="${BRIDGE_BASH_BIN:-$(command -v bash 2>/dev/null || printf '/bin/bash')}"
+    bridge_linux_sudo_as_user "$_iso_sudo_user" \
+      "$_bash_bin" -c 'exec python3 "$@"' bash \
+      "$_list_py" --list-resumable "$workdir" "$max_age_hours" \
+      "$claude_config_dir" 2>/dev/null || true
+  else
+    python3 "$_list_py" --list-resumable "$workdir" "$max_age_hours" \
+      "$claude_config_dir" 2>/dev/null || true
+  fi
+}
+
 # bridge_resume_path_resolves_into <path> <ancestor>
 #
 # Returns 0 (true) iff realpath(<path>) is <ancestor> itself or strictly below
