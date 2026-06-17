@@ -8680,10 +8680,19 @@ bridge_daemon_sweep_nudge_late_success() {
 # Fix: on every daemon tick, scan tasks whose age exceeds
 # BRIDGE_QUEUE_UNCLAIMED_ESCALATE_SECS (default 1800s) AND have not
 # yet been claimed. For each such task, file an admin task + emit
-# `task_unclaimed_escalated`. Re-arm cooldown
-# (BRIDGE_QUEUE_UNCLAIMED_ESCALATE_COOLDOWN_SECS, default 1800s) per
-# task to avoid spam — the marker file persists so a re-tick within
-# the cooldown window is a no-op.
+# `task_unclaimed_escalated`. The per-task marker file is a once-latch
+# keyed by (agent, task): line 1 is the escalation ts, line 2 is the
+# agent it escalated for. While the task stays queued ON THE SAME AGENT
+# the marker suppresses re-escalation, so the alert fires exactly ONCE
+# per (agent, task). The stale-marker sweep clears it when the task
+# leaves `queued`; and a same-id handoff/reassignment to a DIFFERENT
+# agent re-arms (the marker's recorded agent no longer matches the
+# current assignee, so the escalation re-fires and re-stamps for the new
+# agent). (Issue #1944 / cm-prod F6: the pre-fix re-arm cooldown defaulted
+# to 1800s and re-minted a fresh admin escalation every 30min for a
+# still-stuck task. Operators who want periodic re-nudging can set
+# BRIDGE_QUEUE_UNCLAIMED_ESCALATE_COOLDOWN_SECS>0 to opt back in; the
+# default 0 means once-only.)
 #
 # Coordination with the #1106 task-age gate (already in place): the
 # age gate suppresses NUDGES for fresh tasks. This escalation looks
@@ -8712,13 +8721,24 @@ bridge_daemon_unclaimed_escalation_marker_file() {
 process_unclaimed_queue_escalation() {
   local admin_agent="${BRIDGE_ADMIN_AGENT_ID:-}"
   local age_threshold="${BRIDGE_QUEUE_UNCLAIMED_ESCALATE_SECS:-1800}"
-  local cooldown="${BRIDGE_QUEUE_UNCLAIMED_ESCALATE_COOLDOWN_SECS:-1800}"
+  # Issue #1944 (cm-prod F6): escalate ONCE per (agent, task) by default.
+  # The marker is a "we already told the operator about this stuck task"
+  # latch, not a periodically-expiring cooldown. While the task stays
+  # queued the marker suppresses re-escalation entirely; the stale-marker
+  # sweep clears it the moment the task leaves `queued` (claimed / done /
+  # cancelled / reassigned), so a genuine re-queue re-arms naturally.
+  # Pre-#1944 the cooldown defaulted to 1800s and re-minted a fresh admin
+  # escalation task every 30min for a still-stuck task (cm-prod saw
+  # #8691/#8765/... all for the same queued #8677). Operators who DO want
+  # periodic re-nudging can opt back in by setting the cooldown env knob to
+  # a positive value; the default 0 means once-only (no re-arm).
+  local cooldown="${BRIDGE_QUEUE_UNCLAIMED_ESCALATE_COOLDOWN_SECS:-0}"
 
   [[ -n "$admin_agent" ]] || return 1
   bridge_agent_exists "$admin_agent" || return 1
   [[ "$age_threshold" =~ ^[0-9]+$ ]] || age_threshold=1800
   (( age_threshold > 0 )) || return 1
-  [[ "$cooldown" =~ ^[0-9]+$ ]] || cooldown=1800
+  [[ "$cooldown" =~ ^[0-9]+$ ]] || cooldown=0
 
   # Issue #1408: the escalation now files via `bridge_queue_cli upsert-open`
   # (controller-direct to bridge-queue.py) rather than the `agent-bridge`
@@ -8770,17 +8790,46 @@ process_unclaimed_queue_escalation() {
       continue
     fi
 
-    local task_id age_seconds title created_by priority marker age_minutes body_file
+    local task_id age_seconds title created_by priority marker age_minutes body_file cadence_note
+    if (( cooldown > 0 )); then
+      cadence_note="This task fires at most once per ${cooldown}s cooldown window per (agent, queued task id)."
+    else
+      cadence_note="This task fires once per (agent, queued task id) — it re-arms when the task is claimed / done / reassigned to a different agent."
+    fi
     while IFS=$'\t' read -r task_id age_seconds title created_by priority; do
       [[ "$task_id" =~ ^[0-9]+$ ]] || continue
       marker="$(bridge_daemon_unclaimed_escalation_marker_file "$task_id")"
       if [[ -f "$marker" ]]; then
-        # Cooldown gate — re-escalate only when the window has elapsed.
-        local _marker_ts
-        _marker_ts="$(head -n1 "$marker" 2>/dev/null || printf '0')"
-        [[ "$_marker_ts" =~ ^[0-9]+$ ]] || _marker_ts=0
-        if (( _marker_ts > 0 )) && (( now_ts - _marker_ts < cooldown )); then
-          continue
+        # Issue #1944: the latch is keyed by (agent, task), NOT task alone.
+        # The marker records the agent it escalated for (line 2). A same-id
+        # handoff/reassignment keeps status='queued' but changes assigned_to,
+        # so a marker written for the PRIOR assignee must NOT silence the
+        # alert for the NEW assignee (who may now be wedged and was never
+        # escalated). The latch therefore applies ONLY when the marker's
+        # recorded agent matches the current assignee. A mismatched agent OR
+        # an empty line-2 (a legacy single-line marker left by a pre-#1944
+        # daemon at upgrade) falls through to re-escalate, which re-stamps
+        # the marker with the current agent — at most ONE extra escalation
+        # per legacy marker, never a permanent silent-drop.
+        local _marker_agent
+        _marker_agent="$(sed -n '2p' "$marker" 2>/dev/null || printf '')"
+        if [[ -n "$_marker_agent" && "$_marker_agent" == "$agent" ]]; then
+          # Issue #1944: once-per-(agent, task) latch. A marker for THIS agent
+          # means we already escalated this queued task, so by default
+          # (cooldown==0) suppress every further escalation until the
+          # stale-marker sweep clears it (i.e. until the task leaves
+          # `queued`). When the operator opts into periodic re-nudging
+          # (cooldown>0), fall back to the legacy behavior: re-escalate only
+          # after the cooldown window has elapsed.
+          if (( cooldown == 0 )); then
+            continue
+          fi
+          local _marker_ts
+          _marker_ts="$(head -n1 "$marker" 2>/dev/null || printf '0')"
+          [[ "$_marker_ts" =~ ^[0-9]+$ ]] || _marker_ts=0
+          if (( _marker_ts > 0 )) && (( now_ts - _marker_ts < cooldown )); then
+            continue
+          fi
         fi
       fi
 
@@ -8800,7 +8849,9 @@ process_unclaimed_queue_escalation() {
           --detail title="$title" \
           --detail action=audit_only_admin_target \
           2>/dev/null || true
-        printf '%s\n' "$now_ts" >"$marker" 2>/dev/null || true
+        # Marker line 1 = escalation ts, line 2 = agent (the #1944
+        # (agent, task) latch key — a later reassignment re-arms).
+        printf '%s\n%s\n' "$now_ts" "$agent" >"$marker" 2>/dev/null || true
         changed=0
         continue
       fi
@@ -8831,8 +8882,7 @@ Next steps:
 - If the agent should be running: \`agent-bridge agent start ${agent}\`
   clears any backoff state and resumes the daemon's autostart loop.
 
-This task fires at most once per ${cooldown}s cooldown window per
-queued task id. Issue #1318-B operator-visible audit signal.
+${cadence_note} Issue #1318-B operator-visible audit signal.
 EOF
 
       # Issue #1408: refresh ONE open escalation per task id instead of
@@ -8859,7 +8909,9 @@ EOF
           --detail title="$title" \
           --detail cooldown_secs="$cooldown" \
           2>/dev/null || true
-        printf '%s\n' "$now_ts" >"$marker" 2>/dev/null || true
+        # Marker line 1 = escalation ts, line 2 = agent (the #1944
+        # (agent, task) latch key — a later reassignment re-arms).
+        printf '%s\n%s\n' "$now_ts" "$agent" >"$marker" 2>/dev/null || true
         changed=0
       else
         daemon_warn "failed to file [unclaimed-task] escalation for task=${task_id} agent=${agent}"
@@ -14046,9 +14098,11 @@ cmd_sync_cycle() {
   # Issue #1318 (beta5-2 Lane ι) — 7051-B unclaimed-queue escalation.
   # Scans every roster agent's open tasks; for tasks queued > N min
   # (BRIDGE_QUEUE_UNCLAIMED_ESCALATE_SECS, default 1800s) without a
-  # claim, files an admin task + emits a structured audit row. Cooldown
-  # per task id (BRIDGE_QUEUE_UNCLAIMED_ESCALATE_COOLDOWN_SECS, default
-  # 1800s) prevents spam. Edge case #5 (overlap with #1106 task-age
+  # claim, files an admin task + emits a structured audit row. The
+  # per-task marker latches escalation to ONCE per (agent, task) so a
+  # still-stuck task is not re-escalated every cooldown window (#1944);
+  # set BRIDGE_QUEUE_UNCLAIMED_ESCALATE_COOLDOWN_SECS>0 to opt into
+  # periodic re-nudging. Edge case #5 (overlap with #1106 task-age
   # gate): structurally non-overlapping — that gate looks at NEW tasks
   # (<60s), we look at OLD tasks (>1800s). Subshell-isolated per the
   # Lane π defense-in-depth pattern (#1338).
