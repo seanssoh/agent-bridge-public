@@ -4303,6 +4303,13 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # backfill loop cannot silently drop the residue flag or start mutating the
       # flagged file.
       add_required 1906-flag-engine-mismatched-docs
+      # Issue #1930 (+ #1928): detect_engine / detect_session_type anchor codex
+      # detection on the RESOLVED `런타임: Codex CLI` runtime declaration instead
+      # of a bare "Codex CLI" substring (the template placeholder + prose example
+      # both carry that substring on genuine claude profiles). Pull the #1930
+      # smoke on every bridge-upgrade.py move so a refactor of either heuristic
+      # cannot reintroduce the placeholder/prose false positive.
+      add_required 1930-detect-engine-placeholder
       # Issue #1923: bridge-upgrade.sh's Claude hook-propagation loop now also
       # calls bridge_ensure_claude_askuserquestion_ban so existing agents
       # (incl. pre-#1923 dynamic-vanilla agents whose settings.local.json had

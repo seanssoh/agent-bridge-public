@@ -976,6 +976,24 @@ def detect_role_text(agent_dir: Path) -> str:
     return "Bridge-managed agent"
 
 
+# Issue #1930: a genuine *codex* signal in a CLAUDE.md is the RESOLVED runtime
+# declaration line — the `런타임`/`runtime` label whose value is `Codex CLI`
+# (header form `(런타임: Codex CLI)`, body form `- **런타임**: Codex CLI`). A bare
+# `"Codex CLI" in text` substring scan also fires on two NON-codex sources that
+# every rendered claude profile carries, false-flagging the agent as codex (and
+# making the #1892 fail-closed hold alert recur every hygiene/upgrade pass):
+#   1. the unresolved template placeholder `- **런타임**: <Claude Code CLI | Codex CLI>`
+#      (the angle-bracket choice line — both engine tokens present), and
+#   2. prose that merely *mentions* Codex CLI as an example, e.g. the template's
+#      background-subagent note `런타임에 ... 기능이 없으면(예: Codex CLI)`.
+# Anchoring on the resolved runtime-label value excludes both while still
+# detecting a real codex profile's resolved declaration. Shared by BOTH the
+# session-type heuristic (below) and detect_engine — the false positive must be
+# excluded on both paths, since detect_session_type -> "static-codex" itself
+# short-circuits detect_engine to codex.
+_CODEX_RUNTIME_DECL = re.compile(r"(?:런타임|runtime)\**\s*:\s*Codex CLI", re.IGNORECASE)
+
+
 def detect_session_type(agent_dir: Path, admin_agent: str) -> str:
     session_path = agent_dir / "SESSION-TYPE.md"
     if session_path.exists():
@@ -985,7 +1003,9 @@ def detect_session_type(agent_dir: Path, admin_agent: str) -> str:
     if agent_dir.name == admin_agent:
         return "admin"
     claude_path = agent_dir / "CLAUDE.md"
-    if claude_path.exists() and "Codex CLI" in claude_path.read_text(encoding="utf-8", errors="ignore"):
+    if claude_path.exists() and _CODEX_RUNTIME_DECL.search(
+        claude_path.read_text(encoding="utf-8", errors="ignore")
+    ):
         return "static-codex"
     return "static-claude"
 
@@ -1063,7 +1083,9 @@ def detect_engine(agent_dir: Path, session_type: str) -> str:
     if session_type == "static-codex":
         return "codex"
     claude_path = agent_dir / "CLAUDE.md"
-    if claude_path.exists() and "Codex CLI" in claude_path.read_text(encoding="utf-8", errors="ignore"):
+    if claude_path.exists() and _CODEX_RUNTIME_DECL.search(
+        claude_path.read_text(encoding="utf-8", errors="ignore")
+    ):
         return "codex"
     return "claude"
 
