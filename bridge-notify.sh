@@ -102,6 +102,18 @@ cmd_send() {
   [[ -n "$kind" ]] || bridge_die "notify kind이 필요합니다."
   [[ -n "$target" ]] || bridge_die "notify target이 필요합니다."
 
+  # #1996: bridge-notify.py has no teams sender (account-token HTTP only).
+  # A teams-channel agent's notify_kind now resolves to teams, so a
+  # bridge-notify.sh send (e.g. the question-escalation path in
+  # bridge-escalate.sh, which omits --kind and lets it derive) must fail
+  # closed with a clear message rather than hand `--kind teams` to
+  # bridge-notify.py for a cryptic argparse rejection. Teams proactive push
+  # is the managed-send adapter's job (bridge-channels.py send-managed-message).
+  if [[ "$kind" == "teams" ]]; then
+    bridge_warn "notify kind 'teams' routes through managed-send (PreCompact notify), not bridge-notify; skipping push."
+    return 3
+  fi
+
   args=(
     send
     --kind "$kind"

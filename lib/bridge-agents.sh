@@ -11486,7 +11486,56 @@ bridge_agent_notify_kind() {
     return 0
   fi
 
+  # #1996: a Teams-channel agent's human-reach channel is Teams, so its
+  # notify_kind is `teams` (resolves the false notify=miss on the Teams
+  # fleet). Inferred only when no explicit map / discord channel applies, so
+  # discord installs are unaffected.
+  if bridge_agent_uses_teams_plugin "$agent"; then
+    printf 'teams'
+    return 0
+  fi
+
   printf '%s' ""
+}
+
+# #1996: resolve the operator's Teams id for a teams-kind notify target from
+# the agent's `.teams/access.json` allowlist. The first `allowFrom` entry is
+# the primary operator (AAD object id / Teams user id), mirroring how
+# bridge_agent_discord_channel_from_access derives the discord channel from
+# the access sidecar. Exits 1 (no stdout) when the file is absent/unparseable
+# or the allowlist is empty, so the caller can fall through cleanly.
+bridge_agent_teams_notify_target_from_access() {
+  local agent="$1"
+  local access_file=""
+
+  access_file="$(bridge_agent_teams_state_dir "$agent")/access.json"
+  [[ -f "$access_file" ]] || return 1
+
+  bridge_require_python
+  python3 - "$access_file" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+
+if not isinstance(payload, dict):
+    raise SystemExit(1)
+
+allow_from = payload.get("allowFrom") or []
+if isinstance(allow_from, list):
+    for entry in allow_from:
+        value = str(entry).strip()
+        if value:
+            print(value)
+            raise SystemExit(0)
+
+raise SystemExit(1)
+PY
 }
 
 bridge_agent_notify_target() {
@@ -11499,9 +11548,25 @@ bridge_agent_notify_target() {
     explicit="${BRIDGE_AGENT_NOTIFY_TARGET[$agent]-}"
   fi
 
+  # The explicit map stays the highest-precedence override — it is the demux
+  # escape hatch (a multi-user demux bot like test_clean sets an explicit
+  # target rather than relying on allowFrom[0]). Preserve it ahead of the
+  # teams/discord inference. (#1996)
   if [[ -n "$explicit" ]]; then
     printf '%s' "$explicit"
     return 0
+  fi
+
+  # #1996: for a Teams-channel agent, infer the operator from the access
+  # allowlist (allowFrom[0]). Tried before the discord fallback so a pure
+  # Teams agent resolves a target instead of an empty string.
+  if bridge_agent_uses_teams_plugin "$agent"; then
+    local teams_target=""
+    teams_target="$(bridge_agent_teams_notify_target_from_access "$agent" 2>/dev/null || true)"
+    if [[ -n "$teams_target" ]]; then
+      printf '%s' "$teams_target"
+      return 0
+    fi
   fi
 
   printf '%s' "$(bridge_agent_discord_channel_id "$agent")"
@@ -11529,6 +11594,12 @@ bridge_agent_notify_account() {
       printf '%s' "${BRIDGE_DISCORD_RELAY_ACCOUNT:-default}"
       ;;
     telegram)
+      printf 'default'
+      ;;
+    teams)
+      # #1996: the teams adapter is single-account per agent (keyed by the
+      # agent's own .teams state), so `default` keeps notify_account
+      # consistent with telegram rather than dropping to the empty arm.
       printf 'default'
       ;;
     *)
