@@ -21,7 +21,7 @@
 #   3. daemon auto-renewal stays activity-tied (NOT changed by this smoke).
 #   4. unclaimed-watchdog grace via max(created_ts, updated_ts).
 #
-# 6-case matrix (mutation-test non-vacuous):
+# 7-case matrix (mutation-test non-vacuous):
 #   T1 — long multi-turn claim NOT reclaimed (the false-positive shape).
 #   T2 — worker progress renews lease; creator update does NOT (actor guard).
 #   T3 — live abandoned claim reclaimed in bound (exactly ONE lease_expired);
@@ -29,6 +29,9 @@
 #   T4 — down-agent claim reclaims even with a future lease.
 #   T5 — recent tmux activity renews; stale liveness does not.
 #   T6 — post-requeue unclaimed-watchdog grace (max(created_ts, updated_ts)).
+#   T7 — #14837 live-repro oracle: a DEFAULT-path `agb update` by the claimant
+#        (no --lease-seconds) renews the lease end-to-end, so the lease-aware
+#        idle-reclaim does NOT requeue a long claim that was just updated.
 #
 # Footgun #11: no python3 heredoc-stdin / `<<<` at a python3 subprocess. All
 # DB seeding/reads go through file-as-argv helpers under
@@ -294,4 +297,76 @@ OUT_LEGACY="$(
 LEGACY_LINES="$(printf '%s\n' "$OUT_LEGACY" | grep -c . || true)"
 smoke_assert_eq "1" "$LEGACY_LINES" "T6 legacy row (no updated_ts) ages from created_ts (unchanged)"
 
-smoke_log "all tests passed: $SMOKE_NAME (T1-T6)"
+# =======================================================================
+# T7 — #14837 live-repro regression oracle for #1970 (reclaimed 2m24s after
+#   a claimant `agb update`). The existing T2 renews via an EXPLICIT
+#   `update --lease-seconds 900`; the live repro used a PLAIN `agb update`
+#   (no --lease-seconds) and the renewal MUST fire on that DEFAULT path —
+#   AND the actor must resolve to the CLAIMANT, not the OS USER (the #1933
+#   class). This case proves the default-update-by-claimant path end-to-end:
+#   the renewed lease keeps a long claim out of the idle reclaim.
+#
+#   Live timeline (crm-dev task #14837):
+#     08:31:57 claimed by crm-dev
+#     09:29:51 updated by crm-dev          <- plain `agb update` (active work)
+#     09:32:13 stale_claim_requeued        <- BUG: reclaimed 2m24s later
+#     09:33:01 done by crm-dev (work fine; pure noise + false escalation)
+# =======================================================================
+# 7a — DEFAULT-path renewal at the queue layer: a claimant `update` with NO
+# --lease-seconds and NO --status renews the lease to now+default(900). A
+# non-claimant (creator) default update does NOT renew (actor guard holds on
+# the default path too).
+T7A="$(new_task worker-g "T7a default-path update renews lease")"
+seed_claim "$T7A" worker-g "$((NOW - 100))" "$((NOW + 60))" "$((NOW - 100))"
+python3 "$QUEUE" update "$T7A" --actor worker-g --note "still working" >/dev/null
+T7A_LEASE="$(field "$T7A" TASK_LEASE_UNTIL_TS)"
+[[ "$T7A_LEASE" =~ ^[0-9]+$ ]] || smoke_fail "T7a lease not numeric: $T7A_LEASE"
+(( T7A_LEASE >= NOW + 900 )) || smoke_fail "T7a default-path update did NOT apply the 900s default (lease=$T7A_LEASE, want >= $((NOW + 900)))"
+smoke_assert_eq "claimed" "$(field "$T7A" TASK_STATUS)" "T7a stays claimed after default update"
+# Non-claimant default update must NOT extend the claimant's lease.
+seed_claim "$T7A" worker-g "$((NOW - 100))" "$((NOW + 60))" "$((NOW - 100))"
+python3 "$QUEUE" update "$T7A" --actor requester --note "creator metadata edit" >/dev/null
+smoke_assert_eq "$((NOW + 60))" "$(field "$T7A" TASK_LEASE_UNTIL_TS)" "T7a non-claimant default update does NOT renew the lease"
+
+# 7b — END-TO-END actor resolution: drive the REAL `bridge-task.sh update` the
+# way a live agent does (no --actor; BRIDGE_AGENT_ID set), so the actor flows
+# through infer_actor_if_possible → bridge_infer_current_agent and resolves to
+# the CLAIMANT (the #1933 OS-USER-fallback class), then the default lease
+# renewal fires. Register the claimant in the isolated roster so the inference
+# can recognize it.
+printf 'BRIDGE_AGENT_ENGINE["worker-g"]="claude"\nBRIDGE_AGENT_SESSION["worker-g"]="worker-g"\n' >>"$BRIDGE_ROSTER_LOCAL_FILE"
+seed_claim "$T7A" worker-g "$((NOW - 100))" "$((NOW + 60))" "$((NOW - 100))"
+BRIDGE_AGENT_ID=worker-g bash "$REPO_ROOT/bridge-task.sh" update "$T7A" --note "still working" >/dev/null 2>&1
+T7B_LEASE="$(field "$T7A" TASK_LEASE_UNTIL_TS)"
+[[ "$T7B_LEASE" =~ ^[0-9]+$ ]] || smoke_fail "T7b lease not numeric: $T7B_LEASE"
+(( T7B_LEASE >= NOW + 900 )) || smoke_fail "T7b bridge-task.sh default update did NOT renew via the inferred claimant actor (lease=$T7B_LEASE, want >= $((NOW + 900)))"
+smoke_assert_eq "worker-g" "$(field "$T7A" TASK_CLAIMED_BY)" "T7b claim owner preserved through default-path update"
+
+# 7c — THE ORACLE: the live #14837 condition. A long claim (claimed_ts older
+# than max_claim_age → reclaim-eligible by age) whose ORIGINAL lease already
+# expired (NULL = the exact live shape) gets a plain default `agb update` from
+# the claimant (the 09:29:51 step), then the daemon idle-reclaim runs with the
+# agent active-but-prompt-IDLE and a STALE session_activity_ts (> heartbeat
+# window, so the snapshot auto-renewal does NOT fire — the UPDATE's lease is
+# the sole protection, exactly the 09:32:13 condition). It must STAY claimed
+# with NO stale_claim_requeued. Mutation note: revert the cmd_update renewal
+# (so the default update leaves the lease NULL) and this requeues with
+# stale_claim_requeued=1 — the live bug — confirming the oracle is non-vacuous.
+T7="$(new_task worker-g "T7 #14837 live-repro oracle")"
+python3 "$QUEUE" claim "$T7" --agent worker-g >/dev/null
+seed_claim "$T7" worker-g "$((NOW - 2000))" NULL "$((NOW - 2000))"
+BRIDGE_AGENT_ID=worker-g bash "$REPO_ROOT/bridge-task.sh" update "$T7" --note "still working" >/dev/null 2>&1
+T7_LEASE="$(field "$T7" TASK_LEASE_UNTIL_TS)"
+[[ "$T7_LEASE" =~ ^[0-9]+$ ]] || smoke_fail "T7 oracle: default update left lease unrenewed ($T7_LEASE) — the live #14837 gap"
+(( T7_LEASE >= NOW + 900 )) || smoke_fail "T7 oracle: default update did NOT renew (lease=$T7_LEASE, want >= $((NOW + 900)))"
+SNAP="$SMOKE_TMP_ROOT/snap-t7.tsv"
+# active=1, idle (>120s), session_activity_ts=now-500 (> heartbeat_window 300
+# → no snapshot auto-renewal): only the update-renewed lease can protect it.
+write_snapshot "$SNAP" worker-g 1 "$((NOW - 500))" idle
+run_daemon_step "$SNAP"
+smoke_assert_eq "claimed" "$(field "$T7" TASK_STATUS)" "T7 oracle: default-update-renewed long claim stays claimed (#14837)"
+smoke_assert_eq "worker-g" "$(field "$T7" TASK_CLAIMED_BY)" "T7 oracle: claim owner preserved"
+smoke_assert_eq "0" "$(count_events "$T7" stale_claim_requeued)" "T7 oracle: NO stale_claim_requeued (the live #14837 false requeue)"
+smoke_assert_eq "0" "$(count_events "$T7" lease_expired)" "T7 oracle: NO lease_expired (lease renewed by the update)"
+
+smoke_log "all tests passed: $SMOKE_NAME (T1-T7)"
