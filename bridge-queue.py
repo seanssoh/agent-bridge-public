@@ -2690,6 +2690,42 @@ def blocked_task_escalation_body(
     return "\n".join(lines).rstrip() + "\n"
 
 
+def resurface_open_alert(conn: sqlite3.Connection, *, agent: str, task_id: int) -> None:
+    # #1986: make a re-bound daemon alert (blocked-aging reminder/escalation)
+    # VISIBLE again on its cadence without re-minting a fresh id. `upsert_open_task`
+    # re-binds the SAME open task (KNOWN_ISSUES §30: open re-binds, `done` re-mints)
+    # via an in-place UPDATE that bumps body/priority but never re-enters the nudge
+    # pool — so an agent who leaves the alert open (claimed/blocked, or queued but
+    # already in `last_nudge_key`) gets a silent refresh and no new notification.
+    # Re-surface the re-bound task through the EXISTING nudge machinery: (1) put it
+    # back to `queued` so the maintain nudge-scan considers it, and (2) drop its id
+    # from the assignee's `last_nudge_key` so the scan treats it as a fresh queued
+    # trigger (`has_new_queue_ids` → re-nudge). This fires only on the cadence gate
+    # the caller already enforces (`reminder_seconds` / `escalation_seconds`), never
+    # per tick, and never re-mints — §30 dedupe ("one open alert per condition,
+    # `done` re-mints") stays intact.
+    conn.execute(
+        "UPDATE tasks SET status = 'queued' WHERE id = ? AND status != 'queued'",
+        (task_id,),
+    )
+    row = conn.execute(
+        "SELECT last_nudge_key FROM agent_state WHERE agent = ?",
+        (agent,),
+    ).fetchone()
+    if row is None:
+        return
+    current_key = str(row["last_nudge_key"] or "")
+    if not current_key:
+        return
+    remaining = [item for item in current_key.split(",") if item and item != str(task_id)]
+    new_key = ",".join(remaining)
+    if new_key != current_key:
+        conn.execute(
+            "UPDATE agent_state SET last_nudge_key = ? WHERE agent = ?",
+            (new_key, agent),
+        )
+
+
 def process_blocked_task_aging(
     conn: sqlite3.Connection,
     *,
@@ -2733,6 +2769,13 @@ def process_blocked_task_aging(
                 current_ts=current_ts,
                 refresh_note="daemon refreshed blocked-aging reminder",
             )
+            if not created:
+                # #1986: a re-bound (existing-open) reminder would otherwise refresh
+                # silently. On this cadence gate, re-surface it so the assignee gets a
+                # fresh visible nudge instead of an invisible in-place refresh.
+                resurface_open_alert(
+                    conn, agent=str(task["assigned_to"]), task_id=reminder_task_id
+                )
             emit_event(
                 conn,
                 task_id,
@@ -2751,8 +2794,16 @@ def process_blocked_task_aging(
         if not admin_agent:
             continue
 
+        # #1986 (b): relax the strict one-shot escalation to a BOUNDED periodic
+        # re-escalation. Previously `last_escalated_ts != 0 → continue` meant a
+        # long-blocked task escalated to admin exactly once, ever. Re-escalate at
+        # most once per `escalation_seconds` (the same cadence-gate shape the
+        # reminder uses), so a task that stays blocked re-surfaces to admin
+        # periodically instead of silently. The cadence gate bounds it — no
+        # per-tick churn — and §30 dedupe holds (we re-bind the SAME open
+        # escalation task, never re-mint).
         last_escalated_ts = latest_event_ts(conn, task_id, "blocked_escalated")
-        if last_escalated_ts != 0:
+        if last_escalated_ts != 0 and current_ts - last_escalated_ts < escalation_seconds:
             continue
 
         title_prefix = f"{BLOCKED_ESCALATION_TITLE_PREFIX}{task_id} "
@@ -2767,6 +2818,10 @@ def process_blocked_task_aging(
             current_ts=current_ts,
             refresh_note="daemon refreshed blocked-aging escalation",
         )
+        if not created:
+            # Re-bound (existing-open) escalation → re-surface visibly to admin on
+            # the escalation cadence instead of a silent in-place refresh.
+            resurface_open_alert(conn, agent=admin_agent, task_id=escalation_task_id)
         emit_event(
             conn,
             task_id,
