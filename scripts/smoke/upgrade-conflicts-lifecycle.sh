@@ -290,6 +290,9 @@ PY
     : >"$BRIDGE_HOME/$relpath.upgrade-conflict"
   done
 
+  # The pending upgrade-conflict count is an audit-parse / fs-scan analytic
+  # deferred behind `--full` (status-fast-default): the default human
+  # dashboard skips it, so the warning line only renders with `--full`.
   local plain
   plain="$(python3 "$STATUS_PY" \
     --roster-snapshot "$roster_snap" \
@@ -297,7 +300,8 @@ PY
     --daemon-pid-file "$BRIDGE_HOME/state/daemon.pid" \
     --bridge-state-dir "$BRIDGE_STATE_DIR" \
     --bridge-home "$BRIDGE_HOME" \
-    --audit-log "$BRIDGE_AUDIT_LOG")"
+    --audit-log "$BRIDGE_AUDIT_LOG" \
+    --full)"
   rm -f "$roster_snap"
   smoke_assert_contains "$plain" "WARNING: 3 pending upgrade-conflict file(s)" "warning line emitted"
   smoke_assert_contains "$plain" "agent-bridge upgrade conflicts list" "warning points to list subcommand"

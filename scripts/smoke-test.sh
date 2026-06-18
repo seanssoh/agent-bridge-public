@@ -11796,7 +11796,10 @@ assert detail.get("severity") == "critical", detail
 assert detail.get("matched_pattern", "").startswith("hud:context_pct="), detail
 assert "false-positive" in (detail.get("done_note_excerpt") or "").lower(), detail
 PY
-FP_STATUS_OUTPUT="$("$REPO_ROOT/agent-bridge" status --all-agents)"
+# The context-pressure FP-rate line is an audit-parse analytic deferred
+# behind `--full` (status-fast-default): the default dashboard skips it to
+# stay fast, so the assertion requests the full analytics view explicitly.
+FP_STATUS_OUTPUT="$("$REPO_ROOT/agent-bridge" status --all-agents --full)"
 assert_contains "$FP_STATUS_OUTPUT" "context-pressure FP rate (7d): 1/1 (100%)"
 
 # Stale-resume regression: verifies the freshness-gate resolver and its
