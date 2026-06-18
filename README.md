@@ -404,7 +404,7 @@ agb setup telegram <agent> --token <TELEGRAM_BOT_TOKEN> --allow-from <TELEGRAM_U
 BRIDGE_TEAMS_APP_PASSWORD=<TEAMS_APP_PASSWORD> agb setup teams <agent> --app-id <TEAMS_APP_ID> --tenant-id <TEAMS_TENANT_ID> --allow-from <TEAMS_USER_ID>
 ```
 
-참고: `claude mcp list`를 Agent Bridge 밖에서 실행하면 Claude Code의 기본 전역 경로(`~/.claude/channels/...`)를 기준으로 실패가 보일 수 있습니다. Agent Bridge가 실제로 쓰는 기준은 위의 에이전트별 state dir입니다. 검증은 `agb agent show <agent>`에서 `channel_diagnostics`를 보거나, `agb agent start <agent> --dry-run`, `agb status`로 확인하세요.
+검증: `agb agent show <agent>`에서 `channel_diagnostics`를 보거나, `agb agent start <agent> --dry-run`, `agb status`, 또는 세션 자신의 tool 목록에 reply 도구가 떠 있는지로 확인하세요. **`claude mcp list`로 검증하지 마세요** — 살아 있는 Telegram 봇에 대해 실행하면 같은 봇 토큰으로 두 번째 `getUpdates` 롱폴러를 띄우고, Telegram은 단일 소비자만 허용하므로 **409 Conflict**가 발생해 실행 중인 세션의 Telegram MCP 자식이 죽습니다(검증 단계가 검증 대상 채널을 망가뜨림). 또한 Agent Bridge 밖에서 `claude mcp list`를 돌리면 Claude Code의 전역 경로(`~/.claude/channels/...`)를 기준으로 잡아 잘못된 실패가 보일 수 있습니다 — Agent Bridge의 기준은 위의 에이전트별 state dir입니다.
 
 ---
 

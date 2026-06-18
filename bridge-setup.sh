@@ -715,6 +715,18 @@ run_telegram() {
   )
 
   bridge_setup_python "${base_args[@]}" "${py_args[@]}"
+  # Issue #1993: the telegram MCP (plugin:telegram) launches via `bun` on the
+  # bridge launch env PATH, not the interactive shell. When bun is only under
+  # $HOME/.bun/bin and that dir is not on the daemon-spawned PATH, the MCP
+  # fails to start silently and resurfaces far from the root as a daemon
+  # `plugin_mcp_liveness_restart_failed` reboot loop. Surface it at setup time.
+  # Reuses the same PATH-reachability preflight the teams path uses
+  # (bridge_resolve_bun_executable, lib/bridge-channels.sh). Non-fatal: the
+  # env/access config is still recorded so the operator can fix PATH and retry.
+  if command -v bridge_resolve_bun_executable >/dev/null 2>&1 \
+      && ! bridge_resolve_bun_executable >/dev/null 2>&1; then
+    bridge_warn "bun is not resolvable on the bridge launch PATH — the telegram MCP (plugin:telegram) will fail to start and the daemon may kill/restart-loop the session (plugin_mcp_liveness_restart_failed). The official installer drops bun at \$HOME/.bun/bin/bun but does not add it to the daemon-spawned PATH. Add \$HOME/.bun/bin to PATH globally (or symlink bun onto the base PATH, e.g. /opt/homebrew/bin/bun -> ~/.bun/bin/bun) and re-run \`agb setup telegram $agent\`."
+  fi
   if [[ $dry_run -eq 0 ]]; then
     bridge_setup_replace_agent_telegram_channel "$agent" "plugin:telegram"
     if [[ -n "$channel_account" ]]; then

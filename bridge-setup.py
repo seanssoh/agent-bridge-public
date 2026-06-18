@@ -1764,6 +1764,19 @@ def print_telegram_result(result: dict[str, Any], *, stream: Any = sys.stdout) -
         print(f"test_chat_id: {validation['test_chat_id']}", file=stream)
     if validation.get("send"):
         print(f"send: {validation['send']}", file=stream)
+        # Issue #1995: the send test exercises OUTBOUND only (bridge -> Telegram
+        # via getMe + sendMessage). It does NOT verify the inbound MCP injection
+        # path (operator -> session). Do not let a green "send: ok" read as
+        # "channel OK" — state precisely what was and was not verified so a
+        # broken inbound path is not masked by a false-green. (The actual
+        # inbound round-trip check is deferred to a later enhancement.)
+        if validation.get("send") == "ok":
+            print(
+                "verified: outbound send only (bridge -> Telegram). "
+                "Inbound (operator -> session MCP injection) NOT tested — "
+                "send a message TO the bot and confirm the session receives it.",
+                file=stream,
+            )
 
     for warning in result.get("warnings") or []:
         print(f"warning: {warning}", file=stream)
