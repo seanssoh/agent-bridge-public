@@ -2131,7 +2131,7 @@ select_for_path() {
       # also gained a teams short-circuit (teams routes via managed-send, not
       # bridge-notify.py). Pull teams-managed-send on every daemon / notify-lib
       # move so the SSOT handoff + the teams-kind guard cannot regress.
-      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir 1115-cli-usage-drift 1178-helper-contract-daemon-supp F-daemon-supp-groups-mock F-daemon-supp-groups-real δ-1234-daemon-start-policy A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs Beta-beta5-session-id-detect-sudo beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-epsilon-tmux-inject-busy beta5-2-pi-daemon-crashloop-no-set-e-leak beta5-2-kappa-state-audit-reconcile 1359-cron-create-iso-staging 1380-admin-autostart-recovery 1388-daemon-lock-fd-cloexec 1407-runtime-hardening 1405-handoffd-supervision 1679-1680-a2a-receiver-supervisor-robustness 1408-daemon-alert-nudge-hygiene 1473-agent-list-iso-state-fallback 1461-cron-max-parallel-override 1463-launchd-keepalive-singleton-thrash 1563-pr2-daemon-self-abort 1563-pr4-a2a-receiver-healthz 1563-pr5-fp-control-matrix 1563-pr6-watchdog-scan-timeout 1563-pr7-tick-cadence 1563-pr8-a2a-diag-recovery 1629-healthz-not-semaphore-gated 1685-receiver-staleness-selfheal v0165-l0-reconcile-skeleton v0165-l2-tunnel-health v0165-l1-stable-addr v0165-l3-peer-reachability v0165-l4-token-join v0165-l5-relay-roster v0165-l6-net-status-v2 v0166-la-tunnel-bounce-gate v0166-lb-transient-peers 1652-queue-gateway-crashloop 1803-orphan-dir-gc 1809-agents-md-backfill 1855-keychain-free-backfill 1833-status-gateway-timeout-not-down 1934-hook-file-self-heal teams-managed-send
+      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir 1115-cli-usage-drift 1178-helper-contract-daemon-supp F-daemon-supp-groups-mock F-daemon-supp-groups-real δ-1234-daemon-start-policy A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs Beta-beta5-session-id-detect-sudo beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-epsilon-tmux-inject-busy beta5-2-pi-daemon-crashloop-no-set-e-leak beta5-2-kappa-state-audit-reconcile 1359-cron-create-iso-staging 1380-admin-autostart-recovery 1388-daemon-lock-fd-cloexec 1407-runtime-hardening 1405-handoffd-supervision 1679-1680-a2a-receiver-supervisor-robustness 1408-daemon-alert-nudge-hygiene 1473-agent-list-iso-state-fallback 1461-cron-max-parallel-override 1463-launchd-keepalive-singleton-thrash 1563-pr2-daemon-self-abort 1563-pr4-a2a-receiver-healthz 1563-pr5-fp-control-matrix 1563-pr6-watchdog-scan-timeout 1563-pr7-tick-cadence 1563-pr8-a2a-diag-recovery 1629-healthz-not-semaphore-gated 1685-receiver-staleness-selfheal v0165-l0-reconcile-skeleton v0165-l2-tunnel-health v0165-l1-stable-addr v0165-l3-peer-reachability v0165-l4-token-join v0165-l5-relay-roster v0165-l6-net-status-v2 v0166-la-tunnel-bounce-gate v0166-lb-transient-peers 1652-queue-gateway-crashloop 1803-orphan-dir-gc 1809-agents-md-backfill 1855-keychain-free-backfill 1833-status-gateway-timeout-not-down 1934-hook-file-self-heal teams-managed-send 2005-managed-send-plugin-state-dir
       # Issue #1899: bridge-sync.sh's refresh_missing_session_ids backfill sweep
       # now skips dynamic vanilla Codex (it must never detect/persist an operator
       # ~/.codex session id). Pull 1899 on bridge-sync.sh moves so the daemon
@@ -3662,13 +3662,15 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # notify move so a future PR cannot regress the redeliver +
       # dedup_key audit emit contract (the structured signal
       # operators correlate against `plugin_mcp_liveness_recovered`).
-      # Issue #1996: lib/bridge-channels.sh's
-      # bridge_channel_send_managed_message now resolves the canonical
-      # `.teams` state dir (bridge_agent_teams_state_dir) and threads it to
-      # bridge-channels.py as --teams-state-dir for teams managed-send. Pull
-      # teams-managed-send on every channels-lib move so the bash→python
-      # state-dir handoff and the teams adapter contract cannot regress.
-      add_required channel-plugins bridge-notify-no-default-discord-875 1165-track-a-scaffold-modes 1165-track-b-sudo-escalate-and-state 1342-write-state-marker-matrix A12-beta3-1246-1252-daemon-supp-group-and-state-dir mcp-liveness-giveup-auto-clear beta5-2-iota-daemon-escalation-family teams-managed-send
+      # Issue #1996 / #2005: lib/bridge-channels.sh's
+      # bridge_channel_send_managed_message resolves the canonical per-agent
+      # `<workdir>/.<plugin>` state dir (bridge_plugin_channel_state_dir) and
+      # threads it to bridge-channels.py as --plugin-state-dir for every
+      # managed-send adapter (discord/telegram/teams). Pull both
+      # teams-managed-send and 2005-managed-send-plugin-state-dir on every
+      # channels-lib move so the bash→python state-dir handoff and the adapter
+      # contracts cannot regress.
+      add_required channel-plugins bridge-notify-no-default-discord-875 1165-track-a-scaffold-modes 1165-track-b-sudo-escalate-and-state 1342-write-state-marker-matrix A12-beta3-1246-1252-daemon-supp-group-and-state-dir mcp-liveness-giveup-auto-clear beta5-2-iota-daemon-escalation-family teams-managed-send 2005-managed-send-plugin-state-dir
       # Issue #1762: this arm's `runtime-templates/*` glob also matches the
       # shipped picker catalog + the picker-resolve skill (case takes the first
       # matching arm, ahead of the dedicated picker arm below). Pull the picker
@@ -5164,13 +5166,16 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # Pull 1354-setup-teams-fd-password on every bridge-channels move
       # so a future channel-side refactor cannot silently regress the
       # wizard-to-channel credential contract.
-      # Issue #1996: bridge-channels.py grew `_adapter_teams` (managed
+      # Issue #1996 / #2005: bridge-channels.py grew `_adapter_teams` (managed
       # proactive-send shelling out to `bun plugins/teams/server.ts
-      # send-managed`) and bridge-channels.sh threads the bash-resolved
-      # `--teams-state-dir` through. teams-managed-send pins the argv/env
-      # contract, exit-code → SendAdapterError mapping, and the
-      # teams-left-track-c-pending route on every channels move.
-      add_required channel-plugins channel-env-readiness 1354-setup-teams-fd-password teams-managed-send
+      # send-managed`), and #2005 generalized the bash-resolved state-dir
+      # handoff into a single `--plugin-state-dir` consumed by the
+      # discord/telegram/teams adapters (reading `<workdir>/.<plugin>` instead
+      # of the naive agents/<a>/.<plugin>). teams-managed-send pins the teams
+      # argv/env + exit-code mapping; 2005-managed-send-plugin-state-dir pins the
+      # discord/telegram state-dir read + the empty-arg fallback. Pull both on
+      # every channels move.
+      add_required channel-plugins channel-env-readiness 1354-setup-teams-fd-password teams-managed-send 2005-managed-send-plugin-state-dir
       add_integration integration-minimal
       ;;
 

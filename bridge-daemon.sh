@@ -11037,17 +11037,16 @@ print("raw_trigger\t" + str(data.get("raw_trigger") or ""))
     --correlation-id "$event_id"
     --format shell
   )
-  # #1996: this PreCompact-notice path builds the send argv directly (it does
-  # NOT go through bridge_channel_send_managed_message), so the teams adapter's
-  # TEAMS_STATE_DIR must be resolved here too. bridge_agent_teams_state_dir
-  # honors the full iso-v2 / workdir-map precedence — never let the Python
-  # adapter fall back to its naive <bridge_home>/agents/<agent>/.teams default.
-  if [[ "$CHANNEL_ROUTE_PLUGIN" == "teams" ]]; then
-    local _teams_state_dir=""
-    _teams_state_dir="$(bridge_agent_teams_state_dir "$agent" 2>/dev/null || true)"
-    if [[ -n "$_teams_state_dir" ]]; then
-      send_args+=(--teams-state-dir "$_teams_state_dir")
-    fi
+  # #2005 (generalizes #1996): this PreCompact-notice path builds the send argv
+  # directly (it does NOT go through bridge_channel_send_managed_message), so the
+  # adapter's per-agent plugin state dir must be resolved here too.
+  # bridge_plugin_channel_state_dir honors the full iso-v2 / workdir-map
+  # precedence for discord/telegram/teams — never let the Python adapter fall
+  # back to its naive <bridge_home>/agents/<agent>/.<plugin> default.
+  local _plugin_state_dir=""
+  _plugin_state_dir="$(bridge_plugin_channel_state_dir "$agent" "$CHANNEL_ROUTE_PLUGIN" 2>/dev/null || true)"
+  if [[ -n "$_plugin_state_dir" ]]; then
+    send_args+=(--plugin-state-dir "$_plugin_state_dir")
   fi
   if [[ -n "$CHANNEL_ROUTE_REPLY_TO_MESSAGE_ID" ]]; then
     send_args+=(--reply-to-message-id "$CHANNEL_ROUTE_REPLY_TO_MESSAGE_ID")
@@ -11359,14 +11358,13 @@ for k in keys:
       --correlation-id "$pending_event_id"
       --format shell
     )
-    # #1996: same as the notice path — resolve the canonical teams state dir
-    # here since this followup argv bypasses bridge_channel_send_managed_message.
-    if [[ "$pending_plugin" == "teams" ]]; then
-      local _fu_teams_state_dir=""
-      _fu_teams_state_dir="$(bridge_agent_teams_state_dir "$agent" 2>/dev/null || true)"
-      if [[ -n "$_fu_teams_state_dir" ]]; then
-        fu_send_args+=(--teams-state-dir "$_fu_teams_state_dir")
-      fi
+    # #2005 (generalizes #1996): same as the notice path — resolve the canonical
+    # per-agent plugin state dir here since this followup argv bypasses
+    # bridge_channel_send_managed_message.
+    local _fu_plugin_state_dir=""
+    _fu_plugin_state_dir="$(bridge_plugin_channel_state_dir "$agent" "$pending_plugin" 2>/dev/null || true)"
+    if [[ -n "$_fu_plugin_state_dir" ]]; then
+      fu_send_args+=(--plugin-state-dir "$_fu_plugin_state_dir")
     fi
     if [[ -n "$followup_thread_anchor" ]]; then
       fu_send_args+=(--reply-to-message-id "$followup_thread_anchor")
