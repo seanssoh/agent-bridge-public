@@ -257,6 +257,33 @@ smoke_run "T3 cadence elapsed → SAME reminder re-surfaces visibly (no re-mint,
 }
 
 # ======================================================================
+# T6 — claimed-alert guard (patch adversarial seed): a CLAIMED reminder is
+# NOT clobbered on the cadence tick — no status flip, no claim loss, no re-nudge
+# ======================================================================
+smoke_run "T6 a CLAIMED reminder is left untouched on cadence (no claim clobber, no re-nudge)" : ; {
+  task_id="$T1_TASK_ID"; rid="$T1_RID"
+  # Admin claims the open reminder (status=claimed, claimed_by set) — i.e. is
+  # actively working it. rid is 'queued' after T3, so claim succeeds.
+  python3 "$QUEUE" claim "$rid" --agent "$ASSIGNEE" >/dev/null
+  smoke_assert_eq claimed "$(task_status "$rid")" "T6 reminder is claimed before the cadence tick"
+  before_claimed_by="$(sqlite3 "$DB" "SELECT claimed_by FROM tasks WHERE id=$rid;")"
+  # The cadence elapses while the admin holds the claim.
+  mark_nudged "$ASSIGNEE" "$rid"
+  backdate_last_event "$task_id" blocked_reminder "$(( REMINDER_SECS * 2 ))"
+
+  out="$(run_daemon_step)"
+
+  # The claim MUST survive: status stays claimed, claimed_by preserved, no
+  # re-mint, no re-nudge — resurface_open_alert must skip a claimed alert.
+  smoke_assert_eq claimed "$(task_status "$rid")" "T6 claimed reminder stays claimed (NOT clobbered back to queued)"
+  smoke_assert_eq "$before_claimed_by" "$(sqlite3 "$DB" "SELECT claimed_by FROM tasks WHERE id=$rid;")" "T6 claimed_by preserved (no claim clobber)"
+  smoke_assert_eq "$rid" "$(open_reminder_id "$task_id")" "T6 same reminder id (no re-mint)"
+  if nudge_names "$out" "$ASSIGNEE" "$rid"; then
+    smoke_fail "T6 a CLAIMED reminder must NOT be re-nudged (admin already has it in hand); got: $out"
+  fi
+}
+
+# ======================================================================
 # T4 — §30: `done`-ing the reminder re-mints a fresh id on the next scan
 # ======================================================================
 smoke_run "T4 done re-mints a fresh reminder id (§30 dedupe-release intact)" : ; {
@@ -316,6 +343,14 @@ smoke_run "T_teeth visible-refire + bounded-escalation source shape" : ; {
   if grep -Eq '^[[:space:]]*if last_escalated_ts != 0:[[:space:]]*$' "$src"; then
     smoke_fail "teeth: strict one-shot escalation gate must be gone"
   fi
+  # Claimed-alert guard (patch adversarial seed, #1986 review): the resurface
+  # status-flip must be scoped to 'blocked' and skip a 'claimed' alert, so a
+  # revert to the unconditional `status != 'queued'` flip (which clobbers a
+  # claim) fails this teeth.
+  grep -q "status = 'blocked'" "$src" \
+    || smoke_fail "teeth: resurface status-flip must be scoped to 'blocked' (claimed-alert guard)"
+  grep -q "== .claimed." "$src" \
+    || smoke_fail "teeth: resurface must skip a claimed alert (no-clobber guard)"
 }
 
 smoke_log "all tests passed: $SMOKE_NAME"

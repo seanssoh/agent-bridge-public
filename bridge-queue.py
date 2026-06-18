@@ -2704,8 +2704,23 @@ def resurface_open_alert(conn: sqlite3.Connection, *, agent: str, task_id: int) 
     # the caller already enforces (`reminder_seconds` / `escalation_seconds`), never
     # per tick, and never re-mints — §30 dedupe ("one open alert per condition,
     # `done` re-mints") stays intact.
+    # Claimed-alert guard (patch adversarial seed, #1986 review): if the
+    # assignee has CLAIMED the alert (status='claimed', claimed_by/lease set),
+    # they are actively working it — flipping it back to 'queued' here would
+    # clobber the claim (orphan claimed_by/claimed_ts/lease_until_ts) and
+    # re-nudge a task already in progress. Re-surface ONLY a not-yet-claimed
+    # open alert: a 'blocked' alert is flipped to 'queued'; a 'queued' alert
+    # stays 'queued' (the nudge-key eviction below re-surfaces it); a 'claimed'
+    # alert is left entirely untouched (no status flip, no key eviction, no
+    # re-nudge — the admin already has it open and in hand).
+    status_row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if status_row is None or str(status_row["status"]) == "claimed":
+        return
     conn.execute(
-        "UPDATE tasks SET status = 'queued' WHERE id = ? AND status != 'queued'",
+        "UPDATE tasks SET status = 'queued' WHERE id = ? AND status = 'blocked'",
         (task_id,),
     )
     row = conn.execute(
