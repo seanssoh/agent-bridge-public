@@ -1564,6 +1564,12 @@ select_for_path() {
       # Pull beta5-2-kappa-state-audit-reconcile on every bridge-stall.py
       # or bridge-audit.sh move so either regression is caught at PR time.
       add_required beta5-2-kappa-state-audit-reconcile
+      # Issue #1991 safety floor: bridge-stall.py also hosts the detect-only
+      # typed blocked-prompt classifier (`detect-prompt` subcommand) the daemon
+      # safety-floor sweep consumes. Pull the floor smoke on every bridge-stall.py
+      # move so a regression to the affordance gates / coarse_state mapping /
+      # shell-format field names is caught at PR time.
+      add_required 1991-blocked-prompt-safety-floor
       # v0.15.0-beta5-2 Lane ι (#1318-B): bridge-queue.py + bridge-task.sh
       # are the create boundary for queued tasks; the daemon's new
       # process_unclaimed_queue_escalation tick scans these tables on
@@ -2157,6 +2163,15 @@ select_for_path() {
       # smoke on every bridge-daemon.sh move so a scan refactor cannot drop the
       # storm-fuse reset/summary wiring.
       add_required 1783-picker-idle-nonpicker
+      # Issue #1991 safety floor: bridge-daemon.sh hosts the all-pane
+      # blocked-prompt sweep (process_blocked_prompt_safety_floor), the
+      # daemon-owned INDEPENDENT operator notify (bridge_operator_notify_send /
+      # bridge_operator_notify_resolve), and the sweep wiring in cmd_sync_cycle.
+      # Pull the floor smoke on every bridge-daemon.sh move so a refactor cannot
+      # silently: drop the idle-path sweep (the 10-day-wedge blind spot), regress
+      # the direct-external-notify guarantee back to admin-task-only, send keys
+      # (observe-only), or storm. Mutation-tested teeth.
+      add_required 1991-blocked-prompt-safety-floor
       # Fleet-credential Phase 2 (#1470): bridge-daemon.sh gained the
       # periodic Codex single-source → fleet-sync tick
       # (bridge_daemon_periodic_codex_cred_sync_tick). 1470-codex-fleet-sync
@@ -2971,6 +2986,16 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # KEEP-on-read-failure invariant.
       if [[ "$path" == "lib/bridge-tmux.sh" ]]; then
         add_required 1617-pending-attention-arrival-stale 1425-spool-rederive
+      fi
+      # Issue #1991 safety floor: lib/bridge-tmux.sh hosts
+      # bridge_tmux_claude_blocker_state_from_text, the coarse single-token
+      # blocker classifier the floor's typed detector is a SIBLING of (it must
+      # NEVER change the coarse tokens, callers compare them exactly). Pull the
+      # floor smoke on every bridge-tmux.sh move so its coarse-token
+      # compatibility case re-runs and a refactor cannot silently drift the
+      # token contract.
+      if [[ "$path" == "lib/bridge-tmux.sh" ]]; then
+        add_required 1991-blocked-prompt-safety-floor
       fi
       # Issue #1762: lib/bridge-tmux.sh hosts the picker keystroke primitive
       # bridge_tmux_send_picker_key — the ONLY keystroke path the picker

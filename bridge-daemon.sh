@@ -5590,6 +5590,469 @@ process_stall_reports() {
   return "$changed"
 }
 
+# ===========================================================================
+# Issue #1991 — blocked-prompt SAFETY FLOOR (detect + INDEPENDENT escalate).
+#
+# Goal: a blocked interactive Claude prompt (dev-channels picker / trust /
+# summary / permission / feedback / context-pressure / billing / unknown) that
+# the existing best-effort auto-accept fails to clear must become a LOUD
+# operator escalation within ~2 minutes, INDEPENDENTLY of the blocked agent —
+# never a silent stuck pane.
+#
+# This floor is OBSERVE-ONLY. It never sends keys, never selects a UI option,
+# and never asks an LLM to read the pane. The existing auto-accept watchers
+# (bridge-start.sh / bridge-run.sh) stay underneath, unchanged. The agentic
+# resolver (an admin agent that reads + dismisses the pane) is v0.17 and OUT of
+# scope here.
+#
+# The guarantee is the daemon-owned external notify: bridge_operator_notify_send
+# calls bridge-notify.sh send --kind ... --target ... DIRECTLY from the daemon
+# process. It does not require the blocked agent's pane to accept input, does
+# not require the admin to claim a queue task, and does not require any live
+# Claude/Codex session. If no operator-notify target is configured the floor
+# audits operator_notify=missing and does NOT claim independence.
+# ===========================================================================
+
+# Resolve the operator external-notify destination. Resolution order (design):
+#   1. explicit BRIDGE_OPERATOR_NOTIFY_KIND / _TARGET (+ optional _ACCOUNT)
+#   2. admin-agent notify metadata copied into kind/target (still daemon-sent)
+#   3. none -> empty (caller surfaces operator_notify=missing)
+# Echoes a single tab-separated line: "<kind>\t<target>\t<account>\t<source>"
+# where source is explicit|admin|none. Pane text is NEVER consulted here.
+bridge_operator_notify_resolve() {
+  local admin_agent="${BRIDGE_ADMIN_AGENT_ID:-}"
+  local kind="${BRIDGE_OPERATOR_NOTIFY_KIND:-}"
+  local target="${BRIDGE_OPERATOR_NOTIFY_TARGET:-}"
+  local account="${BRIDGE_OPERATOR_NOTIFY_ACCOUNT:-}"
+  local source="explicit"
+
+  if [[ -z "$kind" || -z "$target" ]]; then
+    # Fallback: copy the admin agent's notify metadata into kind/target. The
+    # SEND still happens via the external transport below (never queue-the-admin
+    # / send-keys), so a blocked-on-its-own-picker admin can still be reached.
+    if [[ -n "$admin_agent" ]] && bridge_agent_exists "$admin_agent" \
+        && bridge_agent_has_notify_transport "$admin_agent"; then
+      kind="$(bridge_agent_notify_kind "$admin_agent" 2>/dev/null || printf '')"
+      target="$(bridge_agent_notify_target "$admin_agent" 2>/dev/null || printf '')"
+      account="$(bridge_agent_notify_account "$admin_agent" 2>/dev/null || printf '')"
+      source="admin"
+    fi
+  fi
+
+  if [[ -z "$kind" || -z "$target" ]]; then
+    printf '\t\t\tnone'
+    return 1
+  fi
+  printf '%s\t%s\t%s\t%s' "$kind" "$target" "$account" "$source"
+  return 0
+}
+
+# Daemon-owned external operator notification. Calls bridge-notify.sh send with
+# an explicit --kind/--target so it works with NO live agent and NO pane input.
+# Returns 0 on a successful send, 1 when no operator target is configured (the
+# operator_notify=missing state — caller must NOT claim independence) or the
+# transport call fails. $title/$message are daemon-constructed and prefer
+# hashes/metadata; never raw pane text.
+bridge_operator_notify_send() {
+  local title="$1"
+  local message="$2"
+  local task_id="${3:-}"
+  local priority="${4:-urgent}"
+  local resolved="" kind="" target="" account="" source=""
+
+  resolved="$(bridge_operator_notify_resolve)" || return 1
+  IFS=$'\t' read -r kind target account source <<<"$resolved"
+  [[ -n "$kind" && -n "$target" ]] || return 1
+
+  local args=(send --kind "$kind" --target "$target" --priority "$priority" --title "$title" --message "$message")
+  [[ -n "$account" ]] && args+=(--account "$account")
+  [[ -n "$task_id" ]] && args+=(--task-id "$task_id")
+  if [[ "${BRIDGE_DAEMON_NOTIFY_DRY_RUN:-0}" == "1" ]]; then
+    args+=(--dry-run)
+  fi
+
+  # Bounded so a hung transport (closed Discord SSL pipe, footgun #11 class)
+  # cannot stall the daemon loop. The notify binary is the same one the
+  # smoke stubs.
+  bridge_with_timeout "" operator_notify_send \
+    bash "$SCRIPT_DIR/bridge-notify.sh" "${args[@]}" >/dev/null 2>&1
+}
+
+bridge_safety_floor_state_file() {
+  local agent="$1"
+  printf '%s/safety-floor/%s.env' "$BRIDGE_STATE_DIR" "$agent"
+}
+
+# Marker the operator-notify readiness so `agb status` / a reader can surface
+# operator_notify=missing loudly (the independent no-wedge guarantee is only
+# active when an external target is configured). Writes a single token
+# (configured|missing) + the resolution source. Best-effort, atomic.
+bridge_safety_floor_operator_notify_marker_file() {
+  printf '%s/safety-floor/operator-notify-status' "$BRIDGE_STATE_DIR"
+}
+
+bridge_safety_floor_set_operator_notify_status() {
+  local status="$1"
+  local detail="${2:-}"
+  local file tmp
+  file="$(bridge_safety_floor_operator_notify_marker_file)"
+  mkdir -p "$(dirname "$file")" 2>/dev/null || return 0
+  tmp="$(mktemp "${file}.XXXXXX" 2>/dev/null)" || { printf 'operator_notify=%s\n' "$status" >"$file" 2>/dev/null || true; return 0; }
+  printf 'operator_notify=%s\nsource=%s\nupdated_ts=%s\n' "$status" "$detail" "$(date +%s)" >"$tmp" 2>/dev/null \
+    && mv -f -- "$tmp" "$file" 2>/dev/null || { rm -f -- "$tmp" 2>/dev/null || true; }
+}
+
+bridge_clear_safety_floor_state() {
+  local agent="$1"
+  rm -f "$(bridge_safety_floor_state_file "$agent")"
+}
+
+bridge_note_safety_floor_state() {
+  local agent="$1"
+  local key="$2"
+  local prompt_kind="$3"
+  local content_hash="$4"
+  local session_id="$5"
+  local first_seen_ts="$6"
+  local last_seen_ts="$7"
+  local stable_ticks="$8"
+  local escalated_ts="$9"
+  local notify_ts="${10}"
+  local task_id="${11}"
+  # refire_ts = last escalation ATTEMPT (success OR operator_notify=missing).
+  # This — not notify_ts (last SUCCESS) — gates the 30min refire cooldown so a
+  # host with no operator target does not re-write report/audit/queue every 15s
+  # after the first escalation (codex r1 finding 3).
+  local refire_ts="${12:-0}"
+  local state_file
+
+  state_file="$(bridge_safety_floor_state_file "$agent")"
+  mkdir -p "$(dirname "$state_file")"
+  cat >"$state_file" <<EOF
+SAFETY_FLOOR_KEY=$(printf '%q' "$key")
+SAFETY_FLOOR_PROMPT_KIND=$(printf '%q' "$prompt_kind")
+SAFETY_FLOOR_CONTENT_HASH=$(printf '%q' "$content_hash")
+SAFETY_FLOOR_SESSION_ID=$(printf '%q' "$session_id")
+SAFETY_FLOOR_FIRST_SEEN_TS=$(printf '%q' "$first_seen_ts")
+SAFETY_FLOOR_LAST_SEEN_TS=$(printf '%q' "$last_seen_ts")
+SAFETY_FLOOR_STABLE_TICKS=$(printf '%q' "$stable_ticks")
+SAFETY_FLOOR_ESCALATED_TS=$(printf '%q' "$escalated_ts")
+SAFETY_FLOOR_NOTIFY_TS=$(printf '%q' "$notify_ts")
+SAFETY_FLOOR_TASK_ID=$(printf '%q' "$task_id")
+SAFETY_FLOOR_REFIRE_TS=$(printf '%q' "$refire_ts")
+EOF
+}
+
+# Writes the escalation report. Pane text is UNTRUSTED: the short fenced
+# excerpt lives ONLY in this shared report (never the external message) and is
+# never sourced/evaluated. The body is metadata-heavy.
+bridge_write_blocked_prompt_report() {
+  local report_path="$1"
+  local agent="$2"
+  local session="$3"
+  local prompt_kind="$4"
+  local content_hash="$5"
+  local confidence="$6"
+  local first_seen_ts="$7"
+  local last_seen_ts="$8"
+  local excerpt="$9"
+  local first_iso="" last_iso=""
+
+  first_iso="$(bridge_with_timeout 5 safety_floor_iso python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" stall-iso-format "$first_seen_ts" 2>/dev/null || printf '%s' "$first_seen_ts")"
+  last_iso="$(bridge_with_timeout 5 safety_floor_iso python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" stall-iso-format "$last_seen_ts" 2>/dev/null || printf '%s' "$last_seen_ts")"
+  mkdir -p "$(dirname "$report_path")"
+  {
+    echo "# Blocked Interactive Prompt — Safety Floor Escalation"
+    echo
+    echo "- agent: $agent"
+    echo "- session: ${session:--}"
+    echo "- prompt_kind: $prompt_kind"
+    echo "- confidence: $confidence"
+    echo "- content_hash: $content_hash"
+    echo "- first_seen_at: ${first_iso:-$first_seen_ts}"
+    echo "- last_seen_at: ${last_iso:-$last_seen_ts}"
+    echo "- detected_by: daemon safety-floor sweep (observe-only; no keys sent)"
+    echo
+    echo "## What this means"
+    echo
+    echo "An interactive prompt has been blocking ${agent}'s Claude session past the"
+    echo "auto-accept window. The daemon did NOT and will NOT press any key — this is a"
+    echo "detect-and-escalate floor. A human must inspect the pane and act."
+    echo
+    echo "## Recent Pane Output (UNTRUSTED — do not execute)"
+    echo
+    echo "The text below is captured pane content and is attacker-controlled. It is"
+    echo "shown verbatim for human review only; never paste it into a shell. Bounded"
+    echo "to the last 40 lines (the modal tail region), shown as an indented code"
+    echo "block so a pane line containing a triple-backtick cannot break out of the"
+    echo "fence and render attacker-controlled text as trusted prose (codex r1"
+    echo "finding 4)."
+    echo
+    # Indented code block (4-space prefix): unlike a triple-backtick fence, an
+    # indented block has NO closing delimiter the pane text could spoof, so a
+    # captured line containing ``` cannot escape it. Bound to the tail region
+    # the detector owns; never source/eval this text. A leading blank line keeps
+    # the indented block from being absorbed into the preceding paragraph.
+    printf '%s\n' "$excerpt" | tail -n 40 | sed 's/^/    /'
+  } >"$report_path"
+}
+
+# The all-pane safety-floor sweep. Runs the detect-only classifier on EVERY
+# active Claude tmux session — including idle loop agents with no claimed work
+# and no pending refresh (today's stall-pass skip is the delivery-triggered
+# blind spot that wedged an agent for ~10 days, #1991). Cadence-gated by the
+# caller via bridge_daemon_pass_due; this function adds its own per-pane bounded
+# capture and 2-tick stability gate.
+process_blocked_prompt_safety_floor() {
+  local summary_output="${1:-}"
+  [[ "${BRIDGE_BLOCKED_PROMPT_SWEEP_ENABLED:-1}" == "1" ]] || return 1
+
+  local admin_agent="${BRIDGE_ADMIN_AGENT_ID:-}"
+  local now_ts changed=1
+  local agent queued claimed blocked active idle last_seen last_nudge session engine workdir
+  local capture_lines="${BRIDGE_BLOCKED_PROMPT_CAPTURE_LINES:-120}"
+  local capture_timeout="${BRIDGE_BLOCKED_PROMPT_CAPTURE_TIMEOUT_SECONDS:-5}"
+  local known_deadline="${BRIDGE_BLOCKED_PROMPT_DEADLINE_SECONDS:-90}"
+  local unknown_deadline="${BRIDGE_BLOCKED_PROMPT_UNKNOWN_DEADLINE_SECONDS:-300}"
+  local refire_cooldown="${BRIDGE_BLOCKED_PROMPT_REFIRE_SECONDS:-1800}"
+  local min_stable_ticks="${BRIDGE_BLOCKED_PROMPT_STABLE_TICKS:-2}"
+  local per_pass_cap="${BRIDGE_BLOCKED_PROMPT_ESCALATION_CAP:-3}"
+  local new_escalations=0
+  [[ "$capture_timeout" =~ ^[0-9]+$ ]] || capture_timeout=5
+  [[ "$known_deadline" =~ ^[0-9]+$ ]] || known_deadline=90
+  [[ "$unknown_deadline" =~ ^[0-9]+$ ]] || unknown_deadline=300
+  [[ "$refire_cooldown" =~ ^[0-9]+$ ]] || refire_cooldown=1800
+  [[ "$min_stable_ticks" =~ ^[0-9]+$ ]] || min_stable_ticks=2
+  [[ "$per_pass_cap" =~ ^[0-9]+$ ]] || per_pass_cap=3
+  now_ts="$(date +%s)"
+
+  local _summary_tmp="" _capture_tmp="" _shell_tmp=""
+  _summary_tmp="$(mktemp)"
+  _capture_tmp="$(mktemp)"
+  _shell_tmp="$(mktemp)"
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$_summary_tmp' '$_capture_tmp' '$_shell_tmp'" RETURN
+  printf '%s\n' "$summary_output" > "$_summary_tmp"
+
+  while IFS=$'\t' read -r agent queued claimed blocked active idle last_seen last_nudge session engine workdir; do
+    [[ -n "$agent" ]] || continue
+    # Claude-only floor: Codex panes are explicitly out of scope for v0.16.
+    [[ "$engine" == "claude" ]] || continue
+    [[ "$active" == "1" && -n "$session" ]] || { bridge_clear_safety_floor_state "$agent"; continue; }
+    bridge_tmux_session_exists "$session" || { bridge_clear_safety_floor_state "$agent"; continue; }
+
+    # --- load prior sibling state -------------------------------------------
+    local state_file prior_key="" prior_kind="" prior_hash="" prior_session=""
+    local first_seen_ts=0 last_seen_ts=0 stable_ticks=0 escalated_ts=0 notify_ts=0 refire_ts=0 task_id=""
+    state_file="$(bridge_safety_floor_state_file "$agent")"
+    if [[ -f "$state_file" ]]; then
+      SAFETY_FLOOR_KEY="" SAFETY_FLOOR_PROMPT_KIND="" SAFETY_FLOOR_CONTENT_HASH=""
+      SAFETY_FLOOR_SESSION_ID="" SAFETY_FLOOR_FIRST_SEEN_TS=0 SAFETY_FLOOR_LAST_SEEN_TS=0
+      SAFETY_FLOOR_STABLE_TICKS=0 SAFETY_FLOOR_ESCALATED_TS=0 SAFETY_FLOOR_NOTIFY_TS=0
+      SAFETY_FLOOR_REFIRE_TS=0 SAFETY_FLOOR_TASK_ID=""
+      # shellcheck disable=SC1090
+      source "$state_file" 2>/dev/null || true
+      prior_key="${SAFETY_FLOOR_KEY:-}"
+      prior_kind="${SAFETY_FLOOR_PROMPT_KIND:-}"
+      prior_hash="${SAFETY_FLOOR_CONTENT_HASH:-}"
+      prior_session="${SAFETY_FLOOR_SESSION_ID:-}"
+      first_seen_ts="${SAFETY_FLOOR_FIRST_SEEN_TS:-0}"
+      last_seen_ts="${SAFETY_FLOOR_LAST_SEEN_TS:-0}"
+      stable_ticks="${SAFETY_FLOOR_STABLE_TICKS:-0}"
+      escalated_ts="${SAFETY_FLOOR_ESCALATED_TS:-0}"
+      notify_ts="${SAFETY_FLOOR_NOTIFY_TS:-0}"
+      refire_ts="${SAFETY_FLOOR_REFIRE_TS:-0}"
+      task_id="${SAFETY_FLOOR_TASK_ID:-}"
+    fi
+    [[ "$first_seen_ts" =~ ^[0-9]+$ ]] || first_seen_ts=0
+    [[ "$last_seen_ts" =~ ^[0-9]+$ ]] || last_seen_ts=0
+    [[ "$stable_ticks" =~ ^[0-9]+$ ]] || stable_ticks=0
+    [[ "$escalated_ts" =~ ^[0-9]+$ ]] || escalated_ts=0
+    [[ "$notify_ts" =~ ^[0-9]+$ ]] || notify_ts=0
+    [[ "$refire_ts" =~ ^[0-9]+$ ]] || refire_ts=0
+
+    # --- detect (bounded capture, detect-only classifier) -------------------
+    # bridge_capture_recent is a shell function (a fast `tmux capture-pane`), so
+    # it is called directly — bridge_with_timeout wraps EXTERNAL commands only.
+    # The python detector below IS wrapped (capture_timeout) so one slow/bad
+    # session cannot stall the daemon loop. Matches process_stall_reports.
+    local capture="" prompt_matched=0 prompt_kind="" prompt_conf="" content_hash="" excerpt=""
+    capture="$(bridge_capture_recent "$session" "$capture_lines" join 2>/dev/null || true)"
+    if [[ -n "$capture" ]]; then
+      printf '%s\n' "$capture" > "$_capture_tmp"
+      excerpt="$capture"
+      local detect_shell=""
+      detect_shell="$(bridge_with_timeout "$capture_timeout" safety_floor_detect \
+        python3 "$SCRIPT_DIR/bridge-stall.py" detect-prompt --format shell < "$_capture_tmp" 2>/dev/null || true)"
+      if [[ -n "$detect_shell" ]]; then
+        PROMPT_MATCHED=0 PROMPT_KIND="" PROMPT_CONFIDENCE="" PROMPT_CONTENT_HASH=""
+        printf '%s\n' "$detect_shell" > "$_shell_tmp"
+        # shellcheck disable=SC1090
+        source "$_shell_tmp" 2>/dev/null || true
+        prompt_matched="${PROMPT_MATCHED:-0}"
+        prompt_kind="${PROMPT_KIND:-}"
+        prompt_conf="${PROMPT_CONFIDENCE:-}"
+        content_hash="${PROMPT_CONTENT_HASH:-}"
+      fi
+    fi
+
+    if [[ "$prompt_matched" != "1" || -z "$content_hash" ]]; then
+      # No blocked prompt (or capture failed): clear latched state so a cleared
+      # prompt / ready prompt / content-hash change resets the deadline.
+      if [[ -f "$state_file" ]]; then
+        bridge_audit_log daemon blocked_prompt_cleared "$agent" \
+          --detail prompt_kind="$prior_kind" --detail content_hash="$prior_hash"
+        bridge_clear_safety_floor_state "$agent"
+        changed=0
+      fi
+      continue
+    fi
+
+    # --- dedupe / stability key ---------------------------------------------
+    local cur_key="prompt:${prompt_kind}:${content_hash}"
+    if [[ "$cur_key" != "$prior_key" || "$session" != "$prior_session" ]]; then
+      # New prompt / new session: re-latch. Fresh deadline, escalation reset.
+      first_seen_ts="$now_ts"
+      stable_ticks=1
+      escalated_ts=0
+      notify_ts=0
+      refire_ts=0
+      task_id=""
+      bridge_audit_log daemon blocked_prompt_detected "$agent" \
+        --detail prompt_kind="$prompt_kind" \
+        --detail confidence="$prompt_conf" \
+        --detail content_hash="$content_hash" \
+        --detail session="$session"
+      changed=0
+    else
+      stable_ticks=$((stable_ticks + 1))
+    fi
+    last_seen_ts="$now_ts"
+
+    # --- 2-tick stability gate before arming the deadline -------------------
+    if (( stable_ticks < min_stable_ticks )); then
+      bridge_note_safety_floor_state "$agent" "$cur_key" "$prompt_kind" "$content_hash" \
+        "$session" "$first_seen_ts" "$last_seen_ts" "$stable_ticks" "$escalated_ts" "$notify_ts" "$task_id" "$refire_ts"
+      continue
+    fi
+
+    # --- deadline (known prompts short; unknown/low-confidence longer) ------
+    local deadline="$known_deadline"
+    if [[ "$prompt_kind" == "unknown_interactive" || "$prompt_conf" == "low" ]]; then
+      deadline="$unknown_deadline"
+    fi
+    if (( now_ts - first_seen_ts < deadline )); then
+      bridge_note_safety_floor_state "$agent" "$cur_key" "$prompt_kind" "$content_hash" \
+        "$session" "$first_seen_ts" "$last_seen_ts" "$stable_ticks" "$escalated_ts" "$notify_ts" "$task_id" "$refire_ts"
+      continue
+    fi
+
+    # --- escalate (deadline passed) -----------------------------------------
+    # Dedupe: only the FIRST escalation per key fires immediately; subsequent
+    # ticks refire ONLY after the cooldown (#1986/#1973 — same key still present
+    # after cooldown is still blocked; refire visibly, do not re-mint a task
+    # every tick). The cooldown gates on refire_ts (last ATTEMPT, success OR
+    # operator_notify=missing) — NOT notify_ts (last SUCCESS) — so a host with
+    # no operator target does not re-write report/audit/queue every 15s after
+    # the first escalation (codex r1 finding 3).
+    local want_notify=0
+    if (( escalated_ts == 0 )); then
+      want_notify=1
+    elif (( now_ts - refire_ts >= refire_cooldown )); then
+      want_notify=1
+    fi
+
+    if (( want_notify == 1 )); then
+      if (( new_escalations >= per_pass_cap )); then
+        bridge_audit_log daemon blocked_prompt_escalation_capped "$agent" \
+          --detail prompt_kind="$prompt_kind" --detail content_hash="$content_hash" \
+          --detail cap="$per_pass_cap"
+        bridge_note_safety_floor_state "$agent" "$cur_key" "$prompt_kind" "$content_hash" \
+          "$session" "$first_seen_ts" "$last_seen_ts" "$stable_ticks" "$escalated_ts" "$notify_ts" "$task_id" "$refire_ts"
+        continue
+      fi
+      new_escalations=$((new_escalations + 1))
+      # Stamp the refire attempt NOW (before the send) so the cooldown holds
+      # regardless of whether the external transport succeeds or is missing.
+      refire_ts="$now_ts"
+
+      # Write the report FIRST (untrusted excerpt lives only here).
+      local report_path
+      report_path="$BRIDGE_SHARED_DIR/blocked-prompts/${now_ts}-${agent}-${prompt_kind}-${content_hash}.md"
+      bridge_write_blocked_prompt_report "$report_path" "$agent" "$session" "$prompt_kind" \
+        "$content_hash" "$prompt_conf" "$first_seen_ts" "$last_seen_ts" "$excerpt"
+
+      # Self-picker bootstrap: the admin blocked on its OWN picker cannot read a
+      # task assigned to itself — go DIRECTLY to the operator notify. (For any
+      # agent the direct operator notify is the guarantee; the admin task below
+      # is only a best-effort durable record, never the independence proof.)
+      local is_self_picker=0
+      if [[ -n "$admin_agent" && "$agent" == "$admin_agent" ]]; then
+        is_self_picker=1
+      fi
+
+      # THE GUARANTEE: daemon-owned external operator notify (no live agent).
+      local title message notify_ok=0
+      title="[safety-floor] ${agent} blocked on ${prompt_kind} prompt"
+      message="Agent ${agent} (session ${session}) is stuck on a ${prompt_kind} interactive prompt that auto-accept did not clear. content_hash=${content_hash}, confidence=${prompt_conf}, first_seen=${first_seen_ts}. Inspect the pane and act. Report: ${report_path}"
+      if bridge_operator_notify_send "$title" "$message" "" urgent; then
+        notify_ok=1
+        notify_ts="$now_ts"
+        bridge_safety_floor_set_operator_notify_status configured ok
+        bridge_audit_log daemon blocked_prompt_operator_notified "$agent" \
+          --detail prompt_kind="$prompt_kind" \
+          --detail content_hash="$content_hash" \
+          --detail self_picker="$is_self_picker" \
+          --detail mode=direct_external_notify
+      else
+        # No operator target configured (or transport failed): the independent
+        # no-wedge guarantee is NOT available. Surface it loudly.
+        bridge_safety_floor_set_operator_notify_status missing none
+        bridge_audit_log daemon blocked_prompt_operator_notify_missing "$agent" \
+          --detail prompt_kind="$prompt_kind" \
+          --detail content_hash="$content_hash" \
+          --detail self_picker="$is_self_picker"
+      fi
+
+      # Best-effort durable admin task (NOT the guarantee, NOT for a self-picker
+      # admin who cannot read its own queue while blocked). Upsert, do not
+      # re-mint each tick.
+      if (( is_self_picker == 0 )) && [[ -n "$admin_agent" ]] \
+          && bridge_agent_exists "$admin_agent" && [[ "$agent" != "$admin_agent" ]]; then
+        local title_prefix="[SAFETY-FLOOR] ${agent} "
+        local existing_id=""
+        existing_id="$(bridge_queue_cli find-open --agent "$admin_agent" --title-prefix "$title_prefix" 2>/dev/null || true)"
+        if [[ "$existing_id" =~ ^[0-9]+$ ]]; then
+          bridge_queue_cli update "$existing_id" --actor daemon --title "${title_prefix}(${prompt_kind})" --priority urgent --body-file "$report_path" >/dev/null 2>&1 || true
+          task_id="$existing_id"
+        elif [[ -z "$task_id" ]]; then
+          local create_output=""
+          create_output="$(bridge_queue_cli create --to "$admin_agent" --from daemon --priority urgent --title "${title_prefix}(${prompt_kind})" --body-file "$report_path" 2>/dev/null || true)"
+          if [[ "$create_output" =~ created\ task\ \#([0-9]+) ]]; then
+            task_id="${BASH_REMATCH[1]}"
+          fi
+        fi
+      fi
+
+      if (( escalated_ts == 0 )); then
+        escalated_ts="$now_ts"
+      fi
+      bridge_audit_log daemon blocked_prompt_escalated "$agent" \
+        --detail prompt_kind="$prompt_kind" \
+        --detail content_hash="$content_hash" \
+        --detail operator_notify="$([[ "$notify_ok" == "1" ]] && printf 'sent' || printf 'missing')" \
+        --detail self_picker="$is_self_picker" \
+        --detail task_id="${task_id:--}"
+      changed=0
+    fi
+
+    bridge_note_safety_floor_state "$agent" "$cur_key" "$prompt_kind" "$content_hash" \
+      "$session" "$first_seen_ts" "$last_seen_ts" "$stable_ticks" "$escalated_ts" "$notify_ts" "$task_id" "$refire_ts"
+  done < "$_summary_tmp"
+
+  return "$changed"
+}
+
 bridge_permission_escalation_state_dir() {
   printf '%s/permission-escalations' "$BRIDGE_STATE_DIR"
 }
@@ -14090,6 +14553,18 @@ cmd_sync_cycle() {
       && bridge_daemon_pass_due stall_reports "${BRIDGE_DAEMON_STALL_REPORTS_INTERVAL_SECONDS:-30}" \
       && process_stall_reports "$summary_output"; then
     changed=0
+  fi
+  # Issue #1991 — blocked-prompt SAFETY FLOOR. All-pane sweep on a tighter
+  # cadence than the stall pass (15s default) so a blocked interactive Claude
+  # prompt that auto-accept fails to clear becomes a loud, daemon-independent
+  # operator escalation within ~2min — even on an idle agent with no inbound
+  # work (the delivery-triggered blind spot that wedged an agent ~10 days).
+  # Subshell-isolated (Lane π defense-in-depth, #1338) so a per-pane fault
+  # cannot leak set -e or pollute the loop's locals.
+  _bridge_daemon_mark_progress "blocked_prompt_safety_floor"
+  if [[ -n "$summary_output" ]] \
+      && bridge_daemon_pass_due blocked_prompt_safety_floor "${BRIDGE_BLOCKED_PROMPT_SWEEP_INTERVAL_SECONDS:-15}"; then
+    ( process_blocked_prompt_safety_floor "$summary_output" ) && changed=0 || true
   fi
   BRIDGE_DAEMON_LAST_STEP="permission_timeout_fanout"
   if process_permission_task_timeout_fanout; then
