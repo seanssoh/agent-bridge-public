@@ -191,6 +191,80 @@ def samefiles_registered_agent(
     return None
 
 
+def casefold_registered_agent(
+    candidate: Path,
+    name: str,
+    home_root: Path,
+    known: set[str],
+) -> str | None:
+    """Return the registered id whose name is a case-variant of `candidate`'s
+    basename, but ONLY when the filesystem proves the collision (Issue #1982).
+
+    The `name in known` fast-path in `_classify_child` is a case-SENSITIVE set
+    membership. On a case-INSENSITIVE volume (macOS APFS default) an on-disk
+    `agents/FOO-BAR` for a registered id `foo-bar` misses that fast-path, and
+    the `samefiles_registered_agent` fallback cannot rescue it when the agent's
+    home was migrated to a parallel tree (`data/agents/<id>/home`, a different
+    inode). This shares the inode-aware, case-folding, fail-safe APPROACH of
+    the interactive retire guard (`bridge-agent.sh:6477` / #598 Track 2's
+    `retire-samefile-guard.py`) so the GC stops mis-orphaning a live agent's
+    case-variant dir.
+
+    NOTE: the comparison BASE differs from the retire guard, which compares the
+    candidate against each registered agent's resolved `default_home`/`workdir`
+    (`data/agents/<id>/home` on a v2 install). This classifier compares against
+    `home_root/<id>` — the sibling the case-SENSITIVE `name in known` fast-path
+    would itself keep. That is the right base HERE (the candidate is a child of
+    `home_root`, and the asymmetry being fixed is purely the fast-path's case
+    sensitivity), but the two surfaces can still disagree for a dir that is NOT
+    under `home_root`; full cross-surface alignment is a follow-up, not this fix.
+
+    Filesystem-aware, NOT a bare string compare: a case-insensitive name match
+    is confirmed only when `os.path.samefile(candidate, home_root/<id>)` proves
+    the candidate IS the same on-disk directory the registered id occupies
+    under the home root. On a case-SENSITIVE volume `home_root/foo-bar` is a
+    different inode from (or absent next to) `home_root/FOO-BAR`, so the probe
+    fails and genuinely-distinct dirs are NEVER collapsed.
+
+    Three-state return, fail SAFE toward KEEP (never mis-orphan a case-variant
+    of a live registered agent):
+      * the matching agent id  — a case-insensitive name match the filesystem
+                                 confirms is the same dir → KEEP as registered;
+      * `_SAMEFILE_INDETERMINATE` — a case-insensitive name candidate exists
+                                 but the confirming `samefile`/lstat probe
+                                 raised (identity UNPROVEN) → KEEP, fail-safe;
+      * `None` — no case-insensitive name match, OR the probe PROVED the
+                 candidate is a genuinely different dir (case-sensitive FS).
+    """
+    if not name:
+        return None
+    folded = name.casefold()
+    # An exact-case hit is the caller's fast-path; only act on case-VARIANTS.
+    indeterminate = False
+    for agent_id in known:
+        if agent_id == name:
+            continue
+        if agent_id.casefold() != folded:
+            continue
+        sibling = home_root / agent_id
+        try:
+            if os.path.samefile(candidate, sibling):
+                return agent_id
+        except OSError:
+            # The case-insensitive name matches a registered id but the
+            # confirming probe raised. On a case-insensitive FS the sibling
+            # would be the SAME dir as the candidate, so a raised probe here
+            # could be MASKING a live-agent collision → fail safe (KEEP).
+            # Only treat as a clean no-match when the sibling provably does
+            # not exist (a case-sensitive FS where `home_root/<id>` is absent).
+            if _path_lexists(candidate) and _path_lexists(sibling):
+                indeterminate = True
+            continue
+    if indeterminate:
+        return _SAMEFILE_INDETERMINATE
+    return None
+
+
 # --- Part B: generic resolved-symlink-target keep-set ----------------------
 
 
@@ -368,7 +442,7 @@ def classify_agent_home_root(
         try:
             results.append(
                 _classify_child(
-                    child, name, known, registered_dirs, keepset
+                    child, name, known, registered_dirs, keepset, home_root
                 )
             )
         except Exception as exc:  # noqa: BLE001 — classifier boundary, keep safe
@@ -391,6 +465,7 @@ def _classify_child(
     known: set[str],
     registered_dirs: list[tuple[str, str]],
     keepset: set[str],
+    home_root: Path,
 ) -> dict[str, Any]:
     base = {
         "name": name,
@@ -423,6 +498,30 @@ def _classify_child(
                 ),
             }
         return {**base, "kind": KIND_REGISTERED, "agent": identity}
+
+    # registered (case-variant): on a case-INSENSITIVE volume the candidate's
+    # basename may differ from a registered id ONLY in case (`agents/FOO-BAR`
+    # for registered `foo-bar`). The exact fast-path and the samefile fallback
+    # both miss when the home migrated to a parallel `data/agents/<id>/home`
+    # tree, so case-fold the name against the registry and CONFIRM the
+    # collision via samefile against `home_root/<id>` — sharing the inode-aware,
+    # fail-safe-toward-KEEP approach of the #598 retire guard
+    # (`bridge-agent.sh:6477`), though against a different base; see the
+    # `casefold_registered_agent` docstring (Issue #1982). Case-SENSITIVE
+    # volumes never reach a match here (the sibling probe fails), so
+    # genuinely-distinct dirs are not collapsed.
+    folded = casefold_registered_agent(child, name, home_root, known)
+    if folded is not None:
+        if folded == _SAMEFILE_INDETERMINATE:
+            return {
+                **base,
+                "kind": KIND_ORPHAN_UNVERIFIABLE,
+                "reason": (
+                    "name case-matches a registered agent but the "
+                    "filesystem identity probe failed; kept (fail-safe)"
+                ),
+            }
+        return {**base, "kind": KIND_REGISTERED, "agent": folded}
 
     # referenced-symlink-target (Part B): the candidate IS, or CONTAINS, a
     # target referenced by a kept tree's symlink. A kept symlink usually points

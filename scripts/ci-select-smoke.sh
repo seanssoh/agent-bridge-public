@@ -4646,7 +4646,13 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # containment) and — because the classifier also backs the read-only
       # detector — the doctor's behavior-preserving smoke. Pull both so a
       # change to either file is caught by the detector AND the action teeth.
-      add_required 1803-orphan-dir-gc orphan-agent-dir agent-doctor status-engine-detect
+      # Issue #1982: the registered fast-path now case-folds the name match on
+      # case-insensitive volumes (sharing the #598 retire guard's inode-aware,
+      # fail-safe-toward-KEEP approach, though against a different base — see
+      # the classifier docstring). Pull the casefold smoke so a refactor of the
+      # `_classify_child` registered short-circuit cannot regress the parallel-
+      # tree case-variant keep or the case-sensitive-FS no-collapse.
+      add_required 1803-orphan-dir-gc orphan-agent-dir agent-doctor status-engine-detect 1982-orphan-classifier-casefold
       add_integration integration-minimal
       ;;
 
