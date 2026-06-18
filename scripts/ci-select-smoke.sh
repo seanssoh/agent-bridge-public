@@ -4303,6 +4303,15 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # backfill loop cannot silently drop the residue flag or start mutating the
       # flagged file.
       add_required 1906-flag-engine-mismatched-docs
+      # Issue #2016: migrate_agent_home now engine-gates the codex AGENTS.md
+      # emission on the ROSTER engine in BOTH home locations (the `codex/`
+      # template subtree -> home/codex/AGENTS.md AND the #1809 home-ROOT
+      # entrypoint backfill), and the backfill residue scan now flags a pre-gate
+      # `codex/AGENTS.md` copy too. Pull 2016-codex-agents-engine-gate on every
+      # bridge-upgrade.py move so a refactor of the migrate copy loop / engine
+      # gate cannot reintroduce the spurious codex contract on a claude agent or
+      # regress a genuine codex agent's legitimate AGENTS.md.
+      add_required 2016-codex-agents-engine-gate
       # Issue #1923: bridge-upgrade.sh's Claude hook-propagation loop now also
       # calls bridge_ensure_claude_askuserquestion_ban so existing agents
       # (incl. pre-#1923 dynamic-vanilla agents whose settings.local.json had
@@ -4636,6 +4645,11 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # move so a refactor cannot drop the engine-mismatch non-clean signal or
       # the flag-only section of the [hygiene] task body.
       add_required 1906-flag-engine-mismatched-docs
+      # Issue #2016: the agent-doc-backfill-task-body renderer's Engine-mismatched
+      # section now also names the `codex/AGENTS.md` residue location (the 2nd
+      # copy the old un-gated migrate rglob left). Pull 2016-codex-agents-engine-
+      # gate on every helpers move so a refactor cannot drop that residue surface.
+      add_required 2016-codex-agents-engine-gate
       add_integration integration-minimal
       ;;
 
