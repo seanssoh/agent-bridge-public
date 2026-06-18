@@ -30,6 +30,20 @@
 #   T5 — Scope guard: watchdog/session runtime state in the workdir
 #        (session.lock, *.result.json, memory/) is untouched by the sync.
 #
+# Issue #2004 — onboarding-completion state authority (the 3-layer atomic
+# writer). Extends the set-onboarding assertions:
+#   T6 — set-onboarding complete writes the THIRD (profile source) layer too,
+#        not just home + workdir.
+#   T7 — set-onboarding complete writes the `onboarding-complete` state marker
+#        AND removes a pre-existing `onboarding-pending` marker.
+#   T8 — set-onboarding pending writes the `onboarding-pending` marker AND
+#        removes a pre-existing `onboarding-complete` marker (operator reset).
+#   T9 — fail-loud-on-partial: when a required layer (HOME) lacks the
+#        Onboarding State line (template drift), the verb dies AND does NOT
+#        write the complete marker (never half-records a completion).
+#   T10 — idempotent rerun: running set-onboarding complete twice lands the
+#        same state + markers with no error.
+#
 # Footgun #11 (Bash 5.3.9 heredoc-stdin deadlock): the driver bodies that run
 # as a subprocess are emitted to files via printf and invoked file-as-argv;
 # no `<<'PY'` / `<<EOF` stdin heredocs into a subprocess anywhere.
@@ -238,5 +252,99 @@ smoke_assert_eq "$MEM_AFTER" "$MEM_BEFORE" \
 # runtime state alone).
 smoke_assert_contains "$(workdir_onboarding)" "complete" \
   "T5: identity sync regressed — HOME edit did not propagate alongside the scope guard"
+
+# ===========================================================================
+# Issue #2004 — onboarding-completion state authority (3-layer atomic writer).
+# ===========================================================================
+
+# The state-marker dir matches bridge-agent.sh::_set_onboarding_state_dir =
+# $BRIDGE_STATE_DIR/agents/<agent>.
+STATE_AGENT_DIR="$BRIDGE_STATE_DIR/agents/$AGENT"
+COMPLETE_MARKER="$STATE_AGENT_DIR/onboarding-complete"
+PENDING_MARKER="$STATE_AGENT_DIR/onboarding-pending"
+mkdir -p "$STATE_AGENT_DIR"
+
+# Seed the optional tracked PROFILE SOURCE layer (layer 1) so the writer has a
+# third copy to reconcile. bridge_profile_source_root = $BRIDGE_HOME/agents/<a>.
+PROFILE_DIR="$BRIDGE_HOME/agents/$AGENT"
+mkdir -p "$PROFILE_DIR"
+
+profile_onboarding() {
+  grep -E 'Onboarding State:[[:space:]]*[A-Za-z0-9._-]+' "$PROFILE_DIR/SESSION-TYPE.md" \
+    2>/dev/null | head -n1
+}
+
+# --- T6: complete writes the profile-source layer too -----------------------
+write_session_type "$HOME_DIR/SESSION-TYPE.md" "pending"
+write_session_type "$WORK_DIR/SESSION-TYPE.md" "pending"
+write_session_type "$PROFILE_DIR/SESSION-TYPE.md" "pending"
+"$BRIDGE_BASH" "$REPO_ROOT/bridge-agent.sh" set-onboarding "$AGENT" complete \
+  >/dev/null 2>"$SMOKE_TMP_ROOT/setob-t6.stderr" \
+  || smoke_fail "T6: set-onboarding complete exited non-zero (stderr: $(cat "$SMOKE_TMP_ROOT/setob-t6.stderr"))"
+smoke_assert_contains "$(profile_onboarding)" "complete" \
+  "T6 (#2004): set-onboarding complete did not write the PROFILE SOURCE layer"
+smoke_assert_contains "$(workdir_onboarding)" "complete" \
+  "T6 (#2004): set-onboarding complete did not write the WORKDIR layer"
+
+# --- T7: complete writes the complete marker + clears the pending marker -----
+write_session_type "$HOME_DIR/SESSION-TYPE.md" "pending"
+write_session_type "$WORK_DIR/SESSION-TYPE.md" "pending"
+write_session_type "$PROFILE_DIR/SESSION-TYPE.md" "pending"
+# Pre-seed a stale pending marker (the #2004 incident: never cleared).
+printf 'agent=%s\nreason=fresh-install\n' "$AGENT" >"$PENDING_MARKER"
+rm -f "$COMPLETE_MARKER"
+"$BRIDGE_BASH" "$REPO_ROOT/bridge-agent.sh" set-onboarding "$AGENT" complete \
+  >/dev/null 2>"$SMOKE_TMP_ROOT/setob-t7.stderr" \
+  || smoke_fail "T7: set-onboarding complete exited non-zero (stderr: $(cat "$SMOKE_TMP_ROOT/setob-t7.stderr"))"
+smoke_assert_file_exists "$COMPLETE_MARKER" \
+  "T7 (#2004): set-onboarding complete did not write the onboarding-complete state marker"
+if [[ -f "$PENDING_MARKER" ]]; then
+  smoke_fail "T7 (#2004): stale onboarding-pending marker was NOT cleared on completion"
+fi
+smoke_log "ok: T7 (#2004) stale onboarding-pending marker cleared on completion"
+
+# --- T8: pending writes the pending marker + clears the complete marker ------
+"$BRIDGE_BASH" "$REPO_ROOT/bridge-agent.sh" set-onboarding "$AGENT" pending \
+  >/dev/null 2>"$SMOKE_TMP_ROOT/setob-t8.stderr" \
+  || smoke_fail "T8: set-onboarding pending exited non-zero (stderr: $(cat "$SMOKE_TMP_ROOT/setob-t8.stderr"))"
+smoke_assert_file_exists "$PENDING_MARKER" \
+  "T8 (#2004): set-onboarding pending did not write the onboarding-pending marker"
+if [[ -f "$COMPLETE_MARKER" ]]; then
+  smoke_fail "T8 (#2004): onboarding-complete marker was NOT cleared on reset to pending"
+fi
+smoke_log "ok: T8 (#2004) onboarding-complete marker cleared on operator reset to pending"
+
+# --- T9: fail-loud-on-partial — required HOME layer drift never marks complete
+# Drift: HOME SESSION-TYPE.md has NO Onboarding State line. The verb must die
+# on the HOME rewrite and NEVER write the complete marker.
+rm -f "$COMPLETE_MARKER" "$PENDING_MARKER"
+printf '# Session Type\n\n- Session Type: static-claude\n- Engine: claude\n' \
+  >"$HOME_DIR/SESSION-TYPE.md"   # NO Onboarding State line
+write_session_type "$WORK_DIR/SESSION-TYPE.md" "pending"
+if "$BRIDGE_BASH" "$REPO_ROOT/bridge-agent.sh" set-onboarding "$AGENT" complete \
+    >/dev/null 2>"$SMOKE_TMP_ROOT/setob-t9.stderr"; then
+  smoke_fail "T9 (#2004): set-onboarding complete SUCCEEDED on a drifted HOME (must fail loud)"
+fi
+smoke_log "ok: T9 (#2004) set-onboarding complete failed loud on HOME template drift"
+if [[ -f "$COMPLETE_MARKER" ]]; then
+  smoke_fail "T9 (#2004): a complete marker was written despite a failed required-layer write (HALF-RECORDED COMPLETION)"
+fi
+smoke_log "ok: T9 (#2004) no onboarding-complete marker written on a partial/failed write"
+
+# --- T10: idempotent rerun ---------------------------------------------------
+write_session_type "$HOME_DIR/SESSION-TYPE.md" "pending"
+write_session_type "$WORK_DIR/SESSION-TYPE.md" "pending"
+write_session_type "$PROFILE_DIR/SESSION-TYPE.md" "pending"
+rm -f "$COMPLETE_MARKER" "$PENDING_MARKER"
+"$BRIDGE_BASH" "$REPO_ROOT/bridge-agent.sh" set-onboarding "$AGENT" complete \
+  >/dev/null 2>"$SMOKE_TMP_ROOT/setob-t10a.stderr" \
+  || smoke_fail "T10: first set-onboarding complete exited non-zero (stderr: $(cat "$SMOKE_TMP_ROOT/setob-t10a.stderr"))"
+"$BRIDGE_BASH" "$REPO_ROOT/bridge-agent.sh" set-onboarding "$AGENT" complete \
+  >/dev/null 2>"$SMOKE_TMP_ROOT/setob-t10b.stderr" \
+  || smoke_fail "T10: idempotent rerun of set-onboarding complete exited non-zero (stderr: $(cat "$SMOKE_TMP_ROOT/setob-t10b.stderr"))"
+smoke_assert_file_exists "$COMPLETE_MARKER" \
+  "T10 (#2004): idempotent rerun left the complete marker absent"
+smoke_assert_contains "$(workdir_onboarding)" "complete" \
+  "T10 (#2004): idempotent rerun regressed the workdir onboarding state"
 
 smoke_log "PASS: $SMOKE_NAME (T1-T5)"

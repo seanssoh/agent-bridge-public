@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tarfile
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from stat import S_ISDIR, S_ISFIFO, S_ISLNK, S_ISSOCK
@@ -1014,8 +1014,55 @@ def v2_session_type_candidates(agent_dir: Path) -> list[Path]:
     ]
 
 
+def onboarding_state_dir(agent_dir: Path) -> Path:
+    """The controller state-marker dir ``state/agents/<agent>`` for this agent.
+
+    ``agent_dir`` is ``<target_root>/agents/<agent>``; the markers live under
+    ``<target_root>/state/agents/<agent>`` (bridge-init.sh +
+    bridge-agent.sh::_set_onboarding_state_dir compute the same path).
+    """
+    target_root = agent_dir.parent.parent
+    return target_root / "state" / "agents" / agent_dir.name
+
+
+def detect_onboarding_complete_marker(agent_dir: Path) -> bool:
+    """Return True iff the ``onboarding-complete`` state marker exists.
+
+    Issue #2004: the marker is the authoritative completion signal — the live
+    completion verb (``agent set-onboarding <a> complete``) writes it only
+    AFTER every SESSION-TYPE layer flipped to complete, so its presence is
+    proof of a recorded completion even if a particular SESSION-TYPE candidate
+    is unreadable to the controller (iso v2).
+    """
+    try:
+        return (onboarding_state_dir(agent_dir) / "onboarding-complete").is_file()  # noqa: raw-pathlib-controller-only
+    except (OSError, PermissionError):
+        return False
+
+
+def detect_stale_pending_onboarding(agent_dir: Path) -> bool:
+    """Return True iff an ``onboarding-pending`` marker exists with NO complete signal.
+
+    Issue #2004: a lingering ``onboarding-pending`` marker with no complete
+    signal anywhere is AMBIGUOUS — it is either a genuinely-abandoned fresh
+    install or an install whose completion never recorded. The upgrader must
+    NOT silently force-complete from ``pending`` alone (that would un-onboard a
+    truly-fresh install); instead the caller surfaces a warning so the operator
+    has an explicit repair path. ``complete`` anywhere (marker OR any
+    SESSION-TYPE layer) overrides — there is nothing stale to warn about then.
+    """
+    try:
+        pending = (onboarding_state_dir(agent_dir) / "onboarding-pending").is_file()  # noqa: raw-pathlib-controller-only
+    except (OSError, PermissionError):
+        return False
+    if not pending:
+        return False
+    # A complete signal anywhere resolves the ambiguity — not stale.
+    return not detect_prior_onboarding_complete(agent_dir)
+
+
 def detect_prior_onboarding_complete(agent_dir: Path) -> bool:
-    """Return True iff any existing SESSION-TYPE.md says ``Onboarding State: complete``.
+    """Return True iff onboarding completed — by state marker OR any SESSION-TYPE.md.
 
     Issue #906: ``agent-bridge upgrade --apply`` re-templates
     ``agents/<agent>/SESSION-TYPE.md`` from a fresh template that ships with
@@ -1025,7 +1072,16 @@ def detect_prior_onboarding_complete(agent_dir: Path) -> bool:
     upgrade must not UN-onboard an already-onboarded install — onboarding
     state is a one-way ratchet from pending → complete. If any candidate
     says complete, the re-render must carry that forward.
+
+    Issue #2004: ALSO honor the ``state/agents/<agent>/onboarding-complete``
+    marker. It is the authoritative completion record (the live completion verb
+    writes it only after every SESSION-TYPE layer flipped to complete), and on
+    an iso v2 install the per-UID SESSION-TYPE candidates can be unreadable to
+    the controller while the controller-owned marker is not — so the marker is
+    both more authoritative and more reliably readable here.
     """
+    if detect_onboarding_complete_marker(agent_dir):
+        return True
     pattern = re.compile(r"^-?\s*Onboarding State:\s*complete\b", re.MULTILINE | re.IGNORECASE)
     for path in v2_session_type_candidates(agent_dir):
         try:
@@ -1039,6 +1095,44 @@ def detect_prior_onboarding_complete(agent_dir: Path) -> bool:
         if pattern.search(text):
             return True
     return False
+
+
+def repair_onboarding_complete_markers(agent_dir: Path, dry_run: bool) -> bool:
+    """Issue #2004: write the ``onboarding-complete`` marker + clear ``-pending``.
+
+    Called when ``detect_prior_onboarding_complete`` saw a complete SESSION-TYPE
+    layer but the state markers had drifted (the original #2004 incident: a
+    completed install whose ``onboarding-pending`` marker was never cleared).
+    Idempotent + best-effort: a controller that cannot write the state dir
+    (perms) returns False without aborting the migration. Returns True iff it
+    actually wrote/removed a marker (so the caller can record a repair).
+    """
+    if dry_run:
+        return False
+    state_dir = onboarding_state_dir(agent_dir)
+    complete = state_dir / "onboarding-complete"
+    pending = state_dir / "onboarding-pending"
+    changed = False
+    try:
+        if not complete.is_file():  # noqa: raw-pathlib-controller-only
+            state_dir.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only
+            import time as _time
+
+            complete.write_text(  # noqa: raw-pathlib-controller-only
+                f"agent={agent_dir.name}\nwritten={int(_time.time())}\n"
+                f"reason=upgrade-repair-onboarding-complete\n",
+                encoding="utf-8",
+            )
+            changed = True
+        if pending.is_file():  # noqa: raw-pathlib-controller-only
+            pending.unlink()  # noqa: raw-pathlib-controller-only
+            changed = True
+    except (OSError, PermissionError):
+        # Iso trees / perms can block the controller; the SESSION-TYPE preserve
+        # already carried `complete` forward, so a marker repair miss is a
+        # warning-grade nicety, never fatal.
+        return changed
+    return changed
 
 
 def apply_onboarding_state_complete(text: str) -> str:
@@ -1103,6 +1197,10 @@ class AgentMigrationResult:
     session_type: str
     engine: str
     rematerialize: dict[str, Any] | None = None
+    # Issue #2004: operator-visible, non-fatal upgrade notes (e.g.
+    # stale onboarding-pending marker that the upgrader declined to
+    # auto-complete). Default factory so each result owns its own list.
+    warnings: list[str] = field(default_factory=list)
 
 
 def backfill_codex_agents_md_home(
@@ -1185,6 +1283,7 @@ def migrate_agent_home(agent_dir: Path, template_root: Path, admin_agent: str, d
     added_files: list[str] = []
     created_dirs: list[str] = []
     updated_files: list[str] = []
+    warnings: list[str] = []
 
     for path in sorted(template_root.rglob("*")):
         rel = path.relative_to(template_root)
@@ -1244,6 +1343,46 @@ def migrate_agent_home(agent_dir: Path, template_root: Path, admin_agent: str, d
             session_target.parent.mkdir(parents=True, exist_ok=True)
             session_target.write_text(rendered, encoding="utf-8")
 
+    # Issue #2004: onboarding-state authority reconciliation. The #906 preserve
+    # block above only fires when the SOURCE SESSION-TYPE.md is ABSENT (a fresh
+    # scaffold). On the real-world incident — a mature install whose source
+    # SESSION-TYPE.md already exists but is stuck at `pending` while completion
+    # WAS performed — that block is skipped entirely, so the stale `pending`
+    # and its never-cleared marker survive every upgrade. Run a marker-authority
+    # pass here regardless of whether the source was re-rendered:
+    #   * complete detected anywhere (marker OR any SESSION-TYPE layer) →
+    #     ratchet the existing source to complete (one-way) AND repair the
+    #     state markers (write onboarding-complete, clear onboarding-pending);
+    #   * only a stale `onboarding-pending` and NO complete signal → AMBIGUOUS:
+    #     surface a warning, NEVER silently force-complete (that would un-onboard
+    #     a genuinely-abandoned fresh install).
+    if session_target.exists():  # noqa: raw-pathlib-controller-only
+        if detect_prior_onboarding_complete(agent_dir):
+            # Ratchet an existing, drifted source SESSION-TYPE.md to complete.
+            try:
+                existing = session_target.read_text(encoding="utf-8", errors="ignore")
+            except (OSError, PermissionError):
+                existing = ""
+            if existing and not re.search(
+                r"^-?\s*Onboarding State:\s*complete\b", existing, re.MULTILINE | re.IGNORECASE
+            ):
+                repaired = apply_onboarding_state_complete(existing)
+                if repaired != existing:
+                    updated_files.append("SESSION-TYPE.md")
+                    if not dry_run:
+                        session_target.write_text(repaired, encoding="utf-8")
+            if repair_onboarding_complete_markers(agent_dir, dry_run):
+                updated_files.append("onboarding-complete")
+        elif detect_stale_pending_onboarding(agent_dir):
+            warnings.append(
+                "onboarding-pending marker present with no completion signal in any "
+                "SESSION-TYPE.md layer or the onboarding-complete marker — onboarding "
+                "may never have recorded completion. NOT auto-completing (it could be a "
+                "genuinely-abandoned fresh install). To resolve: finish onboarding, or run "
+                f"`agent-bridge agent set-onboarding {agent} complete` if this install is "
+                "actually operational."
+            )
+
     claude_template = template_root / "CLAUDE.md"
     claude_target = agent_dir / "CLAUDE.md"
     if claude_template.exists() and claude_target.exists():
@@ -1285,6 +1424,7 @@ def migrate_agent_home(agent_dir: Path, template_root: Path, admin_agent: str, d
         updated_files=updated_files,
         session_type=session_type,
         engine=engine,
+        warnings=warnings,
     )
 
 
@@ -1525,6 +1665,13 @@ def cmd_migrate_agents(args: argparse.Namespace) -> int:
         # Issue #1781: agent-written state files kept (not overwritten) but
         # still captured in the targeted backup. Surfaced for operator audit.
         "preserved_files": sum(len((item.rematerialize or {}).get("preserved_paths") or []) for item in results),
+        # Issue #2004: per-agent non-fatal upgrade notes (e.g. an ambiguous
+        # stale onboarding-pending marker the upgrader declined to auto-complete).
+        "onboarding_warnings": [
+            {"agent": item.agent, "warning": w}
+            for item in results
+            for w in item.warnings
+        ],
         "agents": [asdict(item) for item in results],
     }
     return emit_json(payload, 0)
