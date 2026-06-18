@@ -443,10 +443,15 @@ def _unknown_modal_shape(tail: str) -> bool:
     return len(PICKER_OPTION_ROW_RE.findall(tail)) >= 2
 
 
-def detect_blocked_prompt(text: str) -> dict[str, object]:
+def detect_claude_blocked_prompt(text: str) -> dict[str, object]:
     # Detect-only. Returns matched/prompt_kind/confidence + hash fields. The
-    # daemon enforces Claude-only, 2-tick stability, and the deadline; this
+    # daemon enforces engine-scoping, 2-tick stability, and the deadline; this
     # function enforces structured-affordance + ready/active-output rejection.
+    #
+    # Issue #2007: this is the CLAUDE detector, unchanged from the #1991 floor.
+    # The Codex sibling lives in detect_codex_blocked_prompt and the engine
+    # dispatch is detect_blocked_prompt(text, engine). Keeping the Claude body
+    # byte-identical is what guarantees no #1991 regression.
     normalized = normalize_excerpt(text, 8192)
     tail = _tail_region(normalized)
 
@@ -529,9 +534,149 @@ def detect_blocked_prompt(text: str) -> dict[str, object]:
     return result
 
 
+# ---------------------------------------------------------------------------
+# Issue #2007 safety-floor extension: detect-only typed Codex blocked-prompt
+# classifier. Sibling of detect_claude_blocked_prompt with the same contract
+# (detect-only, never sends keys, only hashes/matches affordances on untrusted
+# pane text) but the Codex hook-trust / unknown-modal signatures. The daemon
+# safety-floor sweep dispatches to this by engine; the rc2 floor remains
+# observe-only.
+#
+# Codex renders its top-level menu options EITHER numbered (`1. Review hooks`)
+# OR with an unnumbered `›` selector prefix (`›  Review hooks`); the 6 signature
+# strings are byte-identical across the 1-hook and 10-hook cases. The signature
+# match uses substring checks (the strings appear mid-line, after any prefix),
+# so it is inherently numbering/prefix-independent without an explicit strip
+# (design Addendum point 1, cm-prod 0.140 probe).
+
+# The verbatim Codex hook-trust footer. Distinct from the Claude picker tail
+# ("Enter to confirm · Esc to cancel"): Codex renders this exact line. It must
+# be the LAST non-blank line of a live prompt (a quoted/logged footer has
+# trailing content after it), mirroring the Claude last-line anchor.
+CODEX_FOOTER_RE = re.compile(
+    r"(?i)^press enter to confirm or esc to go back$"
+)
+
+# Codex hook-trust signature: ALL of these must be present. These are substring
+# checks over the tail — NOT anchored to the row start — so they are inherently
+# numbering/prefix-independent (`1. Review hooks` and `›  Review hooks` both
+# contain the substring `Review hooks`). The "new or changed" fragment is
+# singular for 1 hook, plural for 2+; either satisfies it. ALL are required.
+CODEX_HOOK_TRUST_REQUIRED = (
+    "Hooks need review",
+    "Review hooks",
+    "Trust all and continue",
+    "Continue without trusting",
+)
+CODEX_HOOK_TRUST_EITHER = (
+    "hook is new or changed",
+    "hooks are new or changed",
+)
+
+
+def _codex_footer_is_last_line(tail: str) -> bool:
+    # True iff the exact Codex confirm footer is the LAST non-blank line of the
+    # captured pane. A live Codex modal renders this footer at the literal bottom
+    # of the pane; a transcript/log that merely QUOTES it has trailing content
+    # after it (same last-line anchor the Claude path uses against quoted text).
+    lines = [ln for ln in tail.splitlines() if ln.strip()]
+    if not lines:
+        return False
+    return bool(CODEX_FOOTER_RE.match(lines[-1].strip()))
+
+
+def _codex_numbered_option_rows(tail: str) -> int:
+    # Count Codex option rows (selector/number prefix stripped) in the tail. Two
+    # such rows is the minimum structured-chooser shape that distinguishes a real
+    # modal from a one-off line in prose. Only count rows that carried an actual
+    # selector/number prefix so plain prose lines do not inflate the count.
+    count = 0
+    for raw in tail.splitlines():
+        if re.match(r"^[ \t]*(?:[›❯>]\s*|\d+\.\s+)\S", raw):
+            count += 1
+    return count
+
+
+def detect_codex_blocked_prompt(text: str) -> dict[str, object]:
+    # Detect-only Codex sibling. Returns the same field shape as the Claude
+    # detector so the daemon caller is engine-agnostic. NEVER sends keys.
+    normalized = normalize_excerpt(text, 8192)
+    tail = _tail_region(normalized)
+
+    result: dict[str, object] = {
+        "matched": 0,
+        "prompt_kind": "",
+        "confidence": "",
+        "coarse_state": "none",
+        "content_hash": "",
+        "matched_line_hash": "",
+        "excerpt_hash": hashlib.sha256(normalized.encode("utf-8")).hexdigest() if normalized else "",
+    }
+
+    if not tail.strip():
+        return result
+
+    # Reject ready/active-output tails: a settled, blocked modal must not show a
+    # live ready prompt or mid-render output. Reuse the Claude rejection signals
+    # (the Codex ready caret `›`/`❯` and active-output spinners overlap enough
+    # that the shared gates are correct here too).
+    if READY_PROMPT_RE.search(tail) or ACTIVE_OUTPUT_RE.search(tail):
+        return result
+
+    matched_kind = ""
+    matched_fragment = ""
+    confidence = ""
+
+    has_all_required = all(frag in tail for frag in CODEX_HOOK_TRUST_REQUIRED)
+    has_either = any(frag in tail for frag in CODEX_HOOK_TRUST_EITHER)
+    footer_last = _codex_footer_is_last_line(tail)
+
+    if has_all_required and has_either and footer_last:
+        # High-confidence Codex hook-trust prompt: all 6 signature strings plus
+        # the confirm footer as the live last line. The footer-last-line anchor
+        # rejects a transcript/log that merely quotes the prompt.
+        matched_kind = "codex_hook_trust"
+        matched_fragment = "Trust all and continue"
+        confidence = "high"
+    elif footer_last and _codex_numbered_option_rows(tail) >= 2:
+        # Low-confidence unknown Codex modal: the exact confirm footer as the
+        # live last line plus >=2 numbered/selector option rows. The daemon's
+        # longer unknown-prompt deadline applies. Benign prose / a quoted footer
+        # with trailing content does not reach here.
+        matched_kind = "codex_unknown_interactive"
+        matched_fragment = ""
+        confidence = "low"
+    else:
+        return result
+
+    content_hash = hashlib.sha256(tail.encode("utf-8")).hexdigest()[:16]
+    result.update(
+        {
+            "matched": 1,
+            "prompt_kind": matched_kind,
+            "confidence": confidence,
+            "coarse_state": "none",
+            "content_hash": content_hash,
+            "matched_line_hash": f"prompt:{matched_kind}:{content_hash}",
+            "matched_fragment": matched_fragment,
+        }
+    )
+    return result
+
+
+def detect_blocked_prompt(text: str, engine: str = "claude") -> dict[str, object]:
+    # Engine dispatcher for the safety-floor detect-only classifier. Defaults to
+    # the Claude detector for back-compat (the #1991 daemon caller passed no
+    # engine). Issue #2007 adds the Codex path. Any other engine returns the
+    # unmatched result (the daemon also gates engine separately).
+    if engine == "codex":
+        return detect_codex_blocked_prompt(text)
+    return detect_claude_blocked_prompt(text)
+
+
 def cmd_detect_prompt(args: argparse.Namespace) -> int:
     text = read_capture(args.capture_file)
-    payload = detect_blocked_prompt(text)
+    payload = detect_blocked_prompt(text, getattr(args, "engine", "claude"))
     if args.format == "shell":
         print(f"PROMPT_MATCHED={int(payload['matched'])}")
         print(f"PROMPT_KIND={json.dumps(payload['prompt_kind'])}")
@@ -591,6 +736,10 @@ def main() -> int:
     parser.add_argument("--max-bytes", type=int, default=8192)
     parser.add_argument("--format", choices=("json", "shell"), default="json")
     parser.add_argument("--json", action="store_true")
+    # Issue #2007: detect-prompt dispatches to the Claude or Codex detector by
+    # engine. Defaults to claude so the #1991 daemon caller and any other
+    # existing invocation keep their behavior verbatim.
+    parser.add_argument("--engine", choices=("claude", "codex"), default="claude")
     args = parser.parse_args()
 
     if args.command == "detect-prompt":
