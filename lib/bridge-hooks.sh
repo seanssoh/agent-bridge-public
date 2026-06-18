@@ -355,6 +355,62 @@ bridge_ensure_claude_shared_settings_for_managed_workdir() {
   fi
 }
 
+# Issue #1981 (SAFETY): is the link target `<workdir>/.claude/settings.json`
+# actually the OPERATOR's real global `~/.claude/settings.json`? A dynamic agent
+# launched (or mis-launched) with `workdir=$HOME` would make
+# `bridge_link_claude_settings_to_shared` symlink the operator's real global over
+# to a bridge-managed `settings.effective.json`, hijacking the operator's own
+# vanilla Claude sessions (bridge hooks leak in) and stranding an orphan symlink
+# into a dead agent dir when the agent is closed. This predicate answers TRUE
+# (rc 0) when ANY of:
+#   - `<workdir>` resolves (realpath) to the operator HOME, OR
+#   - the computed `<workdir>/.claude/settings.json` resolves to the operator
+#     global `<operator_home>/.claude/settings.json`, OR
+#   - (reverse direction) the `effective_file` link source resolves to the
+#     operator global — never point the operator global AT a bridge effective
+#     file, and never use the operator global AS the link source.
+# Comparison is by realpath (handles a symlinked workdir, a `<home>` vs
+# `<home>/` trailing-slash, and a non-existent leaf — bridge_hook_paths_equal
+# uses os.path.realpath which resolves the existing prefix and appends the rest).
+# Operator HOME is resolved via the canonical #11901 resolver
+# `bridge_agent_operator_home_dir`; when it cannot resolve, fall back to a direct
+# `$HOME` comparison so a resolver-miss never silently lets the operator real
+# global be replaced by a bridge symlink (SAFE-on-miss invariant). Args:
+#   1 = workdir, 2 = effective_file (the link source bridge would point at).
+bridge_link_settings_targets_operator_global() {
+  local workdir="$1"
+  local effective_file="${2-}"
+  local operator_home=""
+  if command -v bridge_agent_operator_home_dir >/dev/null 2>&1; then
+    operator_home="$(bridge_agent_operator_home_dir 2>/dev/null || true)"
+  fi
+  # SAFE-on-miss: if the canonical resolver yielded nothing, fall back to $HOME
+  # (the operator HOME in the controller context) so we still refuse a workdir
+  # that lands on the real global. Only when BOTH are empty can we not identify
+  # the operator global — then there is no global path to protect.
+  [[ -n "$operator_home" ]] || operator_home="${HOME:-}"
+  [[ -n "$operator_home" ]] || return 1
+
+  local operator_global="$operator_home/.claude/settings.json"
+  local target="$workdir/.claude/settings.json"
+
+  # workdir == operator HOME (covers symlinked/trailing-slash/`~` forms).
+  if [[ "$(bridge_hook_paths_equal "$workdir" "$operator_home")" == "1" ]]; then
+    return 0
+  fi
+  # computed link target == operator global.
+  if [[ "$(bridge_hook_paths_equal "$target" "$operator_global")" == "1" ]]; then
+    return 0
+  fi
+  # reverse: the link SOURCE (effective_file) is the operator global — refuse so
+  # the operator global is never used as a bridge effective file either way.
+  if [[ -n "$effective_file" ]] \
+      && [[ "$(bridge_hook_paths_equal "$effective_file" "$operator_global")" == "1" ]]; then
+    return 0
+  fi
+  return 1
+}
+
 bridge_link_claude_settings_to_shared() {
   local workdir="$1"
   # Issue #570: launch_cmd is accepted for backwards compatibility but the
@@ -367,6 +423,23 @@ bridge_link_claude_settings_to_shared() {
   # managed default). When omitted (legacy callers), fall back to the
   # install-wide render so the helper remains backwards-compatible.
   local agent="${3-}"
+  # Issue #1981 (SAFETY) — operator-global hijack guard. This MUST sit FIRST,
+  # before ANY link/render side effect (before the #11901 operator-global thread,
+  # before the #1945 F7 deferral + iso-UID render, before the #1766 group-publish,
+  # before the link-shared-settings call). If the managed `workdir` is the
+  # operator's HOME (or otherwise resolves the link target onto the operator's
+  # real global `~/.claude/settings.json`), refuse the whole operation and warn
+  # loudly — never replace the operator's real global with a bridge symlink. The
+  # normal (non-operator-HOME) agent path is untouched: the predicate is FALSE for
+  # a real agent workdir, so execution falls through unchanged. (The 2-arg form
+  # also catches the reverse direction once effective_file is known; the workdir
+  # check here is the launch-time teeth and runs before effective_file is set.)
+  if bridge_link_settings_targets_operator_global "$workdir"; then
+    local _op_global_1981
+    _op_global_1981="$(bridge_agent_operator_home_dir 2>/dev/null || printf '%s' "${HOME:-}")/.claude/settings.json"
+    bridge_warn "[#1981] refusing to link shared settings for ${agent:-<no-agent>}: workdir '$workdir' resolves the managed settings target onto the operator-global '$_op_global_1981'. Skipping the link to avoid hijacking the operator's vanilla Claude sessions. Fix the agent's workdir (it must NOT be the operator HOME) and restart."
+    return 0
+  fi
   local effective_file
   local agent_class=""
   local channels_csv=""
@@ -405,6 +478,17 @@ bridge_link_claude_settings_to_shared() {
     fi
   else
     effective_file="$(bridge_hook_shared_settings_effective_file)"
+  fi
+  # Issue #1981 (SAFETY) — reverse-direction re-check now that `effective_file`
+  # is resolved: refuse if the link SOURCE itself resolves to the operator
+  # global (never use the operator's real `~/.claude/settings.json` AS a bridge
+  # effective file, in addition to never overwriting it as the target above).
+  # bridge_hook_per_agent_settings_effective_file / *_shared_settings_effective_file
+  # resolve into bridge-managed roots so this is defense-in-depth, not the normal
+  # path; a real agent's effective_file never matches, so this falls through.
+  if bridge_link_settings_targets_operator_global "$workdir" "$effective_file"; then
+    bridge_warn "[#1981] refusing to link shared settings for ${agent:-<no-agent>}: the link source '$effective_file' resolves onto the operator-global settings. Skipping to avoid contaminating the operator's vanilla Claude sessions."
+    return 0
   fi
   # #11901: thread the operator's system-global settings file so the SHARED
   # renderer inherits its safety-filtered contents as the bottom-most layer.
