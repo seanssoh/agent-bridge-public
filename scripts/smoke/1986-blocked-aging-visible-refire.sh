@@ -327,6 +327,35 @@ smoke_run "T5 escalation re-fires periodically (bounded), not strictly once" : ;
 }
 
 # ======================================================================
+# T7 — symmetry (patch adversarial seed): the ESCALATION re-fire shares the
+# reminder's claimed-protection. A CLAIMED [blocked-escalation] task is left
+# untouched on the escalation cadence — both paths route through the same
+# guarded resurface_open_alert, so escalation inherits the no-clobber guard.
+# ======================================================================
+smoke_run "T7 a CLAIMED escalation is left untouched on cadence (escalation parity, no clobber)" : ; {
+  esc_task_id="$(make_aged_blocked_task)"
+  run_daemon_step >/dev/null
+  eid="$(open_escalation_id "$esc_task_id")"
+  smoke_assert_match "$eid" '^[0-9]+$' "T7 escalation task minted for admin"
+  # Admin claims the [blocked-escalation] high task — actively working it.
+  python3 "$QUEUE" claim "$eid" --agent "$ADMIN" >/dev/null
+  smoke_assert_eq claimed "$(task_status "$eid")" "T7 escalation is claimed before the cadence tick"
+  before_claimed_by="$(sqlite3 "$DB" "SELECT claimed_by FROM tasks WHERE id=$eid;")"
+  # The escalation cadence elapses while the admin holds the claim.
+  mark_nudged "$ADMIN" "$eid"
+  backdate_last_event "$esc_task_id" blocked_escalated "$(( ESCALATE_SECS * 2 ))"
+
+  out="$(run_daemon_step)"
+
+  smoke_assert_eq claimed "$(task_status "$eid")" "T7 claimed escalation stays claimed (NOT clobbered)"
+  smoke_assert_eq "$before_claimed_by" "$(sqlite3 "$DB" "SELECT claimed_by FROM tasks WHERE id=$eid;")" "T7 claimed_by preserved (no claim clobber)"
+  smoke_assert_eq "$eid" "$(open_escalation_id "$esc_task_id")" "T7 same escalation id (no re-mint)"
+  if nudge_names "$out" "$ADMIN" "$eid"; then
+    smoke_fail "T7 a CLAIMED escalation must NOT be re-nudged (admin already has it); got: $out"
+  fi
+}
+
+# ======================================================================
 # T_teeth — source shape so a revert fails this smoke
 # ======================================================================
 smoke_run "T_teeth visible-refire + bounded-escalation source shape" : ; {
@@ -351,6 +380,11 @@ smoke_run "T_teeth visible-refire + bounded-escalation source shape" : ; {
     || smoke_fail "teeth: resurface status-flip must be scoped to 'blocked' (claimed-alert guard)"
   grep -q "== .claimed." "$src" \
     || smoke_fail "teeth: resurface must skip a claimed alert (no-clobber guard)"
+  # Escalation visibility parity (patch symmetry seed): the escalation branch
+  # must ALSO route a re-bound escalation through resurface_open_alert, not the
+  # old silent in-place re-bind — else (b) would be "bounded but invisible".
+  grep -q 'resurface_open_alert(conn, agent=admin_agent' "$src" \
+    || smoke_fail "teeth: the escalation re-fire must resurface visibly (parity with the reminder path)"
 }
 
 smoke_log "all tests passed: $SMOKE_NAME"
