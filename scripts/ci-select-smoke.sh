@@ -826,6 +826,14 @@ select_for_path() {
         # or regress the migration fail-safe (which would re-open reaping of
         # operator-created dynamics).
         add_required 1795-reaper-ephemeral-policy
+        # Issue #2003: lib/bridge-state.sh hosts the post-restart wake helpers
+        # (bridge_agent_restart_wake_marker_file idempotency latch +
+        # bridge_run_handoff_task_find_or_create queue-backed handoff dedupe)
+        # that the #1639/#2003 wake decision driver mirrors. Pull the
+        # post-restart-auto-wake smoke on every bridge-state.sh move so a
+        # refactor of either helper cannot silently break the no-double-fire
+        # idempotency or the handoff find/create contract.
+        add_required 1639-post-restart-auto-wake
         # Issue #1738 (SECURITY): lib/bridge-state.sh hosts the config-caller
         # binding writer (bridge_publish_config_caller_binding / _remove /
         # _dir / _file) — the controller-published pane-pid record
@@ -4055,6 +4063,18 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # block, never-block-when-empty), the #1199 queued-vs-claimed split, or the
       # Stop-chain ordering.
       add_required 9780-stop-inbox-drain
+      # Issue #2003: hooks/bridge_hook_common.py::_enqueue_handoff_pending now
+      # shares the ATOMIC upsert-open handoff-task contract with bridge-run.sh's
+      # restart wake (lib/bridge-state.sh bridge_run_handoff_task_find_or_create)
+      # — both create the same `[bridge:handoff-pending] <name> (<digest8>)` task
+      # via upsert-open so the SessionStart hook + the restart wake converge on
+      # ONE row (no TOCTOU duplicate). 1639-post-restart-auto-wake's source-grep
+      # gate pins the upsert-open token on BOTH files; pull it on every
+      # hooks/bridge_hook_common.py move so the hook side cannot regress to a
+      # racy find-open+create.
+      if [[ "$path" == "hooks/bridge_hook_common.py" ]]; then
+        add_required 1639-post-restart-auto-wake
+      fi
       # Issue #1766: bridge_link_claude_settings_to_shared (lib/bridge-hooks.sh)
       # now group-publishes the per-agent effective file (0640) + parent .claude/
       # (0750) for iso v2 agents so the iso UID can read its own

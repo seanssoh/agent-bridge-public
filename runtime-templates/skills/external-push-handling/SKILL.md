@@ -37,6 +37,11 @@ But **only `event` is guaranteed**. Every other field is optional and depends on
   first-ever auto-restart launch: `event=session-resumed agent=<a> reason=auto-restart` — no task fields.
   Treat as "re-read your session onboarding (SOUL.md / CLAUDE.md / NEXT-SESSION.md) and check your inbox",
   not as a task to delegate.
+- handoff resume after an automatic restart (same emitter, #2003), only when a `NEXT-SESSION.md` handoff is
+  present but the queue is unreachable so the wake could not be made queue-backed:
+  `event=handoff-resume agent=<a> reason=auto-restart` — no task fields. Treat as "read `NEXT-SESSION.md`,
+  execute its checklist, notify the operator, then check your inbox", not as a task to delegate. When the
+  queue IS reachable this same handoff arrives instead as `event=inbox-bootstrap top=<handoff-task-id>`.
 
 Match on the `[Agent Bridge] event=` prefix and treat absent fields as not-applicable, not as malformed. New fields and new event kinds may appear over time.
 
@@ -44,7 +49,7 @@ Value encoding: bare token for `^[A-Za-z0-9._/@:-]+$`, otherwise single-quoted w
 
 Fields you will see in practice:
 
-- `event` (always) — `inbox`, `inbox-bootstrap`, `session-resumed`, `pending-attention`, `watchdog`, `cron-followup`, `urgent`, etc. Do not hardcode; treat as opaque but route on it.
+- `event` (always) — `inbox`, `inbox-bootstrap`, `session-resumed`, `handoff-resume`, `pending-attention`, `watchdog`, `cron-followup`, `urgent`, etc. Do not hardcode; treat as opaque but route on it.
 - `agent` — which agent the event targets. Usually you, but a router may forward.
 - `count` — how many items are waiting (>=1). Absent on bootstrap-style pushes.
 - `top` — the single task id the daemon is surfacing first. Process this one first, not an arbitrary item.
@@ -65,6 +70,7 @@ Read `event` (always present) and whichever of `agent`/`count`/`top`/`priority`/
 Some events carry **no `top` task id** and must NOT enter the `agb show <top>` / delegate routine below — there is nothing to show or delegate. Handle them inline and stop:
 
 - `event=session-resumed` (the agent was just auto-restarted by the daemon/upgrade with an empty queue): re-read your session onboarding (`SOUL.md`, `CLAUDE.md`, and `NEXT-SESSION.md` if present), then check your inbox once (`~/.agent-bridge/agb inbox <agent>`). If the inbox is genuinely empty, you are done — do not run `agb show` on an empty id, and do not dispatch a subagent.
+- `event=handoff-resume` (auto-restarted with a `NEXT-SESSION.md` handoff present but the queue was unreachable, #2003): read `NEXT-SESSION.md` in full, execute its checklist, briefly notify the operator, and delete `NEXT-SESSION.md` when the handoff is verified. Then check your inbox once. Handle inline — do not `agb show` an empty id and do not dispatch a subagent for the resume itself.
 
 Only proceed to Step 2 when the event actually names a task (`top=<id>`, e.g. `inbox`, `inbox-bootstrap`, `urgent`).
 

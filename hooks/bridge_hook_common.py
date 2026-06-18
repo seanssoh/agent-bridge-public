@@ -872,35 +872,24 @@ def _enqueue_handoff_pending(agent: str, next_session: Path, digest: str) -> Non
         f"\n"
         f"Auto-enqueued by bridge_hook_common._enqueue_handoff_pending.\n"
     )
-    # find-open guard: skip if a same-digest handoff task is already open.
-    # bridge-queue.py find-open --title-prefix uses SQL LIKE; passing the FULL
-    # digest-bearing title as the prefix is the exact-match form (no other
-    # title starts with this exact string since digest8 + ")" is terminal).
-    # Codex r1 flagged the LIMIT 1 trap: a generic prefix like
-    # "[bridge:handoff-pending]" matches an older different-digest row first
-    # and suppresses the new enqueue, missing the current handoff.
-    try:
-        existing = queue_cli([
-            "find-open",
-            "--agent", agent,
-            "--title-prefix", title,
-            "--format", "json",
-        ])
-        if existing.returncode == 0 and existing.stdout.strip():
-            try:
-                row = json.loads(existing.stdout)
-            except (json.JSONDecodeError, ValueError):
-                row = None
-            if isinstance(row, dict) and row.get("title", "") == title:
-                return  # already enqueued for this exact digest
-    except Exception:
-        pass
+    # Atomic find-or-create via `upsert-open` (#2003 race fix). The previous
+    # find-open-then-create sequence was a TOCTOU: this hook fires at session
+    # start AND the auto-restart wake (bridge-run.sh
+    # bridge_run_handoff_task_find_or_create) fires at prompt-ready, so both can
+    # run on the SAME handoff. `bridge-queue.py create` is a plain INSERT with no
+    # UNIQUE-on-title constraint, so two concurrent misses both INSERT → TWO
+    # `[bridge:handoff-pending]` rows, breaking the "one open task / one nudge
+    # key" convergence. `upsert-open` serializes on `BEGIN IMMEDIATE` +
+    # find_open_task_by_prefix (the #1408 atomic refresh-or-create), so both
+    # callers converge on ONE row. The FULL digest-bearing title is the prefix so
+    # an older different-digest row cannot shadow this one (the LIMIT-1 trap).
     try:
         queue_cli([
-            "create",
+            "upsert-open",
             "--to", agent,
             "--from", agent,
             "--priority", "urgent",
+            "--title-prefix", title,
             "--title", title,
             "--body", body,
         ])
