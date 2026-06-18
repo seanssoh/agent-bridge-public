@@ -455,7 +455,20 @@ PY
 # `settings.json`). We seed `.claude/settings.local.json` inside each
 # agent's home so every agent writes to its own per-agent directory:
 #
-#   ~/.claude/auto-memory/<bridge-home-slug>/<agent>/
+#   <resolved-claude-home>/.claude/auto-memory/<bridge-home-slug>/<agent>/
+#
+# Issue #2014: the seeded value is an ABSOLUTE, fully-resolved path (no
+# leading "~"). We previously seeded the tilde form
+# `~/.claude/auto-memory/<slug>/<agent>`, but the Claude CLI expanded a
+# leading "~/" inconsistently per session — sometimes against $HOME
+# (= operator store, the intended canonical target per #1622), sometimes
+# against CLAUDE_CONFIG_DIR's parent (= the per-agent .claude deviation
+# tree). The same literal string under an identical env therefore split a
+# single agent's auto-memory across two trees. Seeding the fully-resolved
+# Claude home makes the location deterministic with nothing for the CLI to
+# mis-expand. The base is resolved by `bridge_agent_claude_home_dir`:
+# shared mode → operator home (where "~" was meant to land), Linux iso-v2
+# → the iso UID's own home (where its CLAUDE_CONFIG_DIR already lives).
 #
 # The slug is derived from the resolved $BRIDGE_HOME path (Claude-style
 # replacement of "/" with "-"), matching the naming Anthropic already uses
@@ -465,18 +478,29 @@ PY
 # (~/.agent-bridge) or from a source checkout managing that same runtime.
 #
 # Merge policy (fail-closed):
-#   - no file           → create with { autoMemoryDirectory: <path> }
-#   - blank content     → fail (operator must inspect; no silent reset)
-#   - valid JSON, no    → upsert autoMemoryDirectory
-#   - valid JSON, same  → no-op
-#   - valid JSON, diff  → fail (operator must resolve)
-#   - parse failure     → fail (operator must inspect; no silent reset)
+#   - no file               → create with { autoMemoryDirectory: <abs> }
+#   - blank content         → fail (operator must inspect; no silent reset)
+#   - valid JSON, no key    → upsert absolute autoMemoryDirectory
+#   - valid JSON, same      → no-op (equal, or resolves to the same target)
+#   - valid JSON, legacy ~/ → upgrade in place to the absolute form (#2014)
+#   - valid JSON, diff      → fail (operator-customized; must resolve)
+#   - parse failure         → fail (operator must inspect; no silent reset)
 #
 # Safe to call multiple times; fails loudly if another tool left the
 # file in an unexpected state. Only applies to claude engine.
 bridge_ensure_auto_memory_isolation() {
   local agent="$1"
   local workdir="$2"
+  # Issue #2014: optional create-time isolation context. At `agent create`
+  # this runs BEFORE bridge_write_role_block / bridge_load_roster, so the
+  # roster arrays do NOT yet expose this agent's mode/os_user — the
+  # roster-driven bridge_agent_claude_home_dir would then fall through to
+  # the operator home even for a linux-user agent, seeding auto-memory in
+  # the wrong tree. The create caller threads the already-resolved values
+  # so we can derive the iso UID home directly. Empty (any other caller) →
+  # fall back to the roster-driven resolver below.
+  local create_isolation_mode="${3:-}"
+  local create_os_user="${4:-}"
   local bridge_home="${BRIDGE_HOME:-}"
   local settings_local="$workdir/.claude/settings.local.json"
 
@@ -503,7 +527,30 @@ bridge_ensure_auto_memory_isolation() {
 
   mkdir -p "$workdir/.claude"
 
-  bridge_agent_manage_python "$settings_local" "$agent" "$bridge_home" <<'PY'
+  # Issue #2014: resolve the agent's canonical Claude HOME so we seed an
+  # ABSOLUTE autoMemoryDirectory (no leading "~" for the Claude CLI to
+  # mis-resolve). Shared mode → operator home (where "~" was meant to land,
+  # #1622); Linux iso-v2 → the iso UID's own home. If the helper is
+  # unavailable the embedded Python falls back to expanduser("~").
+  local claude_home=""
+  # Prefer the create-time iso context when supplied: at create the roster
+  # is not yet loaded for this agent, so the roster-driven resolver below
+  # would mis-resolve a linux-user agent to the operator home. With an
+  # explicit linux-user + os_user we derive the iso UID home directly
+  # (bridge_agent_linux_user_home: $BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT/
+  # <os_user>), matching where the iso agent's CLAUDE_CONFIG_DIR lives.
+  if [[ "$create_isolation_mode" == "linux-user" && -n "$create_os_user" ]] \
+      && declare -F bridge_agent_linux_user_home >/dev/null 2>&1; then
+    claude_home="$(bridge_agent_linux_user_home "$create_os_user" 2>/dev/null || true)"
+  fi
+  # Otherwise (shared mode, or any non-create caller with a populated
+  # roster) use the roster-driven resolver: shared → operator home, iso-v2
+  # → iso UID home via the roster arrays.
+  if [[ -z "$claude_home" ]] && declare -F bridge_agent_claude_home_dir >/dev/null 2>&1; then
+    claude_home="$(bridge_agent_claude_home_dir "$agent" 2>/dev/null || true)"
+  fi
+
+  bridge_agent_manage_python "$settings_local" "$agent" "$bridge_home" "$claude_home" <<'PY'
 import json
 import os
 import sys
@@ -512,6 +559,11 @@ from pathlib import Path
 settings_path = Path(sys.argv[1])
 agent = sys.argv[2]
 bridge_home = sys.argv[3]
+# Issue #2014: the resolved Claude home (operator home on shared mode; iso
+# UID home on Linux iso-v2). Backward-compatible: an older caller that does
+# not pass argv[4] — or passes a blank value — falls back to the previous
+# tilde target ($HOME-expanded), so the seed never regresses to an empty base.
+claude_home = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4].strip() else os.path.expanduser("~")
 
 resolved_home = os.path.realpath(bridge_home)
 
@@ -559,7 +611,30 @@ if _is_ephemeral(resolved_home) and not _is_ephemeral(resolved_settings):
 # Match Anthropic's ~/.claude/projects/ slug convention: replace both
 # os.sep and "." with "-" so two installs never share a directory.
 slug = resolved_home.replace(os.sep, "-").replace(".", "-")
-expected = f"~/.claude/auto-memory/{slug}/{agent}"
+# Issue #2014: seed an ABSOLUTE path (no leading "~"). The Claude CLI
+# resolved the tilde inconsistently per session, splitting auto-memory
+# across $HOME vs CLAUDE_CONFIG_DIR-parent. The legacy tilde form we used
+# to seed targets the same store, so treat it as an upgradeable equivalent
+# rather than an operator-set conflict.
+expected = f"{claude_home.rstrip('/')}/.claude/auto-memory/{slug}/{agent}"
+legacy = f"~/.claude/auto-memory/{slug}/{agent}"
+
+
+def _same_absolute_target(value) -> bool:
+    # True when an existing ABSOLUTE value points at the same on-disk target
+    # as `expected` once symlinks are resolved (e.g. the operator home is a
+    # symlink, /var -> /private/var on macOS, or a prior equivalent absolute
+    # seed). Avoids a spurious refusal / redundant rewrite. Deliberately
+    # ignores "~"-prefixed values: those are the legacy tilde form the CLI
+    # mis-expands (#2014) and MUST be rewritten to absolute even when they
+    # would expand to the same target — never treated as an already-correct
+    # no-op. A non-string value (e.g. a number/bool/list/dict an operator
+    # set by hand) returns False so it flows to the fail-closed refusal
+    # below instead of raising on the str-only `.startswith`.
+    if not isinstance(value, str) or not value or value.startswith("~"):
+        return False
+    return os.path.realpath(value) == os.path.realpath(expected)
+
 
 if not settings_path.exists():
     settings_path.write_text(
@@ -594,10 +669,18 @@ if not isinstance(data, dict):
     sys.exit(1)
 
 current = data.get("autoMemoryDirectory")
-if current == expected:
+# Already pinned to the absolute target (literally, or via a symlinked
+# operator home / a pre-existing equivalent absolute seed) → no-op. A
+# legacy "~/"-prefixed value is intentionally NOT treated as a match here
+# (see _same_absolute_target) — it falls through to the upgrade below.
+if current == expected or _same_absolute_target(current):
     sys.exit(0)
 
-if current not in (None, ""):
+# Issue #2014: upgrade the bridge's own legacy "~/"-prefixed seed (or a
+# blank value) in place to the absolute form — same target, not an
+# operator-set conflict. Only the exact legacy form we used to seed is
+# auto-upgraded; a genuinely customized value still fail-closes below.
+if current not in (None, "", legacy):
     sys.stderr.write(
         f"[bridge-agent] {settings_path} already sets autoMemoryDirectory "
         f"to {current!r}; expected {expected!r}. Refusing to overwrite. "
@@ -4187,7 +4270,12 @@ report and reap test-fixture agents per their pattern."
       # Issue #1151: thread $agent so the v2-isolation guard polarity fix
       # in bridge_ensure_project_claude_guidance can resolve roster os_user.
       bridge_ensure_project_claude_guidance "$workdir" "$agent" >/dev/null 2>&1 || true
-      bridge_ensure_auto_memory_isolation "$agent" "$workdir"
+      # Issue #2014: thread the already-resolved create-time isolation_mode +
+      # os_user. This runs BEFORE bridge_write_role_block / bridge_load_roster,
+      # so the seed's home resolver cannot read them from the roster yet — pass
+      # them so a fresh linux-user agent seeds its ABSOLUTE autoMemoryDirectory
+      # under the iso UID home, not the operator home.
+      bridge_ensure_auto_memory_isolation "$agent" "$workdir" "$isolation_mode" "$os_user"
     fi
     # Issue #1155: thread $agent so v2-isolation guard can resolve roster os_user.
     bridge_bootstrap_project_skill "$engine" "$workdir" "$agent" >/dev/null 2>&1 || true
