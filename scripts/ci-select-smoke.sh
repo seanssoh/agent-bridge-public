@@ -1570,6 +1570,7 @@ select_for_path() {
       # move so a regression to the affordance gates / coarse_state mapping /
       # shell-format field names is caught at PR time.
       add_required 1991-blocked-prompt-safety-floor
+      add_required 1991-agentic-resolver
       # v0.15.0-beta5-2 Lane ι (#1318-B): bridge-queue.py + bridge-task.sh
       # are the create boundary for queued tasks; the daemon's new
       # process_unclaimed_queue_escalation tick scans these tables on
@@ -2172,6 +2173,7 @@ select_for_path() {
       # the direct-external-notify guarantee back to admin-task-only, send keys
       # (observe-only), or storm. Mutation-tested teeth.
       add_required 1991-blocked-prompt-safety-floor
+      add_required 1991-agentic-resolver
       # Fleet-credential Phase 2 (#1470): bridge-daemon.sh gained the
       # periodic Codex single-source → fleet-sync tick
       # (bridge_daemon_periodic_codex_cred_sync_tick). 1470-codex-fleet-sync
@@ -2996,6 +2998,19 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # token contract.
       if [[ "$path" == "lib/bridge-tmux.sh" ]]; then
         add_required 1991-blocked-prompt-safety-floor
+        add_required 1991-agentic-resolver
+      fi
+      # Issue #1991 AGENTIC RESOLVER (v0.16.16 canary): bridge-start.sh,
+      # bridge-run.sh, lib/bridge-tmux.sh, and agent-bridge are legacy-key-sender
+      # / dispatch surfaces the single-sender resolver gates. bridge-start's
+      # controller dev-channels watcher, bridge-run's agent backstop, the
+      # bridge-tmux primitives (central send-block guard), and the `resolver`
+      # CLI verb all live here. Pull the resolver smoke on any of them so a
+      # refactor cannot silently reintroduce a legacy key send under canary or
+      # drop the dispatch.
+      if [[ "$path" == "bridge-start.sh" || "$path" == "bridge-run.sh" \
+            || "$path" == "lib/bridge-tmux.sh" || "$path" == "agent-bridge" ]]; then
+        add_required 1991-agentic-resolver
       fi
       # Issue #1762: lib/bridge-tmux.sh hosts the picker keystroke primitive
       # bridge_tmux_send_picker_key — the ONLY keystroke path the picker
@@ -3697,6 +3712,13 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
           # the idle composers (and a real picker is NOT shadowed by them).
           add_required 1783-picker-idle-nonpicker
           ;;
+        runtime-templates/shared/prompt-resolver-actions.json)
+          # Issue #1991 AGENTIC RESOLVER: the shipped closed default-deny policy
+          # (case takes this runtime-templates/* arm first, ahead of the
+          # dedicated resolver arm below). Pull the resolver smoke so a policy
+          # edit re-runs the schema + default-deny + closed-token validation.
+          add_required 1991-agentic-resolver
+          ;;
       esac
       add_integration integration-minimal
       ;;
@@ -4320,7 +4342,11 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # lib/upgrade-helpers/cron-unmodeled-claude-warn.py. Pull
       # 1943-cron-unmodeled-warn-on-upgrade whenever the upgrade entry moves so
       # the best-effort cron-scan invocation cannot silently regress.
-      add_required upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision telegram-relay-residue-cleanup upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering upgrade-isolated-agent-migrate 864-upgrade-perm-regressions cleanup-payload-empty-stdin-872 isolation-v2-marker-only-migrate 1067-codex-provisioning 1113-watchdog-legacy-backfill 1144-upgrade-complete-task phase2-install-tree-reconciler phase3-agent-home-contract α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-theta-upgrade-backfill-perms beta5-2-mu-cron-channel-creds codex-version-surface codex-doctor 1516-upgrade-downgrade-guard 1612-upgrade-restart-receiver upgrade-migrate-rematerialize-workdir 1602-dryrun-ref-fidelity 1601-conflicts-adopt-guard 1611-migrate-orphan-skip 1613-wiki-mention-fence-indent 1635-iso-backup-perm-skip 1638-settings-cosmetic-conflict 1636-rematerialize-scaffolding 1660-upgrade-emit-brokenpipe 1661-upgrade-singleton-lock 1662-upgrade-complete-marker 1670-rematerialize-dryrun-agent-preserved 1781-doc-migration-memory-preserve 1817-live-root-claude-stub lts-channel-sticky-resolver 1567-codex-orphan-upgrade-reaper 1675-1694-settings-homebrew-abspath-conflict 1786-tasksdb-doctor-verb 1809-agents-md-backfill 1892-doc-backfill-engine-fail-closed 1905-upgrade-systemd-quiesce-respawn 655-upgrade-launchd-quiesce-respawn 1855-keychain-free-backfill 1813-canon-links-resolve-v2 1943-cron-unmodeled-warn-on-upgrade
+      # Issue #1991 AGENTIC RESOLVER: bridge-upgrade.sh runs the post-upgrade
+      # picker-sweep one-shot, which (via picker-sweep's resolver self-gate) must
+      # NOT key a resolver-owned canary agent's pane. Pull the resolver smoke
+      # whenever the upgrade entry moves so that contract stays pinned.
+      add_required upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision telegram-relay-residue-cleanup upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering upgrade-isolated-agent-migrate 864-upgrade-perm-regressions cleanup-payload-empty-stdin-872 isolation-v2-marker-only-migrate 1067-codex-provisioning 1113-watchdog-legacy-backfill 1144-upgrade-complete-task phase2-install-tree-reconciler phase3-agent-home-contract α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-theta-upgrade-backfill-perms beta5-2-mu-cron-channel-creds codex-version-surface codex-doctor 1516-upgrade-downgrade-guard 1612-upgrade-restart-receiver upgrade-migrate-rematerialize-workdir 1602-dryrun-ref-fidelity 1601-conflicts-adopt-guard 1611-migrate-orphan-skip 1613-wiki-mention-fence-indent 1635-iso-backup-perm-skip 1638-settings-cosmetic-conflict 1636-rematerialize-scaffolding 1660-upgrade-emit-brokenpipe 1661-upgrade-singleton-lock 1662-upgrade-complete-marker 1670-rematerialize-dryrun-agent-preserved 1781-doc-migration-memory-preserve 1817-live-root-claude-stub lts-channel-sticky-resolver 1567-codex-orphan-upgrade-reaper 1675-1694-settings-homebrew-abspath-conflict 1786-tasksdb-doctor-verb 1809-agents-md-backfill 1892-doc-backfill-engine-fail-closed 1905-upgrade-systemd-quiesce-respawn 655-upgrade-launchd-quiesce-respawn 1855-keychain-free-backfill 1813-canon-links-resolve-v2 1943-cron-unmodeled-warn-on-upgrade 1991-agentic-resolver
       # Issue #1906: bridge-upgrade.py's backfill-codex-entrypoints sweep gained
       # the REPORT-ONLY engine-mismatched-doc detector (a stale Codex-contract
       # AGENTS.md on a non-codex agent -> engine_mismatch_docs + non_clean).
@@ -5331,6 +5357,29 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       add_integration integration-minimal
       ;;
 
+    bridge-resolver.sh|bridge-resolver-policy.py|lib/bridge-prompt-resolver.sh|runtime-templates/shared/prompt-resolver-actions.json|scripts/picker-sweep.sh)
+      # Issue #1991 AGENTIC RESOLVER (v0.16.16 canary, HIGH-RISK #1+#2 +
+      # security-sensitive). These are the resolver's own surfaces:
+      #   - bridge-resolver.sh: the single authorized key sender (attempt|drain|
+      #     status), the per-key latch, exact-key re-detect, closed-policy lookup.
+      #   - bridge-resolver-policy.py: default-deny decision + schema validation +
+      #     demote-only locals + closed-token vocabulary.
+      #   - lib/bridge-prompt-resolver.sh: canary gate, central send-block guard,
+      #     latch primitives, shipped-policy resolution.
+      #   - prompt-resolver-actions.json: the shipped closed allow-list.
+      #   - scripts/picker-sweep.sh: a legacy key sender gated for canary agents
+      #     (cron + post-upgrade one-shot). (bridge-upgrade.sh's resolver smoke
+      #     is added in its own arm above — it matches there first.)
+      # Pull the resolver smoke on any of their moves so the single-sender /
+      # default-deny / latch / prompt-injection / #879-batch teeth re-run.
+      add_required 1991-agentic-resolver
+      # picker-sweep moves also exercise the migrate paths.
+      if [[ "$path" == "scripts/picker-sweep.sh" ]]; then
+        add_required 1916-picker-sweep-migrate-atomic
+      fi
+      add_integration integration-minimal
+      ;;
+
     lib/bridge-picker.sh|lib/bridge-picker.py|runtime-templates/shared/picker-catalog.json|runtime-templates/skills/picker-resolve/SKILL.md)
       # Issue #1762: the no-LLM picker auto-resolve stage. lib/bridge-picker.sh
       # (shell orchestrator + safety rails), lib/bridge-picker.py (catalog
@@ -5338,6 +5387,11 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # picker-resolve skill all feed the same smoke. Pull it on any of their
       # moves so a refactor or a catalog schema change is caught.
       add_required 1762-picker-autoresolve
+      # Issue #1991 AGENTIC RESOLVER: lib/bridge-picker.sh's auto-resolve handler
+      # is one of the legacy key senders the single-sender resolver gates. Pull
+      # the resolver smoke so a refactor cannot drop the resolver-owned-agent
+      # report-only gate (which would reintroduce a second sender under canary).
+      add_required 1991-agentic-resolver
       # Issue #1766: the matcher also classifies the claude-settings-error
       # entry; pull the #1766 smoke so a matcher change cannot break it.
       add_required 1766-iso-settings-readable

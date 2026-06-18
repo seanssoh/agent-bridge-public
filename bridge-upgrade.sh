@@ -533,6 +533,9 @@ bridge_upgrade_with_target_env() {
     BRIDGE_LAYOUT_RESOLVER_BYPASS="${BRIDGE_LAYOUT_RESOLVER_BYPASS:-}" \
     BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID="${BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID:-}" \
     BRIDGE_UPGRADE_CONTEXT="${BRIDGE_UPGRADE_CONTEXT:-}" \
+    BRIDGE_PROMPT_RESOLVER_ENABLED="${BRIDGE_PROMPT_RESOLVER_ENABLED:-}" \
+    BRIDGE_PROMPT_RESOLVER_AGENTS="${BRIDGE_PROMPT_RESOLVER_AGENTS:-}" \
+    BRIDGE_PROMPT_RESOLVER_OWNER="${BRIDGE_PROMPT_RESOLVER_OWNER:-}" \
     "$@"
 }
 
@@ -4033,6 +4036,11 @@ if [[ $RESTART_AGENTS -eq 1 ]]; then
   # upgrade returns. This is the reactive primitive that already handles
   # BOTH engines (see scripts/picker-sweep.sh's _PICKER_CODEX_CONFIRM_RE
   # added 2026-05-16); we just invoke it earlier than the next cron tick.
+  #
+  # Issue #1991 single-sender: picker-sweep.sh self-gates resolver-owned canary
+  # agents (its _psw_resolver_owns_agent skip reads BRIDGE_PROMPT_RESOLVER_*),
+  # so this one-shot does NOT key a resolver-owned agent's pane either. The
+  # canary env flows through bridge_upgrade_with_target_env below. Default OFF.
   #
   # Skip when dry-run (no actual restart happened), when no agent reached
   # status="restarted" (avoids running against an all-attached install),

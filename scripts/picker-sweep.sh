@@ -140,6 +140,34 @@ if [[ -z "$SELF_AGENT" && -z "$NOTIFY_AGENT" ]]; then
     _psw_log "warn: BRIDGE_PICKER_SWEEP_SELF and BRIDGE_PICKER_SWEEP_NOTIFY both unset; running without self-skip or admin notification (log only)"
 fi
 
+# Issue #1991 single-sender. When the agentic resolver canary owns an agent, the
+# picker-sweep (default shell-kind cron AND the post-upgrade one-shot) must NOT
+# key that agent's pane — the resolver becomes the sole sender. This is a
+# STANDALONE check (picker-sweep does not source bridge-lib.sh) reading the same
+# canary env the resolver gate uses. Default OFF: when BRIDGE_PROMPT_RESOLVER_ENABLED
+# is unset/0, no agent is owned and the sweep behaves exactly as before.
+_psw_resolver_owns_agent() {
+    local agent="$1"
+    [[ -n "$agent" ]] || return 1
+    case "${BRIDGE_PROMPT_RESOLVER_ENABLED:-0}" in
+        1|true|TRUE|yes|YES|on|ON) ;;
+        *) return 1 ;;
+    esac
+    local list="${BRIDGE_PROMPT_RESOLVER_AGENTS:-}"
+    [[ -n "$list" ]] || return 1
+    if [[ "$list" == "all" ]]; then
+        return 0
+    fi
+    local IFS=','
+    local item
+    for item in $list; do
+        item="${item#"${item%%[![:space:]]*}"}"
+        item="${item%"${item##*[![:space:]]}"}"
+        [[ "$item" == "$agent" ]] && return 0
+    done
+    return 1
+}
+
 # ---------------------------------------------------------------------------
 # Picker pattern allow-list. Line-anchored *strictly* — only whitespace is
 # allowed between line-start and the option marker. This rejects markdown
@@ -454,6 +482,11 @@ rate_limit_rotation_attempted=0
 while IFS= read -r agent; do
     [[ -n "$agent" ]] || continue
     if [[ -n "$SELF_AGENT" && "$agent" == "$SELF_AGENT" ]]; then
+        continue
+    fi
+    # Issue #1991 single-sender: skip resolver-owned canary agents entirely.
+    if _psw_resolver_owns_agent "$agent"; then
+        _psw_log "skip '$agent' — agentic resolver (#1991) owns its blocked prompts (single-sender)"
         continue
     fi
 

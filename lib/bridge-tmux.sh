@@ -83,6 +83,18 @@ bridge_tmux_send_picker_key() {
   local engine="${3:-}"
   local token="${4:-}"
   local pane_target
+
+  # Issue #1991 single-sender guard (defense-in-depth). When the agentic
+  # resolver owns this session, the ONLY process allowed through this primitive
+  # is the resolver helper itself (which sets BRIDGE_PROMPT_RESOLVER_SEND_AUTHORIZED
+  # after latching the key). Any other caller — picker auto-resolve, a legacy
+  # watcher — is refused. No-op when the resolver is disabled (default).
+  if declare -F bridge_prompt_resolver_should_block_send >/dev/null 2>&1 \
+      && bridge_prompt_resolver_should_block_send "$session"; then
+    bridge_warn "bridge_tmux_send_picker_key: resolver owns session=${session}; refusing legacy send (token=${token}, label=${label})"
+    return 1
+  fi
+
   pane_target="$(bridge_tmux_pane_target "$session")"
 
   case "$token" in
@@ -932,6 +944,15 @@ bridge_tmux_claude_advance_blocker() {
   local foreground_wait="${BRIDGE_TMUX_DEV_CHANNELS_FOREGROUND_WAIT_SECONDS:-60}"
   local foreground_poll="${BRIDGE_TMUX_DEV_CHANNELS_FOREGROUND_POLL_SECONDS:-2}"
   local foreground_max="${BRIDGE_TMUX_DEV_CHANNELS_FOREGROUND_MAX_CHECKS:-30}"
+
+  # Issue #1991 single-sender guard. When the resolver owns this session, the
+  # generic trust/summary/devchannels auto-advance must NOT key the pane (the
+  # resolver is the sole sender). Report-only refuse; no-op when disabled.
+  if declare -F bridge_prompt_resolver_should_block_send >/dev/null 2>&1 \
+      && bridge_prompt_resolver_should_block_send "$session"; then
+    bridge_warn "bridge_tmux_claude_advance_blocker: resolver owns session=${session}; report-only, no key sent"
+    return 1
+  fi
 
   state="$(bridge_tmux_claude_blocker_state "$session")"
   # If the caller specified an expected state and the live state has

@@ -313,6 +313,17 @@ bridge_start_schedule_dev_channels_accept() {
         # picker detection and send (e.g. parent bridge-run.sh crashed
         # on a follow-up plugin-cache error) should not be logged as
         # "completed".
+        # Issue #1991 single-sender (in-child guard): a watcher forked BEFORE
+        # the resolver canary was enabled for this agent could still reach this
+        # direct send. Re-check ownership here — at SEND time, not just at arm
+        # time — so the resolver stays the sole sender even across a mid-flight
+        # canary enable. No-op when the resolver is disabled (default).
+        if declare -F bridge_prompt_resolver_owns_agent >/dev/null 2>&1 \
+           && bridge_prompt_resolver_owns_agent "$agent"; then
+          printf "[%s] [info] controller auto-accept dev-channels SKIPPED at send time on session=%s agent=%s — agentic resolver (#1991) owns blocked prompts\n" \
+            "$(date "+%Y-%m-%d %H:%M:%S")" "$session" "$agent"
+          exit 0
+        fi
         if bridge_tmux_session_exists "$session" \
            && bridge_tmux_pane_has_dev_channels_picker "$session"; then
           # Direct send — no attach gate, no foreground gate, no
@@ -1248,8 +1259,15 @@ unset _bridge_start_new_session_err
 bridge_tmux_bootstrap_session_options "$SESSION"
 if [[ "$ENGINE" == "claude" ]]; then
   bridge_tmux_prepare_claude_session "$SESSION" 8 >/dev/null 2>&1 || true
-  if [[ $CONTROLLER_DEV_CHANNELS_ACCEPT -eq 1 ]]; then
+  # Issue #1991 single-sender: when the agentic resolver owns this agent, the
+  # controller-side dev-channels auto-accept watcher must NOT be armed (the
+  # resolver becomes the sole key sender). No-op when the resolver is disabled.
+  if [[ $CONTROLLER_DEV_CHANNELS_ACCEPT -eq 1 ]] \
+      && ! { declare -F bridge_prompt_resolver_owns_agent >/dev/null 2>&1 \
+             && bridge_prompt_resolver_owns_agent "$AGENT"; }; then
     bridge_start_schedule_dev_channels_accept "$SESSION" "$AGENT"
+  elif [[ $CONTROLLER_DEV_CHANNELS_ACCEPT -eq 1 ]]; then
+    echo "[info] controller dev-channels auto-accept SKIPPED for '$AGENT' — agentic resolver (#1991) owns its blocked prompts"
   fi
   # Fresh-install onboarding nudge: SESSION-TYPE.md's first-session
   # checklist for admin agents triggers "when the first user message
