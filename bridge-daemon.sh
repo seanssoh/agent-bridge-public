@@ -7405,6 +7405,70 @@ bridge_daemon_nudge_task_ts_var() {
   printf 'NUDGE_TASK_TS_%s' "$sanitized"
 }
 
+# Issue #1973 Track B — companion per-task fields for capped exponential
+# re-nudge backoff. Stored alongside NUDGE_TASK_TS_<id> in the SAME nudge
+# state file (no parallel registry). For task id <id>:
+#   NUDGE_TASK_ATTEMPTS_<id>   — count of nudges already recorded for this
+#                                (agent, task) pair while it stayed queued.
+#   NUDGE_TASK_NEXT_TS_<id>    — earliest wall-clock ts at which the next
+#                                nudge is allowed (last_ts + capped backoff).
+#   NUDGE_TASK_LAST_RESULT_<id>— last recorded outcome ("sent"/"skip"); kept
+#                                for operator-visible audit detail and so a
+#                                Track-C one-shot recovery bypass can mark a
+#                                forced re-nudge without disturbing attempts.
+# All three are pruned together with NUDGE_TASK_TS_<id> when the task leaves
+# the live set, which IS the reset-on-progress path (claim/done/reassign →
+# task no longer queued → entry pruned → attempts restart at 0 on re-queue).
+bridge_daemon_nudge_task_field_var() {
+  local field="$1" task_id="$2"
+  local sanitized
+  # shellcheck disable=SC2001  # bash parameter expansion lacks regex class
+  sanitized="$(printf '%s' "$task_id" | sed 's/[^A-Za-z0-9_]/_/g')"
+  printf 'NUDGE_TASK_%s_%s' "$field" "$sanitized"
+}
+
+# Compute the capped exponential delay (seconds) for a given prior-attempt
+# count. base * 2^attempts, clamped to cap. Urgent/high-priority tasks get a
+# LOWER cap so an outage backoff cannot bury time-sensitive work (brief risk
+# #1) while still being bounded. Pure arithmetic — no I/O — so Track C can
+# call it directly when reasoning about a forced re-nudge interval.
+#
+#   $1 attempts  — number of nudges already delivered for this (agent, task)
+#   $2 priority  — task priority (urgent|high|normal|low); empty == normal
+# Reads BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS (base, default 60),
+# BRIDGE_DAEMON_NUDGE_REDELIVERY_MAX_SECONDS (cap, default 900), and
+# BRIDGE_DAEMON_NUDGE_REDELIVERY_URGENT_MAX_SECONDS (urgent/high cap,
+# default 300). Echoes the delay in seconds.
+bridge_daemon_nudge_backoff_delay() {
+  local attempts="${1:-0}"
+  local priority="${2:-normal}"
+  local base="${BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS:-60}"
+  local cap="${BRIDGE_DAEMON_NUDGE_REDELIVERY_MAX_SECONDS:-900}"
+  local urgent_cap="${BRIDGE_DAEMON_NUDGE_REDELIVERY_URGENT_MAX_SECONDS:-300}"
+  [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=0
+  [[ "$base" =~ ^[0-9]+$ ]] || base=60
+  [[ "$cap" =~ ^[0-9]+$ ]] || cap=900
+  [[ "$urgent_cap" =~ ^[0-9]+$ ]] || urgent_cap=300
+  # Urgent/high work backs off but never past the lower cap.
+  case "$priority" in
+    urgent|high) (( urgent_cap < cap )) && cap="$urgent_cap" ;;
+  esac
+  (( base > 0 )) || { printf '0'; return 0; }
+  # The cap dominates: when an urgent cap is LOWER than the base window the
+  # effective floor must collapse to the cap, otherwise a base-floor would
+  # push the delay back above the cap. Floor = min(base, cap).
+  local floor="$base"
+  (( cap < floor )) && floor="$cap"
+  # Cap the doubling exponent so `base << attempts` cannot overflow the
+  # 64-bit shift before we clamp; any attempts beyond the cap reach it anyway.
+  local exp="$attempts"
+  (( exp > 30 )) && exp=30
+  local delay=$(( base << exp ))
+  (( delay > cap )) && delay="$cap"
+  (( delay < floor )) && delay="$floor"
+  printf '%s' "$delay"
+}
+
 # Issue #1322 — load per-task state into the caller's scope. Sets
 # NUDGE_TASK_TS_<id> globals (plus the legacy composite fields) and
 # returns 0. Caller is responsible for calling
@@ -7423,9 +7487,15 @@ bridge_daemon_nudge_dedup_load() {
 # in scope. Mirrors the deferred-counter sanitize pattern so an earlier
 # agent's per-task timestamps cannot leak into the next iteration's
 # decision. Does NOT touch the on-disk file.
+#
+# Issue #1973 Track B: also clear the companion NUDGE_TASK_ATTEMPTS_* /
+# NUDGE_TASK_NEXT_TS_* / NUDGE_TASK_LAST_RESULT_* vars so a prior agent's
+# backoff state cannot leak into the next agent's record/skip decision.
+# All three share the NUDGE_TASK_ prefix with TS, so a single compgen on
+# that prefix sweeps every per-task field.
 bridge_daemon_nudge_dedup_reset_scope() {
   local var
-  for var in $(compgen -v NUDGE_TASK_TS_ 2>/dev/null); do
+  for var in $(compgen -v NUDGE_TASK_ 2>/dev/null); do
     unset "$var"
   done
   unset LAST_NUDGE_FINGERPRINT LAST_NUDGE_TS 2>/dev/null || true
@@ -7456,6 +7526,21 @@ bridge_daemon_should_skip_nudge() {
   local redelivery="${BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS:-60}"
   [[ "$redelivery" =~ ^[0-9]+$ ]] || redelivery=60
   (( redelivery > 0 )) || return 1
+  # Issue #1973 Track C SEAM (one-shot bypass): the liveness/recovery work
+  # (separate PR) needs to force exactly ONE re-nudge for an agent the
+  # moment the daemon recovers from a stall — bypassing the backoff window
+  # without permanently disabling it. Track C drops the recovering agent
+  # into BRIDGE_DAEMON_NUDGE_FORCE_AGENTS (CSV) for that single tick; this
+  # gate then returns "do not skip" (fire) for that agent and Track C clears
+  # the env after the tick. The backoff state on disk is untouched, so the
+  # NEXT tick resumes the normal capped-exponential cadence. Kept as a thin
+  # env check so Track C owns the marker/clear lifecycle, not this function.
+  local _force_csv="${BRIDGE_DAEMON_NUDGE_FORCE_AGENTS:-}"
+  if [[ -n "$_force_csv" ]]; then
+    case ",${_force_csv}," in
+      *,"$agent",*) return 1 ;;
+    esac
+  fi
   local file
   file="$(bridge_daemon_nudge_state_file "$agent")"
   [[ -f "$file" ]] || return 1
@@ -7479,7 +7564,7 @@ bridge_daemon_should_skip_nudge() {
       break
     done
     if (( has_per_task == 1 )); then
-      local id ts ts_var
+      local id ts ts_var next_var next_ts
       # shellcheck disable=SC2001
       local ids_nl
       ids_nl="$(printf '%s' "$id_csv" | tr ',' '\n')"
@@ -7489,7 +7574,20 @@ bridge_daemon_should_skip_nudge() {
         ts="${!ts_var:-}"
         [[ -n "$ts" && "$ts" =~ ^[0-9]+$ ]] || return 1
         (( ts <= now )) || return 1   # clock-skew guard
-        (( now - ts < redelivery )) || return 1
+        # Issue #1973 Track B: capped exponential backoff. Prefer the
+        # recorded per-task NUDGE_TASK_NEXT_TS_<id> (last_ts + capped
+        # delay) over the flat redelivery window. A pre-#1973 state file
+        # (per-task TS present but no NEXT_TS) falls back to the legacy
+        # fixed `now - ts < redelivery` gate so an in-flight window is
+        # not discarded across the upgrade. Once bridge_daemon_record_nudge
+        # writes the NEXT_TS field the backoff governs subsequent ticks.
+        next_var="$(bridge_daemon_nudge_task_field_var NEXT_TS "$id")"
+        next_ts="${!next_var:-}"
+        if [[ -n "$next_ts" && "$next_ts" =~ ^[0-9]+$ ]]; then
+          (( now < next_ts )) || return 1
+        else
+          (( now - ts < redelivery )) || return 1
+        fi
       done <<<"$ids_nl"
       return 0
     fi
@@ -7510,14 +7608,30 @@ bridge_daemon_should_skip_nudge() {
 #
 # id_csv="" preserves the legacy composite-only write so callers without
 # a concrete id list (older code paths, tests) still work.
+#
+# Issue #1973 Track B: each write also advances the per-task capped
+# exponential backoff. For every live id we read the PRIOR
+# NUDGE_TASK_ATTEMPTS_<id> (default 0 → first nudge), increment it, and
+# record NUDGE_TASK_NEXT_TS_<id> = now + bridge_daemon_nudge_backoff_delay
+# (attempts-after-this-nudge). Pruning a no-longer-live id (the agent
+# claimed/completed it, or it was reassigned) drops ALL its companion
+# fields, which IS the reset-on-progress: a later re-queue of the same id
+# starts attempts at 0 again. The 4th arg is the priority used to pick the
+# lower urgent/high cap; default normal keeps existing callers unchanged.
 bridge_daemon_record_nudge() {
   local agent="$1"
   local fingerprint="$2"
   local id_csv="${3:-}"
+  local priority="${4:-normal}"
   local file tmp now
   file="$(bridge_daemon_nudge_state_file "$agent")"
   now="$(date +%s)"
   tmp="$(mktemp "${file}.XXXXXX")" || return 1
+
+  # Load the prior state so we can carry the per-task attempt counts
+  # forward. Reset scope first so a sibling agent's vars cannot leak.
+  bridge_daemon_nudge_dedup_reset_scope
+  bridge_daemon_nudge_dedup_load "$agent" || true
 
   # Build the set of "live" ids so we know which NUDGE_TASK_TS_* to keep.
   # Footgun: `printf "%s" "$id_csv" | tr "," "\n"` produces no trailing
@@ -7536,10 +7650,25 @@ bridge_daemon_record_nudge() {
     printf 'LAST_NUDGE_FINGERPRINT=%q\n' "$fingerprint"
     printf 'LAST_NUDGE_TS=%q\n' "$now"
     if [[ -n "$id_csv" ]]; then
-      local id ts_var
+      local id ts_var attempts_var next_var result_var
+      local prior_attempts attempts delay next_ts
       for id in "${!_NUDGE_LIVE_IDS[@]}"; do
         ts_var="$(bridge_daemon_nudge_task_ts_var "$id")"
+        attempts_var="$(bridge_daemon_nudge_task_field_var ATTEMPTS "$id")"
+        next_var="$(bridge_daemon_nudge_task_field_var NEXT_TS "$id")"
+        result_var="$(bridge_daemon_nudge_task_field_var LAST_RESULT "$id")"
+        prior_attempts="${!attempts_var:-0}"
+        [[ "$prior_attempts" =~ ^[0-9]+$ ]] || prior_attempts=0
+        attempts=$(( prior_attempts + 1 ))
+        # NEXT_TS uses the post-increment attempt count: the delay BEFORE
+        # the (attempts+1)-th nudge grows with how many have already fired.
+        delay="$(bridge_daemon_nudge_backoff_delay "$attempts" "$priority")"
+        [[ "$delay" =~ ^[0-9]+$ ]] || delay=0
+        next_ts=$(( now + delay ))
         printf '%s=%q\n' "$ts_var" "$now"
+        printf '%s=%q\n' "$attempts_var" "$attempts"
+        printf '%s=%q\n' "$next_var" "$next_ts"
+        printf '%s=%q\n' "$result_var" "sent"
       done
     fi
   } > "$tmp"
@@ -7867,12 +7996,25 @@ bridge_daemon_attached_human_followup_escalate() {
   [[ "$cooldown" =~ ^[0-9]+$ ]] || cooldown=300
   (( cooldown > 0 )) || cooldown=300
 
-  local now_ts marker marker_ts
+  local now_ts marker marker_ts marker_attempts esc_window
   now_ts="$(date +%s)"
   marker="$(bridge_daemon_attached_human_followup_marker_file "$task_id")"
   marker_ts="$(head -n1 "$marker" 2>/dev/null || printf '0')"
   [[ "$marker_ts" =~ ^[0-9]+$ ]] || marker_ts=0
-  if (( marker_ts > 0 )) && (( now_ts - marker_ts < cooldown )); then
+  # Issue #1973 Track B: rate-limit the refreshable admin alert on a capped
+  # exponential backoff (seeded at the cooldown, doubling per refresh) rather
+  # than a fixed cooldown loop. Marker line 2 carries the attempt count; a
+  # legacy single-line marker reads attempts=0 → first re-fire uses the base
+  # window. The upsert-open below still refreshes ONE open admin task, so the
+  # backoff only governs HOW OFTEN that single task is refreshed/re-notified,
+  # never a stream of new tasks. Forward followups are user-facing, so they
+  # keep a normal-priority cap (no urgent override).
+  marker_attempts="$(sed -n '2p' "$marker" 2>/dev/null || printf '0')"
+  [[ "$marker_attempts" =~ ^[0-9]+$ ]] || marker_attempts=0
+  esc_window="$(BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS="$cooldown" \
+    bridge_daemon_nudge_backoff_delay "$marker_attempts" normal)"
+  [[ "$esc_window" =~ ^[0-9]+$ ]] || esc_window="$cooldown"
+  if (( marker_ts > 0 )) && (( now_ts - marker_ts < esc_window )); then
     return 0
   fi
 
@@ -7904,7 +8046,8 @@ bridge_daemon_attached_human_followup_escalate() {
     bridge_notify_send "$admin" "$alert_title" \
       "Human-facing cron followup #${task_id} is queued on attached admin session ${agent}; drain ${agent}'s inbox." \
       "$task_id" high "${BRIDGE_DAEMON_NOTIFY_DRY_RUN:-0}" >/dev/null 2>&1 || true
-    printf '%s\n' "$now_ts" >"$marker" 2>/dev/null || true
+    # Marker line 1 = ts, line 2 = attempt count (#1973 Track B backoff).
+    printf '%s\n%s\n' "$now_ts" "$(( marker_attempts + 1 ))" >"$marker" 2>/dev/null || true
     return 0
   fi
 
@@ -7931,7 +8074,7 @@ bridge_daemon_attached_human_followup_escalate() {
     printf -- '- `agent-bridge inbox %s` — confirm the stranded followup is still queued.\n' "$agent"
     printf -- '- `agent-bridge urgent %s "drain your inbox; human-facing cron followup #%s is waiting"` — wake the parent agent to claim and forward it.\n' "$agent" "$task_id"
     printf -- '- Keep #1411 intact: do not bypass the attached-session nudge gate with raw daemon injection.\n\n'
-    printf 'This alert is refreshable via `bridge-queue.py upsert-open` and is rate-limited for %ss per source task id by `BRIDGE_FORWARD_FOLLOWUP_ATTACHED_ESCALATE_COOLDOWN_SECS`.\n' "$cooldown"
+    printf 'This alert is refreshable via `bridge-queue.py upsert-open` and is rate-limited on a capped exponential backoff seeded at %ss per source task id (`BRIDGE_FORWARD_FOLLOWUP_ATTACHED_ESCALATE_COOLDOWN_SECS`, doubling each refresh, bounded by `BRIDGE_DAEMON_NUDGE_REDELIVERY_MAX_SECONDS`).\n' "$cooldown"
   } >"$body_file"
 
   local title_prefix="[forward-followup-stranded] #${task_id} on ${agent} "
@@ -7972,7 +8115,8 @@ bridge_daemon_attached_human_followup_escalate() {
     bridge_notify_send "$admin" "$alert_title" \
       "Human-facing cron followup #${task_id} is queued on attached idle agent ${agent}. Admin task #${TASK_ID} has drain instructions." \
       "$TASK_ID" high "${BRIDGE_DAEMON_NOTIFY_DRY_RUN:-0}" >/dev/null 2>&1 || true
-    printf '%s\n' "$now_ts" >"$marker" 2>/dev/null || true
+    # Marker line 1 = ts, line 2 = attempt count (#1973 Track B backoff).
+    printf '%s\n%s\n' "$now_ts" "$(( marker_attempts + 1 ))" >"$marker" 2>/dev/null || true
   else
     daemon_warn "failed to file [forward-followup-stranded] task for source task=${task_id} agent=${agent}"
   fi
@@ -8748,6 +8892,17 @@ process_unclaimed_queue_escalation() {
   # here (the daemon-step only emits nudge candidates). Instead we ask the
   # queue CLI for every task in status='queued' AND whose assigned_to is
   # an existing agent — we filter age + claim status in this loop.
+  #
+  # Issue #1973 Track B / #1970 (PR#1972, parked) SEAM: the "is this task
+  # old enough to escalate" decision lives entirely in the
+  # lib/daemon-helpers/unclaimed-task-filter.py helper invoked below — it
+  # returns the EXPIRED subset, and this function only decides how often to
+  # re-escalate that subset. #1970/PR#1972 makes the helper's effective age
+  # lease-aware (a claimed-then-handed-back task is not "abandoned" until its
+  # lease lapses), which is exactly the right layer: it shrinks the eligible
+  # set WITHOUT this backoff logic needing to know about leases. So Track B
+  # composes cleanly with the parked lease-aware-age change — no hard
+  # dependency on its unmerged symbols; the rc2 cut merges both as-is.
   local now_ts state_dir
   now_ts="$(date +%s)"
   state_dir="$(bridge_daemon_unclaimed_escalation_state_dir)"
@@ -8792,13 +8947,29 @@ process_unclaimed_queue_escalation() {
 
     local task_id age_seconds title created_by priority marker age_minutes body_file cadence_note
     if (( cooldown > 0 )); then
-      cadence_note="This task fires at most once per ${cooldown}s cooldown window per (agent, queued task id)."
+      cadence_note="This task re-fires per (agent, queued task id) on a capped exponential backoff seeded at ${cooldown}s (doubling each re-nudge, bounded by BRIDGE_DAEMON_NUDGE_REDELIVERY_MAX_SECONDS) — not a fixed interval."
     else
       cadence_note="This task fires once per (agent, queued task id) — it re-arms when the task is claimed / done / reassigned to a different agent."
     fi
+    local _esc_new_attempts
     while IFS=$'\t' read -r task_id age_seconds title created_by priority; do
       [[ "$task_id" =~ ^[0-9]+$ ]] || continue
       marker="$(bridge_daemon_unclaimed_escalation_marker_file "$task_id")"
+      # Issue #1973 Track B: carry the per-(agent, task) attempt count
+      # forward (marker line 3). Reset to 0 when the marker is for a
+      # DIFFERENT agent (same-id handoff → the new assignee's backoff
+      # starts fresh) or absent/legacy. Used only by the periodic-mode
+      # (cooldown>0) capped backoff; the default once-latch ignores it.
+      _esc_new_attempts=0
+      if [[ -f "$marker" ]]; then
+        local _esc_prior_agent _esc_prior_attempts
+        _esc_prior_agent="$(sed -n '2p' "$marker" 2>/dev/null || printf '')"
+        if [[ -n "$_esc_prior_agent" && "$_esc_prior_agent" == "$agent" ]]; then
+          _esc_prior_attempts="$(sed -n '3p' "$marker" 2>/dev/null || printf '0')"
+          [[ "$_esc_prior_attempts" =~ ^[0-9]+$ ]] || _esc_prior_attempts=0
+          _esc_new_attempts="$_esc_prior_attempts"
+        fi
+      fi
       if [[ -f "$marker" ]]; then
         # Issue #1944: the latch is keyed by (agent, task), NOT task alone.
         # The marker records the agent it escalated for (line 2). A same-id
@@ -8819,15 +8990,31 @@ process_unclaimed_queue_escalation() {
           # (cooldown==0) suppress every further escalation until the
           # stale-marker sweep clears it (i.e. until the task leaves
           # `queued`). When the operator opts into periodic re-nudging
-          # (cooldown>0), fall back to the legacy behavior: re-escalate only
-          # after the cooldown window has elapsed.
+          # (cooldown>0), re-escalate only after the backoff window elapses.
           if (( cooldown == 0 )); then
             continue
           fi
-          local _marker_ts
+          # Issue #1973 Track B: periodic mode (cooldown>0) no longer
+          # re-arms on a FIXED interval — that was the fixed-5-min storm.
+          # Instead apply the SAME capped exponential backoff as the
+          # routine nudge: the window grows base→base*2→…→cap as attempts
+          # accumulate (marker line 3 = attempt count; the operator's
+          # cooldown env value seeds the base when set). A legacy 2-line
+          # marker (no line 3) reads attempts=0 → first re-arm uses the
+          # base window. Urgent/high tasks use the lower urgent cap so a
+          # backoff cannot bury time-sensitive escalations (brief risk #1).
+          local _marker_ts _marker_attempts _esc_base _esc_window
           _marker_ts="$(head -n1 "$marker" 2>/dev/null || printf '0')"
           [[ "$_marker_ts" =~ ^[0-9]+$ ]] || _marker_ts=0
-          if (( _marker_ts > 0 )) && (( now_ts - _marker_ts < cooldown )); then
+          _marker_attempts="$(sed -n '3p' "$marker" 2>/dev/null || printf '0')"
+          [[ "$_marker_attempts" =~ ^[0-9]+$ ]] || _marker_attempts=0
+          # Seed the backoff base from the operator's cooldown value so an
+          # explicit cooldown is honored as the FIRST window, then doubled.
+          _esc_base="$cooldown"
+          _esc_window="$(BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS="$_esc_base" \
+            bridge_daemon_nudge_backoff_delay "$_marker_attempts" "${priority:-normal}")"
+          [[ "$_esc_window" =~ ^[0-9]+$ ]] || _esc_window="$cooldown"
+          if (( _marker_ts > 0 )) && (( now_ts - _marker_ts < _esc_window )); then
             continue
           fi
         fi
@@ -8851,7 +9038,8 @@ process_unclaimed_queue_escalation() {
           2>/dev/null || true
         # Marker line 1 = escalation ts, line 2 = agent (the #1944
         # (agent, task) latch key — a later reassignment re-arms).
-        printf '%s\n%s\n' "$now_ts" "$agent" >"$marker" 2>/dev/null || true
+        # Line 3 = attempt count for the #1973 Track B periodic backoff.
+        printf '%s\n%s\n%s\n' "$now_ts" "$agent" "$(( _esc_new_attempts + 1 ))" >"$marker" 2>/dev/null || true
         changed=0
         continue
       fi
@@ -8911,7 +9099,8 @@ EOF
           2>/dev/null || true
         # Marker line 1 = escalation ts, line 2 = agent (the #1944
         # (agent, task) latch key — a later reassignment re-arms).
-        printf '%s\n%s\n' "$now_ts" "$agent" >"$marker" 2>/dev/null || true
+        # Line 3 = attempt count for the #1973 Track B periodic backoff.
+        printf '%s\n%s\n%s\n' "$now_ts" "$agent" "$(( _esc_new_attempts + 1 ))" >"$marker" 2>/dev/null || true
         changed=0
       else
         daemon_warn "failed to file [unclaimed-task] escalation for task=${task_id} agent=${agent}"
@@ -9665,7 +9854,9 @@ nudge_agent_session() {
   # place and the next idle-nudge tick re-fires unconditionally.
   # Issue #1322: also pass the live id csv so the per-task NUDGE_TASK_TS_*
   # entries get refreshed atomically with the composite fields.
-  bridge_daemon_record_nudge "$agent" "$nudge_fingerprint" "${live_nudge_key:-$nudge_key}" || true
+  # Issue #1973 Track B: pass the task priority so urgent/high work uses
+  # the lower backoff cap when computing the next-nudge window.
+  bridge_daemon_record_nudge "$agent" "$nudge_fingerprint" "${live_nudge_key:-$nudge_key}" "${task_priority:-normal}" || true
 
   bridge_audit_log daemon session_nudge_sent "$agent" \
     --detail queued="$live_queued" \

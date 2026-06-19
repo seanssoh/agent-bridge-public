@@ -2385,6 +2385,18 @@ select_for_path() {
       # the once-only body cadence, and the sweep-driven re-arm-on-state-
       # change contract are all pinned end-to-end against a real queue DB).
       add_required 1944-unclaimed-escalation-once-latch
+      # Issue #1973 Track B: bridge-daemon.sh's per-task nudge state now
+      # carries a capped exponential re-nudge backoff (base 60 -> *2 ->
+      # cap 900; urgent/high a lower cap) instead of a fixed redelivery
+      # window — closing the v0.16.15 drain-stall notification storm. The
+      # #1944 [unclaimed-task] once-latch stays the DEFAULT; only the
+      # operator-opt-in periodic mode (cooldown>0) and the attached-human
+      # followup refresh now use the same backoff (upsert-open kept).
+      # Pull 1973b-nudge-backoff on every bridge-daemon.sh move so a future
+      # PR cannot silently revert the backoff to a fixed interval, drop the
+      # reset-on-progress prune, lose the urgent lower-cap, or break the
+      # Track-C one-shot force-bypass seam.
+      add_required 1973b-nudge-backoff
       # v0.15.0-beta5-2 Track G (#1323 r3): bridge-daemon.sh's
       # nudge_agent_session verify-grace block does a two-stage check
       # (stage_2 = TOTAL elapsed-time gate, not additional sleep), and

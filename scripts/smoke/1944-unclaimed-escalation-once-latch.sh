@@ -441,7 +441,11 @@ smoke_run "D_teeth once-latch source shape" : ; {
     || smoke_fail "teeth: once-latch short-circuit '(( cooldown == 0 ))' must be present"
   # The (agent, task) latch key: the marker must record the agent and the
   # escalation must compare it against the current assignee (codex r1).
-  grep -qF 'printf '\''%s\n%s\n'\'' "$now_ts" "$agent"' "$daemon_sh" \
+  # Issue #1973 Track B extended the marker with a line-3 attempt count for
+  # the periodic-mode backoff; the agent must still be the line-2 field
+  # (`"$now_ts" "$agent"` immediately after the ts), so anchor on that
+  # ordering rather than the exact line count.
+  grep -qF 'printf '\''%s\n%s\n%s\n'\'' "$now_ts" "$agent" "$(( _esc_new_attempts + 1 ))"' "$daemon_sh" \
     || smoke_fail "teeth: marker must record the agent on line 2 (agent,task latch key)"
   grep -q '_marker_agent' "$daemon_sh" \
     || smoke_fail "teeth: escalation must compare the marker agent to the current assignee"
