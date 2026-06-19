@@ -895,7 +895,42 @@ class SendAdapterError(Exception):
 
 
 def _agent_plugin_dir(bridge_home: Path, agent: str, plugin: str) -> Path:
+    """Naive `<bridge_home>/agents/<agent>/.<plugin>` default.
+
+    This only matches a plain shared-mode layout where the agent's workdir IS
+    `<bridge_home>/agents/<agent>`. For iso-v2 agents, agents with an explicit
+    BRIDGE_AGENT_WORKDIR, or a BRIDGE_DATA_ROOT-relocated install the canonical
+    per-agent plugin state dir is `<workdir>/.<plugin>` — resolved in bash by
+    `bridge_agent_<plugin>_state_dir` and threaded in via `--plugin-state-dir`
+    (#2005). Callers must prefer that bash SSOT value and treat this only as a
+    last-resort fallback (and log when they fall back).
+    """
     return bridge_home / "agents" / agent / f".{plugin}"
+
+
+def _resolve_plugin_state_dir(
+    bridge_home: Path, agent: str, plugin: str, plugin_state_dir: str
+) -> Path:
+    """Return the canonical per-agent plugin state dir for an HTTP adapter.
+
+    Prefers the bash-resolved `--plugin-state-dir` value (the
+    `bridge_agent_<plugin>_state_dir` SSOT, which honors the iso-v2 /
+    BRIDGE_AGENT_WORKDIR-map / BRIDGE_DATA_ROOT workdir precedence). Falls back
+    to the naive `_agent_plugin_dir` only when the arg is empty, and logs the
+    fallback so an iso/custom-workdir mismatch is visible rather than silently
+    reading credentials from the wrong directory (#2005).
+    """
+    resolved = (plugin_state_dir or "").strip()
+    if resolved:
+        return Path(resolved).expanduser()
+    fallback = _agent_plugin_dir(bridge_home, agent, plugin)
+    print(
+        f"send-managed-message warning: {plugin} adapter received no "
+        f"--plugin-state-dir; falling back to {fallback} (canonical value is "
+        f"the bash-resolved bridge_agent_{plugin}_state_dir)",
+        file=sys.stderr,
+    )
+    return fallback
 
 
 def _read_dotenv(path: Path) -> dict[str, str]:
@@ -967,14 +1002,20 @@ def _adapter_discord(
     channel_id: str,
     reply_to_message_id: str,
     body: str,
+    plugin_state_dir: str = "",
 ) -> tuple[str, str]:
     """Discord adapter — POST /channels/{id}/messages with message_reference.
 
     Reads the bot token from the per-agent .discord/.env (DISCORD_BOT_TOKEN
     or BRIDGE_DISCORD_BOT_TOKEN); the access.json sidecar can override the
     token, mirroring how bridge-setup.py persists Discord credentials.
+
+    `plugin_state_dir` is the canonical `.discord` dir resolved in bash by
+    `bridge_agent_discord_state_dir` (the `<workdir>/.discord` SSOT that
+    bridge-setup.py also writes to). We read from that, not a Python-derived
+    path — see `_resolve_plugin_state_dir` (#2005).
     """
-    plugin_dir = _agent_plugin_dir(bridge_home, agent, "discord")
+    plugin_dir = _resolve_plugin_state_dir(bridge_home, agent, "discord", plugin_state_dir)
     env = _read_dotenv(plugin_dir / ".env")
     token = (
         env.get("DISCORD_BOT_TOKEN")
@@ -1023,14 +1064,20 @@ def _adapter_telegram(
     channel_id: str,
     reply_to_message_id: str,
     body: str,
+    plugin_state_dir: str = "",
 ) -> tuple[str, str]:
     """Telegram adapter — POST /bot{token}/sendMessage with reply_parameters.
 
     Reads the bot token from the per-agent .telegram/.env; access.json may
     override. Uses the modern `reply_parameters` envelope when a reply id is
     provided so quote-replies survive forum topics and supergroup retargets.
+
+    `plugin_state_dir` is the canonical `.telegram` dir resolved in bash by
+    `bridge_agent_telegram_state_dir` (the `<workdir>/.telegram` SSOT that
+    bridge-setup.py also writes to). We read from that, not a Python-derived
+    path — see `_resolve_plugin_state_dir` (#2005).
     """
-    plugin_dir = _agent_plugin_dir(bridge_home, agent, "telegram")
+    plugin_dir = _resolve_plugin_state_dir(bridge_home, agent, "telegram", plugin_state_dir)
     env = _read_dotenv(plugin_dir / ".env")
     token = (
         env.get("TELEGRAM_BOT_TOKEN")
@@ -1106,7 +1153,7 @@ def _adapter_teams(
     channel_id: str,
     reply_to_message_id: str,
     body: str,
-    teams_state_dir: str,
+    plugin_state_dir: str = "",
 ) -> tuple[str, str]:
     """Teams adapter — shell out to `bun plugins/teams/server.ts send-managed`.
 
@@ -1115,15 +1162,15 @@ def _adapter_teams(
     which only the bundled bun plugin can replay (`continueConversation`). So
     this adapter spawns the plugin CLI rather than POSTing.
 
-    `teams_state_dir` is the canonical `.teams` state dir resolved in bash by
+    `plugin_state_dir` is the canonical `.teams` state dir resolved in bash by
     `bridge_agent_teams_state_dir` (which honors the full iso-v2 /
     BRIDGE_AGENT_WORKDIR-map / BRIDGE_DATA_ROOT workdir precedence). We do NOT
     re-derive it in Python — the bash value is the single source of truth and
     is exported to the plugin as TEAMS_STATE_DIR so it reads the same
-    conversations.json the inbound listener seeded. The fallback below
-    (`<bridge_home>/agents/<agent>/.teams`) is a last-resort default that only
-    matches a plain shared-mode layout; it is logged so an iso/custom-workdir
-    mismatch is visible rather than silently wrong.
+    conversations.json the inbound listener seeded. The shared resolver below
+    falls back to `<bridge_home>/agents/<agent>/.teams` (a last-resort default
+    matching only a plain shared-mode layout) and logs the fallback so an
+    iso/custom-workdir mismatch is visible rather than silently wrong.
     """
     server_ts = bridge_home / "plugins" / "teams" / "server.ts"
     if not server_ts.is_file():
@@ -1139,15 +1186,9 @@ def _adapter_teams(
             "teams managed-send requires bun",
         )
 
-    resolved_state_dir = (teams_state_dir or "").strip()
-    if not resolved_state_dir:
-        resolved_state_dir = str(bridge_home / "agents" / agent / ".teams")
-        print(
-            "send-managed-message warning: teams adapter received no "
-            f"--teams-state-dir; falling back to {resolved_state_dir} "
-            "(canonical value is the bash-resolved bridge_agent_teams_state_dir)",
-            file=sys.stderr,
-        )
+    resolved_state_dir = str(
+        _resolve_plugin_state_dir(bridge_home, agent, "teams", plugin_state_dir)
+    )
 
     argv = [
         bun,
@@ -1230,16 +1271,26 @@ def _dispatch_send(
     channel_id: str,
     reply_to_message_id: str,
     body: str,
-    teams_state_dir: str = "",
+    plugin_state_dir: str = "",
 ) -> tuple[str, str]:
-    """Route the send call to the correct adapter, raising SendAdapterError."""
+    """Route the send call to the correct adapter, raising SendAdapterError.
+
+    `plugin_state_dir` is the bash-resolved `bridge_agent_<plugin>_state_dir`
+    SSOT (`<workdir>/.<plugin>`), threaded in for every HTTP/CLI adapter so
+    Python never re-derives the workdir (#2005). Each adapter falls back to the
+    naive `<bridge_home>/agents/<agent>/.<plugin>` only when it is empty.
+    """
     if plugin == "discord":
-        return _adapter_discord(bridge_home, agent, channel_id, reply_to_message_id, body)
+        return _adapter_discord(
+            bridge_home, agent, channel_id, reply_to_message_id, body, plugin_state_dir
+        )
     if plugin == "telegram":
-        return _adapter_telegram(bridge_home, agent, channel_id, reply_to_message_id, body)
+        return _adapter_telegram(
+            bridge_home, agent, channel_id, reply_to_message_id, body, plugin_state_dir
+        )
     if plugin == "teams":
         return _adapter_teams(
-            bridge_home, agent, channel_id, reply_to_message_id, body, teams_state_dir
+            bridge_home, agent, channel_id, reply_to_message_id, body, plugin_state_dir
         )
     if plugin in _PLUGINS_TRACK_C_PENDING:
         # Teams / Mattermost true managed-send needs the TS plugin server's
@@ -1280,7 +1331,7 @@ def cmd_send_managed_message(args: argparse.Namespace) -> int:
         kind = "notice"
     reply_to = (args.reply_to_message_id or "").strip()
     correlation_id = (args.correlation_id or "").strip()
-    teams_state_dir = (getattr(args, "teams_state_dir", "") or "").strip()
+    plugin_state_dir = (getattr(args, "plugin_state_dir", "") or "").strip()
 
     if not plugin or not agent or not channel_id or not body:
         return 2
@@ -1308,7 +1359,7 @@ def cmd_send_managed_message(args: argparse.Namespace) -> int:
     # on stderr where bridge-daemon.sh forwards it to the audit row reason.
     try:
         message_id, thread_id = _dispatch_send(
-            plugin, bridge_home, agent, channel_id, reply_to, body, teams_state_dir
+            plugin, bridge_home, agent, channel_id, reply_to, body, plugin_state_dir
         )
     except SendAdapterError as exc:
         print(f"send-managed-message error: {exc.code}: {exc.message}", file=sys.stderr)
@@ -1483,11 +1534,16 @@ def build_parser() -> argparse.ArgumentParser:
     send_parser.add_argument("--kind", default="notice", choices=("notice", "followup"))
     send_parser.add_argument("--bridge-home", required=True)
     send_parser.add_argument("--bridge-state-dir", required=True)
-    # Canonical `.teams` state dir resolved in bash by
-    # bridge_agent_teams_state_dir (honors iso-v2 / workdir-map precedence).
-    # The teams adapter exports it as TEAMS_STATE_DIR; we never re-derive the
-    # workdir in Python. Only set for plugin=teams; harmless otherwise.
-    send_parser.add_argument("--teams-state-dir", default="")
+    # Canonical `<workdir>/.<plugin>` state dir resolved in bash by
+    # bridge_agent_<plugin>_state_dir (honors iso-v2 / BRIDGE_AGENT_WORKDIR-map /
+    # BRIDGE_DATA_ROOT precedence). Every managed-send adapter reads its
+    # credentials/state from here instead of re-deriving the workdir in Python
+    # (#2005 generalizes #1996's teams-only thread to discord/telegram/teams).
+    # `--teams-state-dir` is kept as a back-compat alias for the (unshipped)
+    # #1996 flag name. Both map to the same dest.
+    send_parser.add_argument(
+        "--plugin-state-dir", "--teams-state-dir", dest="plugin_state_dir", default=""
+    )
     send_parser.add_argument("--correlation-id", default="")
     send_parser.add_argument("--format", choices=("shell", "json"), default="shell")
     send_parser.add_argument("--dry-run", action="store_true")

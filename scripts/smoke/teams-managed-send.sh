@@ -192,20 +192,23 @@ smoke_assert_contains "$ENV_CONTENT4" "TEAMS_STATE_DIR=$BRIDGE_HOME/agents/$AGEN
 
 smoke_log "T4 missing-state-dir fallback ok"
 
-# --- T5: the daemon-side send call sites thread --teams-state-dir -----------
+# --- T5: the daemon-side send call sites thread --plugin-state-dir ----------
 # The PreCompact notice + followup paths in bridge-daemon.sh build the
 # send-managed-message argv directly (bypassing
 # bridge_channel_send_managed_message), so they MUST resolve the canonical
-# teams state dir themselves. Guard both inlined argv builders so a future
-# refactor cannot silently drop the SSOT handoff and let the python adapter
-# fall back to the naive <bridge_home>/agents/<agent>/.teams path under iso v2.
+# per-agent plugin state dir themselves. #2005 generalized #1996's teams-only
+# --teams-state-dir into a single --plugin-state-dir (resolved by
+# bridge_plugin_channel_state_dir for discord/telegram/teams). Guard both
+# inlined argv builders so a future refactor cannot silently drop the SSOT
+# handoff and let the python adapter fall back to the naive
+# <bridge_home>/agents/<agent>/.<plugin> path under iso v2.
 DAEMON_SH="$REPO_ROOT/bridge-daemon.sh"
 smoke_assert_file_exists "$DAEMON_SH" "T5 bridge-daemon.sh present"
-DAEMON_TEAMS_HITS="$(grep -c -- '--teams-state-dir "\$_teams_state_dir"\|--teams-state-dir "\$_fu_teams_state_dir"' "$DAEMON_SH" || true)"
-[[ "$DAEMON_TEAMS_HITS" -ge 2 ]] || smoke_fail \
-  "T5 expected both daemon send paths (notice+followup) to thread --teams-state-dir, found $DAEMON_TEAMS_HITS"
+DAEMON_PLUGIN_HITS="$(grep -c -- '--plugin-state-dir "\$_plugin_state_dir"\|--plugin-state-dir "\$_fu_plugin_state_dir"' "$DAEMON_SH" || true)"
+[[ "$DAEMON_PLUGIN_HITS" -ge 2 ]] || smoke_fail \
+  "T5 expected both daemon send paths (notice+followup) to thread --plugin-state-dir, found $DAEMON_PLUGIN_HITS"
 
-smoke_log "T5 daemon send paths thread --teams-state-dir ok"
+smoke_log "T5 daemon send paths thread --plugin-state-dir ok"
 
 # --- T6: bridge_notify_send fails closed for a teams kind -------------------
 # bridge_agent_notify_kind now resolves `teams`, but bridge-notify.py has no
