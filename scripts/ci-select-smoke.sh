@@ -4776,13 +4776,19 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # containment) and — because the classifier also backs the read-only
       # detector — the doctor's behavior-preserving smoke. Pull both so a
       # change to either file is caught by the detector AND the action teeth.
+      # Issue #1982: the registered fast-path now case-folds the name match on
+      # case-insensitive volumes (sharing the #598 retire guard's inode-aware,
+      # fail-safe-toward-KEEP approach, though against a different base — see
+      # the classifier docstring). Pull the casefold smoke so a refactor of the
+      # `_classify_child` registered short-circuit cannot regress the parallel-
+      # tree case-variant keep or the case-sensitive-FS no-collapse.
       # Issue #1966: _enumerate_symlink_targets_under_root now PRUNES heavy
       # non-symlink content trees (node_modules / .git / .claude/{projects,cache})
       # and reads symlink-ness from a cached os.scandir DirEntry. The prune is
       # speed-only — the keep-set RESULT (and thus the orphan COUNT) must be
       # byte-identical. Pull 1966-orphan-walk-prune so a refactor that drops a
       # real keep-set symlink from the walk (changing the result) is caught.
-      add_required 1803-orphan-dir-gc orphan-agent-dir agent-doctor status-engine-detect 1966-orphan-walk-prune
+      add_required 1803-orphan-dir-gc orphan-agent-dir agent-doctor status-engine-detect 1966-orphan-walk-prune 1982-orphan-classifier-casefold
       add_integration integration-minimal
       ;;
 

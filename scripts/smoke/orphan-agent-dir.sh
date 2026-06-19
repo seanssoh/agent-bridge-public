@@ -391,26 +391,33 @@ test_case_variant_registered_not_flagged() {
 }
 
 # ---------------------------------------------------------------------------
-# T9 — Issue #1787 (codex r1): the skip is INODE identity, NOT an unconditional
-#      case-fold. A dir whose basename only case-DIFFERS from a registered id
-#      but is a PHYSICALLY DISTINCT directory (different inode) MUST still be
-#      flagged — otherwise the detector loses its teeth on a case-sensitive fs
-#      (Linux), where `CRM-TEST-BSH` and `crm-test-bsh` are separate dirs and
-#      the uppercase one is a genuine orphan. We reproduce the distinct-inode
-#      case on ANY fs (incl. case-insensitive APFS) by registering the agent's
-#      home at a SEPARATE physical location, so the case-folding on-disk dir is
-#      provably NOT the same file as the registered home.
+# T9 — Issue #1982: the case-fold keep is gated on the FILESYSTEM proving the
+#      collision, so the outcome is fs-dependent.
+#
+#      A registered agent `widget` whose home lives OUTSIDE the home root, plus
+#      an on-disk dir `agents/WIDGET` whose basename case-folds to `widget`:
+#
+#      * case-SENSITIVE fs (Linux ext4): `agents/WIDGET` and `agents/widget`
+#        are genuinely distinct dirs (and `agents/widget` does not even exist),
+#        so the case-fold samefile probe fails → `WIDGET` is a real orphan and
+#        STILL flagged (detector teeth intact, no false negative).
+#      * case-INSENSITIVE fs (macOS APFS): `agents/WIDGET` IS the same inode as
+#        `agents/widget`, which the `name in known` fast-path keeps by NAME
+#        (independent of where the registered home points). Flagging the
+#        uppercase variant while keeping the lowercase one was the #1982 bug;
+#        the case-fold classifier now keeps BOTH → `WIDGET` is NOT flagged.
+#
+#      This is the same registered-name fast-path the lowercase siblings get;
+#      the fix only removes the case-sensitivity asymmetry on the side that can
+#      MOVE data.
 # ---------------------------------------------------------------------------
 test_case_folding_but_distinct_inode_still_flagged() {
   reset_home_root
   # Registered agent `widget` whose home lives OUTSIDE the home root, in a
-  # dedicated physical dir — so the same-named on-disk dir below is a
-  # genuinely different inode even on a case-insensitive volume.
+  # dedicated physical dir (a `--prefer new` worktree-home shape).
   local real_home="$SMOKE_TMP_ROOT/widget-real-home"
   mkdir -p "$real_home"
-  # On-disk dir under the home root whose basename case-folds to `widget` but
-  # is NOT the registered home (different inode). On a case-sensitive fs this
-  # is the canonical "uppercase variant is a separate orphan" shape.
+  # On-disk dir under the home root whose basename case-folds to `widget`.
   mkdir -p "$BRIDGE_AGENT_HOME_ROOT/WIDGET"
 
   # Custom registry: home points at the dedicated dir, not $HOME_ROOT/widget.
@@ -420,18 +427,26 @@ test_case_folding_but_distinct_inode_still_flagged() {
 
   local out
   out="$(run_doctor_orphan "$registry")"
-
-  # `WIDGET` is a distinct inode from the registered home → still flagged
-  # (the case-fold collision must NOT suppress a genuine orphan).
-  local orphan_dir
+  local orphan_dir count
   orphan_dir="$(finding_field "$out" "WIDGET" "dir")"
-  smoke_assert_contains "$orphan_dir" "WIDGET" \
-    "T9 a distinct-inode case-folding dir is STILL flagged (no false negative)"
-
-  local count
   count="$(findings_count "$out")"
-  smoke_assert_eq "1" "$count" \
-    "T9 exactly one finding (the distinct-inode orphan)"
+
+  # Is THIS fs case-insensitive at the home root? (Does the lowercase spelling
+  # reach the same inode as the on-disk uppercase dir?)
+  if [[ -d "$BRIDGE_AGENT_HOME_ROOT/widget" ]] \
+      && [[ "$BRIDGE_AGENT_HOME_ROOT/widget" -ef "$BRIDGE_AGENT_HOME_ROOT/WIDGET" ]]; then
+    # case-insensitive: WIDGET == widget (the name-fast-path keep) → kept (#1982).
+    smoke_assert_eq "__MISSING__" "$orphan_dir" \
+      "T9 case-insensitive fs: a case-variant of a registered id is kept (#1982)"
+    smoke_assert_eq "0" "$count" \
+      "T9 case-insensitive fs: no orphan finding (case-variant of a live agent)"
+  else
+    # case-sensitive: WIDGET is a genuinely distinct orphan → still flagged.
+    smoke_assert_contains "$orphan_dir" "WIDGET" \
+      "T9 case-sensitive fs: a distinct-inode case-folding dir is STILL flagged"
+    smoke_assert_eq "1" "$count" \
+      "T9 case-sensitive fs: exactly one finding (the distinct-inode orphan)"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -511,7 +526,7 @@ smoke_run "T5 _template/shared skipped" test_template_and_shared_skipped
 smoke_run "T6 unreadable subdir partial finding" test_unreadable_subdir_partial_finding
 smoke_run "T7 *-repro-<digits> suffix" test_repro_suffix_artifact
 smoke_run "T8 case-variant registered not flagged" test_case_variant_registered_not_flagged
-smoke_run "T9 distinct-inode case-fold still flagged" test_case_folding_but_distinct_inode_still_flagged
+smoke_run "T9 case-fold keep is fs-gated (#1982)" test_case_folding_but_distinct_inode_still_flagged
 smoke_run "T10 indeterminate fail-safe (no orphan)" test_indeterminate_failsafe_no_orphan
 
 smoke_log "all orphan-agent-dir cases passed"
