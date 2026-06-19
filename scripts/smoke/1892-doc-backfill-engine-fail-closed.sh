@@ -86,17 +86,20 @@ write_roster() {
   } >"$BRIDGE_ROSTER_FILE"
 }
 
-# A profile home whose CLAUDE.md TRIPS the codex filesystem heuristic (mentions
-# "Codex CLI"), with NO agent-meta.env present anywhere (the absent-signal case).
+# A profile home whose CLAUDE.md TRIPS the codex filesystem heuristic (carries a
+# resolved `런타임: Codex CLI` runtime declaration), with NO agent-meta.env present
+# anywhere (the absent-signal case).
 write_codex_tripping_profile() {
   local agent="$1"
   local profile="$BRIDGE_AGENT_HOME_ROOT/$agent"
   local workdir="$BRIDGE_AGENT_ROOT_V2/$agent/workdir"
   mkdir -p "$profile" "$workdir"
   # No SESSION-TYPE.md Session Type line that forces static-codex; the engine
-  # signal must come from the roster, not the session type. The CLAUDE.md string
-  # "Codex CLI" is exactly what would make detect_engine() guess codex.
-  printf '# %s — Monitor (collab via Codex CLI)\n' "$agent" >"$profile/CLAUDE.md"
+  # signal must come from the roster, not the session type. The resolved
+  # `런타임: Codex CLI` runtime declaration is exactly what makes detect_engine()
+  # guess codex (#1930: a bare "Codex CLI" mention no longer trips it — only the
+  # resolved runtime-label value does).
+  printf '# %s — Monitor (런타임: Codex CLI)\n' "$agent" >"$profile/CLAUDE.md"
   printf '# soul\n' >"$profile/SOUL.md"
   # Affirmatively assert the absent-signal precondition.
   [[ ! -f "$BRIDGE_STATE_DIR/agents/$agent/agent-meta.env" ]] || smoke_fail "precondition: agent-meta.env unexpectedly present for $agent"  # noqa: iso-helper-boundary  (controller-only fixture path assertion, not a runtime boundary RW)
