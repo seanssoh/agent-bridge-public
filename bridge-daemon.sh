@@ -5762,6 +5762,8 @@ bridge_write_blocked_prompt_report() {
   local first_seen_ts="$7"
   local last_seen_ts="$8"
   local excerpt="$9"
+  # Issue #2007: engine (claude|codex) so the report names the right runtime.
+  local engine="${10:-claude}"
   local first_iso="" last_iso=""
 
   first_iso="$(bridge_with_timeout 5 safety_floor_iso python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" stall-iso-format "$first_seen_ts" 2>/dev/null || printf '%s' "$first_seen_ts")"
@@ -5772,6 +5774,7 @@ bridge_write_blocked_prompt_report() {
     echo
     echo "- agent: $agent"
     echo "- session: ${session:--}"
+    echo "- engine: $engine"
     echo "- prompt_kind: $prompt_kind"
     echo "- confidence: $confidence"
     echo "- content_hash: $content_hash"
@@ -5781,7 +5784,7 @@ bridge_write_blocked_prompt_report() {
     echo
     echo "## What this means"
     echo
-    echo "An interactive prompt has been blocking ${agent}'s Claude session past the"
+    echo "An interactive prompt has been blocking ${agent}'s ${engine} session past the"
     echo "auto-accept window. The daemon did NOT and will NOT press any key — this is a"
     echo "detect-and-escalate floor. A human must inspect the pane and act."
     echo
@@ -5990,8 +5993,14 @@ process_blocked_prompt_safety_floor() {
 
   while IFS=$'\t' read -r agent queued claimed blocked active idle last_seen last_nudge session engine workdir; do
     [[ -n "$agent" ]] || continue
-    # Claude-only floor: Codex panes are explicitly out of scope for v0.16.
-    [[ "$engine" == "claude" ]] || continue
+    # Issue #2007: the floor now covers Claude AND Codex panes (detect-only for
+    # both — the rc2 floor never sends keys). Any other engine stays out of
+    # scope. The detector below is dispatched by --engine so a Codex hook-trust
+    # prompt and a Claude trust picker never use each other's signatures.
+    case "$engine" in
+      claude|codex) ;;
+      *) continue ;;
+    esac
     [[ "$active" == "1" && -n "$session" ]] || { bridge_clear_safety_floor_state "$agent"; continue; }
     bridge_tmux_session_exists "$session" || { bridge_clear_safety_floor_state "$agent"; continue; }
 
@@ -6037,7 +6046,7 @@ process_blocked_prompt_safety_floor() {
       excerpt="$capture"
       local detect_shell=""
       detect_shell="$(bridge_with_timeout "$capture_timeout" safety_floor_detect \
-        python3 "$SCRIPT_DIR/bridge-stall.py" detect-prompt --format shell < "$_capture_tmp" 2>/dev/null || true)"
+        python3 "$SCRIPT_DIR/bridge-stall.py" detect-prompt --engine "$engine" --format shell < "$_capture_tmp" 2>/dev/null || true)"
       if [[ -n "$detect_shell" ]]; then
         PROMPT_MATCHED=0 PROMPT_KIND="" PROMPT_CONFIDENCE="" PROMPT_CONTENT_HASH=""
         printf '%s\n' "$detect_shell" > "$_shell_tmp"
@@ -6055,7 +6064,7 @@ process_blocked_prompt_safety_floor() {
       # prompt / ready prompt / content-hash change resets the deadline.
       if [[ -f "$state_file" ]]; then
         bridge_audit_log daemon blocked_prompt_cleared "$agent" \
-          --detail prompt_kind="$prior_kind" --detail content_hash="$prior_hash"
+          --detail engine="$engine" --detail prompt_kind="$prior_kind" --detail content_hash="$prior_hash"
         bridge_clear_safety_floor_state "$agent"
         changed=0
       fi
@@ -6063,7 +6072,11 @@ process_blocked_prompt_safety_floor() {
     fi
 
     # --- dedupe / stability key ---------------------------------------------
-    local cur_key="prompt:${prompt_kind}:${content_hash}"
+    # Issue #2007: fold engine into the key so a Codex hook prompt and a Claude
+    # picker on the same agent/hash never collide in dedup/state (the prompt_kind
+    # already differs, but the engine prefix makes the separation explicit and
+    # survives any future kind-name overlap).
+    local cur_key="prompt:${engine}:${prompt_kind}:${content_hash}"
     if [[ "$cur_key" != "$prior_key" || "$session" != "$prior_session" ]]; then
       # New prompt / new session: re-latch. Fresh deadline, escalation reset.
       first_seen_ts="$now_ts"
@@ -6073,6 +6086,7 @@ process_blocked_prompt_safety_floor() {
       refire_ts=0
       task_id=""
       bridge_audit_log daemon blocked_prompt_detected "$agent" \
+        --detail engine="$engine" \
         --detail prompt_kind="$prompt_kind" \
         --detail confidence="$prompt_conf" \
         --detail content_hash="$content_hash" \
@@ -6131,7 +6145,7 @@ process_blocked_prompt_safety_floor() {
     if (( want_notify == 1 )); then
       if (( new_escalations >= per_pass_cap )); then
         bridge_audit_log daemon blocked_prompt_escalation_capped "$agent" \
-          --detail prompt_kind="$prompt_kind" --detail content_hash="$content_hash" \
+          --detail engine="$engine" --detail prompt_kind="$prompt_kind" --detail content_hash="$content_hash" \
           --detail cap="$per_pass_cap"
         bridge_note_safety_floor_state "$agent" "$cur_key" "$prompt_kind" "$content_hash" \
           "$session" "$first_seen_ts" "$last_seen_ts" "$stable_ticks" "$escalated_ts" "$notify_ts" "$task_id" "$refire_ts"
@@ -6142,11 +6156,13 @@ process_blocked_prompt_safety_floor() {
       # regardless of whether the external transport succeeds or is missing.
       refire_ts="$now_ts"
 
-      # Write the report FIRST (untrusted excerpt lives only here).
+      # Write the report FIRST (untrusted excerpt lives only here). The path
+      # carries the engine so a Codex and a Claude prompt for the same agent
+      # never overwrite each other's report (#2007).
       local report_path
-      report_path="$BRIDGE_SHARED_DIR/blocked-prompts/${now_ts}-${agent}-${prompt_kind}-${content_hash}.md"
+      report_path="$BRIDGE_SHARED_DIR/blocked-prompts/${now_ts}-${agent}-${engine}-${prompt_kind}-${content_hash}.md"
       bridge_write_blocked_prompt_report "$report_path" "$agent" "$session" "$prompt_kind" \
-        "$content_hash" "$prompt_conf" "$first_seen_ts" "$last_seen_ts" "$excerpt"
+        "$content_hash" "$prompt_conf" "$first_seen_ts" "$last_seen_ts" "$excerpt" "$engine"
 
       # Self-picker bootstrap: the admin blocked on its OWN picker cannot read a
       # task assigned to itself — go DIRECTLY to the operator notify. (For any
@@ -6159,13 +6175,14 @@ process_blocked_prompt_safety_floor() {
 
       # THE GUARANTEE: daemon-owned external operator notify (no live agent).
       local title message notify_ok=0
-      title="[safety-floor] ${agent} blocked on ${prompt_kind} prompt"
-      message="Agent ${agent} (session ${session}) is stuck on a ${prompt_kind} interactive prompt that auto-accept did not clear. content_hash=${content_hash}, confidence=${prompt_conf}, first_seen=${first_seen_ts}. Inspect the pane and act. Report: ${report_path}"
+      title="[safety-floor] ${agent} blocked on ${engine} ${prompt_kind} prompt"
+      message="Agent ${agent} (${engine} session ${session}) is stuck on a ${prompt_kind} interactive prompt that auto-accept did not clear. content_hash=${content_hash}, confidence=${prompt_conf}, first_seen=${first_seen_ts}. Inspect the pane and act. Report: ${report_path}"
       if bridge_operator_notify_send "$title" "$message" "" urgent; then
         notify_ok=1
         notify_ts="$now_ts"
         bridge_safety_floor_set_operator_notify_status configured ok
         bridge_audit_log daemon blocked_prompt_operator_notified "$agent" \
+          --detail engine="$engine" \
           --detail prompt_kind="$prompt_kind" \
           --detail content_hash="$content_hash" \
           --detail self_picker="$is_self_picker" \
@@ -6175,6 +6192,7 @@ process_blocked_prompt_safety_floor() {
         # no-wedge guarantee is NOT available. Surface it loudly.
         bridge_safety_floor_set_operator_notify_status missing none
         bridge_audit_log daemon blocked_prompt_operator_notify_missing "$agent" \
+          --detail engine="$engine" \
           --detail prompt_kind="$prompt_kind" \
           --detail content_hash="$content_hash" \
           --detail self_picker="$is_self_picker"
@@ -6204,6 +6222,7 @@ process_blocked_prompt_safety_floor() {
         escalated_ts="$now_ts"
       fi
       bridge_audit_log daemon blocked_prompt_escalated "$agent" \
+        --detail engine="$engine" \
         --detail prompt_kind="$prompt_kind" \
         --detail content_hash="$content_hash" \
         --detail operator_notify="$([[ "$notify_ok" == "1" ]] && printf 'sent' || printf 'missing')" \

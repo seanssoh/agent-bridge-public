@@ -2,12 +2,13 @@
 # shellcheck shell=bash
 # scripts/smoke/1991-blocked-prompt-safety-floor.sh — Issue #1991 SAFETY FLOOR.
 #
-# A blocked interactive Claude prompt (dev-channels picker / trust / summary /
-# permission / feedback / context-pressure / billing / unknown) that the
-# existing best-effort auto-accept fails to clear must become a LOUD operator
-# escalation within ~2 minutes, INDEPENDENTLY of the blocked agent — never a
-# silent stuck pane. This floor is OBSERVE-ONLY: it never sends keys, never
-# selects a UI option, and never asks an LLM to read the pane.
+# A blocked interactive prompt (Claude: dev-channels picker / trust / summary /
+# permission / feedback / context-pressure / billing / unknown — or Codex:
+# hook-trust / unknown-modal, #2007) that the existing best-effort auto-accept
+# fails to clear must become a LOUD operator escalation within ~2 minutes,
+# INDEPENDENTLY of the blocked agent — never a silent stuck pane. This floor is
+# OBSERVE-ONLY: it never sends keys, never selects a UI option, and never asks
+# an LLM to read the pane.
 #
 # This smoke implements the design's 11-case matrix. It runs entirely in an
 # isolated BRIDGE_HOME and STUBS bridge-notify.sh so NO real Discord/Telegram
@@ -65,6 +66,12 @@ detect() {
   printf '%s\n' "$1" | python3 "$STALL_PY" detect-prompt --format shell
 }
 
+# shellcheck disable=SC2329
+detect_codex() {
+  # Issue #2007: same as detect() but routed through the Codex detector.
+  printf '%s\n' "$1" | python3 "$STALL_PY" detect-prompt --engine codex --format shell
+}
+
 # detect-prompt --format shell emits JSON-quoted values (KEY="value"). Extract
 # the value for KEY, stripping the surrounding double quotes.
 # shellcheck disable=SC2329
@@ -94,13 +101,19 @@ Resume full session as-is
 }
 
 # shellcheck disable=SC2329
-test_06_codex_pane_no_escalation() {
-  # The floor is Claude-only: the detector may classify the text, but the
-  # daemon sweep skips engine != claude. A Codex-looking chooser is verified
-  # to be excluded at the daemon layer in Part 2 (engine gate). Here we assert
-  # the daemon's Claude-only gate exists in source.
-  grep -q '\[\[ "\$engine" == "claude" \]\] || continue' "$DAEMON_SH" \
-    || smoke_fail "safety-floor sweep is not Claude-only (engine gate missing)"
+test_06_engine_gate_claude_and_codex() {
+  # Issue #2007: the floor now covers Claude AND Codex panes (detect-only for
+  # both). Assert the daemon's engine gate admits claude|codex and skips any
+  # other engine. The actual codex routing + non-claude/codex skip is exercised
+  # behaviorally in Part 2 (test_15 / test_16).
+  grep -Eq 'case[[:space:]]+"\$engine"[[:space:]]+in' "$DAEMON_SH" \
+    || smoke_fail "safety-floor sweep no longer uses an engine case gate (#2007)"
+  grep -Eq 'claude\|codex\)' "$DAEMON_SH" \
+    || smoke_fail "safety-floor engine gate does not admit claude|codex (#2007)"
+  # The detector must be dispatched by engine so codex/claude signatures cannot
+  # cross-match.
+  grep -q 'detect-prompt --engine "\$engine"' "$DAEMON_SH" \
+    || smoke_fail "safety-floor does not pass --engine to the detector (#2007)"
 }
 
 # shellcheck disable=SC2329
@@ -304,6 +317,120 @@ line five'
     || smoke_fail "excerpt backtick line not indented — could close a fence"
 }
 
+# ---------------------------------------------------------------------------
+# Issue #2007: Codex detector cases (detect-only). Numbering/prefix-independent
+# hook-trust match, quoted/logged negative, unknown low-confidence modal, and
+# the back-compat guarantee that the Codex signatures NEVER match on the Claude
+# path (no #1991 regression).
+# ---------------------------------------------------------------------------
+
+# The verified 0.140 hook-trust prompt in its two rendered variants. Numbered
+# (10-hook top-level menu) and unnumbered `›` selector (1-hook). The 6 signature
+# strings are byte-identical across both; only the option-row prefix differs.
+CODEX_HOOK_TRUST_NUMBERED='Hooks need review
+2 hooks are new or changed since you last reviewed them.
+1. Review hooks
+2. Trust all and continue
+3. Continue without trusting
+Press enter to confirm or esc to go back'
+
+CODEX_HOOK_TRUST_UNNUMBERED='Hooks need review
+1 hook is new or changed since you last reviewed it.
+›  Review hooks
+   Trust all and continue
+   Continue without trusting
+Press enter to confirm or esc to go back'
+
+# shellcheck disable=SC2329
+test_15_codex_hook_trust_numbering_independent() {
+  # Both the numbered and the unnumbered-prefix variant must match as a
+  # high-confidence codex_hook_trust prompt (design Addendum: strip N./› before
+  # matching — here the substring signatures are inherently prefix-independent).
+  local num unum
+  num="$(detect_codex "$CODEX_HOOK_TRUST_NUMBERED")"
+  unum="$(detect_codex "$CODEX_HOOK_TRUST_UNNUMBERED")"
+  smoke_assert_eq "1" "$(prompt_field PROMPT_MATCHED "$num")" \
+    "codex hook-trust (numbered menu) detects"
+  smoke_assert_eq "codex_hook_trust" "$(prompt_field PROMPT_KIND "$num")" \
+    "codex hook-trust (numbered) classified as codex_hook_trust"
+  smoke_assert_eq "high" "$(prompt_field PROMPT_CONFIDENCE "$num")" \
+    "codex hook-trust (numbered) is high confidence"
+  smoke_assert_eq "1" "$(prompt_field PROMPT_MATCHED "$unum")" \
+    "codex hook-trust (unnumbered › prefix) detects — numbering-independent"
+  smoke_assert_eq "codex_hook_trust" "$(prompt_field PROMPT_KIND "$unum")" \
+    "codex hook-trust (unnumbered) classified the same as numbered"
+  # content_hash present so escalation can prefer hashes over raw pane text.
+  [[ -n "$(prompt_field PROMPT_CONTENT_HASH "$num")" ]] \
+    || smoke_fail "codex hook-trust content_hash missing"
+}
+
+# shellcheck disable=SC2329
+test_16_codex_quoted_logged_prompt_no_match() {
+  # A transcript/log that QUOTES the hook-trust prompt with trailing content
+  # after the footer must NOT match — the confirm footer must be the LAST
+  # non-blank line (live footer), mirroring the Claude last-line anchor.
+  local QUOTED="The startup log recorded:
+$CODEX_HOOK_TRUST_NUMBERED
+and then the agent trusted the hooks and continued its task."
+  smoke_assert_eq "0" "$(prompt_field PROMPT_MATCHED "$(detect_codex "$QUOTED")")" \
+    "quoted codex hook-trust with trailing text does NOT match (last-line anchor)"
+  # A bare ready caret after the footer (agent returned to the composer) → no match.
+  local RESOLVED="$CODEX_HOOK_TRUST_NUMBERED
+›"
+  smoke_assert_eq "0" "$(prompt_field PROMPT_MATCHED "$(detect_codex "$RESOLVED")")" \
+    "codex hook-trust followed by a bare ready caret does NOT match (resolved)"
+  # Active mid-render output after the footer → no match.
+  local MIDRENDER="$CODEX_HOOK_TRUST_NUMBERED
+✻ Working… (esc to interrupt · 200 tokens)"
+  smoke_assert_eq "0" "$(prompt_field PROMPT_MATCHED "$(detect_codex "$MIDRENDER")")" \
+    "codex active-output tail does NOT match a settled modal"
+}
+
+# shellcheck disable=SC2329
+test_17_codex_unknown_modal_low_confidence() {
+  # A Codex modal with the exact confirm footer as the live last line plus >=2
+  # numbered/selector option rows, but NO hook-trust signature → low-confidence
+  # codex_unknown_interactive (longer unknown deadline applies).
+  local UNKNOWN="Choose how to proceed:
+1. Apply the patch
+2. Skip for now
+Press enter to confirm or esc to go back"
+  local out; out="$(detect_codex "$UNKNOWN")"
+  smoke_assert_eq "1" "$(prompt_field PROMPT_MATCHED "$out")" \
+    "structured unknown codex modal detects"
+  smoke_assert_eq "codex_unknown_interactive" "$(prompt_field PROMPT_KIND "$out")" \
+    "unknown codex modal classified as codex_unknown_interactive"
+  smoke_assert_eq "low" "$(prompt_field PROMPT_CONFIDENCE "$out")" \
+    "unknown codex modal is low confidence (longer deadline)"
+  # Benign prose with the footer text but no option rows → no match.
+  smoke_assert_eq "0" "$(prompt_field PROMPT_MATCHED "$(detect_codex \
+    "All done. The prompt 'Press enter to confirm or esc to go back' is gone.
+Idle now.")")" \
+    "benign prose mentioning the footer does NOT match (footer not last line)"
+  # Footer as last line but only ONE option row → no match (needs >=2).
+  smoke_assert_eq "0" "$(prompt_field PROMPT_MATCHED "$(detect_codex \
+    "Continue?
+1. Yes
+Press enter to confirm or esc to go back")")" \
+    "single option row does NOT match unknown codex modal (needs >=2 rows)"
+}
+
+# shellcheck disable=SC2329
+test_18_codex_signatures_inert_on_claude_path() {
+  # No #1991 regression: the Codex hook-trust prompt must NOT match the Claude
+  # detector (default engine), and a Claude picker must NOT match the Codex
+  # detector. The two signature sets are disjoint.
+  smoke_assert_eq "0" "$(prompt_field PROMPT_MATCHED "$(detect "$CODEX_HOOK_TRUST_NUMBERED")")" \
+    "codex hook-trust does NOT match the Claude detector (default engine)"
+  local CLAUDE_DEVCH='WARNING: Loading development channels
+  1. I am using this for local development
+Enter to confirm · Esc to cancel'
+  smoke_assert_eq "1" "$(prompt_field PROMPT_MATCHED "$(detect "$CLAUDE_DEVCH")")" \
+    "claude devchannels still matches the Claude detector (no regression)"
+  smoke_assert_eq "0" "$(prompt_field PROMPT_MATCHED "$(detect_codex "$CLAUDE_DEVCH")")" \
+    "claude devchannels does NOT match the Codex detector (disjoint signatures)"
+}
+
 # ===========================================================================
 # Part 2: daemon all-pane sweep + INDEPENDENT escalation. We source the real
 # safety-floor functions from bridge-daemon.sh (via bridge-lib.sh for the
@@ -458,10 +585,10 @@ test_01_idle_blocked_no_work_detects_and_escalates() {
   smoke_assert_eq "1" "$(notify_count)" "tick3: deadline passed → exactly one DIRECT operator notify"
   smoke_assert_contains "$(cat "$NOTIFY_LOG")" "--kind discord" "daemon called external transport with --kind"
   smoke_assert_contains "$(cat "$NOTIFY_LOG")" "--target 123456789" "daemon called external transport with --target"
-  smoke_assert_contains "$(cat "$NOTIFY_LOG")" "worker-claude blocked on devchannels" "notify names the agent + prompt kind"
+  smoke_assert_contains "$(cat "$NOTIFY_LOG")" "worker-claude blocked on claude devchannels" "notify names the agent + engine + prompt kind"
 
   # A report was written FIRST under shared/blocked-prompts.
-  local reports; reports="$(find "$BRIDGE_SHARED_DIR/blocked-prompts" -name '*-worker-claude-devchannels-*.md' 2>/dev/null | head -1)"
+  local reports; reports="$(find "$BRIDGE_SHARED_DIR/blocked-prompts" -name '*-worker-claude-claude-devchannels-*.md' 2>/dev/null | head -1)"
   [[ -n "$reports" ]] || smoke_fail "escalation report not written under shared/blocked-prompts"
   smoke_assert_contains "$(cat "$reports")" "UNTRUSTED" "report flags pane text as untrusted"
 }
@@ -514,7 +641,7 @@ test_04_self_picker_bootstrap_direct_notify() {
   local row; row="$(summary_row patch patch claude)"
   floor_tick "$row"; floor_tick "$row"; age_first_seen patch 120; floor_tick "$row"
   smoke_assert_eq "1" "$(notify_count)" "self-picker admin → DIRECT operator notify (not a self-task)"
-  smoke_assert_contains "$(cat "$NOTIFY_LOG")" "patch blocked on devchannels" "self-picker notify names the admin"
+  smoke_assert_contains "$(cat "$NOTIFY_LOG")" "patch blocked on claude devchannels" "self-picker notify names the admin"
 }
 
 # shellcheck disable=SC2329
@@ -577,6 +704,59 @@ test_09_missing_operator_notify_config_audit_no_guarantee() {
     "missing-operator escalation respects cooldown (no report-storm every tick, codex r1 #3)"
 }
 
+# A live Codex hook-trust pane (numbered top-level menu). Footer is the literal
+# last line — a live modal, not a quoted transcript.
+CODEX_PANE='Hooks need review
+2 hooks are new or changed since you last reviewed them.
+1. Review hooks
+2. Trust all and continue
+3. Continue without trusting
+Press enter to confirm or esc to go back'
+
+# shellcheck disable=SC2329
+test_19_daemon_routes_codex_via_same_floor() {
+  # Issue #2007: a Codex pane blocked on a hook-trust prompt routes through the
+  # SAME safety floor and escalates via the SAME direct operator notify — no
+  # second floor, no keys sent.
+  reset_floor_state
+  export BRIDGE_ADMIN_AGENT_ID=""
+  export BRIDGE_OPERATOR_NOTIFY_KIND="discord"
+  export BRIDGE_OPERATOR_NOTIFY_TARGET="222"
+  PANE_FIXTURE=([worker-codex]="$CODEX_PANE")
+  local row; row="$(summary_row worker-codex worker-codex codex)"
+  floor_tick "$row"   # detect (stable=1)
+  smoke_assert_eq "0" "$(notify_count)" "codex tick1: detect only, no escalation before 2-tick stability"
+  floor_tick "$row"   # armed (stable=2), within deadline
+  smoke_assert_eq "0" "$(notify_count)" "codex tick2: armed but within 90s deadline → no escalation"
+  age_first_seen worker-codex 120
+  floor_tick "$row"
+  smoke_assert_eq "1" "$(notify_count)" "codex tick3: deadline passed → exactly one DIRECT operator notify"
+  smoke_assert_contains "$(cat "$NOTIFY_LOG")" "--kind discord" "codex floor used the external transport"
+  smoke_assert_contains "$(cat "$NOTIFY_LOG")" "worker-codex blocked on codex codex_hook_trust" \
+    "codex notify names the engine + codex_hook_trust kind"
+  # The report carries the engine in both its path and its body.
+  local reports; reports="$(find "$BRIDGE_SHARED_DIR/blocked-prompts" -name '*-worker-codex-codex-codex_hook_trust-*.md' 2>/dev/null | head -1)"
+  [[ -n "$reports" ]] || smoke_fail "codex escalation report (engine in path) not written"
+  smoke_assert_contains "$(cat "$reports")" "- engine: codex" "codex report names the engine"
+}
+
+# shellcheck disable=SC2329
+test_20_daemon_skips_other_engines() {
+  # An engine that is neither claude nor codex (e.g. a future/unknown runtime)
+  # must be skipped entirely — no detect, no escalation. Even with a pane that
+  # WOULD match the codex detector, a gemini-engine row produces no notify.
+  reset_floor_state
+  export BRIDGE_ADMIN_AGENT_ID=""
+  export BRIDGE_OPERATOR_NOTIFY_KIND="discord"
+  export BRIDGE_OPERATOR_NOTIFY_TARGET="333"
+  PANE_FIXTURE=([worker-other]="$CODEX_PANE")
+  local row; row="$(summary_row worker-other worker-other gemini)"
+  floor_tick "$row"; floor_tick "$row"; age_first_seen worker-other 120 || true; floor_tick "$row"
+  smoke_assert_eq "0" "$(notify_count)" "non-claude/codex engine is skipped (no escalation)"
+  [[ ! -f "$(bridge_safety_floor_state_file worker-other)" ]] \
+    || smoke_fail "non-claude/codex engine left safety-floor state (should be skipped before detect)"
+}
+
 # ===========================================================================
 # Part 3: mutation tests — the key teeth are non-vacuous.
 # ===========================================================================
@@ -613,19 +793,25 @@ test_mutation_escalation_independence() {
 
 # --- run -------------------------------------------------------------------
 smoke_run "05: non-picker false-positive guards (numbered list / docs / ready)" test_05_non_picker_false_positives
-smoke_run "06: Codex pane → Claude-only gate (no escalation)" test_06_codex_pane_no_escalation
+smoke_run "06: engine gate admits claude|codex, dispatches by --engine (#2007)" test_06_engine_gate_claude_and_codex
 smoke_run "07: mid-render / active output → no stable modal" test_07_mid_render_no_stable_key
 smoke_run "10: untrusted pane text → hashes only, no execution" test_10_untrusted_pane_text
 smoke_run "11: coarse-token compatibility (classifier unchanged)" test_11_coarse_token_compatibility
 smoke_run "12: picker-style quoted text → no match (codex r1 #1)" test_12_picker_style_quoted_text_no_match
 smoke_run "13: structured unknown picker → unknown_interactive low (codex r1 #2)" test_13_unknown_interactive_structured_picker
 smoke_run "14: report fence-breakout guard (codex r1 #4)" test_14_report_fence_breakout_guard
+smoke_run "15: codex hook-trust numbering/prefix-independent (#2007)" test_15_codex_hook_trust_numbering_independent
+smoke_run "16: codex quoted/logged prompt → no match (#2007 last-line anchor)" test_16_codex_quoted_logged_prompt_no_match
+smoke_run "17: codex unknown modal → low confidence (#2007)" test_17_codex_unknown_modal_low_confidence
+smoke_run "18: codex signatures inert on Claude path (no #1991 regression)" test_18_codex_signatures_inert_on_claude_path
 smoke_run "01: idle blocked no-work pane → detect + DIRECT escalate" test_01_idle_blocked_no_work_detects_and_escalates
 smoke_run "02: auto-accept succeeds → no escalation" test_02_auto_accept_succeeds_no_escalation
 smoke_run "03: admin unavailable → operator still notified (independent)" test_03_admin_unavailable_operator_still_notified
 smoke_run "04: self-picker bootstrap → direct operator notify" test_04_self_picker_bootstrap_direct_notify
 smoke_run "08: dedupe/no-storm then cooldown refire + re-latch" test_08_dedupe_no_storm_then_cooldown_refire
 smoke_run "09: missing operator-notify config → audit operator_notify=missing, no guarantee" test_09_missing_operator_notify_config_audit_no_guarantee
+smoke_run "19: daemon routes codex via the SAME floor → direct escalate (#2007)" test_19_daemon_routes_codex_via_same_floor
+smoke_run "20: daemon skips non-claude/codex engines (#2007)" test_20_daemon_skips_other_engines
 smoke_run "MUTATION: idle sweep removed → no detect (non-vacuous)" test_mutation_idle_sweep_removed_no_detect
 smoke_run "MUTATION: escalation independence (direct transport, observe-only)" test_mutation_escalation_independence
 
