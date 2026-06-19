@@ -94,6 +94,21 @@ bridge_channel_send_managed_message() {
     --bridge-state-dir "$BRIDGE_STATE_DIR"
     --format shell
   )
+  # Teams proactive-send (#1996) needs the canonical per-agent `.teams` state
+  # dir so the bun plugin reads the same conversations.json the inbound
+  # listener seeded. bridge_agent_teams_state_dir (lib/bridge-agents.sh)
+  # resolves the full iso-v2 / BRIDGE_AGENT_WORKDIR-map / BRIDGE_DATA_ROOT
+  # workdir precedence — the Python adapter must NOT re-derive it. Resolve it
+  # here and thread it through as --teams-state-dir. Guard the empty case so a
+  # resolution miss does not pass an empty flag the adapter would fall back
+  # from anyway.
+  if [[ "$plugin" == "teams" ]]; then
+    local teams_state_dir=""
+    teams_state_dir="$(bridge_agent_teams_state_dir "$agent" 2>/dev/null || true)"
+    if [[ -n "$teams_state_dir" ]]; then
+      args+=(--teams-state-dir "$teams_state_dir")
+    fi
+  fi
   if [[ -n "$reply_to_message_id" ]]; then
     args+=(--reply-to-message-id "$reply_to_message_id")
   fi

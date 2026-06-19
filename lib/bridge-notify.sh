@@ -38,6 +38,19 @@ bridge_notify_send() {
   [[ -n "$kind" ]] || bridge_die "notify kind이 설정되지 않았습니다: $agent"
   [[ -n "$target" ]] || bridge_die "notify target이 설정되지 않았습니다: $agent"
 
+  # #1996: a teams-channel agent now resolves notify_kind=teams (so agb status
+  # stops reporting a false notify=miss), but bridge-notify.py's account-token
+  # HTTP senders cover discord/telegram/mattermost only — Teams proactive push
+  # goes through the managed-send adapter (bridge-channels.py send-managed-
+  # message → bun plugin continueConversation), NOT this path. Fail closed with
+  # a clear message instead of letting `bridge-notify.py --kind teams` reject
+  # with a cryptic argparse "invalid choice" error. The PreCompact-notify daemon
+  # path already uses the managed-send adapter, so teams reach is unaffected.
+  if [[ "$kind" == "teams" ]]; then
+    bridge_warn "notify kind 'teams' for '${agent}' routes through managed-send (PreCompact notify), not bridge-notify; skipping bridge-notify push."
+    return 3
+  fi
+
   args=(
     send
     --agent "$agent"
