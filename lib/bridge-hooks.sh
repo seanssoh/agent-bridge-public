@@ -1264,8 +1264,62 @@ bridge_codex_hooks_status() {
   bridge_hooks_python status-codex-hooks --codex-hooks-file "$(bridge_codex_hooks_file)"
 }
 
+# bridge_codex_config_file_for_hooks <hooks_file>
+#
+# Issue #2007: Codex reads its trust store from `config.toml` in the SAME
+# CODEX_HOME directory as the `hooks.json` it loads. The pretrust wrapper writes
+# trust into that sibling config — `<dirname hooks.json>/config.toml` — which is
+# exactly what the launched codex will read (for `~/.codex/hooks.json` the
+# sibling is `~/.codex/config.toml`; for a per-agent `<agent_home>/.codex/
+# hooks.json` it is `<agent_home>/.codex/config.toml`).
+bridge_codex_config_file_for_hooks() {
+  local hooks_file="$1"
+  [[ -n "$hooks_file" ]] || return 1
+  printf '%s/config.toml' "$(dirname "$hooks_file")"
+}
+
+# bridge_codex_pretrust_first_party_hooks <hooks_file> [bridge_home]
+#
+# Issue #2007 (prevention layer): pre-trust ONLY the bridge's own first-party
+# Codex hooks in the sibling config.toml so a hook-changing upgrade never wedges
+# a managed Codex agent at Codex's startup hook-trust gate. STRICT first-party
+# boundary + fail-closed inside bridge-hooks.py (never
+# --dangerously-bypass-hook-trust; foreign/plugin/operator entries left
+# untrusted for the #1992/#2007 detector). Non-fatal here: a pretrust failure
+# downgrades to the detector path — it must NEVER block the launch/render.
+bridge_codex_pretrust_first_party_hooks() {
+  local hooks_file="$1"
+  local bridge_home="${2:-${BRIDGE_HOME:-$BRIDGE_SCRIPT_DIR}}"
+  local config_file=""
+  [[ -n "$hooks_file" ]] || return 0
+  config_file="$(bridge_codex_config_file_for_hooks "$hooks_file")" || return 0
+  # Suppress only the shell-parseable STDOUT fields (the caller does not consume
+  # them here); let STDERR flow so the helper's fail-closed warn line ("leaving
+  # hooks UNtrusted for the detector to surface ...") reaches the start/upgrade
+  # log — the detector relies on that signal, not the exit code alone (codex
+  # review #2007 r1, Finding 3). Non-fatal regardless.
+  bridge_hooks_python ensure-codex-hook-trust \
+    --codex-hooks-file "$hooks_file" \
+    --codex-config-file "$config_file" \
+    --bridge-home "$bridge_home" \
+    --python-bin "$(command -v python3 || printf '/usr/bin/python3')" \
+    >/dev/null || true
+  return 0
+}
+
 bridge_ensure_codex_hooks() {
-  bridge_hooks_python ensure-codex-hooks --codex-hooks-file "$(bridge_codex_hooks_file)" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)"
+  local hooks_file rc=0
+  hooks_file="$(bridge_codex_hooks_file)"
+  bridge_hooks_python ensure-codex-hooks --codex-hooks-file "$hooks_file" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)" || rc=$?
+  # The render exit code is load-bearing (the caller bridge_die's on failure),
+  # so capture it BEFORE the pretrust step and return it unchanged.
+  if [[ $rc -eq 0 ]]; then
+    # Issue #2007: pre-trust the bridge's own hooks AFTER a successful render so
+    # the managed launch does not wedge at Codex's hook-trust gate (prevention).
+    # Non-fatal: a pretrust failure downgrades to the detector path.
+    bridge_codex_pretrust_first_party_hooks "$hooks_file" "$BRIDGE_HOME"
+  fi
+  return "$rc"
 }
 
 # bridge_ensure_codex_agent_hooks <agent> <agent_home>
@@ -1303,6 +1357,9 @@ bridge_ensure_codex_agent_hooks() {
     --bridge-home "${BRIDGE_HOME:-$BRIDGE_SCRIPT_DIR}" \
     --python-bin "$(command -v python3 || printf '/usr/bin/python3')" \
     >/dev/null 2>&1 || true
+  # Issue #2007: pre-trust the per-agent first-party hooks so a fresh codex
+  # agent (or a partially-upgraded host) does not wedge at the hook-trust gate.
+  bridge_codex_pretrust_first_party_hooks "$hook_config_path" "${BRIDGE_HOME:-$BRIDGE_SCRIPT_DIR}"
 }
 
 # Issue #1899: a dynamic vanilla Codex agent runs as vanilla Codex CLI against

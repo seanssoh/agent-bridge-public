@@ -743,6 +743,15 @@ elif [[ "$ENGINE" == "codex" && $SAFE_MODE -eq 0 ]]; then
   elif ! bridge_ensure_codex_hooks >/dev/null; then
     bridge_die "Codex hook 설정에 실패했습니다: $WORK_DIR"
   fi
+  # Issue #2007: bridge_ensure_codex_hooks renders the static/managed Codex hook
+  # suite AND then pre-trusts the bridge's own first-party hooks in the sibling
+  # config.toml — running here, after the render and BEFORE the Codex process
+  # starts, so a hook-changing upgrade never wedges this managed agent at
+  # Codex's startup hook-trust gate. The pretrust is fail-closed + STRICT
+  # first-party (never --dangerously-bypass-hook-trust; foreign/plugin/operator
+  # hooks stay untrusted for the #1992/#2007 detector) and non-fatal — only the
+  # render failure above is load-bearing. The dynamic-vanilla branch is left
+  # report-only in rc2 (project-local hooks under the operator-global home).
 fi
 
 if [[ $FORCE_FRESH_SESSION -eq 1 ]]; then
