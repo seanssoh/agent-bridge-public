@@ -46,6 +46,48 @@ SOCKET_NAME = "queue-gateway.sock"
 MAX_SOCKET_BYTES = 2 * 1024 * 1024
 SOCKET_TIMEOUT_SECONDS = 5.0
 SOCKET_ACL_REFRESH_SECONDS = 30.0
+
+# #1973 Track A — drain containment.
+#
+# EX_TEMPFAIL (sysexits.h). A queue child that the gateway server KILLED on the
+# per-request timeout, or a stale `.working.json` retired before it ran, did not
+# commit a known outcome. We surface this as a distinct exit code so the client
+# (bridge-queue.py proxy) can recognise "outcome unknown — retry" and NEVER
+# fabricate success. Deliberately distinct from the 1/2/3 codes the queue child
+# and the deny path already use.
+GATEWAY_TEMPFAIL_EXIT_CODE = 75
+
+# Per-request execution ceiling inside run_queue(). A single hung queue child
+# (e.g. a wedged SQLite lock) would otherwise block the WHOLE serve-once batch —
+# which is one daemon tick — indefinitely, paralysing every other agent's
+# claim/done behind it (the #1973 ~1.5h stall shape). Short enough for normal
+# queue ops; the smoke overrides it down.
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 15.0
+
+# A `.working.json` whose age exceeds this with no live child owning it is the
+# residue of a prior serve-once that the OUTER daemon timeout killed mid-drain.
+# iter_requests keeps re-globbing it, so without retirement it is "retried every
+# tick" forever. Retire it with a tempfail response so its waiting client fails
+# fast instead of hanging, and the batch moves on.
+DEFAULT_WORKING_STALE_SECONDS = 120.0
+
+# Operator-critical queue ops drain ahead of cron/followup churn after a stall:
+# a wedged fleet's `claim`/`done`/`show`/`inbox` must not sit behind a backlog of
+# cron/followup `create`s. But the priority MUST NOT starve non-control work:
+# sorting control-first and relying only on the per-cycle max-request cap would
+# let sustained claim/done traffic consume the entire cap every tick and never
+# reach a cron/followup `create` (#1973 codex review). So each cycle RESERVES a
+# slice of the budget for non-control requests whenever any are pending — a
+# weighted fair share, not a strict priority. Control still drains first within
+# its (budget − reserve) share; the reserved slots guarantee forward progress
+# for creates under constant control load.
+_CONTROL_PRIORITY_OPS = frozenset({"claim", "done", "show", "inbox"})
+
+# Fraction of the per-cycle budget guaranteed to non-control work when any is
+# pending (the anti-starvation reserve). 0.25 keeps control strongly favored
+# (75% of the cap) while guaranteeing creates always advance. Clamped to [0,1];
+# the reserve is also floored at 1 slot so a small cap still makes progress.
+DEFAULT_NONCONTROL_RESERVE_FRACTION = 0.25
 BRIDGE_SHARED_GROUP_DEFAULT = "ab-shared"
 INLINE_OVERHEAD_BYTES = 64 * 1024
 INLINE_BODY_CAP_BYTES = MAX_SOCKET_BYTES - INLINE_OVERHEAD_BYTES
@@ -751,19 +793,88 @@ def cmd_client(args: argparse.Namespace) -> int:
     raise SystemExit("queue gateway timed out waiting for daemon")
 
 
+def _request_op(path: Path) -> str:
+    """Best-effort first argv token (the queue op) for a request/working file.
+
+    Used only for the control-priority sort; a file we cannot parse sorts into
+    the non-control class (it never gets PROMOTED for being control ops it isn't)
+    and is still drained by mtime within that class. Never raises.
+    """
+    try:
+        request = load_json(path)
+    except Exception:  # noqa: BLE001 — a malformed file is handled by handle_request; here it just sorts low
+        return ""
+    argv = request.get("argv")
+    if isinstance(argv, list) and argv and isinstance(argv[0], str):
+        return argv[0]
+    return ""
+
+
 def iter_requests(root: Path) -> list[Path]:
     files = list(root.glob("*/requests/*.request.json"))
     files.extend(root.glob("*/requests/*.working.json"))
 
-    def sort_key(item: Path) -> tuple[float, str]:
+    def sort_key(item: Path) -> tuple[int, float, str]:
+        # #1973 Track A: control priority class. After a stall, operator-critical
+        # claim/done/show/inbox should drain ahead of cron/followup `create`
+        # churn so a wedged fleet can recover. class 0 = control, 1 = everything
+        # else; WITHIN a class we keep oldest-first (mtime, name) order. This is
+        # the BASE ordering; cmd_serve_once layers an anti-starvation reserve on
+        # top so control-first never fully buries non-control work.
+        op_class = 0 if _request_op(item) in _CONTROL_PRIORITY_OPS else 1
         try:
-            mtime = item.stat().st_mtime
+            mtime = item.stat().st_mtime  # noqa: raw-pathlib-controller-only — gateway server stats its OWN controller-side request files for drain ordering
         except OSError:
             mtime = 0.0
-        return (mtime, item.name)
+        return (op_class, mtime, item.name)
 
     files.sort(key=sort_key)
     return files
+
+
+def _fair_drain_order(candidates: list[Path], max_requests: int) -> list[Path]:
+    """#1973 Track A: bound `candidates` to `max_requests` with an anti-starvation
+    reserve for non-control work.
+
+    `candidates` arrives control-first (iter_requests). A pure control-first cut
+    at the cap would let sustained claim/done traffic consume the WHOLE budget
+    every tick and never reach a cron/followup `create` (#1973 codex review).
+    So when the cap binds AND non-control work is pending, we RESERVE a slice of
+    the budget (DEFAULT_NONCONTROL_RESERVE_FRACTION, ≥1 slot) for non-control
+    requests: control fills `budget − reserve` of the budget, non-control fills
+    the reserve, and any leftover budget (one class exhausted) is filled from the
+    other. Each class stays oldest-first internally. With `max_requests <= 0`
+    (uncapped) the whole list passes through unchanged."""
+    if max_requests <= 0 or len(candidates) <= max_requests:
+        return candidates
+
+    control = [p for p in candidates if _request_op(p) in _CONTROL_PRIORITY_OPS]
+    non_control = [p for p in candidates if _request_op(p) not in _CONTROL_PRIORITY_OPS]
+    if not non_control or not control:
+        # Only one class present — the plain cap is already fair.
+        return candidates[:max_requests]
+
+    fraction = _env_float(
+        "BRIDGE_QUEUE_GATEWAY_NONCONTROL_RESERVE_FRACTION",
+        DEFAULT_NONCONTROL_RESERVE_FRACTION,
+        minimum=0.0,
+    )
+    fraction = min(fraction, 1.0)
+    # Reserve at least 1 non-control slot (so a small cap still advances creates),
+    # but never more than the non-control backlog or the whole budget.
+    reserve = max(1, int(max_requests * fraction))
+    reserve = min(reserve, len(non_control), max_requests)
+    control_budget = max_requests - reserve
+
+    chosen = control[:control_budget] + non_control[:reserve]
+    # Backfill any slack from a class that did not use its full share.
+    if len(chosen) < max_requests:
+        remaining = max_requests - len(chosen)
+        leftover = control[control_budget:] + non_control[reserve:]
+        chosen.extend(leftover[:remaining])
+    # Drain control-first within the chosen set for the common (recovery) case.
+    chosen.sort(key=lambda p: 0 if _request_op(p) in _CONTROL_PRIORITY_OPS else 1)
+    return chosen
 
 
 def run_queue(
@@ -826,14 +937,43 @@ def run_queue(
                 safe_cwd = None
         except OSError:
             safe_cwd = None
-    proc = subprocess.run(
-        [sys.executable, str(queue_script), *argv],
-        cwd=safe_cwd,
-        capture_output=True,
-        text=True,
-        env=child_env,
-        check=False,
+    # #1973 Track A: bound each queue child. A wedged SQLite lock (or any hung
+    # child) must NOT block the rest of the serve-once batch — the whole daemon
+    # tick — indefinitely behind it. On the ceiling we KILL the child and return
+    # an authoritative tempfail response: the outcome is genuinely unknown (the
+    # write may or may not have committed), so the caller must NOT treat it as
+    # success and must retry after verifying with show/inbox. subprocess.run with
+    # timeout= sends SIGKILL and reaps the child before raising, so a killed
+    # child cannot linger and pin the gateway.
+    request_timeout = _env_float(
+        "BRIDGE_QUEUE_GATEWAY_REQUEST_TIMEOUT_SECONDS",
+        DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        minimum=0.1,
     )
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(queue_script), *argv],
+            cwd=safe_cwd,
+            capture_output=True,
+            text=True,
+            env=child_env,
+            check=False,
+            timeout=request_timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        partial = ""
+        if exc.stdout:
+            partial = exc.stdout if isinstance(exc.stdout, str) else exc.stdout.decode("utf-8", "replace")
+        return {
+            "exit_code": GATEWAY_TEMPFAIL_EXIT_CODE,
+            "stdout": partial,
+            "stderr": (
+                f"queue gateway: request exceeded {request_timeout:g}s and was killed; "
+                "outcome unknown; retry after show/inbox\n"
+            ),
+            "processed_at": now_iso(),
+            "tempfail": True,
+        }
     return {
         "exit_code": int(proc.returncode),
         "stdout": proc.stdout,
@@ -964,14 +1104,74 @@ def _dead_letter_poison_request(working: Path, exc: BaseException) -> None:
             pass
 
 
+def _retire_stale_working(working: Path, age: float, stale_after: float) -> None:
+    """#1973 Track A: retire a `.working.json` left behind by a prior serve-once
+    that the OUTER daemon timeout killed mid-drain.
+
+    Such a file owns no live child (the killed serve-once is gone) yet
+    iter_requests keeps re-globbing it every tick — the "retried every tick"
+    loop the issue describes. We write an authoritative tempfail response so the
+    waiting client fails fast (outcome unknown — retry after show/inbox) instead
+    of hanging, then rename it OUT of the drain to `.timeout` (a name
+    iter_requests does not match) so the EVIDENCE is retained for triage. Falls
+    back to unlink. Best-effort; never raises into the batch loop."""
+    req_id = working.name.split(".", 1)[0]
+    try:
+        responses_dir = working.parent.parent / "responses"
+        responses_dir.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — gateway server writes its own controller-side responses dir
+        atomic_write_json(responses_dir / f"{req_id}.json", {
+            "id": req_id,
+            "exit_code": GATEWAY_TEMPFAIL_EXIT_CODE,
+            "stdout": "",
+            "stderr": (
+                f"queue gateway: stale in-flight request retired after {age:.0f}s "
+                f"(threshold {stale_after:g}s); outcome unknown; retry after show/inbox\n"
+            ),
+            "processed_at": now_iso(),
+            "tempfail": True,
+        })
+    except Exception:  # noqa: BLE001 — best-effort error surfacing; never re-raise into the batch loop
+        pass
+    try:
+        working.rename(working.with_name(working.name + ".timeout"))  # noqa: raw-pathlib-controller-only — gateway server retires its own controller-side working file, keeping evidence out of the drain
+    except OSError:
+        try:
+            working.unlink(missing_ok=True)  # noqa: raw-pathlib-controller-only — gateway server consumes its own controller-side working file
+        except OSError:
+            pass
+
+
 def cmd_serve_once(args: argparse.Namespace) -> int:
     root = Path(args.root).expanduser()
     queue_script = Path(args.queue_script).expanduser()
+    stale_after = _env_float(
+        "BRIDGE_QUEUE_GATEWAY_WORKING_STALE_SECONDS",
+        DEFAULT_WORKING_STALE_SECONDS,
+        minimum=1.0,
+    )
     processed = 0
-    for candidate in iter_requests(root):
-        if args.max_requests and processed >= args.max_requests:
-            break
+    # #1973 Track A: bound the batch with an anti-starvation reserve for
+    # non-control work so sustained claim/done traffic cannot consume the whole
+    # per-cycle budget and bury cron/followup creates. _fair_drain_order returns
+    # at most max_requests candidates (or all of them when uncapped).
+    candidates = _fair_drain_order(iter_requests(root), args.max_requests or 0)
+    for candidate in candidates:
+        # #1973 Track A: a pre-existing `.working.json` is the residue of a prior
+        # serve-once. The serve-once that promoted it is no longer running (this
+        # is a fresh invocation), so if it is OLD it owns no live child and is the
+        # "retried every tick" loop — retire it with a tempfail response instead
+        # of re-running it under the (now killed-mid-commit) cwd/argv. A young
+        # `.working.json` is left alone: it could be a same-tick leftover whose
+        # response just has not been observed yet.
         if candidate.name.endswith(".working.json"):
+            try:
+                age = time.time() - candidate.stat().st_mtime  # noqa: raw-pathlib-controller-only — gateway server ages its OWN controller-side working file
+            except OSError:
+                age = 0.0
+            if age >= stale_after:
+                _retire_stale_working(candidate, age, stale_after)
+                processed += 1
+                continue
             working = candidate
         else:
             working = candidate.with_name(candidate.name.replace(".request.json", ".working.json"))
@@ -1248,6 +1448,69 @@ def cmd_daemon_liveness(args: argparse.Namespace) -> int:
         print(json.dumps({"liveness": liveness}, ensure_ascii=True))
     else:
         print(liveness)
+    return 0
+
+
+def gateway_status(root: Path) -> dict[str, Any]:
+    """#1973 Track A: a snapshot of the file-transport drain queue for audit.
+
+    Reports pending (`*.request.json`) and in-flight (`*.working.json`) counts,
+    the age in seconds of the OLDEST request/working file in each class (the
+    backlog/stall signal), and the most recent response mtime (drain liveness).
+    Read-only; never raises. The daemon audits these fields so a drain failure is
+    diagnosable instead of collapsing to `processed=0`."""
+    now = time.time()
+
+    def _oldest_age(paths: list[Path]) -> float | None:
+        oldest: float | None = None
+        for p in paths:
+            try:
+                mtime = p.stat().st_mtime  # noqa: raw-pathlib-controller-only — gateway server stats its OWN controller-side request/working files for the status snapshot
+            except OSError:
+                continue
+            if oldest is None or mtime < oldest:
+                oldest = mtime
+        return round(now - oldest, 1) if oldest is not None else None
+
+    try:
+        pending = list(root.glob("*/requests/*.request.json"))
+        working = list(root.glob("*/requests/*.working.json"))
+        responses = list(root.glob("*/responses/*.json"))
+    except OSError:
+        pending, working, responses = [], [], []
+
+    last_response_age: float | None = None
+    newest: float | None = None
+    for p in responses:
+        try:
+            mtime = p.stat().st_mtime  # noqa: raw-pathlib-controller-only — gateway server stats its OWN controller-side response files for drain liveness
+        except OSError:
+            continue
+        if newest is None or mtime > newest:
+            newest = mtime
+    if newest is not None:
+        last_response_age = round(now - newest, 1)
+
+    return {
+        "pending": len(pending),
+        "working": len(working),
+        "oldest_pending_age": _oldest_age(pending),
+        "oldest_working_age": _oldest_age(working),
+        "last_response_age": last_response_age,
+    }
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """Emit the drain-queue snapshot. Exit 0 — the snapshot is the payload, not
+    the exit code (the daemon parses the JSON fields). JSON is the only format
+    a machine consumer needs; the daemon passes --json."""
+    root = Path(args.root).expanduser()
+    status = gateway_status(root)
+    if args.format == "json":
+        print(json.dumps(status, ensure_ascii=True))
+    else:
+        for key in ("pending", "working", "oldest_pending_age", "oldest_working_age", "last_response_age"):
+            print(f"{key}={status.get(key)}")
     return 0
 
 
@@ -2301,6 +2564,14 @@ def build_parser() -> argparse.ArgumentParser:
     serve_once.add_argument("--queue-script", required=True)
     serve_once.add_argument("--max-requests", type=int, default=100)
     serve_once.set_defaults(handler=cmd_serve_once)
+
+    # #1973 Track A: drain-queue snapshot the daemon audits on a drain
+    # timeout/stall so a failure is diagnosable instead of collapsing to
+    # `processed=0`.
+    status = sub.add_parser("status")
+    status.add_argument("--root", required=True)
+    status.add_argument("--format", choices=("text", "json"), default="text")
+    status.set_defaults(handler=cmd_status)
 
     runtime_id = sub.add_parser("print-runtime-id")
     runtime_id.add_argument("--bridge-home")

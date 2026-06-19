@@ -568,6 +568,15 @@ def should_proxy_via_queue_gateway(argv: list[str]) -> bool:
     return bool(queue_gateway_proxy_agent())
 
 
+# #1973 Track A — EX_TEMPFAIL (sysexits.h). The queue gateway server returns
+# this code when it KILLED a hung queue child on the per-request timeout, or
+# retired a stale in-flight request: the outcome is genuinely unknown (the write
+# may or may not have committed). MUST match bridge-queue-gateway.py's
+# GATEWAY_TEMPFAIL_EXIT_CODE. The proxy surfaces it as actionable retry guidance
+# for claim/done and NEVER masks it into a success.
+GATEWAY_TEMPFAIL_EXIT_CODE = 75
+
+
 def proxy_via_queue_gateway(argv: list[str]) -> int:
     agent = queue_gateway_proxy_agent()
     if not agent:
@@ -599,7 +608,25 @@ def proxy_via_queue_gateway(argv: list[str]) -> int:
             queue_gateway_float_env("BRIDGE_QUEUE_GATEWAY_POLL_SECONDS", "0.2"),
             *argv,
         ]
-    return int(subprocess.run(command, check=False).returncode)
+    rc = int(subprocess.run(command, check=False).returncode)
+    # #1973 Track A: degraded claim/done messaging. When the gateway server
+    # bounded the request (killed-on-timeout / stale-retired -> EX_TEMPFAIL) the
+    # outcome is UNKNOWN. We must NOT fabricate success: the nonzero rc is
+    # preserved verbatim. For the operator-critical claim/done ops we add a
+    # one-line guidance pointing at the safe recovery command. claim is safe to
+    # retry (re-claiming a task already assigned to the same agent is idempotent)
+    # and done is idempotent (already-done -> success), so retry-after-recovery
+    # is safe; a non-idempotent create is NOT auto-retried and gets no such hint.
+    op = argv[0] if argv else ""
+    if rc == GATEWAY_TEMPFAIL_EXIT_CODE and op in {"claim", "done"}:
+        task_ref = argv[1] if len(argv) > 1 and not argv[1].startswith("-") else ""
+        verify = f"agb show {task_ref}".rstrip()
+        sys.stderr.write(
+            f"queue gateway: '{op}' outcome UNKNOWN (drain stalled, request bounded); "
+            f"not retried automatically. Verify with `{verify}` / `agb inbox`, "
+            f"then re-run `agb {op}{(' ' + task_ref) if task_ref else ''}` if still needed.\n"
+        )
+    return rc
 
 
 def get_cron_state_dir() -> Path:
