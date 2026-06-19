@@ -425,7 +425,12 @@ smoke_run "T3d H3 PRODUCTION bridge_notify_send wires miss-queue on rc!=0+giveup
   # Minimum stubs the real bridge_notify_send needs to flow through to
   # its rc check. The body content / payload doesn't matter — only the
   # rc + giveup_active + agent name matter for the H3 branch.
-  bridge_agent_notify_kind()    { printf 'teams'; }
+  # ★Kind must be a push kind that flows THROUGH to bridge_notify_python:
+  # #1996 made `kind == teams` fail-closed early (return 3, routes via
+  # managed-send) BEFORE the python primitive, so a `teams` stub would
+  # short-circuit and never exercise this H3 miss-queue-on-giveup path.
+  # Use `discord` (a real bridge-notify push kind with no early return).
+  bridge_agent_notify_kind()    { printf 'discord'; }
   bridge_agent_notify_target()  { printf 'channel-stub'; }
   bridge_agent_notify_account() { printf ''; }
   bridge_compat_config_file()   { printf '%s/runtime.json' "$SMOKE_TMP_ROOT"; }
