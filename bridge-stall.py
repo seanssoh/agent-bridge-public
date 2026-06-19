@@ -278,15 +278,274 @@ def classify(normalized: str) -> tuple[str, str, str]:
     return "", "", ""
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("analyze",))
-    parser.add_argument("--capture-file")
-    parser.add_argument("--max-bytes", type=int, default=8192)
-    parser.add_argument("--format", choices=("json", "shell"), default="json")
-    parser.add_argument("--json", action="store_true")
-    args = parser.parse_args()
+# ---------------------------------------------------------------------------
+# Issue #1991 safety floor: detect-only typed blocked-prompt classifier.
+#
+# This is a SIBLING of bridge-tmux.sh::bridge_tmux_claude_blocker_state_from_text
+# (which returns a coarse single-token state many callers compare exactly). It
+# is intentionally NOT that function and never changes its output. It runs in
+# the daemon's all-pane safety-floor sweep purely to DETECT a stuck interactive
+# prompt and feed it to the deterministic escalation path. It NEVER sends keys,
+# never selects a UI option, and never asks an LLM to read the pane (that is the
+# v0.17 resolver, out of scope here).
+#
+# Captured pane text is attacker-controlled. We only HASH it and match known
+# structured affordances; we never source/eval/interpolate it. The escalation
+# message prefers hashes + metadata; only the shared report keeps a short
+# fenced excerpt.
+#
+# Confidence gating lives partly here (ready-prompt rejection, structured
+# affordance requirement, mid-render rejection) and partly in the daemon caller
+# (Claude-only, tail-owned, 2-tick stability, deadline). A normal numbered list
+# must NOT match.
 
+# A structured picker renders its option list followed by the verbatim
+# confirm/cancel tail. Requiring this tail (or a recognized y/n / Press-Enter
+# modal signature) is what separates a real modal from a normal numbered list.
+PICKER_TAIL_RE = re.compile(r"(?m)^\s*Enter to confirm\s*·\s*Esc to cancel\s*$")
+
+# Per-kind structured signatures. Each entry is (prompt_kind, [required
+# fragments — ALL must be present]). The fragments mirror the coarse classifier
+# so the typed detector cannot drift away from it, plus the billing/usage
+# picker that the coarse classifier does not name (it surfaces as
+# interactive_picker via the stall analyzer). Order matters: billing is checked
+# before the generic summary picker so a usage picker is not mislabeled.
+PROMPT_SIGNATURES: list[tuple[str, list[str]]] = [
+    ("trust", ["Quick safety check:", "Yes, I trust this folder"]),
+    ("billing", ["Stop and wait for limit to reset"]),
+    ("billing", ["Switch to extra usage"]),
+    ("billing", ["Switch to Team plan"]),
+    ("summary", ["Resume from summary (recommended)", "Resume full session as-is"]),
+    ("devchannels", ["WARNING: Loading development channels", "I am using this for local development"]),
+    ("feedback", ["How is Claude doing this session?", "0: Dismiss"]),
+    ("permission", ["Allow ", "for this session?", "(y/n)"]),
+    ("permission", ["Overwrite?", "(y/n)"]),
+    ("context_pressure", ["context pressure", "Press Enter to"]),
+]
+
+# A ready/input-ready prompt or active mid-render output in the tail means the
+# pane is NOT stuck on a modal. These are rejection signals applied to the tail
+# region only.
+#   - "waiting for your input" / "Type your ..." — explicit idle prompt text.
+#   - A BARE prompt caret line ("❯" / ">" / "›" with only whitespace after) is
+#     the idle Claude input box AFTER a modal has been dismissed. This is NOT a
+#     picker selection row: a live picker always renders its caret ON an option
+#     ("❯ 1. option"), never bare. Rejecting a bare-caret tail prevents a
+#     transcript that quotes a past picker (option rows + the confirm tail) from
+#     escalating once the agent has returned to the ready prompt (codex r3).
+READY_PROMPT_RE = re.compile(
+    r"(?m)^\s*(?:[❯>›]\s*$|[❯>›]\s*(?:waiting for your input|Type your)|waiting for your input|Type your)",
+    re.IGNORECASE,
+)
+# Claude renders a working spinner / token meter while actively producing
+# output. If the tail still shows live work, the prompt has not settled.
+ACTIVE_OUTPUT_RE = re.compile(
+    r"(?:esc to interrupt|·\s*\d+\s*tokens|Thinking…|Working…|✶|✻\s+\w+ing)",
+    re.IGNORECASE,
+)
+
+# Coarse-token map: only the prompt_kinds that the coarse blocker classifier
+# also names map back to a coarse token (for the daemon's compatibility-stable
+# hash field). billing/unknown_interactive have no coarse equivalent.
+COARSE_STATE_BY_KIND = {
+    "trust": "trust",
+    "summary": "summary",
+    "devchannels": "devchannels",
+    "feedback": "feedback_survey",
+    "permission": "permission_grant",
+    "context_pressure": "context_pressure",
+}
+
+# Picker-style prompt kinds render as an option-list modal whose ONLY reliable
+# structured affordance is the picker confirm tail ("Enter to confirm · Esc to
+# cancel"). The verbatim option strings can also appear quoted in prose /
+# scrollback / a review transcript, so these kinds MUST have a structured
+# affordance in the tail or they are NOT treated as a live blocked modal
+# (otherwise quoted text would escalate — codex r1 finding 1). The other kinds
+# carry their own inherent affordance in the matched signature itself
+# (permission/overwrite end in "(y/n)", context_pressure has "Press Enter to",
+# feedback has the "N: Dismiss" option row), so they do not need the tail.
+PICKER_STYLE_KINDS = frozenset({"trust", "summary", "devchannels", "billing"})
+
+
+def _tail_region(normalized: str, tail_lines: int = 40) -> str:
+    lines = normalized.splitlines()
+    if len(lines) > tail_lines:
+        lines = lines[-tail_lines:]
+    return "\n".join(lines)
+
+
+# A real Claude Code picker renders each option on its own line as
+# "<glyph-or-space> <n>. <option text>". Two such option rows is the minimum
+# shape that distinguishes a structured chooser from a one-off "Press Enter"
+# acknowledgement line embedded in prose.
+PICKER_OPTION_ROW_RE = re.compile(r"(?m)^[ \t❯>›]*\d+\.\s+\S")
+
+
+def _structured_affordance(tail: str) -> bool:
+    # Confirms a KNOWN modal (already matched by its verbatim signature) is a
+    # live blocked prompt: the picker confirm tail, a (y/n) confirm, a "Press
+    # Enter to" acknowledgement, or the feedback survey's "N: Dismiss" option
+    # row. This is the SUPPORTING evidence for a known signature only — it is
+    # deliberately NOT used to admit UNKNOWN prompts (a bare "Press Enter to"
+    # or "(y/n)" in prose is far too loose to mint an unknown escalation; see
+    # _unknown_modal_shape — codex r2). A bare numbered list does NOT qualify.
+    if PICKER_TAIL_RE.search(tail):
+        return True
+    if "(y/n)" in tail:
+        return True
+    if re.search(r"Press Enter to", tail):
+        return True
+    if re.search(r"(?m)^\s*\d+:\s*Dismiss\s*$", tail):
+        return True
+    return False
+
+
+def _picker_tail_is_last_line(tail: str) -> bool:
+    # True iff the exact picker confirm tail ("Enter to confirm · Esc to cancel")
+    # is the LAST non-blank line of the captured pane. A live picker renders its
+    # footer at the literal bottom of the pane; a transcript/log that merely
+    # QUOTES a picker footer has trailing content after it (codex r3). Used by
+    # both the known picker-style gate and the unknown-modal gate so neither can
+    # be tripped by quoted/logged footer text.
+    lines = [ln for ln in tail.splitlines() if ln.strip()]
+    return bool(lines) and bool(PICKER_TAIL_RE.match(lines[-1]))
+
+
+def _unknown_modal_shape(tail: str) -> bool:
+    # The STRICT gate for admitting an UNKNOWN interactive prompt (no known
+    # signature matched). Requires ALL of:
+    #   1. the exact picker confirm tail is the LAST non-blank line (live footer,
+    #      not a quoted/logged one with trailing content — codex r3); and
+    #   2. at least two numbered option rows above it — the structured-chooser
+    #      shape that a normal numbered list / prose / "Press Enter" line lacks.
+    # This rejects benign prose, stray "(y/n)", and quoted/logged picker footers
+    # that have trailing content, while still admitting a real unknown picker.
+    #
+    # ACCEPTED RESIDUAL (codex r4, by design): if the captured pane is byte-for-
+    # byte the bottom of a live picker — >=2 option rows then the verbatim Claude
+    # footer "Enter to confirm · Esc to cancel" as the literal last line — it is
+    # INDISTINGUISHABLE from a real picker by pane-text shape alone (e.g. a
+    # transcript whose quote ENDS exactly at the footer). No pane-text classifier
+    # can separate a perfect reproduction of a live picker from the real thing,
+    # and we deliberately do NOT add a keyword/preamble heuristic ("transcript",
+    # "quoted", …): pane text is attacker-controlled and must never be
+    # interpreted semantically — such a filter is trivially bypassed by omitting
+    # the word. This residual is SAFE BY CONSTRUCTION: the floor is observe-only
+    # (a false match escalates to a HUMAN, never auto-actions), and the daemon
+    # gates it further with Claude-only + an ACTIVE live session + 2-tick
+    # content-hash stability (the same bytes must persist >=2 sweeps) + the
+    # unknown 5-min deadline + dedup/30-min-cooldown/per-pass-cap. A static
+    # quoted-picker tail that stays byte-stable in a live, otherwise-idle Claude
+    # pane for 5+ minutes is itself anomalous and worth one (deduped) human glance.
+    if not _picker_tail_is_last_line(tail):
+        return False
+    return len(PICKER_OPTION_ROW_RE.findall(tail)) >= 2
+
+
+def detect_blocked_prompt(text: str) -> dict[str, object]:
+    # Detect-only. Returns matched/prompt_kind/confidence + hash fields. The
+    # daemon enforces Claude-only, 2-tick stability, and the deadline; this
+    # function enforces structured-affordance + ready/active-output rejection.
+    normalized = normalize_excerpt(text, 8192)
+    tail = _tail_region(normalized)
+
+    result: dict[str, object] = {
+        "matched": 0,
+        "prompt_kind": "",
+        "confidence": "",
+        "coarse_state": "none",
+        "content_hash": "",
+        "matched_line_hash": "",
+        "excerpt_hash": hashlib.sha256(normalized.encode("utf-8")).hexdigest() if normalized else "",
+    }
+
+    if not tail.strip():
+        return result
+
+    # Rejection gates first: a ready prompt or active mid-render output means
+    # the pane is not blocked on a settled modal.
+    if READY_PROMPT_RE.search(tail) or ACTIVE_OUTPUT_RE.search(tail):
+        return result
+
+    matched_kind = ""
+    matched_fragment = ""
+    for kind, fragments in PROMPT_SIGNATURES:
+        if all(fragment in tail for fragment in fragments):
+            matched_kind = kind
+            matched_fragment = fragments[-1]
+            break
+
+    confidence = "high"
+    if matched_kind:
+        # codex r1 finding 1 + r3: picker-style kinds (trust/summary/devchannels/
+        # billing) match only verbatim option strings, which also appear quoted
+        # in prose/scrollback/transcripts. Require the picker confirm tail to be
+        # the LAST non-blank line (a LIVE footer, not a quoted/logged one) or
+        # they are NOT a live blocked modal — hard-reject, do NOT escalate quoted
+        # text. The other kinds carry their own inherent affordance in the
+        # signature (y/n / Press-Enter / N: Dismiss), confirmed by
+        # _structured_affordance.
+        if matched_kind in PICKER_STYLE_KINDS:
+            if not _picker_tail_is_last_line(tail):
+                return result
+        elif not _structured_affordance(tail):
+            return result
+    elif _unknown_modal_shape(tail):
+        # codex r1 finding 2 + codex r2: no KNOWN signature matched, but the tail
+        # has the STRICT structured-chooser shape (picker confirm tail + >=2
+        # numbered option rows) — an unknown interactive prompt. Keep it (low
+        # confidence) so the daemon's longer unknown-prompt deadline applies,
+        # rather than dropping a real stuck modal. The strict shape rejects
+        # benign "Press Enter to ..." / "(y/n)" prose that a looser affordance
+        # check would wrongly admit (codex r2 false-positive).
+        matched_kind = "unknown_interactive"
+        matched_fragment = ""
+        confidence = "low"
+    else:
+        # No known signature and no strict unknown-modal shape: not a blocked
+        # modal (a normal numbered list / prose / scrollback). Do not match.
+        return result
+
+    # content_hash: stable hash over the tail region of the recognized modal so
+    # dedupe distinguishes devchannels vs trust vs permission vs billing vs
+    # unknown and so a new prompt (different tail) re-keys.
+    content_hash = hashlib.sha256(tail.encode("utf-8")).hexdigest()[:16]
+
+    result.update(
+        {
+            "matched": 1,
+            "prompt_kind": matched_kind,
+            "confidence": confidence,
+            "coarse_state": COARSE_STATE_BY_KIND.get(matched_kind, "none"),
+            "content_hash": content_hash,
+            # Fold typed detail into matched_line_hash so the daemon's existing
+            # dedup keyspace distinguishes prompt kinds while the coarse
+            # activity_state surfaces stay stable (design §Compatibility rule).
+            "matched_line_hash": f"prompt:{matched_kind}:{content_hash}",
+            "matched_fragment": matched_fragment,
+        }
+    )
+    return result
+
+
+def cmd_detect_prompt(args: argparse.Namespace) -> int:
+    text = read_capture(args.capture_file)
+    payload = detect_blocked_prompt(text)
+    if args.format == "shell":
+        print(f"PROMPT_MATCHED={int(payload['matched'])}")
+        print(f"PROMPT_KIND={json.dumps(payload['prompt_kind'])}")
+        print(f"PROMPT_CONFIDENCE={json.dumps(payload['confidence'])}")
+        print(f"PROMPT_COARSE_STATE={json.dumps(payload['coarse_state'])}")
+        print(f"PROMPT_CONTENT_HASH={json.dumps(payload['content_hash'])}")
+        print(f"PROMPT_MATCHED_LINE_HASH={json.dumps(payload['matched_line_hash'])}")
+        print(f"PROMPT_EXCERPT_HASH={json.dumps(payload['excerpt_hash'])}")
+    else:
+        print(json.dumps(payload, ensure_ascii=False))
+    return 0
+
+
+def cmd_analyze(args: argparse.Namespace) -> int:
     normalized = normalize_excerpt(read_capture(args.capture_file), max(args.max_bytes, 256))
     classification, matched, matched_line = classify(normalized)
     # Issue #329 Track D: matched_line_hash is the dedup key the daemon uses
@@ -320,6 +579,23 @@ def main() -> int:
     else:
         print(json.dumps(payload, ensure_ascii=False))
     return 0
+
+
+def main() -> int:
+    # `analyze` is the long-standing default (positional, no subparser) so
+    # existing callers — including the daemon stall analyzer — keep working
+    # verbatim. `detect-prompt` is the new #1991 safety-floor sibling.
+    parser = argparse.ArgumentParser()
+    parser.add_argument("command", choices=("analyze", "detect-prompt"))
+    parser.add_argument("--capture-file")
+    parser.add_argument("--max-bytes", type=int, default=8192)
+    parser.add_argument("--format", choices=("json", "shell"), default="json")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+
+    if args.command == "detect-prompt":
+        return cmd_detect_prompt(args)
+    return cmd_analyze(args)
 
 
 if __name__ == "__main__":
