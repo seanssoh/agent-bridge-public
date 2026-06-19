@@ -292,6 +292,14 @@ assert_wrapper_denied \
   "$ADMIN_AGENT" "operator-tui" \
   "BRIDGE_A2A_PEER_SUSPECT_THRESHOLD=1"
 
+# 1j (#2024): the room-autojoin flag is allowlisted but STRICT — only the
+# literal "1" is a valid value; any other value (here "0") is denied by the
+# flag_one type screen so a confusing no-op can't be persisted.
+assert_wrapper_denied \
+  "wrapper: room-autojoin non-1 value denied (flag_one)" \
+  "$ADMIN_AGENT" "operator-tui" \
+  "BRIDGE_A2A_ROOM_AUTOJOIN=0"
+
 # Confirm NOTHING was written by any denied attempt.
 if [[ -f "$ENV_FILE" ]]; then
   smoke_fail "managed env file exists after only-denied attempts: $ENV_FILE"

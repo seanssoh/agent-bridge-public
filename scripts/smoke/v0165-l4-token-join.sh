@@ -186,19 +186,88 @@ test_valid_token_admits_to_pending() {
 }
 
 # ---------------------------------------------------------------------------
-# default-unchanged: with the env gate UNSET, an unknown peer is STILL 403
+# default-unchanged + actionable-403 (#2024 A.3): with the env gate UNSET an
+# unknown peer is STILL 403, but the reply now carries the ACTIONABLE posture
+# code `room_autojoin_disabled` (so a first-contact joiner can be told the
+# leader's gate is off and to ask the leader to enable it, rather than rotating
+# the invite — rotation does not change the gate posture). The code is POSTURE
+# ONLY: the gate fires BEFORE any body shape parse / room lookup / token verify,
+# so it says nothing about whether the invite is valid (an expired/revoked token
+# under the disabled gate gets the same code) — never room existence or token
+# validity (no oracle). It must also leave the leader pristine: NO peer, NO
+# pending row, NO disk write.
 # ---------------------------------------------------------------------------
-test_gate_default_unchanged_403() {
+test_gate_disabled_actionable_403() {
   reset_leader_cfg
+  # Snapshot the leader cfg on disk so we can prove the disabled gate wrote
+  # NOTHING (posture-only — it returns before any peer/disk work).
+  local cfg_before
+  cfg_before="$(python3 "$HELPER" config-text "$CFG_A")"
   join_as bart -- "$LINK" >/dev/null 2>&1 || smoke_fail "capture a request"
   local res
   res="$(deliver_no_gate)"
   smoke_assert_contains "$res" "status=403" \
     "with BRIDGE_A2A_ROOM_AUTOJOIN unset, an unknown peer is STILL 403 (default unchanged)"
-  smoke_assert_contains "$res" "unknown peer" "the reject is the unchanged unknown_peer 403"
+  smoke_assert_contains "$res" "room_autojoin_disabled" \
+    "the reject now carries the actionable posture code room_autojoin_disabled"
+  smoke_assert_contains "$res" "disabled on the leader" \
+    "the reply error names the leader posture, not the peer/token"
+  # POSTURE ONLY — the disabled reply must NOT leak room existence or token
+  # validity: no room id, no token-outcome word, no invite-token phrasing.
+  smoke_assert_not_contains "$res" "$ROOM" \
+    "the disabled-403 reply does NOT echo the room id (no room-existence oracle)"
+  smoke_assert_not_contains "$res" "invite token" \
+    "the disabled-403 reply does NOT carry a token-validity verdict (no token oracle)"
+  # No peer auto-registered, no pending row, no disk mutation under the gate.
   local ids
   ids="$(python3 "$HELPER" peer-ids "$CFG_A")"
   smoke_assert_not_contains "$ids" "$NODE_B" "no peer auto-registered when the gate is off"
+  local rows
+  rows="$(python3 "$HELPER" pending-rows "$BRIDGE_A2A_ROOMS_DB" "$ROOM")"
+  smoke_assert_not_contains "$rows" "bart" "no pending row written under the disabled gate"
+  local cfg_after
+  cfg_after="$(python3 "$HELPER" config-text "$CFG_A")"
+  smoke_assert_eq "$cfg_before" "$cfg_after" \
+    "the disabled gate writes NOTHING to the leader cfg (posture-only, no disk write)"
+  # The PRECISE audit reason is autojoin_disabled (not unknown_peer) so the
+  # leader can see the join was refused by the gate posture (not a token check —
+  # the gate fires first). The JSONL audit row carries the structured reason +
+  # the message_id, and NEVER the room id / token.
+  local audit="$BRIDGE_LOG_DIR/a2a-handoff.jsonl"
+  if [[ -f "$audit" ]]; then
+    local last_reject
+    last_reject="$(grep room_join_reject "$audit" | tail -1)"
+    smoke_assert_contains "$last_reject" '"reason": "autojoin_disabled"' \
+      "the audit reason is the precise autojoin_disabled"
+    smoke_assert_contains "$last_reject" '"message_id"' \
+      "the audit carries the message_id for correlation"
+    smoke_assert_not_contains "$last_reject" "$ROOM" \
+      "the disabled-gate audit does NOT record the room id (posture-only)"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# negative control (#2024 A.3): genuinely MALFORMED/garbage requests stay
+# OPAQUE — the actionable room_autojoin_disabled code is reserved for the gate
+# posture, never handed to noise. A request that fails the receiver's preamble
+# (bad protocol tag) is rejected opaquely BEFORE the gate is even reached, and
+# must NOT carry room_autojoin_disabled.
+# ---------------------------------------------------------------------------
+test_malformed_stays_opaque_under_gate_off() {
+  reset_leader_cfg
+  join_as bess -- "$LINK" >/dev/null 2>&1 || smoke_fail "capture a request"
+  # Garbage protocol tag → opaque 400 "unsupported protocol", never the gate code.
+  local res
+  res="$(deliver_no_gate '{"headers":{"X-AGB-Protocol":"garbage-vNaN"}}')"
+  smoke_assert_contains "$res" "status=400" \
+    "a malformed (bad-protocol) request is rejected at the preamble, before the gate"
+  smoke_assert_contains "$res" "unsupported protocol" \
+    "the malformed reject stays opaque (unsupported protocol)"
+  smoke_assert_not_contains "$res" "room_autojoin_disabled" \
+    "garbage requests do NOT receive the actionable posture code (reserved for the gate)"
+  local ids
+  ids="$(python3 "$HELPER" peer-ids "$CFG_A")"
+  smoke_assert_not_contains "$ids" "$NODE_B" "no peer registered for a malformed request"
 }
 
 # ---------------------------------------------------------------------------
@@ -290,7 +359,19 @@ test_revoked_and_expired_still_403() {
   local res
   res="$(deliver)"
   smoke_assert_contains "$res" "status=403" "case 4: an EXPIRED token is still 403 (not admitted)"
-  smoke_assert_contains "$res" "expired" "case 4: refusal reason is expired"
+  # NO TOKEN ORACLE (#2024 A.4): the UNKNOWN-peer reply is OPAQUE `unknown peer`
+  # — it must NOT leak the token verdict (`expired`) to an unpaired prober. The
+  # precise verdict lives ONLY in the operator-side audit.
+  smoke_assert_contains "$res" "unknown peer" \
+    "case 4 (A.4): an unknown-peer expired token replies OPAQUE (no token-verdict oracle)"
+  smoke_assert_not_contains "$res" "expired" \
+    "case 4 (A.4): the peer-facing reply does NOT disclose the expired verdict"
+  local audit="$BRIDGE_LOG_DIR/a2a-handoff.jsonl"
+  if [[ -f "$audit" ]]; then
+    smoke_assert_contains "$(grep room_join_reject "$audit" | tail -1)" \
+      '"reason": "unknown_peer_token_expired"' \
+      "case 4 (A.4): the AUDIT keeps the precise expired verdict for the operator"
+  fi
   local ids
   ids="$(python3 "$HELPER" peer-ids "$CFG_A")"
   smoke_assert_not_contains "$ids" "$NODE_B" "case 4: no peer auto-registered for an expired token"
@@ -533,7 +614,8 @@ test_remote_addr_socket_only() {
 # ---------------------------------------------------------------------------
 smoke_run "setup: room on node A + v2 SIGNED invite (reach= + s=)" test_setup_signed_invite
 smoke_run "case 4: a valid token admits to PENDING (not 403); peer auto-registered" test_valid_token_admits_to_pending
-smoke_run "gate default-unchanged: env unset → unknown peer STILL 403" test_gate_default_unchanged_403
+smoke_run "gate disabled: env unset → 403 room_autojoin_disabled (posture-only, no write)" test_gate_disabled_actionable_403
+smoke_run "negative: a malformed request stays OPAQUE under the gate (no posture code)" test_malformed_stays_opaque_under_gate_off
 smoke_run "case 1: token-hash-as-key rejected (domain separation)" test_token_hash_as_key_rejected
 smoke_run "case 1b: bad-sig bootstrap does not poison the shared in-mem cfg (r2 P1)" test_shared_cfg_no_poison_across_requests
 smoke_run "case 4 (neg): revoked / expired token still 403, no peer" test_revoked_and_expired_still_403

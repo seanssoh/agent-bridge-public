@@ -2488,6 +2488,51 @@ def _setup_detect_state(
     return "DONE", probes
 
 
+def _receiver_room_autojoin_enabled() -> bool:
+    """Best-effort: will the A2A receiver's effective env have
+    ``BRIDGE_A2A_ROOM_AUTOJOIN=1`` on its next (re)start?  (#2024 A.1)
+
+    Mirrors what `bridge_load_roster` sources at receiver startup
+    (lib/bridge-state.sh:1388-1405): the live process env first, then the
+    managed install-wide override file `$BRIDGE_HOME/agent-env.local.sh` that
+    `agb config set-env` writes and `agb a2a daemon restart` re-sources.
+    Returns False on any read error (fail-loud: hint when in doubt)."""
+    # noqa: iso-helper-boundary - feature env gate, not a .env file
+    if os.environ.get("BRIDGE_A2A_ROOM_AUTOJOIN") == "1":
+        return True
+    env_file = a2a.bridge_home() / "agent-env.local.sh"
+    try:
+        text = env_file.read_text(encoding="utf-8")  # noqa: raw-pathlib-controller-only
+    except OSError:
+        return False
+    for line in text.splitlines():
+        if line.strip() == "export BRIDGE_A2A_ROOM_AUTOJOIN='1'":
+            return True
+    return False
+
+
+def _print_room_autojoin_hint() -> None:
+    """After A2A transport setup is DONE, surface the cross-node ROOM
+    self-service onboarding posture (#2024 A.1/A.2). Transport setup (S0–S6)
+    pairs two KNOWN peers; it does NOT enable first-contact room auto-join,
+    which is a separate, default-OFF gate. Tell the operator how to turn it on
+    if they intend to use the signed-invite room onboarding flow."""
+    if _receiver_room_autojoin_enabled():
+        print("  cross-node room auto-join: ENABLED "
+              "(first-contact `room join` of a signed invite is admitted to a "
+              "leader-approved PENDING join).")
+        return
+    print("  cross-node room auto-join: DISABLED (default). A first-contact "
+          "`agb room join '<signed invite>'` will 403 "
+          "(code=room_autojoin_disabled). To enable self-service room "
+          "onboarding on THIS leader receiver:")
+    print("    agb config set-env BRIDGE_A2A_ROOM_AUTOJOIN=1")
+    print("    agb a2a daemon restart   # re-sources the override; a direct "
+          "`bash bridge-handoff-daemon.sh start` does NOT")
+    print("  (the leader still approves every join, so this admits nobody "
+          "automatically.)")
+
+
 def _setup_show_state(args: argparse.Namespace) -> int:
     """`--show-state` — report the detected S-state + next action + needed inputs.
 
@@ -2510,6 +2555,7 @@ def _setup_show_state(args: argparse.Namespace) -> int:
     print(f"current state: {current}")
     if current == "DONE":
         print("  A2A setup is complete (S0–S6 satisfied). Nothing to do.")
+        _print_room_autojoin_hint()
         return 0
     probe = by_state.get(current, {})
     action = probe.get("action", "")
