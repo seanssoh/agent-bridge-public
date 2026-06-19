@@ -7,6 +7,11 @@ another install's inbox queue — secure, audited, and with no human in the
 loop. It replaces the manual copy-paste / ssh `bridge-task create` relay
 that the operator previously did by hand.
 
+> **See also**: [`a2a-quickref.md`](./a2a-quickref.md) — a task-oriented quick
+> reference ("send to an agent by id / find an agent's node / view the roster /
+> send to a room / onboard a new machine / troubleshoot"). This page is the
+> protocol + security model; that one is "how do I actually use it."
+
 ## Model
 
 N independent Agent Bridge installs each own a private `state/tasks.db`
