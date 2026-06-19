@@ -21,7 +21,7 @@ import uuid
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from stat import S_ISDIR, S_ISFIFO, S_ISLNK, S_ISSOCK
+from stat import S_ISDIR, S_ISFIFO, S_ISLNK, S_ISREG, S_ISSOCK
 import tempfile
 from typing import Any, Iterator
 
@@ -4358,6 +4358,522 @@ def validate_claude_config(path: Path) -> dict[str, Any]:
     return payload
 
 
+# Issue #1985 (follow-up to #1981 / PR #1984): detect + backup-gated repair of an
+# operator-global `~/.claude/settings.json` that was ALREADY hijacked into a
+# bridge-managed `settings.effective.json` symlink before the #1981 launch-time
+# guard shipped. This is the REMEDIATION half — #1981 only *prevents* new
+# hijacks. Default behavior is REPORT-ONLY: detection never mutates and never
+# fails the upgrade. Repair runs only with the explicit
+# `--repair-operator-global-settings-hijack` flag AND only after a complete,
+# non-overwriting backup directory is written. The replacement is a neutral `{}`
+# settings file (mode 0600) unless an explicit trusted restore-file is supplied.
+# We deliberately do NOT reconstruct user intent by stripping bridge hooks out of
+# the effective output (that is v0.17). Kept isolated from any Track A onboarding
+# marker repair — different rollback/visibility contracts (design §"Sequencing").
+OPERATOR_GLOBAL_NEUTRAL_SETTINGS = "{}\n"
+
+
+def resolve_operator_global_settings_file(args: argparse.Namespace) -> Path:
+    """Resolve the operator-global Claude settings path to inspect.
+
+    The shell caller (lib/bridge-cleanup.sh) passes the already-resolved
+    `--operator-global-settings-file` from the #1984 resolver
+    (`bridge_hook_operator_global_settings_file`, which delegates to
+    `bridge_agent_operator_home_dir`). Direct manual `cleanup-residue` runs omit
+    it, so we fall back to `Path.home() / ".claude/settings.json"` — the same
+    operator-home authority the #1984 guard uses for the manual case.
+    """
+    raw = getattr(args, "operator_global_settings_file", "") or ""
+    if raw.strip():
+        return Path(raw).expanduser()
+    return Path.home() / ".claude" / "settings.json"  # noqa: raw-pathlib-controller-only — operator-HOME global settings probe; read-only classify, controller/operator-side only.
+
+
+def _classify_bridge_effective_target(
+    link_target_real: str,
+    target_root: Path,
+) -> dict[str, str]:
+    """Return {matched_layout, matched_agent} if the resolved symlink target is a
+    recognized bridge `settings.effective.json` output, else empty strings.
+
+    Matches both exact existing candidates AND the dangling/orphan path shape so a
+    symlink that went dangling (source agent closed/moved after the live hijack)
+    is still classified. Detection stays narrow: the basename must be exactly
+    `settings.effective.json`, the parent suffix exactly `.claude/
+    settings.effective.json`, and the path must live under `<target_root>/agents/`
+    or `<target_root>/data/agents/`.
+    """
+    out = {"matched_layout": "", "matched_agent": ""}
+    if not link_target_real:
+        return out
+    try:
+        target_root_real = os.path.realpath(str(target_root))
+    except OSError:
+        target_root_real = str(target_root)
+
+    real = link_target_real
+    real_path = Path(real)
+    if real_path.name != "settings.effective.json":
+        return out
+    parent = real_path.parent
+    if parent.name != ".claude":
+        return out
+
+    agents_v1 = os.path.join(target_root_real, "agents")
+    agents_v2 = os.path.join(target_root_real, "data", "agents")
+    under_v1 = real == agents_v1 or real.startswith(agents_v1 + os.sep)
+    under_v2 = real == agents_v2 or real.startswith(agents_v2 + os.sep)
+    if not (under_v1 or under_v2):
+        return out
+
+    # Shared install-wide effective: <target_root>/agents/.claude/settings.effective.json
+    if under_v1 and os.path.realpath(parent.parent) == agents_v1:
+        out["matched_layout"] = "shared"
+        return out
+    # v2 per-agent: <target_root>/data/agents/<agent>/home/.claude/settings.effective.json
+    if under_v2:
+        # parent = .../<agent>/home/.claude ; want <agent>
+        home_dir = parent.parent
+        if home_dir.name == "home":
+            out["matched_layout"] = "v2-agent"
+            out["matched_agent"] = home_dir.parent.name
+            return out
+        # Defensive: still under data/agents with the effective shape.
+        out["matched_layout"] = "orphan-shape"
+        return out
+    # legacy v1 per-agent: <target_root>/agents/<agent>/.claude/settings.effective.json
+    if under_v1:
+        out["matched_layout"] = "legacy-agent"
+        out["matched_agent"] = parent.parent.name
+        return out
+    out["matched_layout"] = "orphan-shape"
+    return out
+
+
+def classify_operator_global_settings_hijack(
+    operator_global: Path,
+    target_root: Path,
+) -> dict[str, Any]:
+    """Classify the operator-global settings file.
+
+    Returns a payload whose `status` is one of:
+      absent | non_symlink | symlink_non_bridge | detected | error
+
+    A `detected` status means the operator-global path is a symlink whose
+    realpath resolves to (or has the path-shape of) a bridge effective output.
+    Regular files, non-bridge symlinks, and missing files are NOT hijacks.
+    """
+    payload: dict[str, Any] = {
+        "status": "absent",
+        "operator_global": str(operator_global),
+        "is_symlink": False,
+        "link_target_raw": "",
+        "link_target_real": "",
+        "matched_layout": "",
+        "matched_agent": "",
+    }
+    try:
+        st = os.lstat(operator_global)  # noqa: raw-pathlib-controller-only — read-only lstat on the operator-HOME global; OSError-guarded.
+    except FileNotFoundError:
+        return payload
+    except OSError as exc:
+        payload["status"] = "error"
+        payload["message"] = f"{type(exc).__name__}: {exc}"
+        return payload
+
+    if not S_ISLNK(st.st_mode):
+        payload["status"] = "non_symlink"
+        return payload
+
+    payload["is_symlink"] = True
+    try:
+        link_target_raw = os.readlink(operator_global)
+    except OSError as exc:
+        payload["status"] = "error"
+        payload["message"] = f"{type(exc).__name__}: {exc}"
+        return payload
+    payload["link_target_raw"] = link_target_raw
+    try:
+        link_target_real = os.path.realpath(operator_global)
+    except OSError:
+        link_target_real = ""
+    payload["link_target_real"] = link_target_real
+
+    match = _classify_bridge_effective_target(link_target_real, target_root)
+    payload["matched_layout"] = match["matched_layout"]
+    payload["matched_agent"] = match["matched_agent"]
+    if match["matched_layout"]:
+        payload["status"] = "detected"
+    else:
+        payload["status"] = "symlink_non_bridge"
+    return payload
+
+
+def backup_operator_global_settings_hijack(
+    detection: dict[str, Any],
+    backup_parent: Path,
+    restore_bytes: bytes,
+    restore_mode: str,
+    restore_source: str = "",
+) -> dict[str, Any]:
+    """Write a complete, non-overwriting backup of the hijacked operator-global
+    symlink BEFORE any mutation. Returns {ok: bool, backup_dir, error?}.
+
+    On ANY write failure, the partial dir is left in place (best-effort) and
+    `ok=False` is returned so the caller refuses to mutate the operator global.
+    """
+    operator_global = Path(detection["operator_global"])
+    link_target_raw = detection.get("link_target_raw", "")
+    link_target_real = detection.get("link_target_real", "")
+    result: dict[str, Any] = {"ok": False, "backup_dir": ""}
+    try:
+        backup_parent.mkdir(parents=True, exist_ok=True, mode=0o700)  # noqa: raw-pathlib-controller-only — controller/operator-owned backup tree under target_root.
+    except OSError as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        return result
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_dir: Path | None = None
+    for _ in range(8):
+        nonce = uuid.uuid4().hex[:8]
+        candidate = backup_parent / f"{stamp}-{os.getpid()}-{nonce}"
+        try:
+            candidate.mkdir(mode=0o700)  # noqa: raw-pathlib-controller-only — exclusive backup-run dir creation; never overwrites.
+            run_dir = candidate
+            break
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            result["error"] = f"{type(exc).__name__}: {exc}"
+            return result
+    if run_dir is None:
+        result["error"] = "could not create a unique backup directory after 8 attempts"
+        return result
+    result["backup_dir"] = str(run_dir)
+
+    target_readable = False
+    target_sha256 = ""
+    try:
+        # 1. raw link target text
+        (run_dir / "operator-global-settings.link-target.txt").write_text(  # noqa: raw-pathlib-controller-only — owner-only backup evidence file.
+            link_target_raw + "\n", encoding="utf-8"
+        )
+        os.chmod(run_dir / "operator-global-settings.link-target.txt", 0o600)
+
+        # 2. symlink backup with the SAME raw target (not a copy of the file)
+        symlink_backup = run_dir / "operator-global-settings.symlink"
+        os.symlink(link_target_raw, symlink_backup)
+
+        # 3. best-effort target evidence (the effective file is expected to
+        #    contain bridge hooks — evidence only, NEVER auto-restored from).
+        if link_target_real and os.path.isfile(link_target_real):
+            try:
+                raw = Path(link_target_real).read_bytes()  # noqa: raw-pathlib-controller-only — best-effort read of the resolved effective target for evidence.
+                (run_dir / "operator-global-settings.target.json").write_bytes(raw)  # noqa: raw-pathlib-controller-only — owner-only evidence copy.
+                os.chmod(run_dir / "operator-global-settings.target.json", 0o600)
+                target_sha256 = hashlib.sha256(raw).hexdigest()
+                (run_dir / "operator-global-settings.target.sha256").write_text(  # noqa: raw-pathlib-controller-only — owner-only evidence hash.
+                    target_sha256 + "\n", encoding="utf-8"
+                )
+                os.chmod(run_dir / "operator-global-settings.target.sha256", 0o600)
+                target_readable = True
+            except OSError:
+                target_readable = False
+
+        # 4. the exact replacement bytes that will be installed
+        (run_dir / "restore-neutral.json").write_bytes(restore_bytes)  # noqa: raw-pathlib-controller-only — owner-only record of the installed replacement.
+        os.chmod(run_dir / "restore-neutral.json", 0o600)
+
+        # 5. manifest
+        manifest = {
+            "issue": "1985",
+            "operator_global": str(operator_global),
+            "link_target_raw": link_target_raw,
+            "link_target_real": link_target_real,
+            "target_root": str(detection.get("target_root", "")),
+            "matched_layout": detection.get("matched_layout", ""),
+            "matched_agent": detection.get("matched_agent", ""),
+            "target_readable": target_readable,
+            "target_sha256": target_sha256,
+            "restore_mode": restore_mode,
+            "restore_source": restore_source,
+            "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "rollback": [
+                f'rm -f "{operator_global}"',
+                f'ln -s "$(cat \'{run_dir}/operator-global-settings.link-target.txt\')" "{operator_global}"',
+            ],
+        }
+        (run_dir / "manifest.json").write_text(  # noqa: raw-pathlib-controller-only — owner-only manifest.
+            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        )
+        os.chmod(run_dir / "manifest.json", 0o600)
+
+        # 6. operator-facing ROLLBACK.txt
+        rollback_txt = (
+            "# Issue #1985 operator-global settings de-hijack rollback\n"
+            "#\n"
+            "# This backup was written before agb upgrade replaced a hijacked\n"
+            f"# {operator_global}\n"
+            "# (a symlink into a bridge settings.effective.json) with a neutral\n"
+            "# Claude Code settings file.\n"
+            "#\n"
+            "# 1. Restore the previous symlink exactly (undo the repair):\n"
+            f'rm -f "{operator_global}"\n'
+            f"ln -s \"$(cat '{run_dir}/operator-global-settings.link-target.txt')\" "
+            f'"{operator_global}"\n'
+            "#\n"
+            "# 2. Keep the repaired neutral file but inspect the saved target evidence:\n"
+            f"less '{run_dir}/operator-global-settings.target.json'\n"
+        )
+        (run_dir / "ROLLBACK.txt").write_text(rollback_txt, encoding="utf-8")  # noqa: raw-pathlib-controller-only — owner-only rollback note.
+        os.chmod(run_dir / "ROLLBACK.txt", 0o600)
+    except OSError as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        return result
+
+    result["ok"] = True
+    result["target_readable"] = target_readable
+    return result
+
+
+def repair_operator_global_settings_hijack(
+    detection: dict[str, Any],
+    restore_bytes: bytes,
+) -> dict[str, Any]:
+    """Install the replacement file over the hijacked symlink ATOMICALLY.
+
+    Stages a same-directory temp file, JSON-validates it, chmod 0600, then
+    `os.replace` so the SYMLINK ITSELF is replaced (os.replace does not follow
+    the link — it never touches the bridge effective target). Post-checks with
+    lstat that the final path is a regular non-symlink valid-JSON file.
+
+    Returns {ok: bool, error?}. On failure after staging, best-effort removes the
+    temp file; that cleanup error never masks the primary failure.
+    """
+    operator_global = Path(detection["operator_global"])
+    result: dict[str, Any] = {"ok": False}
+    parent = operator_global.parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — ensure operator ~/.claude exists; operator-owned.
+    except OSError as exc:
+        result["error"] = f"mkdir parent: {type(exc).__name__}: {exc}"
+        return result
+
+    # Validate the replacement bytes are a JSON object before staging.
+    try:
+        parsed = json.loads(restore_bytes.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        result["error"] = f"replacement is not valid JSON: {type(exc).__name__}: {exc}"
+        return result
+    if not isinstance(parsed, dict):
+        result["error"] = "replacement JSON is not an object"
+        return result
+
+    tmp_path: Path | None = None
+    try:
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=".settings.json.1985-", dir=str(parent)
+        )
+        tmp_path = Path(tmp_name)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(restore_bytes)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp_path, 0o600)
+        # Re-validate the staged file on disk.
+        with tmp_path.open("rb") as handle:
+            json.loads(handle.read().decode("utf-8"))
+        os.replace(tmp_path, operator_global)
+        tmp_path = None
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        if tmp_path is not None:
+            with contextlib.suppress(OSError):
+                tmp_path.unlink()  # noqa: raw-pathlib-controller-only — best-effort staged-temp cleanup.
+        return result
+
+    # Post-check: final path is a regular non-symlink valid-JSON file.
+    try:
+        final_st = os.lstat(operator_global)  # noqa: raw-pathlib-controller-only — post-replace verify.
+        if S_ISLNK(final_st.st_mode):
+            result["error"] = "post-check: operator global is still a symlink"
+            return result
+        with operator_global.open("rb") as handle:
+            json.loads(handle.read().decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        result["error"] = f"post-check failed: {type(exc).__name__}: {exc}"
+        return result
+
+    result["ok"] = True
+    result["mode"] = oct(final_st.st_mode & 0o777)
+    return result
+
+
+def run_operator_global_settings_hijack_sweep(
+    args: argparse.Namespace,
+    target_root: Path,
+) -> dict[str, Any]:
+    """Detect (always) + repair (only with the explicit flag) the operator-global
+    settings hijack. Returns the stable `operator_global_settings_hijack` payload.
+
+    Report-only is the default and NEVER mutates / NEVER fails the upgrade. This
+    function is exception-safe: a classify error is reported as status=error in
+    the payload (the caller decides whether it counts as a cleanup_failure).
+    """
+    operator_global = resolve_operator_global_settings_file(args)
+    repair_requested = bool(getattr(args, "repair_operator_global_settings_hijack", False))
+    restore_file = getattr(args, "operator_global_settings_restore_file", "") or ""
+
+    detection = classify_operator_global_settings_hijack(operator_global, target_root)
+    detection["target_root"] = str(target_root)
+    payload: dict[str, Any] = dict(detection)
+    payload["repair_requested"] = repair_requested
+    payload["backup_dir"] = ""
+    payload["restore_mode"] = "report-only"
+    payload["rollback"] = ""
+
+    if payload["status"] != "detected":
+        # absent / non_symlink / symlink_non_bridge / error — nothing to repair.
+        if payload["status"] == "error":
+            payload["message"] = payload.get("message", "classify error")
+        else:
+            payload.setdefault("message", "no operator-global settings hijack detected")
+        return payload
+
+    if not repair_requested:
+        payload["message"] = (
+            "operator-global settings is a symlink into a bridge effective file; "
+            "re-run with --repair-operator-global-settings-hijack to back up and "
+            "replace it with a neutral Claude settings file"
+        )
+        return payload
+
+    # --- Repair path (explicit flag) ---
+    # Resolve the replacement bytes.
+    restore_mode = "neutral"
+    restore_source = ""
+    restore_bytes = OPERATOR_GLOBAL_NEUTRAL_SETTINGS.encode("utf-8")
+    if restore_file.strip():
+        restore_path = Path(restore_file).expanduser()
+        try:
+            rst = os.lstat(restore_path)  # noqa: raw-pathlib-controller-only — validate explicit restore-file.
+        except OSError as exc:
+            payload["status"] = "repair_failed"
+            payload["message"] = f"restore-file unreadable: {type(exc).__name__}: {exc}"
+            return payload
+        if S_ISLNK(rst.st_mode):
+            payload["status"] = "repair_failed"
+            payload["message"] = "restore-file must be a regular file, not a symlink"
+            return payload
+        if not S_ISREG(rst.st_mode):
+            payload["status"] = "repair_failed"
+            payload["message"] = (
+                "restore-file must be a regular file "
+                "(not a directory, fifo, device, or socket)"
+            )
+            return payload
+        try:
+            candidate = restore_path.read_bytes()  # noqa: raw-pathlib-controller-only — read explicit trusted restore-file.
+            parsed = json.loads(candidate.decode("utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError) as exc:
+            payload["status"] = "repair_failed"
+            payload["message"] = f"restore-file is not valid JSON: {type(exc).__name__}: {exc}"
+            return payload
+        if not isinstance(parsed, dict):
+            payload["status"] = "repair_failed"
+            payload["message"] = "restore-file JSON must be an object"
+            return payload
+        restore_bytes = candidate
+        restore_mode = "explicit-restore-file"
+        restore_source = str(restore_path)
+
+    payload["restore_mode"] = restore_mode
+
+    # Re-run detection immediately before backup (TOCTOU narrowing). The recheck
+    # result is what backup + repair act on — NOT the original detection — so a
+    # symlink that re-pointed between the first classify and now is backed up and
+    # replaced against its CURRENT raw target (the backed-up symlink + manifest
+    # never record a stale link target).
+    recheck = classify_operator_global_settings_hijack(operator_global, target_root)
+    if recheck.get("status") != "detected":
+        payload["status"] = recheck.get("status", "error")
+        payload["message"] = (
+            "operator-global state changed before repair; left untouched "
+            f"(recheck status={recheck.get('status')})"
+        )
+        return payload
+    recheck["target_root"] = str(target_root)
+    # Surface the (possibly re-pointed) current target in the report payload too.
+    payload["link_target_raw"] = recheck.get("link_target_raw", "")
+    payload["link_target_real"] = recheck.get("link_target_real", "")
+    payload["matched_layout"] = recheck.get("matched_layout", "")
+    payload["matched_agent"] = recheck.get("matched_agent", "")
+
+    backup_parent = (
+        Path(args.operator_global_settings_hijack_backup_dir).expanduser()
+        if getattr(args, "operator_global_settings_hijack_backup_dir", "")
+        else (target_root / "backups" / "operator-global-settings-hijack")
+    )
+    backup = backup_operator_global_settings_hijack(
+        recheck, backup_parent, restore_bytes, restore_mode, restore_source
+    )
+    payload["backup_dir"] = backup.get("backup_dir", "")
+    if not backup.get("ok"):
+        payload["status"] = "repair_failed"
+        payload["message"] = (
+            "backup failed; operator-global symlink left UNCHANGED: "
+            + backup.get("error", "unknown")
+        )
+        return payload
+
+    payload["rollback"] = f"see {payload['backup_dir']}/ROLLBACK.txt"
+    repair = repair_operator_global_settings_hijack(recheck, restore_bytes)
+    if not repair.get("ok"):
+        payload["status"] = "repair_failed"
+        payload["message"] = (
+            "replace failed after backup; operator-global symlink left UNCHANGED "
+            "(backup retained): " + repair.get("error", "unknown")
+        )
+        return payload
+
+    payload["status"] = "repaired"
+    payload["message"] = (
+        "operator-global settings symlink backed up and replaced with a neutral "
+        f"Claude settings file ({restore_mode}); rollback at "
+        f"{payload['backup_dir']}/ROLLBACK.txt"
+    )
+    return payload
+
+
+def _warn_operator_global_settings_hijack(hijack: dict[str, Any]) -> None:
+    """Emit a stderr warning for the loud #1985 statuses so a standalone manual
+    `cleanup-residue` run surfaces them even when nobody reads the JSON. stdout
+    stays pure JSON (emit_json owns it); only stderr is touched here.
+    """
+    status = hijack.get("status", "")
+    if status not in ("detected", "repaired", "repair_failed"):
+        return
+    op = hijack.get("operator_global", "~/.claude/settings.json")
+    if status == "detected":
+        sys.stderr.write(
+            f"[bridge-upgrade] WARNING (#1985): operator-global settings '{op}' is "
+            "a symlink into a bridge effective file (report-only — no change made). "
+            "Re-run cleanup-residue with --repair-operator-global-settings-hijack "
+            "to back it up and replace it with a neutral Claude settings file.\n"
+        )
+    elif status == "repaired":
+        sys.stderr.write(
+            f"[bridge-upgrade] (#1985): operator-global settings '{op}' was backed "
+            f"up and replaced with a neutral Claude settings file; rollback at "
+            f"{hijack.get('backup_dir', '?')}/ROLLBACK.txt\n"
+        )
+    else:  # repair_failed
+        sys.stderr.write(
+            f"[bridge-upgrade] ERROR (#1985): repair of operator-global settings "
+            f"'{op}' FAILED; symlink left unchanged: {hijack.get('message', '?')}\n"
+        )
+
+
 def cmd_cleanup_residue(args: argparse.Namespace) -> int:
     target_root = Path(args.target_root).expanduser()
     # PR #508 r2: default these to the canonical layout under target_root.
@@ -4394,6 +4910,7 @@ def cmd_cleanup_residue(args: argparse.Namespace) -> int:
         "snapshots_pruned": [],
         "upgrade_backups": {},
         "claude_config": {},
+        "operator_global_settings_hijack": {},
         "free_bytes_before": 0,
         "free_bytes_after": 0,
         "cleanup_failures": [],
@@ -4468,6 +4985,39 @@ def cmd_cleanup_residue(args: argparse.Namespace) -> int:
     except Exception as exc:
         payload["cleanup_failures"].append(
             {"step": "claude_config", "error": f"{type(exc).__name__}: {exc}"}
+        )
+
+    # 6. Issue #1985: operator-global settings hijack detect (always) + repair
+    # (explicit flag only). Report-only is the default and never mutates / never
+    # fails the upgrade — so a report-only `detected` does NOT add to
+    # cleanup_failures. Only an unexpected classify error or a *requested* repair
+    # that failed (backup/replace) counts as a cleanup failure.
+    try:
+        hijack = run_operator_global_settings_hijack_sweep(args, target_root)
+        payload["operator_global_settings_hijack"] = hijack
+        status = hijack.get("status", "")
+        # Warn on stderr too (stdout stays pure JSON): a standalone manual
+        # `cleanup-residue` run may never read the JSON, so the louder statuses
+        # must surface even without the renderer.
+        _warn_operator_global_settings_hijack(hijack)
+        if status == "error":
+            payload["cleanup_failures"].append(
+                {"step": "operator_global_settings_hijack",
+                 "error": hijack.get("message", "classify error")}
+            )
+        elif status == "repair_failed":
+            payload["cleanup_failures"].append(
+                {"step": "operator_global_settings_hijack",
+                 "error": hijack.get("message", "repair failed")}
+            )
+    except Exception as exc:
+        payload["operator_global_settings_hijack"] = {
+            "status": "error",
+            "message": f"{type(exc).__name__}: {exc}",
+        }
+        payload["cleanup_failures"].append(
+            {"step": "operator_global_settings_hijack",
+             "error": f"{type(exc).__name__}: {exc}"}
         )
 
     if measure_path and measure_path.exists():
@@ -5069,6 +5619,36 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup_residue.add_argument(
         "--claude-config-path", default="",
         help="Override path to .claude.json (default: ~/.claude.json).",
+    )
+    # Issue #1985: operator-global settings hijack detect/repair.
+    cleanup_residue.add_argument(
+        "--operator-global-settings-file", default="",
+        help=(
+            "Already-resolved operator-global Claude settings path "
+            "(from the #1984 resolver). Default: ~/.claude/settings.json."
+        ),
+    )
+    cleanup_residue.add_argument(
+        "--repair-operator-global-settings-hijack", action="store_true",
+        help=(
+            "Repair (not just report) an operator-global settings symlink that "
+            "points at a bridge effective file: back it up, then replace it with "
+            "a neutral Claude settings file. Default is report-only."
+        ),
+    )
+    cleanup_residue.add_argument(
+        "--operator-global-settings-hijack-backup-dir", default="",
+        help=(
+            "Backup parent dir for the #1985 repair (default: "
+            "<target-root>/backups/operator-global-settings-hijack)."
+        ),
+    )
+    cleanup_residue.add_argument(
+        "--operator-global-settings-restore-file", default="",
+        help=(
+            "Optional trusted regular JSON-object file to install instead of the "
+            "neutral {} replacement during #1985 repair."
+        ),
     )
     cleanup_residue.set_defaults(handler=cmd_cleanup_residue)
 

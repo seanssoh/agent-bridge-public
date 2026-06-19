@@ -49,6 +49,7 @@ def main() -> int:
     upg_pruned = upg.get("pruned") or []
     upg_preserved = upg.get("preserved") or []
     cfg = data.get("claude_config") or {}
+    hijack = data.get("operator_global_settings_hijack") or {}
     fails = data.get("cleanup_failures") or []
 
     freed_human = data.get("bytes_freed_human") or "0 B"
@@ -81,6 +82,62 @@ def main() -> int:
     lines.append(f"- `~/.claude.json`: {status_blurb}")
     if cfg_status == "corrupted" and cfg.get("recovery_candidate"):
         lines.append(f"  - Suggested recovery source: `{cfg['recovery_candidate']}`")
+
+    # Issue #1985: operator-global settings hijack. `detected` is a LOUD warning
+    # (report-only by default — the operator must opt in to repair); `repaired`
+    # surfaces the backup/rollback pointer; `repair_failed` confirms the symlink
+    # was left unchanged. Quiet statuses (clean/absent/non_symlink/
+    # symlink_non_bridge) are omitted to avoid noise.
+    hijack_status = hijack.get("status", "")
+    op_global = hijack.get("operator_global", "~/.claude/settings.json")
+    if hijack_status == "detected":
+        lines.append("")
+        lines.append("### ⚠️  Operator-global settings hijack DETECTED (#1985)")
+        lines.append(
+            f"- `{op_global}` is a **symlink** into a bridge "
+            f"`settings.effective.json` (layout: {hijack.get('matched_layout', '?')}"
+            + (f", agent: {hijack.get('matched_agent')}" if hijack.get("matched_agent") else "")
+            + ")."
+        )
+        lines.append(
+            "- This leaks bridge hooks into your vanilla Claude sessions and can "
+            "strand the global config when that agent is deleted."
+        )
+        lines.append(
+            "- **Report-only** — no file was changed. To back up and replace it "
+            "with a neutral Claude settings file, run:"
+        )
+        lines.append(
+            "  ```bash\n"
+            "  python3 <source>/bridge-upgrade.py cleanup-residue "
+            "--target-root <BRIDGE_HOME> "
+            "--repair-operator-global-settings-hijack\n"
+            "  ```"
+        )
+    elif hijack_status == "repaired":
+        lines.append("")
+        lines.append("### Operator-global settings hijack REPAIRED (#1985)")
+        lines.append(
+            f"- `{op_global}` was backed up and replaced with a neutral "
+            f"Claude settings file ({hijack.get('restore_mode', 'neutral')})."
+        )
+        if hijack.get("backup_dir"):
+            lines.append(f"- Backup: `{hijack['backup_dir']}`")
+            lines.append(f"- Rollback: `{hijack['backup_dir']}/ROLLBACK.txt`")
+    elif hijack_status == "repair_failed":
+        lines.append("")
+        lines.append("### Operator-global settings hijack repair FAILED (#1985)")
+        lines.append(
+            f"- `{op_global}` was **left unchanged**: {hijack.get('message', '?')}"
+        )
+        if hijack.get("backup_dir"):
+            lines.append(f"- Partial backup (if any): `{hijack['backup_dir']}`")
+    elif hijack_status == "error":
+        lines.append("")
+        lines.append(
+            f"- Operator-global settings hijack check errored (#1985): "
+            f"{hijack.get('message', '?')}"
+        )
 
     if fails:
         lines.append("")
