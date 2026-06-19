@@ -398,6 +398,22 @@ _remat_path_under_target_dir() {
   _remat_path_under "$target_dir" "$1"
 }
 
+# Issue #1931 (DATA-LOSS): the instruction ENTRYPOINT docs (CLAUDE.md for claude,
+# AGENTS.md for codex) are the operating contract the runtime loads from the
+# workdir cwd. They are the only identity docs an operator commonly customizes IN
+# THE WORKDIR while leaving the identity-source/home copy at the placeholder
+# template — so a blind home->workdir overwrite of an entrypoint with a
+# placeholder source clobbers the operator's role/queue-protocol/rules contract.
+# The set is populated once `remat_entrypoint_names` is computed below.
+declare -a REMAT_ENTRYPOINT_DOC_RELS=()
+_remat_is_entrypoint_doc() {
+  local rel="$1" name=""
+  for name in ${REMAT_ENTRYPOINT_DOC_RELS[@]+"${REMAT_ENTRYPOINT_DOC_RELS[@]}"}; do
+    [[ "$rel" == "$name" ]] && return 0
+  done
+  return 1
+}
+
 if ! _remat_path_under_target_root "$target_dir"; then
   skipped_reason="target_outside_root"
   _remat_finish
@@ -491,6 +507,114 @@ _remat_target_differs_or_missing() {
   return 0
 }
 
+# Issue #1931: write decoded UTF-8 bytes (from the preserve helper's managed-block
+# refresh) to the workdir entrypoint, honoring the iso-UID write path. Reads the
+# base64 payload on stdin and lands it at <dst> exactly like the normal copy.
+_remat_write_refreshed() {
+  local dst="$1" b64="$2" tmp="" rc=0
+  tmp="$(mktemp "${TMPDIR:-/tmp}/agb-remat-refresh.XXXXXX")" || return 1
+  if ! printf '%s' "$b64" | python3 -c 'import base64,sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))' >"$tmp" 2>/dev/null; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  if (( iso_effective == 1 )); then
+    bridge_isolation_write_file_as_agent_user_via_bash "$agent" "$dst" "0660" <"$tmp" >/dev/null 2>&1 || rc=$?
+    if (( rc == 0 )); then
+      bridge_isolation_v2_chgrp_file_iso_group "$agent" "$dst" 0660 "$target_dir" >/dev/null 2>&1 || true
+    fi
+  else
+    cp -f -- "$tmp" "$dst" 2>/dev/null || rc=1
+  fi
+  rm -f -- "$tmp"
+  return "$rc"
+}
+
+# Issue #1931: cheap inline placeholder probe — true iff the entrypoint head (the
+# `# <Agent Name> — <Role>` skeleton + the `<한 줄 역할 설명>` / `<표시 이름>`
+# slots the create-time render fills in) still carries an unsubstituted template
+# token, i.e. the file was never rendered for a concrete agent. Used as the
+# FAIL-SAFE fallback when the python decision helper is unexpectedly absent, so a
+# partial/corrupted upgrade source never reopens the silent clobber the issue is
+# about. Mirrors preserve-customized-entrypoint.py::is_placeholder_entrypoint
+# (head-window only) so the fallback classification matches the helper's.
+_remat_entrypoint_is_placeholder() {
+  local file="$1" head_block=""
+  [[ -f "$file" ]] || return 1
+  head_block="$(head -n 8 -- "$file" 2>/dev/null)" || return 1
+  case "$head_block" in
+    *'<Agent Name>'* | *'<Role>'* | *'<agent-id>'* | *'<한 줄 역할 설명>'* | *'<표시 이름>'* | *'<핵심 책임>'*)
+      return 0 ;;
+  esac
+  return 1
+}
+
+# Issue #1931: record + warn that an operator-customized workdir entrypoint was
+# preserved instead of clobbered by the placeholder home copy. Shared by the
+# python-helper path and the inline fail-safe fallback.
+_remat_record_preserved_entrypoint() {
+  local target_rel="$1"
+  REMAT_PRESERVED_PATHS+=("$target_rel")
+  _remat_audit_line preserve "$target_rel"
+  printf '[rematerialize] agent=%s WARNING: preserved operator-customized workdir %s (home copy is the placeholder template; not overwriting — Issue #1931)\n' \
+    "$agent" "$target_rel" >&2
+}
+
+# Issue #1931 (DATA-LOSS): decide+act for an entrypoint OVERWRITE that the copy
+# gate would otherwise perform with a placeholder source. Returns 0 when the file
+# was preserved (managed-block-only refresh or kept verbatim) so the caller skips
+# the clobbering copy; returns 1 to let the caller proceed with the normal copy
+# (the source is a real authored identity, not the placeholder). Mirrors the
+# #1817 "operator-customized contract is sacred" pattern for the workdir copy.
+_remat_preserve_customized_entrypoint() {
+  local rel="$1" src="$2" dst="$3" target_rel="$4"
+  local helper="$source_root/lib/upgrade-helpers/preserve-customized-entrypoint.py"
+  local decision_json="" decision="" refresh="" refreshed_b64=""
+
+  # FAIL-SAFE fallback: if the python decision helper is missing OR errors, do
+  # NOT fail open to the clobber. Re-derive the only decision that matters here
+  # — "is the SOURCE the placeholder while the DST is operator-customized?" —
+  # inline, and if so preserve the workdir copy verbatim (no managed-block
+  # refresh in this degraded path, but the operator's contract is never lost).
+  if [[ ! -f "$helper" ]]; then
+    if _remat_entrypoint_is_placeholder "$src" && ! _remat_entrypoint_is_placeholder "$dst"; then
+      _remat_record_preserved_entrypoint "$target_rel"
+      _remat_add_error "preserve helper missing ($helper); kept $target_rel verbatim (no managed-block refresh)"
+      return 0
+    fi
+    return 1
+  fi
+
+  decision_json="$(python3 "$helper" "$src" "$dst" 2>/dev/null || printf '')"
+  decision="$(printf '%s' "$decision_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("decision",""))' 2>/dev/null || printf '')"
+  if [[ -z "$decision_json" || ( "$decision" != "preserve" && "$decision" != "proceed" ) ]]; then
+    # Helper produced no usable verdict (crash / malformed JSON). Apply the same
+    # inline fail-safe rather than trusting the clobbering copy by default.
+    if _remat_entrypoint_is_placeholder "$src" && ! _remat_entrypoint_is_placeholder "$dst"; then
+      _remat_record_preserved_entrypoint "$target_rel"
+      _remat_add_error "preserve helper gave no verdict for $target_rel; kept verbatim (no managed-block refresh)"
+      return 0
+    fi
+    return 1
+  fi
+  [[ "$decision" == "preserve" ]] || return 1
+
+  # Operator-customized workdir entrypoint vs placeholder source: PRESERVE.
+  _remat_record_preserved_entrypoint "$target_rel"
+
+  refresh="$(printf '%s' "$decision_json" | python3 -c 'import json,sys; print("1" if json.load(sys.stdin).get("refresh") else "0")' 2>/dev/null || printf '0')"
+  if [[ "$refresh" == "1" && "$dry_run" != "1" ]]; then
+    refreshed_b64="$(printf '%s' "$decision_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("refreshed_b64",""))' 2>/dev/null || printf '')"
+    if [[ -n "$refreshed_b64" ]]; then
+      if _remat_write_refreshed "$dst" "$refreshed_b64"; then
+        _remat_audit_line rematerialize "$target_rel (managed-block only)"
+      else
+        _remat_add_error "managed-block refresh failed for $target_rel (preserved verbatim)"
+      fi
+    fi
+  fi
+  return 0
+}
+
 _remat_copy_one_file() {
   local rel="$1"
   local src="$source_dir/$rel"
@@ -530,6 +654,21 @@ _remat_copy_one_file() {
   fi
   if (( force_plan == 0 )) && ! _remat_target_differs_or_missing "$src" "$dst"; then
     return 0
+  fi
+  # Issue #1931 (DATA-LOSS): never overwrite an operator-customized workdir
+  # ENTRYPOINT doc (CLAUDE.md / AGENTS.md) with the placeholder template. On
+  # installs where the operator customized only the workdir copy and left the
+  # home copy at the unrendered placeholder, the differ-then-copy gate above
+  # silently clobbered the live operating contract. When the SOURCE is the
+  # placeholder and the DST is operator-customized, preserve dst and update only
+  # its managed DOC-MIGRATION block (so the upgrade's new doc line still lands).
+  # `[[ -f "$dst" ]]` scopes this to an OVERWRITE — a missing workdir entrypoint
+  # still gets its normal create-if-absent copy below (placeholder included, the
+  # legitimate fresh scaffold).
+  if _remat_is_entrypoint_doc "$rel" && [[ -f "$dst" && ! -L "$dst" ]]; then
+    if _remat_preserve_customized_entrypoint "$rel" "$src" "$dst" "$target_rel"; then
+      return 0
+    fi
   fi
   REMAT_UPDATED_PATHS+=("$target_rel")
   _remat_audit_line rematerialize "$target_rel"
@@ -707,6 +846,11 @@ fi
 if bridge_engine_wants_claude_compat_copy "$engine" 2>/dev/null && [[ "$engine_entry" != "CLAUDE.md" ]]; then
   remat_entrypoint_names+=("CLAUDE.md")
 fi
+
+# Issue #1931: the entrypoint docs above are the operator-customizable workdir
+# contract; the copy gate (_remat_copy_one_file) consults this set to refuse a
+# placeholder-source clobber of a customized workdir copy.
+REMAT_ENTRYPOINT_DOC_RELS=(${remat_entrypoint_names[@]+"${remat_entrypoint_names[@]}"})
 
 # Issue #1809: entrypoint-backfill-only mode. The daemon doc-backfill hygiene
 # pass (cmd_backfill_codex_entrypoints) sets this to mirror ONLY the freshly
