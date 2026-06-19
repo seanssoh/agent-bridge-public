@@ -9264,11 +9264,31 @@ bridge_plugin_mcp_is_probeable_item() {
 # that it is missing. Callers should gate on bridge_plugin_mcp_is_probeable_item
 # *before* invoking this probe so unprobeable plugins do not get flagged
 # as missing and trigger restart loops (issue #542).
+#
+# Issue #2021: this probe is TRI-STATE so the engine-log second signal can
+# rescue ONLY the inconclusive case without ever overriding a clean process
+# verdict:
+#   0  alive       — a matching bun MCP descendant is in the pane's tree.
+#   1  dead         — the process table was read cleanly and no matching
+#                     descendant exists. This verdict is AUTHORITATIVE; the
+#                     engine-log signal must NOT override it (a genuinely
+#                     dead channel stays dead even if an old connect/register
+#                     pair sits in the current session's log).
+#   2  inconclusive — the process table could not be read (`ps` unavailable
+#                     or it failed). We do not know whether the channel is
+#                     alive; the engine-log second signal MAY rescue this case.
+# The non-zero rc=1 ⇄ rc=2 split is invisible to plain `if probe; then`
+# callers (both fall to the else branch) — only callers that explicitly
+# branch on the inconclusive code (bridge_agent_plugin_mcp_alive_for_item)
+# consult the log.
 bridge_plugin_mcp_descendant_ready_for_item() {
   local root_pid="$1"
   local item="$2"
   local identity=""
 
+  # A non-numeric / empty pid or unprobeable item is a hard, deterministic
+  # "not ready" — not an inconclusive process-table read — so it stays rc=1
+  # (authoritative dead) and never invites a log rescue.
   [[ "$root_pid" =~ ^[0-9]+$ ]] || return 1
   identity="$(bridge_plugin_mcp_identity_for_item "$item")"
   [[ -n "$identity" ]] || return 1
@@ -9290,8 +9310,12 @@ try:
         text=True,
         capture_output=True,
     )
-except subprocess.CalledProcessError:
-    raise SystemExit(1)
+except (OSError, subprocess.SubprocessError):
+    # The process table could not be read (ps missing, transient failure,
+    # OS error). This is INCONCLUSIVE, not a clean negative — exit 2 so the
+    # caller may consult the current-session engine log before declaring the
+    # channel dead. Issue #2021.
+    raise SystemExit(2)
 
 procs = {}
 children = defaultdict(list)
@@ -9337,11 +9361,200 @@ raise SystemExit(1)
 PY
 }
 
+# bridge_plugin_mcp_engine_log_ready_for_item <agent> <item> <root_pid>
+#
+# Issue #2021 (re-implementation of community PR #1770 by @sankyul, credited).
+# SECOND liveness signal — consulted ONLY when the descendant process probe
+# is inconclusive (rc=2). Returns 0 iff the CURRENT Claude session's engine
+# MCP log for this plugin shows BOTH connect markers — `Successfully
+# connected` AND `Channel notifications registered` — written after the pane
+# process started and from this agent's own workdir + session id. Returns 1
+# otherwise (including any case we cannot positively confirm) so the caller
+# falls back to the process-probe verdict and never declares a flaky channel
+# alive on weak evidence.
+#
+# Current-session scoping is the false-positive guard (the whole point of the
+# issue): a stale prior-session log that happens to contain the marker pair
+# must NOT yield a false "alive". We bind on three independent facts:
+#   1. session id  — the line's `sessionId` must equal the agent's persisted
+#                    current session id; an empty/unresolvable id fails closed
+#                    (return 1) so a child/cron/subagent log in the same cwd
+#                    cannot satisfy the pair.
+#   2. workdir     — the line's `cwd` must realpath-match the agent workdir.
+#   3. start time  — the line's timestamp (and the file mtime) must be at or
+#                    after the pane process start, so a pre-restart log from
+#                    an earlier process in the same session cannot rescue. If
+#                    the pane start time cannot be read (`ps -o lstart` fails)
+#                    we have no temporal anchor, so we fail closed rather than
+#                    accept a recent-only window (codex r1).
+bridge_plugin_mcp_engine_log_ready_for_item() {
+  local agent="$1"
+  local item="$2"
+  local root_pid="$3"
+  local identity=""
+  local workdir=""
+  local session_id=""
+  local cache_roots=""
+  local xdg_cache=""
+
+  [[ "$(bridge_agent_engine "$agent")" == "claude" ]] || return 1
+  [[ "$root_pid" =~ ^[0-9]+$ ]] || return 1
+  identity="$(bridge_plugin_mcp_identity_for_item "$item")"
+  [[ -n "$identity" ]] || return 1
+  workdir="$(bridge_agent_workdir "$agent" 2>/dev/null || true)"
+  [[ -n "$workdir" ]] || return 1
+  # Engine-log evidence is only trustworthy when bound to the CURRENT Claude
+  # session. Without a resolvable session id, same-cwd child/cron/subagent
+  # logs (or a stale prior session) can satisfy the connected+registered pair
+  # and mask a dead channel — fail closed (Issue #2021).
+  session_id="$(bridge_agent_session_id "$agent" 2>/dev/null || true)"
+  [[ -n "$session_id" ]] || return 1
+
+  if [[ -n "${BRIDGE_CLAUDE_NODEJS_CACHE_DIR:-}" ]]; then
+    cache_roots="$BRIDGE_CLAUDE_NODEJS_CACHE_DIR"
+  else
+    xdg_cache="${XDG_CACHE_HOME:-${HOME:-}/.cache}"
+    cache_roots="${HOME:-}/Library/Caches/claude-cli-nodejs:${xdg_cache}/claude-cli-nodejs"
+  fi
+
+  bridge_require_python
+  BRIDGE_PLUGIN_MCP_ENGINE_LOG_CACHE_DIRS="$cache_roots" \
+  BRIDGE_PLUGIN_MCP_ENGINE_LOG_SESSION_ID="$session_id" \
+    python3 - "$identity" "$workdir" "$root_pid" <<'PY'
+import datetime as dt
+import glob
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+identity = sys.argv[1].strip().lower()
+workdir = os.path.realpath(sys.argv[2])
+root_pid = sys.argv[3]
+expected_session_id = os.environ.get("BRIDGE_PLUGIN_MCP_ENGINE_LOG_SESSION_ID", "").strip()
+cache_roots = [
+    root
+    for root in os.environ.get("BRIDGE_PLUGIN_MCP_ENGINE_LOG_CACHE_DIRS", "").split(":")
+    if root
+]
+slack_seconds = int(os.environ.get("BRIDGE_PLUGIN_MCP_ENGINE_LOG_START_SLACK_SECONDS", "5"))
+max_files = int(os.environ.get("BRIDGE_PLUGIN_MCP_ENGINE_LOG_MAX_FILES", "80"))
+
+# Fail closed: an unbound expected session id can never be matched safely.
+if not expected_session_id:
+    raise SystemExit(1)
+
+
+def process_start_epoch(pid):
+    try:
+        completed = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", pid],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    raw = completed.stdout.strip()
+    if not raw:
+        return None
+    try:
+        parsed = dt.datetime.strptime(raw, "%a %b %d %H:%M:%S %Y")
+    except ValueError:
+        return None
+    return parsed.timestamp()
+
+
+def parse_timestamp(raw):
+    if not isinstance(raw, str) or not raw:
+        return None
+    value = raw
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    try:
+        parsed = dt.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.datetime.now().astimezone().tzinfo)
+    return parsed.timestamp()
+
+
+start_epoch = process_start_epoch(root_pid)
+if start_epoch is None:
+    # Issue #2021 (codex r1): without the pane start time we have no temporal
+    # anchor to reject pre-restart / stale evidence, so a recent-only window
+    # could promote an inconclusive probe to alive on an old log. Fail closed
+    # — return 1 so the caller falls back to the process-probe verdict.
+    raise SystemExit(1)
+min_epoch = start_epoch - slack_seconds
+
+candidates = []
+for root in cache_roots:
+    if not os.path.isdir(root):
+        continue
+    pattern = os.path.join(root, "*", f"mcp-logs-plugin-{identity}-*", "*.jsonl")
+    candidates.extend(Path(p) for p in glob.glob(pattern))
+
+
+def safe_mtime(path):
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+candidates.sort(key=safe_mtime, reverse=True)
+state = {"connected": False, "registered": False}
+
+for path in candidates[:max_files]:
+    try:
+        if path.stat().st_mtime < min_epoch:
+            continue
+    except OSError:
+        continue
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        continue
+    for line in lines:
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        # Current-session binding: the line MUST name our session id. A
+        # missing/blank sessionId, or any other session's id, is skipped so
+        # a stale or sibling session can never satisfy the pair.
+        session_id = payload.get("sessionId")
+        if not isinstance(session_id, str) or session_id.strip() != expected_session_id:
+            continue
+        cwd = payload.get("cwd")
+        if not isinstance(cwd, str) or not cwd:
+            continue
+        if os.path.realpath(cwd) != workdir:
+            continue
+        ts = parse_timestamp(payload.get("timestamp"))
+        if ts is None or ts < min_epoch:
+            continue
+        message = str(payload.get("debug") or payload.get("info") or payload.get("error") or "")
+        if "Successfully connected" in message:
+            state["connected"] = True
+        if "Channel notifications registered" in message:
+            state["registered"] = True
+        if state["connected"] and state["registered"]:
+            raise SystemExit(0)
+
+raise SystemExit(1)
+PY
+}
+
 bridge_agent_plugin_mcp_alive_for_item() {
   local agent="$1"
   local item="$2"
   local session=""
   local pane_pid=""
+  local probe_rc=0
 
   [[ "$(bridge_agent_engine "$agent")" == "claude" ]] || return 1
   session="$(bridge_agent_session "$agent")"
@@ -9349,7 +9562,26 @@ bridge_agent_plugin_mcp_alive_for_item() {
   bridge_tmux_session_exists "$session" || return 1
   pane_pid="$(bridge_tmux_session_pane_pid "$session")"
   [[ "$pane_pid" =~ ^[0-9]+$ ]] || return 1
-  bridge_plugin_mcp_descendant_ready_for_item "$pane_pid" "$item"
+
+  # PRIMARY signal: the descendant process probe. Issue #2021 tri-state:
+  #   0 -> alive (authoritative)        : done.
+  #   1 -> dead  (authoritative)        : done — the engine log must NOT
+  #        rescue a clean negative, or a genuinely dead channel would be
+  #        masked by an old connect/register pair in the current log.
+  #   2 -> inconclusive (ps unreadable) : consult the SECOND signal (the
+  #        current-session engine MCP log). If the log cannot positively
+  #        confirm connect+register for THIS session, fall back to the
+  #        probe's not-alive verdict (return 1) — never guess alive.
+  probe_rc=0
+  bridge_plugin_mcp_descendant_ready_for_item "$pane_pid" "$item" || probe_rc=$?
+  case "$probe_rc" in
+    0) return 0 ;;
+    2)
+      bridge_plugin_mcp_engine_log_ready_for_item "$agent" "$item" "$pane_pid"
+      return $?
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 bridge_agent_missing_plugin_mcp_channels_csv() {
