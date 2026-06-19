@@ -99,9 +99,26 @@ assert_start_dry_run_discriminator() {
 # (B) wake decision matrix via the driver.
 # --------------------------------------------------------------------------
 run_driver() {
-  # args: <auto_restart_wake> <queue_state: queued|claimed|cron|empty> <marker_present> <next_present>
-  BRIDGE_INJECT_METADATA_ONLY=1 \
-    "$BRIDGE_BASH_BIN" "$DRIVER" "$SMOKE_REPO_ROOT" "$SMOKE_TMP_ROOT/dec-$RANDOM$RANDOM" "ag" "$@"
+  # args: <auto_restart_wake> <queue_state: queued|claimed|cron|empty> \
+  #       <marker_present> <next_present> [queue_available] [session_identity]
+  # Each scenario gets its OWN BRIDGE_ACTIVE_AGENT_DIR so the #2003 restart-wake
+  # marker latch (rooted at $BRIDGE_ACTIVE_AGENT_DIR/<agent>/restart-wake) does
+  # NOT leak between independent scenarios. The no-double-fire test
+  # (run_driver_shared) deliberately shares the dir to exercise the latch.
+  local scen_root="$SMOKE_TMP_ROOT/scen-$RANDOM$RANDOM"
+  mkdir -p "$scen_root/agents/ag"
+  BRIDGE_INJECT_METADATA_ONLY=1 BRIDGE_ACTIVE_AGENT_DIR="$scen_root/agents" \
+    "$BRIDGE_BASH_BIN" "$DRIVER" "$SMOKE_REPO_ROOT" "$scen_root/dec" "ag" "$@"
+}
+
+# Run the driver against a CALLER-PROVIDED state root + dec dir so two calls can
+# share the restart-wake marker latch (same session_identity → suppress) or use
+# a fresh session id (→ re-wake). Used by the #2003 no-double-fire assertions.
+run_driver_shared() {
+  local active_agent_dir="$1" dec_dir="$2"; shift 2
+  mkdir -p "$active_agent_dir/ag"
+  BRIDGE_INJECT_METADATA_ONLY=1 BRIDGE_ACTIVE_AGENT_DIR="$active_agent_dir" \
+    "$BRIDGE_BASH_BIN" "$DRIVER" "$SMOKE_REPO_ROOT" "$dec_dir" "ag" "$@"
 }
 
 assert_auto_restart_queued_marker_present_wakes_once() {
@@ -187,11 +204,71 @@ assert_first_launch_queued_legacy_unchanged() {
     "no regression: first-ever launch writes the once-per-lifetime marker"
 }
 
-assert_pending_next_session_suppresses_wake() {
+# --------------------------------------------------------------------------
+# (B7-B9) #2003 NEXT-SESSION restart-wake matrix.
+# --------------------------------------------------------------------------
+assert_next_session_queued_handoff_wakes_queue_backed() {
+  # auto-restart + NEXT-SESSION + a handoff task ALREADY queued (the
+  # SessionStart hook ran first): ONE inbox-bootstrap wake + the #1199 nudge
+  # key = the handoff task id. Queue-backed → daemon dedup skips it.
   local out
-  out="$(run_driver 1 queued 1 1)"
-  smoke_assert_eq "0" "$(driver_field SEND_COUNT "$out")" \
-    "a pending NEXT-SESSION.md handoff suppresses the auto-restart wake (resume drives the turn)"
+  out="$(run_driver 1 queued 1 1 1)"
+  smoke_assert_eq "1" "$(driver_field SEND_COUNT "$out")" \
+    "#2003: NEXT-SESSION + already-queued handoff injects exactly one wake (no longer suppressed)"
+  smoke_assert_contains "$(driver_field SEND_TEXT "$out")" "event=inbox-bootstrap" \
+    "#2003: the queued-handoff wake is a queue-backed inbox-bootstrap"
+  smoke_assert_contains "$(driver_field SEND_TEXT "$out")" "top=55" \
+    "#2003: the surfaced top is the existing queued handoff task id"
+  smoke_assert_eq "1" "$(driver_field NUDGE_COUNT "$out")" \
+    "#2003: the queue-backed handoff wake records exactly one #1199 nudge (daemon dedup)"
+}
+
+assert_next_session_no_task_creates_and_wakes() {
+  # auto-restart + NEXT-SESSION + NO queued task: bridge-run finds/creates ONE
+  # handoff task (same digest/title contract as the SessionStart hook) → one
+  # inbox-bootstrap wake + nudge recorded against the created task id.
+  local out
+  out="$(run_driver 1 empty 1 1 1)"
+  smoke_assert_eq "1" "$(driver_field SEND_COUNT "$out")" \
+    "#2003: NEXT-SESSION + no queued task → bridge-run creates a handoff task and wakes exactly once"
+  smoke_assert_contains "$(driver_field SEND_TEXT "$out")" "event=inbox-bootstrap" \
+    "#2003: the created-handoff wake is a queue-backed inbox-bootstrap"
+  smoke_assert_contains "$(driver_field SEND_TEXT "$out")" "top=77" \
+    "#2003: the surfaced top is the just-created handoff task id"
+  smoke_assert_eq "1" "$(driver_field NUDGE_COUNT "$out")" \
+    "#2003: the created-handoff wake records exactly one #1199 nudge"
+}
+
+assert_next_session_queue_unavailable_fallback_kick() {
+  # auto-restart + NEXT-SESSION + queue create/find UNAVAILABLE: ONE
+  # handoff-resume fallback kick, NO #1199 key (queue-less), latched on the
+  # per-session restart-wake marker.
+  local out
+  out="$(run_driver 1 empty 1 1 0)"
+  smoke_assert_eq "1" "$(driver_field SEND_COUNT "$out")" \
+    "#2003: NEXT-SESSION + queue unavailable → one fallback handoff-resume kick (never sits idle)"
+  smoke_assert_contains "$(driver_field SEND_TEXT "$out")" "event=handoff-resume" \
+    "#2003: the queue-less handoff wake is a handoff-resume event"
+  smoke_assert_eq "0" "$(driver_field NUDGE_COUNT "$out")" \
+    "#2003: the queue-less handoff wake records NO #1199 key (nothing queued to dedup)"
+}
+
+assert_next_session_fallback_no_double_fire() {
+  # Same launched session (same session_identity + same handoff digest): the
+  # queue-less fallback wakes ONCE then suppresses on retry (the restart-wake
+  # marker latch). A NEW session (new id) with the same handoff MAY wake again.
+  local shared_root dec out1 out2 out3
+  shared_root="$SMOKE_TMP_ROOT/ddf-$RANDOM$RANDOM/agents"
+  dec="$SMOKE_TMP_ROOT/ddf-dec-$RANDOM$RANDOM"
+  out1="$(run_driver_shared "$shared_root" "$dec" 1 empty 1 1 0 sess-A)"
+  out2="$(run_driver_shared "$shared_root" "$dec" 1 empty 1 1 0 sess-A)"
+  out3="$(run_driver_shared "$shared_root" "$dec" 1 empty 1 1 0 sess-B)"
+  smoke_assert_eq "1" "$(driver_field SEND_COUNT "$out1")" \
+    "#2003 no-double-fire: first queue-less handoff wake fires once"
+  smoke_assert_eq "0" "$(driver_field SEND_COUNT "$out2")" \
+    "#2003 no-double-fire: a retry in the SAME launched session does NOT re-wake (restart-wake marker latch)"
+  smoke_assert_eq "1" "$(driver_field SEND_COUNT "$out3")" \
+    "#2003: a NEW launched session (new session id) with the same handoff MAY wake again"
 }
 
 # --------------------------------------------------------------------------
@@ -200,6 +277,8 @@ assert_pending_next_session_suppresses_wake() {
 assert_production_guards_present() {
   local run_sh="$SMOKE_REPO_ROOT/bridge-run.sh"
   local start_sh="$SMOKE_REPO_ROOT/bridge-start.sh"
+  local state_sh="$SMOKE_REPO_ROOT/lib/bridge-state.sh"
+  local hook_py="$SMOKE_REPO_ROOT/hooks/bridge_hook_common.py"
 
   smoke_assert_contains "$(cat "$start_sh")" 'BRIDGE_AUTO_RESTART_WAKE=1 ${SESSION_CMD}' \
     "bridge-start.sh still injects BRIDGE_AUTO_RESTART_WAKE into SESSION_CMD"
@@ -223,6 +302,30 @@ assert_production_guards_present() {
     "bridge-run.sh scopes the post-restart fallback to claimed|blocked open work (#1639 Phase-4 codex r4 — guards against a revert to the unscoped find-open)"
   smoke_assert_contains "$(cat "$run_sh")" "--exclude-title-prefix '[cron-dispatch]'" \
     "bridge-run.sh excludes cron-dispatch rows from the post-restart fallback so a cron-only queue cannot spuriously wake (#1639 Phase-4 codex r4)"
+  # --- #2003 production-token gate -----------------------------------------
+  smoke_assert_contains "$(cat "$run_sh")" 'bridge_run_handoff_task_find_or_create' \
+    "bridge-run.sh makes a NEXT-SESSION restart wake queue-backed via the handoff find/create helper (#2003 step 4)"
+  # The handoff find-or-create MUST be ATOMIC (upsert-open), NOT racy
+  # find-open+create — both this helper and the SessionStart hook can run on the
+  # same handoff concurrently (codex review BLOCKING: TOCTOU → duplicate tasks).
+  smoke_assert_contains "$(cat "$state_sh")" 'upsert-open' \
+    "lib/bridge-state.sh::bridge_run_handoff_task_find_or_create uses atomic upsert-open (no find-open+create TOCTOU race)"
+  smoke_assert_contains "$(cat "$hook_py")" 'upsert-open' \
+    "hooks/bridge_hook_common.py::_enqueue_handoff_pending uses atomic upsert-open so the hook + restart paths converge on ONE handoff task (#2003 race fix)"
+  smoke_assert_contains "$(cat "$run_sh")" 'bridge_agent_restart_wake_marker_file' \
+    "bridge-run.sh latches the queue-less handoff/first-launch wake on a per-session restart-wake marker (#2003 idempotency layer 2)"
+  smoke_assert_contains "$(cat "$run_sh")" 'handoff-resume' \
+    "bridge-run.sh emits the handoff-resume kick when the queue is unreachable but a NEXT-SESSION handoff is present (#2003 step 5)"
+  smoke_assert_contains "$(cat "$run_sh")" 'session_identity' \
+    "bridge-run.sh builds the #2003 idempotency key from the launched-session identity (refreshed Claude id / tmux+nonce)"
+  # The blanket whole-inject suppression `if [[ ! -f "$next_file" ]] \` (the
+  # OLD #1639 gate) MUST be gone — a present NEXT-SESSION.md now drives a
+  # queue-backed wake, not suppression. Match the exact old code statement (the
+  # `if [[ ! -f "$next_file" ]]` followed by a line-continuation `\`), not the
+  # explanatory comment that quotes the old token in backticks.
+  if grep -qE 'if \[\[ ! -f "\$next_file" \]\] \\$' "$run_sh"; then
+    smoke_fail "#2003 regression: bridge-run.sh still suppresses the post-restart inject on a present NEXT-SESSION.md (the blanket 'if [[ ! -f \$next_file ]]' gate must be removed)"
+  fi
 }
 
 main() {
@@ -239,7 +342,10 @@ main() {
   smoke_run "(B3) auto-restart + empty queue + marker → no spam"       assert_auto_restart_empty_queue_marker_present_no_spam
   smoke_run "(B4) auto-restart + empty queue + first launch → kick"    assert_auto_restart_empty_queue_first_launch_minimal_kick
   smoke_run "(B5) first launch + queued (legacy) → unchanged"          assert_first_launch_queued_legacy_unchanged
-  smoke_run "(B6) pending NEXT-SESSION.md suppresses the wake"         assert_pending_next_session_suppresses_wake
+  smoke_run "(B7) #2003 NEXT + already-queued handoff → one wake+nudge" assert_next_session_queued_handoff_wakes_queue_backed
+  smoke_run "(B8) #2003 NEXT + no task → create + one wake+nudge"       assert_next_session_no_task_creates_and_wakes
+  smoke_run "(B9) #2003 NEXT + queue unavailable → one fallback kick"   assert_next_session_queue_unavailable_fallback_kick
+  smoke_run "(B10) #2003 fallback no-double-fire + cross-session rewake" assert_next_session_fallback_no_double_fire
   smoke_run "(C) production guard tokens present (anti-divergence)"    assert_production_guards_present
   smoke_log "passed"
 }

@@ -7595,15 +7595,108 @@ except OSError:
 ' "$file" "$new_state"
 }
 
-# run_set_onboarding <agent> <state> — issue #1417.
+# _set_onboarding_state_dir <agent> — issue #2004.
+#
+# The per-agent state-marker dir `state/agents/<agent>` that holds the
+# `onboarding-pending` / `onboarding-complete` markers and (since #2004) the
+# `onboarding-state.lock` serializer. Resolved EXACTLY the way bridge-init.sh
+# computes it (`$BRIDGE_STATE_DIR/agents/<agent>`, with the BRIDGE_HOME
+# fallback) so the writer here and the init-time marker helpers agree on one
+# path — bridge_agent_idle_marker_dir resolves to the same `state/agents/<a>`
+# leaf in shared mode but reroots under the per-agent root for iso v2, while
+# the onboarding markers have always lived under the controller state tree.
+_set_onboarding_state_dir() {
+  local agent="$1"
+  local state_root="${BRIDGE_STATE_DIR:-${BRIDGE_HOME:-$HOME/.agent-bridge}/state}"
+  printf '%s/agents/%s' "$state_root" "$agent"
+}
+
+# _set_onboarding_write_marker <marker_path> <reason> — issue #2004.
+#
+# Write a state marker (`agent=`/`written=`/`reason=` body) atomically via a
+# same-dir temp file + rename, mode 0600. Returns 0 on success, 1 on any IO
+# failure (caller fails LOUD — a half-written or absent complete marker must
+# never be silently accepted). The agent line is derived from the marker path's
+# parent dir name so the body matches the bridge-init.sh writers byte-for-byte.
+_set_onboarding_write_marker() {
+  local marker="$1" reason="$2"
+  local dir agent tmp
+  dir="$(dirname "$marker")"
+  agent="$(basename "$dir")"
+  mkdir -p "$dir" 2>/dev/null || return 1
+  tmp="$(mktemp "${marker}.XXXXXX" 2>/dev/null)" || return 1
+  {
+    printf 'agent=%s\n' "$agent"
+    printf 'written=%s\n' "$(date +%s)"
+    printf 'reason=%s\n' "$reason"
+  } >"$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  chmod 0600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$marker" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  return 0
+}
+
+# _set_onboarding_lock_run <agent> <fn> [args...] — issue #2004.
+#
+# Serialize an onboarding-state mutation on a per-agent lock under
+# `state/agents/<agent>/onboarding-state.lock` so two concurrent
+# `set-onboarding` callers cannot interleave the 3-layer SESSION-TYPE rewrite
+# with the marker write. Mirrors the flock-with-mkdir-fallback idiom of
+# bridge_clear_persisted_session_id (lib/bridge-state.sh). The wrapped function
+# runs in THIS shell (not a subshell) so its bridge_die aborts the verb as the
+# caller expects; the lock fd / mkdir mutex is released on return. Returns the
+# wrapped function's rc; rc 99 means the lock could not be acquired.
+_set_onboarding_lock_run() {
+  local agent="$1"; shift
+  local state_dir lock_file rc=0
+  state_dir="$(_set_onboarding_state_dir "$agent")"
+  mkdir -p "$state_dir" 2>/dev/null || bridge_die "set-onboarding: cannot create state dir for '$agent': $state_dir"
+  lock_file="$state_dir/onboarding-state.lock"
+  if command -v flock >/dev/null 2>&1; then
+    {
+      if ! flock -w 30 9; then
+        bridge_die "set-onboarding: onboarding-state.lock busy after 30s for '$agent' — a concurrent set-onboarding is in flight; retry"
+      fi
+      "$@" || rc=$?
+    } 9>"$lock_file"
+  else
+    # Portable fallback (older macOS / minimal containers without flock(1)).
+    local lock_dir="${lock_file}.d" attempt=0
+    while ! mkdir "$lock_dir" 2>/dev/null; do
+      attempt=$(( attempt + 1 ))
+      if (( attempt >= 30 )); then
+        bridge_die "set-onboarding: onboarding-state.lock busy after 30 retries for '$agent' — a concurrent set-onboarding is in flight; retry"
+      fi
+      sleep 1
+    done
+    "$@" || rc=$?
+    rmdir "$lock_dir" 2>/dev/null || true
+  fi
+  return "$rc"
+}
+
+# run_set_onboarding <agent> <state> — issue #1417, extended #2004.
 #
 # Atomically set the agent's onboarding state by writing the
-# `- Onboarding State:` line in BOTH the authored HOME SESSION-TYPE.md (the
-# SSOT) AND the runtime-canonical WORKDIR copy (which the runtime reads
-# workdir-first via bridge_agent_onboarding_state). Closes the "no CLI verb,
-# hand-editing two files is the only path" gap (#1417): before this verb an
-# operator who edited only the HOME copy saw it silently no-op because the
-# workdir copy never reconciled.
+# `- Onboarding State:` line across ALL live identity layers — the optional
+# tracked PROFILE SOURCE (layer 1), the authored HOME/identity SESSION-TYPE.md
+# (layer 2, the SSOT) AND the runtime-canonical WORKDIR copy (layer 3, which
+# the runtime reads workdir-first via bridge_agent_onboarding_state) — and,
+# for `complete`/`pending`, reconciling the `state/agents/<agent>/onboarding-*`
+# markers the watchdog + upgrader treat as authoritative.
+#
+# Issue #2004: before this, completion only ever wrote SESSION-TYPE.md text and
+# never the markers, so a stale `onboarding-pending` marker survived completion
+# and the #906 upgrade-preserve path (which the upgrader keys partly off the
+# marker) saw `pending` and regressed the rendered source back to pending. The
+# writer now closes the loop: all required SESSION-TYPE layers AND the markers
+# move together, serialized under a per-agent lock, and the complete marker is
+# written ONLY after every required layer write has already succeeded — a
+# partial layer write fails LOUD and leaves the marker untouched (a rerun
+# repairs it because the operation is idempotent).
+#
+# Closes the "no CLI verb, hand-editing two files is the only path" gap (#1417):
+# before this verb an operator who edited only the HOME copy saw it silently
+# no-op because the workdir copy never reconciled.
 #
 # Contract:
 #   * Touches SESSION-TYPE.md ONLY — never CLAUDE.md, memory, or any
@@ -7625,60 +7718,22 @@ except OSError:
 #     sudo-as-iso path + chgrp, never a controller direct-write into the iso
 #     tree (CLAUDE.md iso-v2 boundary). Shared mode (home == workdir) writes a
 #     single physical copy in the HOME step above.
-_set_onboarding_usage() {
-  # Printed to STDOUT (issue #1117 universal --help gate: rc=0 + non-empty
-  # stdout). bridge_die routes usage to STDERR + rc=1, which the gate fails,
-  # so the --help path must NOT go through it.
-  printf 'Usage: %s set-onboarding <agent> <state>\n' "$(basename "$0")"
-  printf '\n'
-  printf 'Set the agent onboarding state in BOTH the HOME and workdir\n'
-  printf 'SESSION-TYPE.md copies atomically (issue #1417). Use this instead of\n'
-  printf 'hand-editing SESSION-TYPE.md — a managed-project (workdir != home)\n'
-  printf 'agent reads workdir-first, so a HOME-only edit silently no-ops.\n'
-  printf '\n'
-  printf '  <state>   onboarding state to set (e.g. complete | pending | partial;\n'
-  printf '            any [A-Za-z0-9._-]+ token the runtime parser accepts)\n'
-  printf '\n'
-  printf 'Example: %s set-onboarding reviewer complete\n' "$(basename "$0")"
-}
 
-run_set_onboarding() {
-  # #1117 universal --help gate: support -h/--help anywhere in the args with
-  # rc=0 + usage on STDOUT, BEFORE positional consumption (so the verb does
-  # not treat `--help` as the <agent> positional — the #1114 bug class).
-  local _arg
-  for _arg in "$@"; do
-    case "$_arg" in
-      -h|--help|help)
-        _set_onboarding_usage
-        return 0
-        ;;
-    esac
-  done
+# _set_onboarding_critical <agent> <new_state> <home_dir> <home_file> <work_dir>
+#
+# Issue #2004 critical section, run under the per-agent onboarding-state lock.
+# Performs the ordered 3-layer SESSION-TYPE rewrite (HOME → WORKDIR → PROFILE
+# SOURCE) and, ONLY after every REQUIRED layer write succeeds, reconciles the
+# state markers. Assigns the parent-scope outputs `wrote_workdir`,
+# `wrote_profile`, `profile_file`, `work_file`, `wrote_markers`. Fails LOUD via
+# bridge_die on any required-layer or marker failure — the complete marker is
+# never written on a partial SESSION-TYPE write, so a stale `pending` can never
+# masquerade as `complete` (and a rerun repairs a partial because every step is
+# idempotent).
+_set_onboarding_critical() {
+  local agent="$1" new_state="$2" home_dir="$3" home_file="$4" work_dir="$5"
 
-  local agent="${1:-}"
-  local new_state="${2:-}"
-  shift 2 2>/dev/null || true
-  [[ -n "$agent" && -n "$new_state" ]] \
-    || bridge_die "Usage: $(basename "$0") set-onboarding <agent> <state>  (state: complete|pending|partial|…)"
-  [[ $# -eq 0 ]] || bridge_die "지원하지 않는 agent set-onboarding 옵션입니다: $1"
-  # The parser (bridge_agent_onboarding_state) accepts [A-Za-z0-9._-]+ — keep
-  # the verb input in the same alphabet so a set value round-trips on read.
-  [[ "$new_state" =~ ^[A-Za-z0-9._-]+$ ]] \
-    || bridge_die "유효하지 않은 onboarding state '$new_state' (allowed: [A-Za-z0-9._-]+)"
-  bridge_require_agent "$agent"
-
-  local engine home_dir work_dir
-  engine="$(bridge_agent_engine "$agent" 2>/dev/null || printf 'claude')"
-  home_dir="$(bridge_agent_default_home "$agent" 2>/dev/null || printf '')"
-  work_dir="$(bridge_agent_workdir "$agent" 2>/dev/null || printf '')"
-  [[ -n "$home_dir" ]] || bridge_die "set-onboarding: cannot resolve home dir for '$agent'"
-
-  local home_file="$home_dir/SESSION-TYPE.md"
-  [[ -f "$home_file" ]] \
-    || bridge_die "set-onboarding: HOME SESSION-TYPE.md 가 없습니다: $home_file"
-
-  # 1) Rewrite the HOME copy (the authored SSOT) atomically.
+  # 1) Rewrite the HOME copy (the authored SSOT / layer 2) atomically.
   local _hrc=0
   _set_onboarding_rewrite_line "$home_file" "$new_state" || _hrc=$?
   case "$_hrc" in
@@ -7687,10 +7742,8 @@ run_set_onboarding() {
     *) bridge_die "set-onboarding: HOME SESSION-TYPE.md 쓰기 실패: $home_file" ;;
   esac
 
-  # 2) Reconcile the WORKDIR copy. Shared mode (home == workdir) already
-  # wrote the single physical copy in step 1.
-  local wrote_workdir="no"
-  local work_file=""
+  # 2) Reconcile the WORKDIR copy (layer 3). Shared mode (home == workdir)
+  # already wrote the single physical copy in step 1.
   if [[ -n "$work_dir" && "$work_dir" != "$home_dir" ]]; then
     work_file="$work_dir/SESSION-TYPE.md"
     local _iso_effective=0
@@ -7744,19 +7797,159 @@ run_set_onboarding() {
     fi
   fi
 
+  # 3) Reconcile the optional tracked PROFILE SOURCE copy (layer 1). Only some
+  # agents (admin / imported / migrated) have one, and the upgrader keys its
+  # #906 preserve off the profile-source SESSION-TYPE.md too, so leaving it
+  # stale at `pending` is exactly the #2004 drift this commit closes. We write
+  # it ONLY when it already carries an `Onboarding State:` line — never
+  # synthesize a layer a template did not author. Same-dir-as-the-source is
+  # controller-owned tracked-source-shaped state; rewrite in place, atomic.
+  if declare -F bridge_layout_has_profile_source >/dev/null 2>&1 \
+      && bridge_layout_has_profile_source "$agent" 2>/dev/null; then
+    local profile_dir
+    profile_dir="$(bridge_layout_profile_source_dir "$agent" 2>/dev/null || printf '')"
+    if [[ -n "$profile_dir" ]]; then
+      profile_file="$profile_dir/SESSION-TYPE.md"
+      # The profile source can be the SAME physical file as HOME on installs
+      # where the identity home IS the profile source — skip a redundant
+      # rewrite in that case (step 1 already moved it).
+      if [[ -f "$profile_file" && "$profile_file" != "$home_file" ]]; then
+        local _prc=0
+        _set_onboarding_rewrite_line "$profile_file" "$new_state" || _prc=$?
+        case "$_prc" in
+          0) wrote_profile="yes" ;;
+          2)
+            # Profile source SESSION-TYPE.md lacks the line — a half-scaffolded
+            # profile. Reconcile from HOME so the tracked source matches.
+            _set_onboarding_atomic_copy "$home_file" "$profile_file" \
+              && wrote_profile="yes" \
+              || bridge_die "set-onboarding: profile-source SESSION-TYPE.md 쓰기 실패: $profile_file" ;;
+          *) bridge_die "set-onboarding: profile-source SESSION-TYPE.md 쓰기 실패: $profile_file" ;;
+        esac
+      fi
+    fi
+  fi
+
+  # 4) Marker reconciliation — ONLY AFTER every required SESSION-TYPE layer
+  # write above has already succeeded (a partial write bridge_die'd before
+  # reaching here, leaving the markers untouched). #2004:
+  #   * complete: write `onboarding-complete`, remove `onboarding-pending`.
+  #   * pending : write `onboarding-pending`, remove `onboarding-complete`
+  #               (an intentional operator reset — the only path that clears
+  #               complete).
+  #   * other states (partial, …): leave markers alone — product semantics do
+  #     not define a marker for them, and we must not claim fresh-or-complete.
+  local state_dir complete_marker pending_marker
+  state_dir="$(_set_onboarding_state_dir "$agent")"
+  complete_marker="$state_dir/onboarding-complete"
+  pending_marker="$state_dir/onboarding-pending"
+  case "$new_state" in
+    complete)
+      _set_onboarding_write_marker "$complete_marker" "onboarding-complete" \
+        || bridge_die "set-onboarding: SESSION-TYPE layers updated but the onboarding-complete marker write FAILED ($complete_marker) — refusing to leave a half-recorded completion; fix the state dir perms and rerun"
+      rm -f "$pending_marker" 2>/dev/null || true
+      wrote_markers="complete (pending cleared)"
+      ;;
+    pending)
+      _set_onboarding_write_marker "$pending_marker" "operator-reset" \
+        || bridge_die "set-onboarding: SESSION-TYPE layers updated but the onboarding-pending marker write FAILED ($pending_marker) — fix the state dir perms and rerun"
+      rm -f "$complete_marker" 2>/dev/null || true
+      wrote_markers="pending (complete cleared)"
+      ;;
+    *)
+      wrote_markers="unchanged (state '$new_state' has no canonical marker)"
+      ;;
+  esac
+}
+
+_set_onboarding_usage() {
+  # Printed to STDOUT (issue #1117 universal --help gate: rc=0 + non-empty
+  # stdout). bridge_die routes usage to STDERR + rc=1, which the gate fails,
+  # so the --help path must NOT go through it.
+  printf 'Usage: %s set-onboarding <agent> <state>\n' "$(basename "$0")"
+  printf '\n'
+  printf 'Set the agent onboarding state in BOTH the HOME and workdir\n'
+  printf 'SESSION-TYPE.md copies atomically (issue #1417). Use this instead of\n'
+  printf 'hand-editing SESSION-TYPE.md — a managed-project (workdir != home)\n'
+  printf 'agent reads workdir-first, so a HOME-only edit silently no-ops.\n'
+  printf '\n'
+  printf '  <state>   onboarding state to set (e.g. complete | pending | partial;\n'
+  printf '            any [A-Za-z0-9._-]+ token the runtime parser accepts)\n'
+  printf '\n'
+  printf 'Example: %s set-onboarding reviewer complete\n' "$(basename "$0")"
+}
+
+run_set_onboarding() {
+  # #1117 universal --help gate: support -h/--help anywhere in the args with
+  # rc=0 + usage on STDOUT, BEFORE positional consumption (so the verb does
+  # not treat `--help` as the <agent> positional — the #1114 bug class).
+  local _arg
+  for _arg in "$@"; do
+    case "$_arg" in
+      -h|--help|help)
+        _set_onboarding_usage
+        return 0
+        ;;
+    esac
+  done
+
+  local agent="${1:-}"
+  local new_state="${2:-}"
+  shift 2 2>/dev/null || true
+  [[ -n "$agent" && -n "$new_state" ]] \
+    || bridge_die "Usage: $(basename "$0") set-onboarding <agent> <state>  (state: complete|pending|partial|…)"
+  [[ $# -eq 0 ]] || bridge_die "지원하지 않는 agent set-onboarding 옵션입니다: $1"
+  # The parser (bridge_agent_onboarding_state) accepts [A-Za-z0-9._-]+ — keep
+  # the verb input in the same alphabet so a set value round-trips on read.
+  [[ "$new_state" =~ ^[A-Za-z0-9._-]+$ ]] \
+    || bridge_die "유효하지 않은 onboarding state '$new_state' (allowed: [A-Za-z0-9._-]+)"
+  bridge_require_agent "$agent"
+
+  local engine home_dir work_dir
+  engine="$(bridge_agent_engine "$agent" 2>/dev/null || printf 'claude')"
+  home_dir="$(bridge_agent_default_home "$agent" 2>/dev/null || printf '')"
+  work_dir="$(bridge_agent_workdir "$agent" 2>/dev/null || printf '')"
+  [[ -n "$home_dir" ]] || bridge_die "set-onboarding: cannot resolve home dir for '$agent'"
+
+  local home_file="$home_dir/SESSION-TYPE.md"
+  [[ -f "$home_file" ]] \
+    || bridge_die "set-onboarding: HOME SESSION-TYPE.md 가 없습니다: $home_file"
+
+  # Outputs assigned by the locked critical section below (it runs in THIS
+  # shell, so the assignments persist after the lock is released).
+  local wrote_workdir="no"
+  local work_file=""
+  local wrote_profile="no"
+  local profile_file=""
+  local wrote_markers="n/a"
+
+  # #2004: serialize the whole 3-layer SESSION-TYPE rewrite + marker
+  # reconciliation on a per-agent lock so two concurrent set-onboarding
+  # callers cannot interleave a partial layer write with a marker write.
+  _set_onboarding_lock_run "$agent" \
+    _set_onboarding_critical "$agent" "$new_state" "$home_dir" "$home_file" "$work_dir"
+
   bridge_audit_log daemon agent_onboarding_set "$agent" \
     --detail state="$new_state" \
     --detail engine="$engine" \
-    --detail wrote_workdir="$wrote_workdir" >/dev/null 2>&1 || true
+    --detail wrote_profile="$wrote_profile" \
+    --detail wrote_workdir="$wrote_workdir" \
+    --detail wrote_markers="$wrote_markers" >/dev/null 2>&1 || true
 
   printf 'agent: %s\n' "$agent"
   printf 'onboarding_state: %s\n' "$new_state"
   printf 'home_file: %s\n' "$home_file"
+  if [[ "$wrote_profile" == "yes" ]]; then
+    printf 'profile_file: %s\n' "$profile_file"
+  else
+    printf 'profile_file: (none)\n'
+  fi
   if [[ "$wrote_workdir" == "yes" ]]; then
     printf 'workdir_file: %s\n' "$work_file"
   else
     printf 'workdir_file: (shared — single copy)\n'
   fi
+  printf 'markers: %s\n' "$wrote_markers"
   if bridge_agent_is_active "$agent" 2>/dev/null; then
     bridge_warn "active=yes — the running session reads its identity at launch; restart to pick up the new state if it is mid-onboarding: bridge-agent.sh restart $agent"
   fi

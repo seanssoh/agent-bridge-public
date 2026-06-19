@@ -68,17 +68,43 @@ bridge_start_effective_dev_channels_csv() {
 }
 
 bridge_start_should_send_onboarding_nudge() {
-  # Fresh-install nudge gate (see usage in main flow). Returns 0 only
-  # when the agent's SESSION-TYPE.md declares `Session Type: admin` AND
-  # `Onboarding State: pending`. Static-claude and dynamic agents are
-  # NOT nudged — they have no onboarding flow tied to first user msg.
+  # Fresh-install nudge gate (see usage in main flow). Returns 0 only on a
+  # GENUINE first-ever launch of an onboarding-pending admin:
+  #   * SESSION-TYPE.md declares `Session Type: admin`, AND
+  #   * `Onboarding State: pending`, AND
+  #   * this is NOT a `--replace` launch (REPLACE==0 — a replacement is never a
+  #     first-run onboarding prompt), AND
+  #   * no prior launch-history (`initial-inbox.started` marker absent — the
+  #     once-per-lifetime first-launch breadcrumb bridge-run.sh writes).
+  # Static-claude and dynamic agents are NOT nudged — they have no onboarding
+  # flow tied to the first user msg.
+  #
+  # Issue #2002 (defense-in-depth): before, `onboarding_state == pending` was
+  # the ONLY first-launch proxy. So if the state ever drifted back to `pending`
+  # (the #2004 stale-marker incident), every subsequent RESTART re-typed the
+  # canned onboarding prompt into an already-operational session. The two new
+  # gates make a restart safe even if the state has drifted: a replacement or a
+  # second-and-later launch (marker present) is never nudged. This does NOT
+  # suppress a genuine first launch — a newly-created admin has pending state,
+  # no initial-inbox marker, and is not a replace launch.
   local agent="$1"
+  local replace="${2:-0}"
   local home_dir
   home_dir="$(bridge_agent_workdir "$agent" 2>/dev/null || true)"
   [[ -d "$home_dir" ]] || return 1
   [[ -f "$home_dir/SESSION-TYPE.md" ]] || return 1
   grep -qE '^- Session Type:[[:space:]]*admin\b' "$home_dir/SESSION-TYPE.md" 2>/dev/null || return 1
-  [[ "$(bridge_agent_onboarding_state "$agent" 2>/dev/null || printf '')" == "pending" ]]
+  [[ "$(bridge_agent_onboarding_state "$agent" 2>/dev/null || printf '')" == "pending" ]] || return 1
+  # --replace is never a genuine first-run onboarding prompt — suppress even if
+  # the marker is somehow absent (a replacement re-creates an existing agent).
+  [[ "$replace" == "0" ]] || return 1
+  # Launch-history gate: a present initial-inbox marker means this agent has
+  # already had its first-ever launch, so any pending state now is drift, not a
+  # fresh install — do not re-type onboarding.
+  local marker_file=""
+  marker_file="$(bridge_agent_initial_inbox_marker_file "$agent" 2>/dev/null || printf '')"
+  [[ -n "$marker_file" && -e "$marker_file" ]] && return 1
+  return 0
 }
 
 bridge_start_send_onboarding_nudge_async() {
@@ -1282,7 +1308,7 @@ if [[ "$ENGINE" == "claude" ]]; then
   # state-agent-dir row), causing bridge-start.sh to exit before
   # reaching the nudge. The nudge spawn is itself async + heavily
   # guarded against errors.
-  if bridge_start_should_send_onboarding_nudge "$AGENT"; then
+  if bridge_start_should_send_onboarding_nudge "$AGENT" "$REPLACE"; then
     bridge_start_send_onboarding_nudge_async "$SESSION" "$AGENT" || true
   fi
   bridge_agent_mark_idle_now "$AGENT" || true
