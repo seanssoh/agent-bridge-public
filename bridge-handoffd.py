@@ -4110,19 +4110,34 @@ class HandoffHandler(BaseHTTPRequestHandler):
           * `inbound_allowlist` is the room's `leader_agent` (room-derived, NOT
             bridge_id).
         """
-        # --- env gate: feature-enable, DEFAULT-UNCHANGED. Unset/!=1 → the prior
-        # unknown-peer 403 (reply + audit preserved). NB (SK-2): the body is now
+        # --- env gate: feature-enable, DEFAULT-UNCHANGED. Unset/!=1 → a 403 that
+        # reveals the leader's POSTURE ONLY (auto-join disabled), so a first-
+        # contact joiner is told the gate is off and to ask the leader to enable
+        # it rather than rotating the invite (the code does NOT assert the invite
+        # is valid — it is returned before any token check) (#2024 A.3). NB
+        # (SK-2): the body is
         # read BEFORE this reject (hoisted above find_peer so the bootstrap path
         # can inspect room_id/token), so it is not literally byte-for-byte at the
         # I/O level — but the read is bounded by the 8KB Content-Length guard +
-        # the socket request timeout, so it adds no unbounded work, and the
-        # peer-facing reply + the audit row are identical to before. This is the
-        # feature flag, NOT a POC `=1` test toggle: when ON the production path is
-        # always-on, gated by TOKEN VALIDITY (never on the env alone). ---
+        # the socket request timeout, so it adds no unbounded work.
+        #
+        # POSTURE ONLY — NO ORACLE (codex HIGH-RISK #6): the gate fires HERE,
+        # before ANY body shape parse, room lookup, or token verify below. The
+        # reply + audit are therefore independent of whether the room exists or
+        # the token is valid — they disclose only that auto-join is OFF, never
+        # room existence or token validity. The `room_id` is deliberately NOT in
+        # the reply/audit (the body is not parsed under the disabled gate). A
+        # malformed body that fails the shape parse once the gate is ON still
+        # gets the opaque `unknown peer`; that distinction does NOT widen the
+        # disabled path's disclosure. This is the feature flag, NOT a POC `=1`
+        # test toggle: when ON the production path is always-on, gated by TOKEN
+        # VALIDITY (never on the env alone). ---
         if os.environ.get("BRIDGE_A2A_ROOM_AUTOJOIN") != "1":  # noqa: iso-helper-boundary - feature env gate, not a .env file
-            audit("room_join_reject", reason="unknown_peer",
-                  peer=peer_id, client=client_ip, security=True)
-            self._reply(403, {"ok": False, "error": "unknown peer"})
+            audit("room_join_reject", reason="autojoin_disabled",
+                  peer=peer_id, client=client_ip, message_id=message_id,
+                  security=True)
+            self._reply(403, {"ok": False, "code": "room_autojoin_disabled",
+                              "error": "room auto-join is disabled on the leader"})
             return None
 
         if rooms is None:
@@ -4181,11 +4196,21 @@ class HandoffHandler(BaseHTTPRequestHandler):
             leader_agent = str(room["leader_agent"] or "")
             outcome = _room_join_verify_hash(room, token_hash)
             if outcome != rooms.TOKEN_OK:
+                # NO TOKEN ORACLE (#2024 A.4): an UNKNOWN peer is not yet a
+                # trusted party, so the peer-facing reply must NOT disclose the
+                # token verdict (mismatch / expired / revoked) — that would let
+                # an unpaired prober distinguish "this token was once valid but
+                # expired/revoked" from "this token never matched", i.e. probe
+                # the leader's invite state. The reply collapses to the SAME
+                # opaque `unknown peer` every other unknown-peer reject uses; the
+                # AUDIT keeps the precise `unknown_peer_token_<outcome>` reason
+                # for the operator. (An already-authenticated peer keeps the
+                # detailed `invite token <outcome>` error elsewhere — it has
+                # already proven the node-link, so there is no oracle there.)
                 audit("room_join_reject", reason=f"unknown_peer_token_{outcome}",
                       peer=peer_id, client=client_ip, room_id=room_id,
                       security=True)
-                self._reply(403, {"ok": False,
-                                  "error": f"invite token {outcome}"})
+                self._reply(403, {"ok": False, "error": "unknown peer"})
                 return None
             try:
                 key_seed = room["invite_key_seed"]
