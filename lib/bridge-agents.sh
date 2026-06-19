@@ -11512,14 +11512,18 @@ bridge_agent_teams_notify_target_from_access() {
   [[ -f "$access_file" ]] || return 1
 
   bridge_require_python
-  python3 - "$access_file" <<'PY'
+  # File-as-argv (NOT heredoc-stdin) to avoid footgun #11 and the
+  # heredoc-baseline ratchet (the byte-identical heredoc body would collide
+  # with the already-baselined discord sibling's hash). Behavior is identical
+  # to the prior heredoc: parse access.json, print allowFrom[0], exit 1 when
+  # the file is absent/unparseable, not a dict, or the allowlist is empty.
+  python3 -c '
 import json
 import sys
 from pathlib import Path
 
-path = Path(sys.argv[1])
 try:
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 except Exception:
     raise SystemExit(1)
 
@@ -11535,7 +11539,7 @@ if isinstance(allow_from, list):
             raise SystemExit(0)
 
 raise SystemExit(1)
-PY
+' "$access_file"
 }
 
 bridge_agent_notify_target() {
