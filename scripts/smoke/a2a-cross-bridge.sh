@@ -356,7 +356,7 @@ dry_run_no_outbox_write() {
   # --dry-run must not persist anything to the outbox.
   local out before after
   before="$(sender_outbox outbox list | grep -c . || true)"
-  out="$(sender_outbox send --peer bridge-b --to reviewer \
+  out="$(sender_outbox send --peer bridge-b --to reviewer --from senderX \
     --title "dry one" --body "x" --dry-run)"
   smoke_assert_contains "$out" '"dry_run": true' "dry-run reports dry_run flag"
   after="$(sender_outbox outbox list | grep -c . || true)"

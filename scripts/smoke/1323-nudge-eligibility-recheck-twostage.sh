@@ -497,15 +497,18 @@ smoke_run "T4b same-agent different-task → should_skip returns OK (fire)" : ; 
   unset BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS
 }
 
-# T4c: window expiry — after the redelivery window slides past, the same
-# (agent, task) is eligible again. Uses a real 2s sleep against a 1s
-# redelivery window so the elapsed-time math is exercised, not faked.
-# The window is 2s (not 1s): with a 1s window the record's `now=N` and an
-# immediate recheck at `now=N+1` would compute `(( 1 < 1 ))` = not-skip and
-# flake. 2s gives the in-window recheck a full second of slack; the expiry
-# sleep is then 3s (> 2s window + 1s clock granularity). The immediate
-# in-window skip is already pinned by T4a, so the load-bearing assertion
-# here is the post-expiry not-skip.
+# T4c: window expiry — after the per-task backoff window slides past, the
+# same (agent, task) is eligible again. Exercises real elapsed-time math,
+# not faked. ★Issue #1973 Track B: the FIRST record advances attempts 0->1,
+# so the recorded NUDGE_TASK_NEXT_TS = now + backoff_delay(1) = base<<1 =
+# base*2 (the blessed cadence pinned by 1973b B1 "next-window after attempt1
+# = 120s (base*2)"). So with base=BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS=2
+# the first re-nudge window is 4s, NOT 2s — the should_skip per-task path
+# consults NEXT_TS, which overrides the flat redelivery window. The expiry
+# sleep is therefore 5s (> 4s window + 1s clock granularity); a 3s sleep
+# stays INSIDE the 4s backoff window and still (correctly) skips. The
+# immediate in-window skip is already pinned by T4a, so the load-bearing
+# assertion here is the post-expiry not-skip.
 smoke_run "T4c window expiry → should_skip returns OK after window slides past" : ; {
   : >"$AUDIT_LOG"
   rm -f "$(bridge_daemon_nudge_state_file agent-t4c)"
@@ -518,8 +521,9 @@ smoke_run "T4c window expiry → should_skip returns OK after window slides past
   else
     smoke_fail "T4c should_skip must SKIP immediately after record (inside 2s window)"
   fi
-  # Wait past the 2s redelivery window (3s = window + 1s granularity).
-  sleep 3
+  # Wait past the first-record backoff window: base<<1 = 2*2 = 4s
+  # (Track B; see header). 5s = 4s window + 1s clock granularity.
+  sleep 5
   if bridge_daemon_should_skip_nudge "agent-t4c" "$fp" "1"; then
     smoke_fail "T4c should_skip must NOT skip after the redelivery window expires"
   else
