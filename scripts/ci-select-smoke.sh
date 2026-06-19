@@ -3894,6 +3894,18 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # selection. Cover the exclusion regression smoke whenever the
       # ingest orchestrator moves.
       add_required 679-wiki-ingest-exclude-precompact
+      # Issue #1983: Lane B selects the [librarian-ingest] target by LIVENESS
+      # (librarian's `active` flag), not mere existence, and reports the real
+      # `task create` outcome — so a stopped librarian falls through to the
+      # live admin fallback instead of silently dropping Lane B while claiming
+      # success. Cover the liveness/honest-status regression smoke.
+      add_required 1983-wiki-ingest-lane-b-liveness
+      add_integration integration-minimal
+      ;;
+
+    scripts/wiki-ingest-librarian-live.py)
+      # Issue #1983: the Lane B librarian-liveness gate's file-as-argv helper.
+      add_required 1983-wiki-ingest-lane-b-liveness
       add_integration integration-minimal
       ;;
 
