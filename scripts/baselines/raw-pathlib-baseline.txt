@@ -3,7 +3,7 @@ bridge-audit.py:5
 bridge-auth.py:17
 bridge-bundle.py:8
 bridge-channel-server.py:4
-bridge-channels.py:11
+bridge-channels.py:13
 bridge-config.py:8
 bridge-context-pressure.py:0
 bridge-cron-runner.py:22
@@ -30,6 +30,7 @@ bridge-queue-gateway.py:19
 bridge-queue.py:12
 bridge-relay-cleanup.py:27
 bridge-release.py:2
+bridge-resolver-policy.py:1
 bridge-rooms.py:0
 bridge-runtime-inventory.py:23
 bridge-setup.py:0
