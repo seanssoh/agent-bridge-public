@@ -67,7 +67,9 @@ Subcommands:
   safe-mode          Launch <agent> in safe-mode (no auto-resume).
   stop               Stop <agent>'s tmux session.
   restart            Restart <agent> with channel-banner verification.
-  forget-session     Clear the persisted Claude/Codex resume id.
+  forget-session     Clear the persisted Claude/Codex resume id and quarantine
+                     the agent's own in-window transcripts so the next launch
+                     is genuinely fresh (no most-recent-.jsonl re-resume).
   set-onboarding     Set onboarding state in BOTH the HOME + workdir
                      SESSION-TYPE.md copies atomically (#1417).
   attach             Attach to <agent>'s tmux session.
@@ -7225,6 +7227,16 @@ run_attach() {
 # takes effect. Idempotent — running it twice on an already-empty id exits
 # 0 with `changed=no`.
 #
+# Issue #1968: clearing the persisted id alone is not enough. The resolver's
+# fallback (#1769) re-selects the project dir's most-recent in-window `.jsonl`
+# transcript when the persisted id is empty, so forget-session was inert while a
+# transcript remained. When the agent is not active we also quarantine the
+# agent's OWN in-window transcripts (all of them, not just the newest) via the
+# resume-quarantine, which the resolver auto-excludes — so the fallback has
+# nothing stale left and the next launch is genuinely fresh. A transcript
+# created AFTER forget (the new fresh session) is not quarantined, so a normal
+# restart still resumes; this only affects the explicit forget path.
+#
 # This is the supported recovery path for issue #268 (stale Claude resume
 # target). The companion warning in bridge-start.sh / bridge-run.sh tells an
 # operator who used `--no-continue` that the persisted id is still there.
@@ -7280,6 +7292,105 @@ run_forget_session() {
   done
   changed="${changed:-no}"
 
+  # Issue #1968: clearing the persisted id is not enough for a genuinely fresh
+  # next launch. bridge_resolve_resume_session_id (#1769) falls back to the
+  # project dir's most-recent in-window `.jsonl` transcript when the persisted
+  # id is empty, so forget-session is inert while a transcript remains (a
+  # reseeded bot keeps resuming the pre-reseed conversation). Quarantine the
+  # agent's OWN in-window transcripts via the resume-quarantine — the resolver
+  # auto-fetches that list as its exclude set, so the fallback has nothing stale
+  # left to re-select.
+  #
+  # Enumerate ALL in-window transcripts at forget time (not just the newest):
+  # the resolver picks most-recent, so quarantining only the single newest would
+  # let it walk to the next-newest stale one. Transcripts created AFTER forget
+  # (the new fresh session) are not enumerated here and stay resumable, so the
+  # next legitimate restart is unaffected — this only touches the EXPLICIT
+  # forget path, never a normal restart's recovery fallback.
+  #
+  # bridge_agent_resume_quarantine_add carries the foreign-transcript guard (it
+  # refuses an operator/daemon-HOME session that is not under the agent's own
+  # config dir), the dynamic-vanilla-Claude refusal, the cap, and id validation,
+  # so this only ever records the agent's OWN transcripts.
+  #
+  # Cap completeness + ordering (codex review BLOCKING, r1+r2): the resume-
+  # quarantine is capped at $BRIDGE_RESUME_QUARANTINE_CAP (default 50) and the
+  # add evicts the EARLIEST-appended entries when over cap (keeps the last
+  # `cap`). That cap bounds the runner's REACTIVE quarantine growth; an
+  # operator's deliberate forget must instead neutralize EVERY in-window
+  # transcript, so an eviction that silently leaves a stale transcript resumable
+  # (the resolver always re-selects the freshest non-quarantined transcript)
+  # would re-open #1968. Two defenses:
+  #   (1) Raise the effective cap for THIS forget's adds to fit the existing
+  #       entries PLUS every enumerated id — with no ceiling — so the WHOLE
+  #       in-window set actually lands (the set is self-bounding: only
+  #       transcripts within BRIDGE_RESUME_MAX_AGE_HOURS are enumerated and
+  #       re-forget is idempotent, so the file cannot grow without bound).
+  #   (2) Feed the guarded add OLDEST-first (the enumeration is newest-first), so
+  #       even in the degenerate case the cap is hit, the cap evicts the OLDEST
+  #       (which the resolver would pick last) and the freshest — the resolver's
+  #       actual target — always survive. Feeding newest-first would evict the
+  #       freshest. With (1) the cap is never hit, but (2) is the safety net.
+  #
+  # Gate on active!=yes, exactly like the resume-quarantine *clear* above: while
+  # the agent is running, its live transcript is the current session and a
+  # rapid-fail bridge-run loop could re-introduce ids between the clear and the
+  # next quarantine pass. The operator is told (active=yes warning) to re-run
+  # after `agent stop`, at which point the live transcript is enumerated.
+  #
+  # The reported count is the number of transcripts genuinely RECORDED (the
+  # before/after delta of the quarantine id set). A transcript the add-side
+  # guard refuses (proven-foreign operator session), an already-present id, or a
+  # cap-evicted entry never inflates the operator-facing number.
+  local _transcripts_quarantined=0
+  if [[ "$active" != "yes" ]]; then
+    local _sid=""
+    local -a _resumable=()
+    local _q_before="" _q_after=""
+    _q_before="$(bridge_agent_resume_quarantine_ids "$agent" 2>/dev/null || true)"
+    # Collect the newest-first enumeration into an array so we can feed the
+    # guarded add OLDEST-first (see cap note above).
+    while IFS= read -r _sid; do
+      [[ -n "$_sid" ]] || continue
+      _resumable+=("$_sid")
+    done < <(bridge_agent_list_resumable_transcripts "$agent" 2>/dev/null || true)
+    # Raise the effective cap for this forget's adds to fit EVERY enumerated id
+    # alongside any pre-existing entries, with NO arbitrary ceiling. Forget is a
+    # deliberate operator action that must neutralize all of the agent's in-
+    # window transcripts; a ceiling (codex r2 BLOCKING) would silently leave the
+    # over-ceiling oldest entries unrecorded and the resolver would then resume
+    # the freshest of those stale survivors — re-opening #1968 for a high-churn
+    # project dir. There is no runaway-growth risk: the set is bounded by the
+    # transcripts on disk WITHIN the resolver's own age window
+    # (BRIDGE_RESUME_MAX_AGE_HOURS, default 48h) — stale ids age out of the
+    # window and stop being enumerated, and re-running forget is idempotent
+    # (the add no-ops a duplicate id), so the quarantine cannot grow without
+    # bound. The default cap still governs the runner's REACTIVE adds elsewhere;
+    # only this forget loop's per-call env raises it.
+    local _default_cap="${BRIDGE_RESUME_QUARANTINE_CAP:-50}"
+    [[ "$_default_cap" =~ ^[0-9]+$ ]] || _default_cap=50
+    local _q_before_n_pre=0
+    [[ -n "$_q_before" ]] && _q_before_n_pre="$(printf '%s' "$_q_before" | tr ',' '\n' | grep -c . || true)"
+    local _forget_cap=$(( _q_before_n_pre + ${#_resumable[@]} ))
+    (( _forget_cap < _default_cap )) && _forget_cap=$_default_cap
+    local _i
+    for (( _i = ${#_resumable[@]} - 1; _i >= 0; _i-- )); do
+      BRIDGE_RESUME_QUARANTINE_CAP="$_forget_cap" \
+        bridge_agent_resume_quarantine_add "$agent" "${_resumable[$_i]}" "forget-session" 2>/dev/null || true
+    done
+    # Count what was genuinely added (delta in the recorded id set), so a
+    # refused-foreign / already-present / cap-evicted id never inflates the
+    # operator-facing number.
+    _q_after="$(bridge_agent_resume_quarantine_ids "$agent" 2>/dev/null || true)"
+    if [[ -n "$_q_after" ]]; then
+      local _q_after_n=0 _q_before_n=0
+      _q_after_n="$(printf '%s' "$_q_after" | tr ',' '\n' | grep -c . || true)"
+      [[ -n "$_q_before" ]] && _q_before_n="$(printf '%s' "$_q_before" | tr ',' '\n' | grep -c . || true)"
+      _transcripts_quarantined=$(( _q_after_n - _q_before_n ))
+      (( _transcripts_quarantined < 0 )) && _transcripts_quarantined=0
+    fi
+  fi
+
   if [[ "$changed" != "yes" ]]; then
     bridge_audit_log daemon agent_session_forgotten "$agent" \
       --detail cleared_files= \
@@ -7287,12 +7398,14 @@ run_forget_session() {
       --detail active="$active" \
       --detail changed=no \
       --detail resume_quarantine_cleared="$_quarantine_cleared" \
+      --detail transcripts_quarantined="$_transcripts_quarantined" \
       --detail reason=already_forgotten >/dev/null 2>&1 || true
     printf 'agent: %s\n' "$agent"
     printf 'changed: no\n'
     printf 'reason: already_forgotten\n'
     printf 'active: %s\n' "$active"
     printf 'resume_quarantine_cleared: %s\n' "$_quarantine_cleared"
+    printf 'transcripts_quarantined: %s\n' "$_transcripts_quarantined"
     if [[ "$active" == "yes" && -n "$_quarantine_file" && -f "$_quarantine_file" ]]; then
       bridge_warn "active=yes — resume-quarantine left intact; run forget-session again after 'agent stop $agent' for a clean slate"
     fi
@@ -7304,6 +7417,7 @@ run_forget_session() {
     --detail prior_id_hash="$prior_id_hash" \
     --detail active="$active" \
     --detail resume_quarantine_cleared="$_quarantine_cleared" \
+    --detail transcripts_quarantined="$_transcripts_quarantined" \
     --detail changed=yes >/dev/null 2>&1 || true
 
   printf 'agent: %s\n' "$agent"
@@ -7312,6 +7426,7 @@ run_forget_session() {
   printf 'prior_id_hash: %s\n' "${prior_id_hash:--}"
   printf 'active: %s\n' "$active"
   printf 'resume_quarantine_cleared: %s\n' "$_quarantine_cleared"
+  printf 'transcripts_quarantined: %s\n' "$_transcripts_quarantined"
   if [[ "$active" == "yes" ]]; then
     bridge_warn "active=yes — running tmux session must be restarted fresh to pick up cleared id; suggested next: bridge-agent.sh restart $agent --no-continue"
     if [[ -n "$_quarantine_file" && -f "$_quarantine_file" ]]; then
