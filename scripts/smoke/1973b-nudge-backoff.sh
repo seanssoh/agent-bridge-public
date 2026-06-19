@@ -352,6 +352,7 @@ PY
 # shellcheck source=/dev/null
 source "$ESC_HELPERS"
 
+# shellcheck disable=SC2120  # optional override arg; all callers use the $TARGET default
 escalations_for_target() {
   local who="${1:-$TARGET}" n
   if n="$(grep -c "\"action\":\"task_unclaimed_escalated\".*target_agent=${who};" "$AUDIT_LOG" 2>/dev/null)"; then
