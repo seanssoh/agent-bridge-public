@@ -362,7 +362,20 @@ def cmd_send(args: argparse.Namespace) -> int:
         return die("config has no 'bridge_id' — set it in handoff.local.json "
                    "to this bridge's id (the receiver matches it against "
                    "its inbound peer allowlist).") or 1
-    sender_agent = args.from_agent or os.environ.get("BRIDGE_AGENT_ID") or os.environ.get("USER", "unknown")
+    # sender_agent is the reply-to identity stamped into the envelope. It
+    # MUST be a real agent id: resolve --from first, then BRIDGE_AGENT_ID.
+    # Do NOT fall back to the OS login name — an OS username is never a
+    # valid agent id, so any reply echoing it is rejected by this bridge's
+    # own inbound allowlist (self-inflicted 403). Fail closed instead.
+    # ``.strip()`` also drops the empty-string trap (e.g. --from "$UNSET").
+    sender_agent = (args.from_agent or "").strip() \
+        or os.environ.get("BRIDGE_AGENT_ID", "").strip()
+    if not sender_agent:
+        return die("a2a send needs a valid sender agent id: pass "
+                   "--from <agent-id> or export BRIDGE_AGENT_ID. "
+                   "(The OS username is not a valid sender — a reply "
+                   "to it would be rejected by this bridge's own "
+                   "inbound allowlist.)") or 1
     message_id = a2a.new_message_id(sender_bridge)
 
     body_bytes = body_text.encode("utf-8")
