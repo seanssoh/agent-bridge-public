@@ -11,7 +11,11 @@ bridge_load_roster
 
 usage() {
   cat <<EOF
-Usage: bash $SCRIPT_DIR/bridge-status.sh [--watch] [--refresh <seconds>] [--open-limit <count>] [--all-agents] [--json]
+Usage: bash $SCRIPT_DIR/bridge-status.sh [--watch] [--refresh <seconds>] [--open-limit <count>] [--all-agents] [--full] [--json]
+  --full / --analytics  also compute the expensive audit-parse / fs-scan
+                        analytics (context-pressure FP rate, config-drift,
+                        nudge-recheck, pending upgrade-conflicts, orphan-dirs).
+                        Skipped by default so the dashboard stays fast.
 EOF
 }
 
@@ -19,12 +23,17 @@ WATCH_MODE=0
 REFRESH_SECONDS=2
 OPEN_LIMIT=8
 ALL_AGENTS=0
+FULL_MODE=0
 JSON_MODE=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --json)
       JSON_MODE=1
+      shift
+      ;;
+    --full|--analytics)
+      FULL_MODE=1
       shift
       ;;
     --watch|--tui)
@@ -81,6 +90,9 @@ render_once() {
   )
   if [[ $ALL_AGENTS -eq 1 ]]; then
     status_args+=(--all-agents)
+  fi
+  if [[ $FULL_MODE -eq 1 ]]; then
+    status_args+=(--full)
   fi
   if [[ $JSON_MODE -eq 1 ]]; then
     status_args+=(--json)

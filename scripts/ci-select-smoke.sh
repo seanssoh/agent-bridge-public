@@ -1231,6 +1231,15 @@ select_for_path() {
       # bridge-status.py move so the probe wiring + omit-when-no-probe
       # contract cannot silently regress back to all-unknown rows.
       add_required queue upgrade-conflicts-lifecycle status-engine-detect 835-static-admin-launch 1155-bootstrap-skill-guard 1165-track-a-scaffold-modes 1170-safe-path-check-sudo-escalate 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp 1209-ms365-redirect-resolver 1215-ms365-dir-mode G-channel-spec-resolution γ-cli-consistency B-beta4-setup-wizard H-beta4-iso-ownership 1803-orphan-dir-gc 1844-plugin-liveness-probe 1833-status-gateway-timeout-not-down
+      # status-fast-default: render_dashboard now SKIPS the expensive
+      # audit-parse / fs-walk analytics (context-pressure FP rate,
+      # config-drift, nudge-recheck, pending upgrade-conflicts,
+      # orphan-agent-dirs) by default and only computes them under `--full`
+      # (alias `--analytics`); the `--json` machine path stays full. Pull
+      # status-fast-default on every bridge-status.py / bridge-status.sh move
+      # so a future PR cannot silently re-arm the slow analytics in the
+      # default human dashboard (the ~30s regression) or drop a JSON field.
+      add_required status-fast-default
       # Issue #1405 (v0.15.0 self-heal stack): bridge-status.py gained
       # read_handoffd_health + the A2A receiver health row + the
       # `a2a=DOWN`/`a2a=ALARM` header flag (text + JSON dashboards). Pull

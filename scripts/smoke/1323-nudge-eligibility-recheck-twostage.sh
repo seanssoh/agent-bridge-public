@@ -666,12 +666,15 @@ smoke_run "T5 bridge-status renders nudge-recheck line + JSON counter" : ; {
   python3 "$REPO_ROOT/bridge-queue.py" cancel "$TASK_ID" --actor requester >/dev/null
   unset TASK_ID
 
+  # The nudge-recheck line is an audit-parse analytic deferred behind
+  # `--full` (status-fast-default): the default human dashboard skips it,
+  # so the line only renders with `--full`. The JSON path below stays full.
   STATUS_OUT="$(python3 "$REPO_ROOT/bridge-status.py" \
     --roster-snapshot "$ROSTER_SNAPSHOT" \
     --db "$BRIDGE_TASK_DB" \
     --daemon-pid-file "$DAEMON_PID_FILE" \
     --bridge-state-dir "$BRIDGE_STATE_DIR" \
-    --audit-log "$AUDIT_LOG" 2>&1)" || smoke_fail "T5 bridge-status.py text render failed: $STATUS_OUT"
+    --audit-log "$AUDIT_LOG" --full 2>&1)" || smoke_fail "T5 bridge-status.py text render failed: $STATUS_OUT"
   smoke_assert_contains "$STATUS_OUT" "nudge-recheck" "T5 dashboard renders nudge-recheck line"
   smoke_assert_contains "$STATUS_OUT" "drop_total=2" "T5 drop_total counter correct (both legacy + stage2)"
   smoke_assert_contains "$STATUS_OUT" "drop_stage2_used=1" "T5 stage2_used counter correct (only post-fix shape)"
