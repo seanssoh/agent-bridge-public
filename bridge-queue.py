@@ -2034,6 +2034,40 @@ def cmd_update(args: argparse.Namespace) -> int:
             body_text = stabilized_text
             body_path = note_path
 
+        # Issue #1970: an explicit worker-progress update renews the task
+        # lease so the daemon's lease-aware idle stale-claim reclaim does not
+        # yank a long multi-turn claim mid-work. Renew ONLY when:
+        #   - the task is currently claimed AND stays claimed after this update
+        #     (an update that moves the task out of `claimed` must not extend a
+        #     lease — handoff/blocked/done own that transition); and
+        #   - the actor is the current claimant or assignee.
+        # Actor guard (security): a creator/admin metadata update may edit
+        # fields but must NOT extend the claimant's lease — no lease spoofing.
+        lease_until_ts = task["lease_until_ts"]
+        try:
+            lease_seconds = int(getattr(args, "lease_seconds", None) or 0)
+        except (TypeError, ValueError):
+            lease_seconds = 0
+        if lease_seconds <= 0:
+            try:
+                lease_seconds = int(os.environ.get("BRIDGE_TASK_LEASE_SECONDS", "900"))
+            except (TypeError, ValueError):
+                lease_seconds = 900
+        lease_owners = {
+            str(task["claimed_by"] or ""),
+            str(task["assigned_to"] or ""),
+        }
+        lease_owners.discard("")
+        if (
+            task["status"] == "claimed"
+            and status == "claimed"
+            and actor in lease_owners
+        ):
+            renewed_until = current_ts + lease_seconds
+            existing_lease = int(task["lease_until_ts"] or 0)
+            if existing_lease < renewed_until:
+                lease_until_ts = renewed_until
+
         conn.execute(
             """
             UPDATE tasks
@@ -2042,10 +2076,20 @@ def cmd_update(args: argparse.Namespace) -> int:
                 status = ?,
                 body_text = ?,
                 body_path = ?,
+                lease_until_ts = ?,
                 updated_ts = ?
             WHERE id = ?
             """,
-            (title, priority, status, body_text, body_path, current_ts, args.task_id),
+            (
+                title,
+                priority,
+                status,
+                body_text,
+                body_path,
+                lease_until_ts,
+                current_ts,
+                args.task_id,
+            ),
         )
         event_note = args.body or args.note
         emit_event(
@@ -3048,7 +3092,7 @@ def cmd_daemon_step(args: argparse.Namespace) -> int:
         # on anything — its claimed tasks should be released.
         stale_claimed = conn.execute(
             """
-            SELECT id, claimed_by
+            SELECT id, claimed_by, lease_until_ts
             FROM tasks
             WHERE status = 'claimed'
               AND claimed_ts IS NOT NULL
@@ -3060,9 +3104,28 @@ def cmd_daemon_step(args: argparse.Namespace) -> int:
             agent_name = str(row["claimed_by"])
             note_text = ""
             if agent_name not in active_agents:
+                # Inactive (down) claimant: NOT lease-aware. A down agent's
+                # claim must release on claimed_ts age even if its lease is
+                # still in the future — nothing is going to renew it.
                 note_text = f"claimed for >{max_claim_age}s by inactive agent"
             elif agent_name in idle_agents:
-                note_text = f"claimed for >{max_claim_age}s by idle agent"
+                # Issue #1970: a LIVE-but-prompt-idle claimant is a long
+                # multi-turn task between turns, not an abandoned claim. Skip
+                # the requeue while its lease is still valid — the renewal
+                # path (recent session_activity_ts) and explicit `agb update
+                # --lease-seconds` keep a working agent's lease alive, and the
+                # lease-expiry path above reclaims a genuinely-abandoned claim.
+                # Boundary matches lease-expiry (`>= current_ts` still valid).
+                # A NULL lease stays reclaimable: legacy / hand-built rows and
+                # the bash↔python upgrade window have no lease to honor, so
+                # they still release here via stale_claim_requeued.
+                lease_until = int(row["lease_until_ts"] or 0)
+                if lease_until and lease_until >= current_ts:
+                    continue
+                note_text = (
+                    f"claimed for >{max_claim_age}s by idle agent "
+                    "with expired/missing lease"
+                )
             else:
                 continue
             conn.execute(
@@ -3534,6 +3597,12 @@ def build_parser() -> argparse.ArgumentParser:
     update_parser.add_argument("--status", choices=UPDATE_STATUS_CHOICES)
     update_parser.add_argument("--priority", choices=PRIORITY_CHOICES)
     update_parser.add_argument("--note")
+    # Issue #1970: renew the task lease on explicit worker progress. Only the
+    # current claimant/assignee renews, and only while the task stays claimed.
+    update_parser.add_argument(
+        "--lease-seconds",
+        default=os.environ.get("BRIDGE_TASK_LEASE_SECONDS", "900"),
+    )
     update_body_group = update_parser.add_mutually_exclusive_group()
     update_body_group.add_argument("--body")
     update_body_group.add_argument("--body-file")
