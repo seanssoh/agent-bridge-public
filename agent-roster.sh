@@ -82,6 +82,21 @@ declare -Ag BRIDGE_AGENT_PERMISSION_MODE=()
 # shellcheck disable=SC2034
 declare -Ag BRIDGE_AGENT_WEBHOOK_PORT=()
 
+# #2020 (same class as #1407/#1627): extra-runtime-skills map written by
+# `agent roster materialize-fields --skills` / `agent create --skills` (#1427)
+# as `BRIDGE_AGENT_SKILLS["<agent>"]=...` into agent-roster.local.sh. Without a
+# prior `declare -A`, a bare source of these roster files (agent-roster.sh then
+# agent-roster.local.sh) evaluates the non-numeric subscript arithmetically →
+# index 0 → a broken INDEXED array. bridge_agent_skills_csv guards on
+# bridge_var_is_assoc, so an indexed map reads back as empty and the runtime
+# skill sync materializes NO configured skill for ANY agent — silently. Declare
+# it associative up front, BEFORE agent-roster.local.sh is sourced, exactly like
+# the sibling maps above. (The lib path also resets it in bridge_reset_roster_maps;
+# this is the file-level half of that belt-and-suspenders, the only #1427 map
+# previously missing it.)
+# shellcheck disable=SC2034
+declare -Ag BRIDGE_AGENT_SKILLS=()
+
 # shellcheck disable=SC2034
 declare -Ag BRIDGE_LEGACY_AGENT_TARGET=()
 declare -Ag BRIDGE_OPENCLAW_AGENT_TARGET=()
