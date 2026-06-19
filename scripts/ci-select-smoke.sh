@@ -5027,6 +5027,14 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # all-unsupported-engine mute that swallows real drift. Pull it on every
       # bridge-watchdog.py move.
       add_required watchdog-profile-contract watchdog-registry-anchored watchdog-silence-stderr-capture 1108-watchdog-v2-workdir 1119-watchdog-perm-error 1113-watchdog-legacy-backfill ε-watchdog-rescan-codex G-beta4-watchdog-noise 1520c-create-isolate-profile-publish 1801-watchdog-bounded-broken-links 1872-watchdog-unsupported-engine-info 1820-rc4-iso-stale-group-preflight codex-doctor queue
+      # Issue #2018: the missing_managed_claude_block check now treats the block
+      # as present when it lives in the agent's IDENTITY HOME (not only the
+      # scanned registry workdir), so a static Claude agent with a custom
+      # project-folder workdir stops false-flagging drift — mirroring the #1750
+      # entrypoint home fall-back. Pull 2018-watchdog-managed-block-identity-home
+      # on every watchdog move so a refactor can neither re-introduce the
+      # workdir-only false positive nor mask a block genuinely absent from BOTH.
+      add_required 2018-watchdog-managed-block-identity-home
       add_integration integration-minimal
       ;;
 
