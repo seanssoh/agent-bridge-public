@@ -1203,6 +1203,15 @@ bridge_run_schedule_dev_channels_accept() {
     return 0
   fi
 
+  # Issue #1991 single-sender: when the agentic resolver owns this agent, the
+  # agent-side backstop watcher must NOT be armed (the resolver is the sole key
+  # sender). Report-only and return. No-op when the resolver is disabled.
+  if declare -F bridge_prompt_resolver_owns_agent >/dev/null 2>&1 \
+      && bridge_prompt_resolver_owns_agent "${AGENT:-}"; then
+    log_line "[info] agent-side dev-channels backstop SKIPPED for '${AGENT:-}' — agentic resolver (#1991) owns blocked prompts"
+    return 0
+  fi
+
   # Operator-tunable timeout. Default 60s covers 4-plugin cold-start
   # (bun teams + bun ms365 + node cosmax-* MCP servers) on isolated
   # linux-user agents where claude takes longer than the historic 15s

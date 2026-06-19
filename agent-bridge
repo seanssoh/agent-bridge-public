@@ -1128,6 +1128,14 @@ URGENT_HELP
       shift
       exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-agent.sh" "$@"
       ;;
+    resolver)
+      # Issue #1991 — agentic blocked-prompt resolver (canary-gated, DEFAULT
+      # OFF). The resolver owner (patch) drains [RESOLVER] tasks routed by the
+      # #1992 safety floor and sends at most one closed semantic key sequence
+      # per blocked-prompt key. attempt|drain|status. See bridge-resolver.sh.
+      shift
+      exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-resolver.sh" "$@"
+      ;;
     cron)
       shift
       exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-cron.sh" "$@"

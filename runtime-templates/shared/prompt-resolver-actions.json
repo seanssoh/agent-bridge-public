@@ -1,0 +1,131 @@
+{
+  "_comment": [
+    "Issue #1991 agentic blocked-prompt resolver — CLOSED, default-deny action policy.",
+    "This is the SHIPPED, source-controlled allow-list the v0.16.16 canary resolver",
+    "reads from $BRIDGE_SCRIPT_DIR/runtime-templates/shared/prompt-resolver-actions.json.",
+    "",
+    "SECURITY CONTRACT (do not weaken):",
+    "  - Default-deny: a prompt_kind NOT listed here, or listed with enabled=false, is",
+    "    NEVER auto-actioned. The resolver denies and lets the #1992 safety floor escalate.",
+    "  - An install-local override file may only DEMOTE a row to deny/report-only. It may",
+    "    NEVER promote a new auto-action or enable a denied kind (the resolver merges with",
+    "    a deny-wins intersection — see bridge-resolver.sh::resolver_policy_decision).",
+    "  - 'keys' are SEMANTIC tokens only, drawn from the closed vocabulary that",
+    "    bridge_tmux_send_picker_key accepts (confirm|select_first|down|up|y|n). The resolver",
+    "    refuses any token outside that set. Pane text NEVER supplies a key token.",
+    "  - required_confidence gates which detector confidence is allowed to auto-action.",
+    "    'low' / 'unknown' confidence never matches a high-required row.",
+    "",
+    "billing / usage / plan-upgrade / permission / overwrite / feedback / context_pressure /",
+    "unknown_interactive are explicitly DENY for v0.16.16 — they are never auto-actioned."
+  ],
+  "version": 1,
+  "default_action": "deny",
+  "actions": [
+    {
+      "prompt_kind": "devchannels",
+      "enabled": true,
+      "required_confidence": "high",
+      "action": "select_named_safe_option",
+      "keys": ["select_first", "confirm"],
+      "required_fragments": [
+        "WARNING: Loading development channels",
+        "I am using this for local development"
+      ],
+      "post_verify": "same_prompt_gone",
+      "note": "Select option 1 'I am using this for local development'. Replaces the controller/agent dev-channels auto-accept under the single owner."
+    },
+    {
+      "prompt_kind": "trust",
+      "enabled": true,
+      "required_confidence": "high",
+      "action": "confirm_registered_session_only",
+      "keys": ["confirm"],
+      "required_fragments": [
+        "Quick safety check:",
+        "Yes, I trust this folder"
+      ],
+      "require_registered_session": true,
+      "require_workdir_match": true,
+      "post_verify": "same_prompt_gone",
+      "note": "Allowed ONLY when the target is a bridge-registered agent session AND the live session workdir equals the registered agent workdir. Otherwise deny."
+    },
+    {
+      "prompt_kind": "summary",
+      "enabled": true,
+      "required_confidence": "high",
+      "action": "resume_from_summary_safe",
+      "keys": ["select_first", "confirm"],
+      "required_fragments": [
+        "Resume from summary (recommended)",
+        "Resume full session as-is"
+      ],
+      "post_verify": "same_prompt_gone",
+      "note": "Safe resume path only ('Resume from summary (recommended)', option 1). Never choose 'full session as-is' by text inference."
+    },
+    {
+      "prompt_kind": "feedback",
+      "enabled": false,
+      "required_confidence": "high",
+      "action": "deny",
+      "keys": [],
+      "note": "DENY in the initial canary. No free-form digit passthrough; escalate."
+    },
+    {
+      "prompt_kind": "context_pressure",
+      "enabled": false,
+      "required_confidence": "high",
+      "action": "deny",
+      "keys": [],
+      "note": "DENY. Ambiguous context-pressure modal — never blindly press Enter; escalate."
+    },
+    {
+      "prompt_kind": "permission",
+      "enabled": false,
+      "required_confidence": "high",
+      "action": "deny",
+      "keys": [],
+      "note": "DENY. No auto-yes / blanket approval / session permission grant. Escalate."
+    },
+    {
+      "prompt_kind": "overwrite_confirm",
+      "enabled": false,
+      "required_confidence": "high",
+      "action": "deny",
+      "keys": [],
+      "note": "DENY. Potentially irreversible. Escalate."
+    },
+    {
+      "prompt_kind": "billing",
+      "enabled": false,
+      "required_confidence": "high",
+      "action": "deny",
+      "keys": [],
+      "note": "DENY, even 'Stop and wait for limit to reset'. Usage/billing surfaces are never auto-actioned by the resolver. Escalate."
+    },
+    {
+      "prompt_kind": "usage",
+      "enabled": false,
+      "required_confidence": "high",
+      "action": "deny",
+      "keys": [],
+      "note": "DENY. Escalate."
+    },
+    {
+      "prompt_kind": "plan-upgrade",
+      "enabled": false,
+      "required_confidence": "high",
+      "action": "deny",
+      "keys": [],
+      "note": "DENY. Escalate."
+    },
+    {
+      "prompt_kind": "unknown_interactive",
+      "enabled": false,
+      "required_confidence": "high",
+      "action": "deny",
+      "keys": [],
+      "note": "DENY. Unknown structured picker — escalate (the floor's longer unknown deadline applies)."
+    }
+  ]
+}
