@@ -368,7 +368,11 @@ count_open_with_prefix() {
 backdate_task() {
   local task_id="$1" seconds_ago="${2:-600}" cutoff
   cutoff="$(( $(date +%s) - seconds_ago ))"
-  sqlite3 "$DB" "UPDATE tasks SET created_ts=${cutoff} WHERE id=${task_id};"
+  # Age BOTH created_ts and updated_ts: the unclaimed-task filter ages from
+  # max(created_ts, updated_ts) (Issue #1970 — a just-requeued task carries a
+  # fresh updated_ts), so backdating created_ts alone leaves the fixture
+  # "fresh" and no escalation fires. Backdate both to age it past threshold.
+  sqlite3 "$DB" "UPDATE tasks SET created_ts=${cutoff}, updated_ts=${cutoff} WHERE id=${task_id};"
 }
 queue_stuck_task() {
   local title="$1" out id
