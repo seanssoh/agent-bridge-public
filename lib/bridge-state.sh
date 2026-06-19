@@ -2912,6 +2912,64 @@ print(",".join(ids), end="")
 PY
 }
 
+# bridge_agent_list_resumable_transcripts <agent> [workdir]
+#
+# Issue #1968: print every in-window project transcript session-id the resolver
+# fallback (bridge_resolve_resume_session_id / #1769) could re-select for
+# <agent>, one per line, newest first. This is the enumeration the explicit
+# `agb agent forget-session` path uses to quarantine the agent's OWN transcripts
+# so the most-recent-.jsonl fallback has nothing stale left to resume.
+#
+# It reuses the resolver's python helper in `--list-resumable` mode (so the slug
+# + eligibility + max-age logic stays single-sourced — no drift), and mirrors
+# the resolver's config-dir + iso-v2 sudo plumbing: iso-v2 agents keep their
+# transcripts under their own `<agent-home>/.claude/` at 0600, so the scan must
+# run as the iso UID. Empty output (no eligible transcript) is the normal,
+# nothing-to-quarantine case — rc is always 0 so callers treat it as a list.
+bridge_agent_list_resumable_transcripts() {
+  local agent="$1"
+  local workdir="${2:-}"
+  [[ -n "$agent" ]] || return 0
+
+  if [[ -z "$workdir" ]]; then
+    workdir="$(bridge_agent_workdir "$agent" 2>/dev/null || true)"
+  fi
+  [[ -n "$workdir" ]] || return 0
+
+  if ! bridge_resolve_script_dir_check; then
+    return 0
+  fi
+
+  local max_age_hours="${BRIDGE_RESUME_MAX_AGE_HOURS:-48}"
+
+  # Same config-dir resolution as bridge_resolve_resume_session_id: empty for
+  # non-isolated / unregistered agents (helper falls back to its env/HOME
+  # default), the agent's own `<agent-home>/.claude` for iso v2.
+  local claude_config_dir=""
+  claude_config_dir="$(bridge_resolve_agent_claude_config_dir "$agent" 2>/dev/null || true)"
+
+  local _list_py="$BRIDGE_SCRIPT_DIR/scripts/python-helpers/resolve-claude-resume-session-id.py"
+
+  # Same iso-v2 sudo-as-user drop the resolver uses so 0600 transcripts owned by
+  # the iso UID are readable during the scan.
+  local _iso_sudo_user=""
+  if command -v bridge_resolve_agent_iso_sudo_user >/dev/null 2>&1; then
+    _iso_sudo_user="$(bridge_resolve_agent_iso_sudo_user "$agent" 2>/dev/null || true)"
+  fi
+
+  if [[ -n "$_iso_sudo_user" ]] \
+      && command -v bridge_linux_sudo_as_user >/dev/null 2>&1; then
+    local _bash_bin="${BRIDGE_BASH_BIN:-$(command -v bash 2>/dev/null || printf '/bin/bash')}"
+    bridge_linux_sudo_as_user "$_iso_sudo_user" \
+      "$_bash_bin" -c 'exec python3 "$@"' bash \
+      "$_list_py" --list-resumable "$workdir" "$max_age_hours" \
+      "$claude_config_dir" 2>/dev/null || true
+  else
+    python3 "$_list_py" --list-resumable "$workdir" "$max_age_hours" \
+      "$claude_config_dir" 2>/dev/null || true
+  fi
+}
+
 # bridge_resume_path_resolves_into <path> <ancestor>
 #
 # Returns 0 (true) iff realpath(<path>) is <ancestor> itself or strictly below
@@ -3751,6 +3809,104 @@ bridge_agent_pending_attention_lock_dir() {
 bridge_agent_initial_inbox_marker_file() {
   local agent="$1"
   printf '%s/initial-inbox.started' "$(bridge_agent_runtime_state_dir "$agent")"
+}
+
+# Issue #2003 — restart-wake idempotency (queue-less fallback latch).
+#
+# The auto-restart wake (bridge-run.sh) is queue-backed + #1199-deduped when
+# the queue is reachable. When queue access FAILS we still want to wake a
+# restarted handoff session exactly once per launched session + wake reason —
+# but without a durable latch a retry/relaunch in the same session would
+# re-fire. These helpers compute a per-(agent, session_identity, wake_kind,
+# payload_digest) marker under the controller state tree so the wake is
+# checked-before / written-after the tmux send.
+#
+# The dir lives under `state/agents/<agent>/restart-wake/` (the controller
+# `bridge_agent_idle_marker_dir`, same tree as the next-session + onboarding
+# markers), NOT the per-UID iso runtime — the controller is the only writer of
+# the post-restart wake decision, mirroring the next-session marker placement.
+bridge_agent_restart_wake_marker_dir() {
+  local agent="$1"
+  printf '%s/restart-wake' "$(bridge_agent_idle_marker_dir "$agent")"
+}
+
+# bridge_agent_restart_wake_marker_file <agent> <session_identity> <wake_kind> <payload_digest>
+#
+# Print the fallback idempotency-latch path:
+#   state/agents/<agent>/restart-wake/<sha1(auto-restart:<agent>:<sid>:<kind>:<digest>)>.env
+# The sha1 keeps the filename bounded + filesystem-safe regardless of the
+# session id / digest contents.
+bridge_agent_restart_wake_marker_file() {
+  local agent="$1"
+  local session_identity="$2"
+  local wake_kind="$3"
+  local payload_digest="$4"
+  local key sha
+  key="auto-restart:${agent}:${session_identity}:${wake_kind}:${payload_digest}"
+  sha="$(bridge_sha1 "$key")"
+  printf '%s/%s.env' "$(bridge_agent_restart_wake_marker_dir "$agent")" "$sha"
+}
+
+# bridge_run_handoff_task_find_or_create <agent> <next_file>
+#
+# Issue #2003 — make a NEXT-SESSION.md restart wake queue-backed + daemon-
+# deduped by finding or creating the EXACT same handoff task the SessionStart
+# hook uses (hooks/bridge_hook_common.py::_enqueue_handoff_pending). Same digest
+# + title contract:
+#   digest = bridge_agent_next_session_digest (sha1 of the file content, newline-
+#            stripped — byte-identical to the Python hook);
+#   title  = "[bridge:handoff-pending] NEXT-SESSION.md (<digest8>)";
+# Prints the task id on stdout (found or created); prints nothing + returns 1
+# when the queue is unreachable (the caller falls back to the per-session marker
+# latch). Best-effort: every queue call is guarded so a queue outage never
+# aborts the wake path.
+#
+# ATOMICITY (codex review): the SessionStart hook fires as the session starts
+# AND this restart wake fires at prompt-ready, so both can run concurrently on
+# the SAME handoff. A naive find-open-then-create is a TOCTOU race — both could
+# miss the row and both INSERT, producing TWO `[bridge:handoff-pending]` rows.
+# `bridge-queue.py create` is a plain INSERT with no UNIQUE-on-title constraint,
+# so we route through `upsert-open` instead: it serializes on `BEGIN IMMEDIATE`
+# + find_open_task_by_prefix (the #1408 atomic refresh-or-create the daemon's
+# recurring-alert families already use), so two concurrent callers on the same
+# digest-bearing title converge on ONE row. The full digest-bearing title is the
+# prefix so a generic "[bridge:handoff-pending]" older-digest row cannot shadow
+# this one (the LIMIT-1 trap the Python hook also guards against).
+bridge_run_handoff_task_find_or_create() {
+  local agent="$1"
+  local next_file="$2"
+  [[ -n "$agent" && -f "$next_file" ]] || return 1
+
+  local digest title
+  digest="$(bridge_agent_next_session_digest "$agent" 2>/dev/null || true)"
+  [[ -n "$digest" ]] || return 1
+  # Mirror Python's `next_session.name` — the canonical handoff filename.
+  title="[bridge:handoff-pending] $(basename "$next_file") (${digest:0:8})"
+
+  local body
+  body="NEXT-SESSION.md handoff detected at ${next_file}.
+
+Read this file in full and execute its checklist before any other work. Reply briefly to the operator if a user message is also pending; resume normal flow only after the file is deleted by the agent.
+
+Auto-enqueued by bridge_run_handoff_task_find_or_create (#2003 restart wake)."
+
+  # Atomic find-or-create. `upsert-open --format shell` emits `TASK_ID=<n>`
+  # (the existing OR newly-created row id) — extract it; on any queue failure
+  # the caller falls back to the per-session marker latch.
+  local upsert_out task_id=""
+  upsert_out="$(bridge_queue_cli upsert-open --to "$agent" --from "$agent" \
+    --priority urgent --title-prefix "$title" --title "$title" \
+    --body "$body" --format shell 2>/dev/null || true)"
+  task_id="$(printf '%s\n' "$upsert_out" | sed -n "s/^TASK_ID=['\"]\\{0,1\\}\\([0-9][0-9]*\\)['\"]\\{0,1\\}.*/\\1/p" | head -n1)"
+  # Robust fallback: if the shell-quote shape ever changes, re-find by the exact
+  # title (upsert already guarantees a single open row for this prefix).
+  if [[ -z "$task_id" ]]; then
+    task_id="$(bridge_queue_cli find-open --agent "$agent" \
+      --title-prefix "$title" --format id 2>/dev/null | head -n1 || true)"
+  fi
+  [[ -n "$task_id" ]] || return 1
+  printf '%s' "$task_id"
+  return 0
 }
 
 bridge_agent_context_pressure_report_file() {

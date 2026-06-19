@@ -28,4 +28,13 @@ source "$source_root/bridge-lib.sh"
 bridge_load_roster
 # shellcheck source=lib/bridge-isolation-v2-migrate.sh
 source "$source_root/lib/bridge-isolation-v2-migrate.sh"
+
+# #1971: on macOS the v2 groups are inert (ENFORCE is Linux-only), and
+# the create path is now Linux-gated. Sweep any inert ab-* groups a
+# pre-#1971 install left in "Users & Groups" before the migrate-apply
+# emits its terminal JSON line. The helper is a no-op on non-Darwin and
+# never fails the caller, so it cannot affect the upgrade outcome; its
+# diagnostics go to stderr and never contaminate the JSON on stdout.
+bridge_isolation_v2_darwin_cleanup_inert_groups || true
+
 bridge_isolation_v2_migrate_apply_for_upgrade --target-root "$target_root" --json

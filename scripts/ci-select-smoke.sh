@@ -155,8 +155,15 @@ add_live() {
 
 add_all_required_static() {
 
-add_required queue daemon daemon-periodic-token-sync launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering 1495-settings-invalid-hook-key 1453-channel-sticky-false-inbound 1455-settings-two-tree-doctor isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env bsd-mktemp-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-create-caller-trust-gate agent-create-idle-timeout 1105-agent-add-audit 1100-audit-since-tz agent-update agent-update-launch-cmd-redaction 1122-admin-auto-caller-source 1136-always-on-no agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner 1114-cli-help-contract upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering 1120-controller-ops-isolated 1139-link-shared-settings-perm 1144-upgrade-complete-task 1145-ensure-dir-actually-sudo 1145-option1-deferral-guard 1151-step-a-helper 1151-r2-sudo-escalate 1155-bootstrap-skill-guard 1158-marker-controller-uid-exemption 1158-marker-load-order 1161-marker-readable-by-isolated 1165-track-a-scaffold-modes 1165-track-b-sudo-escalate-and-state 1165-track-c-hooks-and-dispatcher 1342-write-state-marker-matrix 1170-safe-path-check-sudo-escalate 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp shared-settings-preserve-user-keys 1689-statusline-preserve-rerender 1756-settings-preserve-model-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1028-isolated-workdir-check 1118-v2-engine-binary-path admin-protocol-shared-link bridge-notify-no-default-discord-875 cleanup-payload-empty-stdin-872 dynamic-agent-shared-mode-workdir v2-scaffold-home-and-workdir 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair agent-env-no-stale-bridge-layout 1015-resume-claude-config-dir 1073-fresh-channel-first-run-seed 1753-hud-config-seed isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup 1400-purge-home-degrade-no-sudo nudge-task-age-gate 1106-nudge-shell-recheck nudge-redundant-active-agent 1323-nudge-eligibility-recheck-twostage 1199-action-required-claimed-skip tool-policy-roster-read-classify 1690-tasksdb-read-carveout 1692-admin-bash-symmetry 1709-shared-secret-suffix-guard 679-wiki-ingest-exclude-precompact a2a-cross-bridge 1405-handoffd-supervision 1058-bootstrap-tmux-ux legacy-install-migrator 1117-cli-help-universal-gate 1087-migrator-apply-contract 1067-codex-provisioning 1077-migrate-iso-v2-data-dir 1108-watchdog-v2-workdir 1119-watchdog-perm-error 1113-watchdog-legacy-backfill 1115-cli-usage-drift phase2-install-tree-reconciler phase3-agent-home-contract 1201-1202-directory-marketplace-seed 1205-hook-iso-fail-open 1207-stale-supp-groups-allowlist 1208-lock-metadata-normalize 1209-ms365-redirect-resolver 1210-ms365-scope-normalize 1212-bridge-hooks-marketplace 1213-iso-uid-predicate 1214-channel-validator-iso-fallback 1215-ms365-dir-mode beta27-D-inject-timestamp-resolved beta27-E-hook-permission-fail-open-markers G-channel-spec-resolution F-daemon-supp-groups-mock F-daemon-supp-groups-real H-bootstrap-memory-iso-rebuild I-agent-description-roster ζ-1236-plugins-list-marketplaces β-1231-1236-fresh-install-seed-sudoers 6607-hook-admin-allowlist γ-cli-consistency δ-1234-daemon-start-policy B-beta3-1249-1250-plugin-ux C1-beta3-1251-restart-preflight-rollback A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir C-beta4-logger-and-spec B-beta4-setup-wizard A-beta4-iso-path-resolution D-beta4-daemon-lifecycle E-beta4-fresh-install-gate-state-dir H-beta4-iso-ownership F-beta4-oauth-bootstrap G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs K-beta4-nits Beta-beta5-session-id-detect-sudo α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-epsilon-tmux-inject-busy beta5-2-zeta-teams-mcp-dedup beta5-2-pi-daemon-crashloop-no-set-e-leak beta5-2-eta-cron-iso-uid-preflight beta5-2-delta-nudge-session-empty beta5-2-theta-upgrade-backfill-perms beta5-2-nu-daemon-path-quarantine beta5-2-kappa-state-audit-reconcile beta5-2-iota-daemon-escalation-family beta5-2-lambda-a2a-robustness beta5-2-mu-cron-channel-creds beta5-2-xi-misc-fixes 1359-cron-create-iso-staging 1379-iso-cron-staging-group 1383-iso-cron-result-json-group 1354-setup-teams-fd-password 1360-onboarding-next-actions-persona 1353-setup-pending-grace 1355-1356-ms365-wizard 1357-iso-boundary-quickref 1358-admin-credential-routine-exempt 1352-shared-codex-pair-path 1343-ms365-token-refresh 1378-iso-session-lock-fresh-start 1388-daemon-lock-fd-cloexec 1416-onboarding-state-field-anchor a2a-setup-wizard 1408-daemon-alert-nudge-hygiene 1944-unclaimed-escalation-once-latch 1409-claude-midturn-busy-gate 1427-A-roster-materialize 1427-B-template-sync-wizard 1426-cron-shell-noniso-help 1437-reactive-cron-rotation 1425-spool-rederive 1617-pending-attention-arrival-stale 1437-native-usage-probe 1468-usage-429-positive-signal usage-probe-edge-classification 1464-cron-aware-stale-health 1497-v2-dynamic-handoff 1497-p1-home-resolver 1506-isolate-normalize 1497-p2-operator-home 1513-iso-teams-prune-eacces 1516-upgrade-downgrade-guard 1612-upgrade-restart-receiver plugin-requires-resolver 1520-shared-claude-config-dir 1520b-create-time-creds-sync 1520c-create-isolate-profile-publish 1533-create-isolate-content-publish 1766-iso-settings-readable 1402-stat-platform-order 1398-a2a-inbound-stopped-target-force 1463-launchd-keepalive-singleton-thrash 1470-engine-auth-seam 1470-codex-fleet-sync 1459-cron-dispatch-recovery 1417-identity-sync-on-start 1750-admin-workdir-identity-not-pair-template upgrade-migrate-rematerialize-workdir 1367-auth-sealed-paste 1563-daemon-singleton 9882-daemon-audit-fp 9981-iso-urgent-instant-wake 9981-iso-pending-attention-readable 1563-pr2-daemon-self-abort 1563-pr3-daemon-escalation 1563-pr4-a2a-receiver-healthz 1563-pr5-fp-control-matrix 1563-pr6-watchdog-scan-timeout 1563-pr7-tick-cadence 1563-pr8-a2a-diag-recovery 1602-dryrun-ref-fidelity 1601-conflicts-adopt-guard 1569-askuserquestion-bound 1611-migrate-orphan-skip 1613-wiki-mention-fence-indent 1623-a2a-backpressure-failopen 1628-a2a-deliver-per-row-guard 1631-nudge-helper-db-guard 1630-a2a-fresh-arrival-nudge 1637-agb-list-iso-marker 1635-iso-backup-perm-skip 1629-healthz-not-semaphore-gated 1640-urgent-from-override 1639-post-restart-auto-wake 1638-settings-cosmetic-conflict 1650-ms365-get-valid-token 1636-rematerialize-scaffolding 1659-cron-status-walk-perf 1663-plugin-cache-sidecar-skip 1660-upgrade-emit-brokenpipe 1661-upgrade-singleton-lock 1662-upgrade-complete-marker 1667-daemon-control-lock-serialize 1672-link-shared-settings-idempotent 1671-teams-eaddrinuse-diagnostic 1670-rematerialize-dryrun-agent-preserved 1677-cron-summary-short-derive lts-channel-sticky-resolver 1685-receiver-staleness-selfheal 1701-warp-healthz-socket-held 1697-a2a-net-status 1693-read-viewers v0165-l0-reconcile-skeleton v0165-l2-tunnel-health v0165-l1-stable-addr v0165-l3-peer-reachability v0165-l4-token-join v0165-l5-relay-roster v0165-l6-net-status-v2 v0166-la-tunnel-bounce-gate v0166-lb-transient-peers v0166-lc-config-set-env 1567-codex-orphan-upgrade-reaper 1675-1694-settings-homebrew-abspath-conflict 1652-queue-gateway-crashloop 11901-shared-global-settings-inherit 1759-selfref-global-loop-guard 1679-1680-a2a-receiver-supervisor-robustness 1762-picker-autoresolve 1783-picker-idle-nonpicker 1764-ratchet-anchoring 1769-freshness-gate-resume 1763-static-model-effort 1781-doc-migration-memory-preserve 1786-tasksdb-doctor-verb 1795-reaper-ephemeral-policy 1803-orphan-dir-gc 1801-watchdog-bounded-broken-links 1872-watchdog-unsupported-engine-info 1809-agents-md-backfill 1806-admin-guard-allow-audit 1823-v2-peer-home-containment 1852-dynamic-agent-restart 1855-keychain-free-backfill 1860-smoke-daemon-stub-temp-guard 1853-self-restart-footgun 1797-reaper-keep-audit-latch 1857-recreate-provisioning-preserve 1844-plugin-liveness-probe 1826-cron-at-naive-tz 1842-cron-tamper-iso-groupwrite 1833-status-gateway-timeout-not-down 1837-gateway-exit-code-on-commit 1825-ms365-token-key-by-claim 1836-iso-first-start-queue-dir-ownership dynamic-agent-resume-config-dir-scope 1891-iso-create-path-completeness 1892-doc-backfill-engine-fail-closed 1906-flag-engine-mismatched-docs 1890-dynamic-vanilla-claude 1900-dynamic-vanilla-refresh-noop 1900-dynamic-vanilla-v2-secret-env-scrub 1899-dynamic-vanilla-codex 1899-dynamic-vanilla-codex-v2-secret-env-repin 1923-askuserquestion-hard-ban 1934-hook-path-canonical-fence 1934-hook-file-self-heal
+add_required queue daemon daemon-periodic-token-sync launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering 1495-settings-invalid-hook-key 1453-channel-sticky-false-inbound 1455-settings-two-tree-doctor isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env bsd-mktemp-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-create-caller-trust-gate agent-create-idle-timeout 1105-agent-add-audit 1100-audit-since-tz agent-update agent-update-launch-cmd-redaction 1122-admin-auto-caller-source 1136-always-on-no agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner 1114-cli-help-contract upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering 1120-controller-ops-isolated 1139-link-shared-settings-perm 1144-upgrade-complete-task 1145-ensure-dir-actually-sudo 1145-option1-deferral-guard 1151-step-a-helper 1151-r2-sudo-escalate 1155-bootstrap-skill-guard 1158-marker-controller-uid-exemption 1158-marker-load-order 1161-marker-readable-by-isolated 1165-track-a-scaffold-modes 1165-track-b-sudo-escalate-and-state 1165-track-c-hooks-and-dispatcher 1342-write-state-marker-matrix 1170-safe-path-check-sudo-escalate 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp shared-settings-preserve-user-keys 1689-statusline-preserve-rerender 1756-settings-preserve-model-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1028-isolated-workdir-check 1118-v2-engine-binary-path admin-protocol-shared-link bridge-notify-no-default-discord-875 cleanup-payload-empty-stdin-872 dynamic-agent-shared-mode-workdir v2-scaffold-home-and-workdir 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair agent-env-no-stale-bridge-layout 1015-resume-claude-config-dir 1073-fresh-channel-first-run-seed 1753-hud-config-seed isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup 1400-purge-home-degrade-no-sudo nudge-task-age-gate 1106-nudge-shell-recheck nudge-redundant-active-agent 1323-nudge-eligibility-recheck-twostage 1199-action-required-claimed-skip tool-policy-roster-read-classify 1690-tasksdb-read-carveout 1692-admin-bash-symmetry 1709-shared-secret-suffix-guard 679-wiki-ingest-exclude-precompact a2a-cross-bridge 1405-handoffd-supervision 1058-bootstrap-tmux-ux legacy-install-migrator 1117-cli-help-universal-gate 1087-migrator-apply-contract 1067-codex-provisioning 1077-migrate-iso-v2-data-dir 1108-watchdog-v2-workdir 1119-watchdog-perm-error 1113-watchdog-legacy-backfill 1115-cli-usage-drift phase2-install-tree-reconciler phase3-agent-home-contract 1201-1202-directory-marketplace-seed 1205-hook-iso-fail-open 1207-stale-supp-groups-allowlist 1208-lock-metadata-normalize 1209-ms365-redirect-resolver 1210-ms365-scope-normalize 1212-bridge-hooks-marketplace 1213-iso-uid-predicate 1214-channel-validator-iso-fallback 1215-ms365-dir-mode beta27-D-inject-timestamp-resolved beta27-E-hook-permission-fail-open-markers G-channel-spec-resolution F-daemon-supp-groups-mock F-daemon-supp-groups-real H-bootstrap-memory-iso-rebuild I-agent-description-roster ζ-1236-plugins-list-marketplaces β-1231-1236-fresh-install-seed-sudoers 6607-hook-admin-allowlist γ-cli-consistency δ-1234-daemon-start-policy B-beta3-1249-1250-plugin-ux C1-beta3-1251-restart-preflight-rollback A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir C-beta4-logger-and-spec B-beta4-setup-wizard A-beta4-iso-path-resolution D-beta4-daemon-lifecycle E-beta4-fresh-install-gate-state-dir H-beta4-iso-ownership F-beta4-oauth-bootstrap G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs K-beta4-nits Beta-beta5-session-id-detect-sudo α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-epsilon-tmux-inject-busy beta5-2-zeta-teams-mcp-dedup beta5-2-pi-daemon-crashloop-no-set-e-leak beta5-2-eta-cron-iso-uid-preflight beta5-2-delta-nudge-session-empty beta5-2-theta-upgrade-backfill-perms beta5-2-nu-daemon-path-quarantine beta5-2-kappa-state-audit-reconcile beta5-2-iota-daemon-escalation-family beta5-2-lambda-a2a-robustness beta5-2-mu-cron-channel-creds beta5-2-xi-misc-fixes 1359-cron-create-iso-staging 1379-iso-cron-staging-group 1383-iso-cron-result-json-group 1354-setup-teams-fd-password 1360-onboarding-next-actions-persona 1353-setup-pending-grace 1355-1356-ms365-wizard 1357-iso-boundary-quickref 1358-admin-credential-routine-exempt 1352-shared-codex-pair-path 1343-ms365-token-refresh 1378-iso-session-lock-fresh-start 1388-daemon-lock-fd-cloexec 1416-onboarding-state-field-anchor a2a-setup-wizard 1408-daemon-alert-nudge-hygiene 1944-unclaimed-escalation-once-latch 1409-claude-midturn-busy-gate 1427-A-roster-materialize 1427-B-template-sync-wizard 1426-cron-shell-noniso-help 1437-reactive-cron-rotation 1425-spool-rederive 1617-pending-attention-arrival-stale 1437-native-usage-probe 1468-usage-429-positive-signal usage-probe-edge-classification 1464-cron-aware-stale-health 1497-v2-dynamic-handoff 1497-p1-home-resolver 1506-isolate-normalize 1497-p2-operator-home 1513-iso-teams-prune-eacces 1516-upgrade-downgrade-guard 1612-upgrade-restart-receiver plugin-requires-resolver 1520-shared-claude-config-dir 1520b-create-time-creds-sync 1520c-create-isolate-profile-publish 1533-create-isolate-content-publish 1766-iso-settings-readable 1402-stat-platform-order 1398-a2a-inbound-stopped-target-force 1463-launchd-keepalive-singleton-thrash 1470-engine-auth-seam 1470-codex-fleet-sync 1459-cron-dispatch-recovery 1417-identity-sync-on-start 1750-admin-workdir-identity-not-pair-template upgrade-migrate-rematerialize-workdir 1367-auth-sealed-paste 1563-daemon-singleton 9882-daemon-audit-fp 9981-iso-urgent-instant-wake 9981-iso-pending-attention-readable 1563-pr2-daemon-self-abort 1563-pr3-daemon-escalation 1563-pr4-a2a-receiver-healthz 1563-pr5-fp-control-matrix 1563-pr6-watchdog-scan-timeout 1563-pr7-tick-cadence 1563-pr8-a2a-diag-recovery 1602-dryrun-ref-fidelity 1601-conflicts-adopt-guard 1569-askuserquestion-bound 1611-migrate-orphan-skip 1613-wiki-mention-fence-indent 1623-a2a-backpressure-failopen 1628-a2a-deliver-per-row-guard 1631-nudge-helper-db-guard 1630-a2a-fresh-arrival-nudge 1637-agb-list-iso-marker 1635-iso-backup-perm-skip 1629-healthz-not-semaphore-gated 1640-urgent-from-override 1639-post-restart-auto-wake 1638-settings-cosmetic-conflict 1650-ms365-get-valid-token 1636-rematerialize-scaffolding 1659-cron-status-walk-perf 1663-plugin-cache-sidecar-skip 1660-upgrade-emit-brokenpipe 1661-upgrade-singleton-lock 1662-upgrade-complete-marker 1667-daemon-control-lock-serialize 1672-link-shared-settings-idempotent 1671-teams-eaddrinuse-diagnostic 1670-rematerialize-dryrun-agent-preserved 1677-cron-summary-short-derive lts-channel-sticky-resolver 1685-receiver-staleness-selfheal 1701-warp-healthz-socket-held 1697-a2a-net-status 1693-read-viewers v0165-l0-reconcile-skeleton v0165-l2-tunnel-health v0165-l1-stable-addr v0165-l3-peer-reachability v0165-l4-token-join v0165-l5-relay-roster v0165-l6-net-status-v2 v0166-la-tunnel-bounce-gate v0166-lb-transient-peers v0166-lc-config-set-env 1567-codex-orphan-upgrade-reaper 1675-1694-settings-homebrew-abspath-conflict 1652-queue-gateway-crashloop 11901-shared-global-settings-inherit 1759-selfref-global-loop-guard 1679-1680-a2a-receiver-supervisor-robustness 1762-picker-autoresolve 1783-picker-idle-nonpicker 1764-ratchet-anchoring 1769-freshness-gate-resume 1763-static-model-effort 1781-doc-migration-memory-preserve 1786-tasksdb-doctor-verb 1795-reaper-ephemeral-policy 1803-orphan-dir-gc 1801-watchdog-bounded-broken-links 1872-watchdog-unsupported-engine-info 1809-agents-md-backfill 1806-admin-guard-allow-audit 1823-v2-peer-home-containment 1852-dynamic-agent-restart 1855-keychain-free-backfill 1860-smoke-daemon-stub-temp-guard 1853-self-restart-footgun 1797-reaper-keep-audit-latch 1857-recreate-provisioning-preserve 1844-plugin-liveness-probe 1826-cron-at-naive-tz 1842-cron-tamper-iso-groupwrite 1833-status-gateway-timeout-not-down 1837-gateway-exit-code-on-commit 1825-ms365-token-key-by-claim 1836-iso-first-start-queue-dir-ownership dynamic-agent-resume-config-dir-scope 1891-iso-create-path-completeness 1892-doc-backfill-engine-fail-closed 1956-backfill-dynamic-engine 1906-flag-engine-mismatched-docs 1890-dynamic-vanilla-claude 1900-dynamic-vanilla-refresh-noop 1900-dynamic-vanilla-v2-secret-env-scrub 1899-dynamic-vanilla-codex 1899-dynamic-vanilla-codex-v2-secret-env-repin 1923-askuserquestion-hard-ban 1934-hook-path-canonical-fence 1934-hook-file-self-heal 1955-daemon-rogue-warn 1970-idle-reclaim-lease-aware 1931-upgrade-preserves-workdir-claudemd 1986-blocked-aging-visible-refire 2014-auto-memory-absolute-seed 1971-macos-group-create-gate 2020-skills-assoc-declare 1981-operator-global-hijack-guard 1985-operator-global-settings-hijack-cleanup 2002-onboarding-nudge-guard 2004-onboarding-marker-authority 2007-codex-hook-trust
 add_required 1425-cron-dispatch-nudge-scope
+# Issue #1966: the orphan keep-set walk now PRUNES heavy non-symlink content
+# trees (node_modules / .git / .claude/{projects,cache}) and reads symlink-ness
+# from a cached os.scandir DirEntry. 1966-orphan-walk-prune is the non-vacuous
+# correctness teeth (keep-set RESULT byte-identical pre/post the prune). In the
+# full static suite so any scripts/smoke/* or bridge_orphan_classifier.py move
+# re-runs the result-preserving guard.
+add_required 1966-orphan-walk-prune
 # Issue #1894: the memory-daily harvester runs the iso agent's transcript scan
 # AS the iso UID (run-as-iso narrow helper) and marshals it back to the
 # controller-UID harvest via --transcripts-json, replacing the broken
@@ -185,6 +192,15 @@ add_required 1881-channel-enable-live-mcp-readiness
 # surfaces). In the full static suite so any scripts/smoke/* move re-runs the
 # detection + status-surface contract.
 add_required 1181-modal-blocker-detect
+# Issue #1973 (Track C): the daemon liveness backstop is now part of install/
+# upgrade/ensure (scripts/install-daemon-systemd.sh +
+# scripts/install-daemon-liveness-systemd.sh + bridge-upgrade.sh +
+# bridge-daemon.sh `ensure`), the liveness watcher gained gateway-stall
+# detection + a recovery marker (scripts/bridge-daemon-liveness.sh), and the
+# daemon consumes that marker for a one-shot re-nudge pass (bridge-daemon.sh
+# cmd_run, arming Track B's BRIDGE_DAEMON_NUDGE_FORCE_AGENTS seam). In the full
+# static suite so any of those surfaces re-runs the C1-C3 acceptance teeth.
+add_required 1973c-liveness-recovery
 # Issue #1820: layout-v2 four-writer migration + gated v1->v2 reconciliation.
 # All eight verdict gates as smokes — cron/precompact/settings/doc-sync writer
 # fixes, the reconcile conflict policy + idempotence, the dry-run inventory and
@@ -799,6 +815,22 @@ select_for_path() {
         # every bridge-agent.sh move so a refactor cannot drop the create-time
         # seed call or reopen the abbreviated-HUD regression.
         add_required 1753-hud-config-seed
+        # Issue #2014: bridge-agent.sh's bridge_ensure_auto_memory_isolation
+        # now seeds an ABSOLUTE autoMemoryDirectory (no leading "~" for the
+        # Claude CLI to mis-expand per session) resolved via
+        # bridge_agent_claude_home_dir (operator home on shared mode, iso UID
+        # home on Linux iso-v2), and auto-upgrades the bridge's own legacy
+        # tilde seed in place while still fail-closing on a user-customized
+        # value. Pull the smoke on every bridge-agent.sh move so a refactor
+        # cannot reintroduce the tilde seed or clobber an operator-set value.
+        # Issue #1968: bridge-agent.sh's run_forget_session now enumerates the
+        # agent's own in-window transcripts and quarantines them (alongside
+        # clearing the persisted id) so the resolver's most-recent-.jsonl
+        # fallback (#1769) has nothing stale left to resume — a genuinely fresh
+        # next launch. Pull the smoke on every bridge-agent.sh move so a
+        # refactor cannot drop the quarantine loop and reopen the inert-forget
+        # bug (dry-run launch keeps `--resume <old-id>` after forget-session).
+        add_required 1968-forget-session-fresh 2014-auto-memory-absolute-seed
       fi
       ;;
     lib/bridge-cron.sh|lib/bridge-state.sh)
@@ -810,6 +842,22 @@ select_for_path() {
       # so a future PR cannot regress a verb's --help path via the
       # underlying helper.
       add_required 1117-cli-help-universal-gate
+      if [[ "$path" == "lib/bridge-cron.sh" ]]; then
+        # Issue #1929: lib/bridge-cron.sh hosts bridge_check_memory_pressure,
+        # whose Darwin branch must probe the kernel pressure TIER
+        # (kern.memorystatus_vm_pressure_level) rather than vm.swapusage —
+        # gating on swap-percent chronically false-defers ALL cron dispatch on
+        # macOS (a healthy host routinely sits at 80-90%+ swap). Pull the smoke
+        # on every bridge-cron.sh move so a refactor cannot revert to the
+        # swap-only gate or disable the real-pressure (level>=Warn) defer.
+        add_required 1929-macos-memory-pressure
+        # Incident #8807: bridge_check_memory_pressure is the primitive the
+        # resource-guard (lib/bridge-resource-guard.sh) delegates its mem-pressure
+        # check to (bridge_resource_guard_mem_pressured). Pull the guard smoke on
+        # every bridge-cron.sh move so a change to the pressure primitive cannot
+        # silently break the daemon-facing defer/fail-open/throttle contract.
+        add_required 8807-resource-guard-defer
+      fi
       # Issue #1378: lib/bridge-state.sh hosts bridge_agent_session_lock_file,
       # which must anchor the per-agent session.lock on the controller-owned
       # state leaf (state/agents/<a>/) and NOT on the iso data tree
@@ -826,6 +874,14 @@ select_for_path() {
         # or regress the migration fail-safe (which would re-open reaping of
         # operator-created dynamics).
         add_required 1795-reaper-ephemeral-policy
+        # Issue #2003: lib/bridge-state.sh hosts the post-restart wake helpers
+        # (bridge_agent_restart_wake_marker_file idempotency latch +
+        # bridge_run_handoff_task_find_or_create queue-backed handoff dedupe)
+        # that the #1639/#2003 wake decision driver mirrors. Pull the
+        # post-restart-auto-wake smoke on every bridge-state.sh move so a
+        # refactor of either helper cannot silently break the no-double-fire
+        # idempotency or the handoff find/create contract.
+        add_required 1639-post-restart-auto-wake
         # Issue #1738 (SECURITY): lib/bridge-state.sh hosts the config-caller
         # binding writer (bridge_publish_config_caller_binding / _remove /
         # _dir / _file) — the controller-published pane-pid record
@@ -834,6 +890,14 @@ select_for_path() {
         # adversarial binding smoke on every bridge-state.sh move so a refactor
         # cannot rename/drop the writer or change the binding shape/path.
         add_required 1738-config-caller-binding
+        # Issue #1968: lib/bridge-state.sh hosts bridge_agent_list_resumable_
+        # transcripts (the forget-session enumeration helper) and the guarded
+        # bridge_agent_resume_quarantine_add the resolver fallback auto-excludes.
+        # Pull the smoke on every bridge-state.sh move so a refactor cannot drop
+        # the enumeration helper or weaken the foreign-transcript guard (which
+        # would either reopen the inert-forget bug or start quarantining the
+        # operator's own sessions).
+        add_required 1968-forget-session-fresh
         add_required 1378-iso-session-lock-fresh-start
         # Issue #9981 (sibling of #1378): lib/bridge-state.sh hosts the
         # pending-attention spool resolvers (bridge_agent_pending_attention_
@@ -1192,6 +1256,15 @@ select_for_path() {
       # bridge-status.py move so the probe wiring + omit-when-no-probe
       # contract cannot silently regress back to all-unknown rows.
       add_required queue upgrade-conflicts-lifecycle status-engine-detect 835-static-admin-launch 1155-bootstrap-skill-guard 1165-track-a-scaffold-modes 1170-safe-path-check-sudo-escalate 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp 1209-ms365-redirect-resolver 1215-ms365-dir-mode G-channel-spec-resolution γ-cli-consistency B-beta4-setup-wizard H-beta4-iso-ownership 1803-orphan-dir-gc 1844-plugin-liveness-probe 1833-status-gateway-timeout-not-down
+      # status-fast-default: render_dashboard now SKIPS the expensive
+      # audit-parse / fs-walk analytics (context-pressure FP rate,
+      # config-drift, nudge-recheck, pending upgrade-conflicts,
+      # orphan-agent-dirs) by default and only computes them under `--full`
+      # (alias `--analytics`); the `--json` machine path stays full. Pull
+      # status-fast-default on every bridge-status.py / bridge-status.sh move
+      # so a future PR cannot silently re-arm the slow analytics in the
+      # default human dashboard (the ~30s regression) or drop a JSON field.
+      add_required status-fast-default
       # Issue #1405 (v0.15.0 self-heal stack): bridge-status.py gained
       # read_handoffd_health + the A2A receiver health row + the
       # `a2a=DOWN`/`a2a=ALARM` header flag (text + JSON dashboards). Pull
@@ -1458,7 +1531,12 @@ select_for_path() {
       # every bridge-queue.py move so a future refactor cannot regress the
       # filter (or the daemon-step queued-only candidate scan) and let a
       # just-claimed task get re-nudged.
-      add_required queue 1106-nudge-shell-recheck nudge-task-age-gate nudge-redundant-active-agent 1323-nudge-eligibility-recheck-twostage 1199-action-required-claimed-skip a2a-cross-bridge 1100-audit-since-tz 1115-cli-usage-drift J-beta4-workflow-docs K-beta4-nits beta5-2-delta-nudge-session-empty beta5-2-kappa-state-audit-reconcile 1408-daemon-alert-nudge-hygiene
+      # Issue #1973 Track A: bridge-queue.py's proxy_via_queue_gateway now
+      # special-cases the gateway EX_TEMPFAIL (75) for claim/done — preserving
+      # the nonzero rc and printing safe-next-command guidance, NEVER fabricating
+      # success. Pull 1973a-gateway-drain-containment on every bridge-queue.py
+      # move so the degraded-claim/done contract cannot regress to a false 0.
+      add_required queue 1106-nudge-shell-recheck nudge-task-age-gate nudge-redundant-active-agent 1323-nudge-eligibility-recheck-twostage 1199-action-required-claimed-skip a2a-cross-bridge 1100-audit-since-tz 1115-cli-usage-drift J-beta4-workflow-docs K-beta4-nits beta5-2-delta-nudge-session-empty beta5-2-kappa-state-audit-reconcile 1408-daemon-alert-nudge-hygiene 1973a-gateway-drain-containment
       # Issue #1630 (audit R3, root cause of #10561): bridge-queue.py
       # daemon-step now consumes the A2A fresh-arrival markers and exempts
       # the named task ids from ONLY the redelivery-age gate; bridge-task.sh
@@ -1476,6 +1554,16 @@ select_for_path() {
       # body rendering). Pull it on every bridge-queue.py move so a refactor
       # of those shapes cannot silently break the dedupe contract.
       add_required 1944-unclaimed-escalation-once-latch
+      # Issue #1986 (cm-prod RCA): process_blocked_task_aging now re-surfaces a
+      # re-bound (existing-open) blocked-aging reminder/escalation VISIBLY on its
+      # cadence (resurface_open_alert: re-queue + drop last_nudge_key) instead of
+      # a silent in-place refresh, and relaxes the escalation one-shot to a
+      # bounded periodic re-fire. The smoke drives daemon-step end-to-end against
+      # a real queue DB, depending on the upsert-open re-bind, the daemon-step
+      # nudge-candidate tsv, and the §30 done-re-mint shape. Pull it on every
+      # bridge-queue.py move so a refactor cannot silently re-introduce the
+      # silent-refresh (no visible re-fire) or break the §30 dedupe contract.
+      add_required 1986-blocked-aging-visible-refire
       # Issue #1497 (P2): bridge-queue.py's six inline operator-home resolvers
       # (get_db_path / get_queue_gateway_root / proxy_via_queue_gateway --bridge-
       # home arg / get_cron_state_dir / get_queue_bodies_dir / bridge_managed_roots)
@@ -1518,6 +1606,15 @@ select_for_path() {
       # drop the column, the resolve_origin precedence (cron over session), the
       # `agb show` origin line, or regress a legacy (no-origin) row to an error.
       add_required 1792-cron-scope-fence
+      # Issue #1970: bridge-queue.py's daemon idle stale-claim reclaim is now
+      # lease-aware (skips a LIVE-idle claimant while lease_until_ts is valid;
+      # inactive branch UNCHANGED; NULL lease still reclaimable) and cmd_update
+      # renews the lease for the claimant/assignee only. Pull
+      # 1970-idle-reclaim-lease-aware on every bridge-queue.py move so a
+      # refactor cannot regress the idle-branch lease gate, re-introduce the
+      # in-progress-claim-yank false positive, or let a creator/admin update
+      # spoof-extend the claimant's lease.
+      add_required 1970-idle-reclaim-lease-aware
       add_integration integration-minimal
       ;;
 
@@ -1564,6 +1661,15 @@ select_for_path() {
       # Pull beta5-2-kappa-state-audit-reconcile on every bridge-stall.py
       # or bridge-audit.sh move so either regression is caught at PR time.
       add_required beta5-2-kappa-state-audit-reconcile
+      # Issue #1991 safety floor (+ #2007 codex extension): bridge-stall.py hosts
+      # the detect-only typed blocked-prompt classifier (`detect-prompt
+      # [--engine claude|codex]`) the daemon safety-floor sweep consumes. Pull
+      # the floor smoke on every bridge-stall.py move so a regression to the
+      # affordance gates / coarse_state mapping / shell-format field names — or
+      # to the #2007 Codex hook-trust / unknown-modal detectors and the engine
+      # dispatch — is caught at PR time.
+      add_required 1991-blocked-prompt-safety-floor
+      add_required 1991-agentic-resolver
       # v0.15.0-beta5-2 Lane ι (#1318-B): bridge-queue.py + bridge-task.sh
       # are the create boundary for queued tasks; the daemon's new
       # process_unclaimed_queue_escalation tick scans these tables on
@@ -1625,7 +1731,14 @@ select_for_path() {
       # 1949-gateway-poison-request on every gateway move so a serve-once
       # change cannot silently reintroduce the F8 batch-crash (one poison
       # request aborting the whole batch → fleet-wide silent queue death).
-      add_required queue a2a-rooms-p1b-acl 1652-queue-gateway-crashloop 1792-cron-scope-fence 1837-gateway-exit-code-on-commit 1835-create-bodyfile-iso-fallback 1833-status-gateway-timeout-not-down 1836-iso-first-start-queue-dir-ownership 1949-gateway-poison-request
+      # Issue #1973 Track A: run_queue now bounds each queue child with a
+      # per-request timeout, cmd_serve_once retires stale `.working.json` out of
+      # the drain, iter_requests gives claim/done/show/inbox a control-priority
+      # class, and a `status --json` snapshot exists for the daemon audit. Pull
+      # 1973a-gateway-drain-containment on every gateway move so a refactor
+      # cannot drop the bound, the stale-working retirement, or the priority
+      # sort (the #1973 drain-stall containment teeth).
+      add_required queue a2a-rooms-p1b-acl 1652-queue-gateway-crashloop 1792-cron-scope-fence 1837-gateway-exit-code-on-commit 1835-create-bodyfile-iso-fallback 1833-status-gateway-timeout-not-down 1836-iso-first-start-queue-dir-ownership 1949-gateway-poison-request 1973a-gateway-drain-containment
       ;;
 
     bridge-a2a.py|bridge-handoffd.py|bridge_a2a_common.py|bridge_reconcile_common.py|bridge-rooms.py|bridge_rooms_common.py|bridge-handoff-daemon.sh|lib/bridge-a2a.sh|lib/daemon-helpers/a2a-receiver-exit-cause.py|lib/daemon-helpers/a2a-receiver-staleness.py|handoff.local.example.json|scripts/smoke/a2a-cross-bridge-helper.py|scripts/smoke/a2a-tailscale-identity-resolve-helper.py|scripts/smoke/a2a-daemon-selfheal-reconcile-helper.py|scripts/smoke/a2a-migrate-identity-helper.py|scripts/smoke/a2a-ip-change-announce-helper.py|scripts/smoke/a2a-setup-wizard-helper.py|scripts/smoke/a2a-rooms-p1a-helper.py|scripts/smoke/a2a-rooms-p1b-acl-helper.py|scripts/smoke/a2a-rooms-1517-bootstrap-helper.py|scripts/smoke/rooms-p4-1-cross-node-join-helper.py|scripts/smoke/rooms-p4-1-post-hook.sh|scripts/smoke/rooms-p4-2-roster-broadcast-helper.py|scripts/smoke/rooms-p4-2-post-hook.sh|scripts/smoke/rooms-p4-3-room-talk-helper.py|scripts/smoke/rooms-p4-3-post-hook.sh|scripts/smoke/1594-rooms-fanout-helper.py|scripts/smoke/1594-rooms-fanout-post-hook.sh|scripts/smoke/1594-rooms-fanout-local-hook.sh|scripts/smoke/rooms-p4-5-polish.sh|scripts/smoke/rooms-p4-5-helper.py|scripts/smoke/1563-pr8-a2a-diag-recovery-helper.py|scripts/smoke/1575b-a2a-backoff-ceiling-helper.py|scripts/smoke/1618-outbox-retry-resets-attempts-helper.py|scripts/smoke/1628-a2a-deliver-per-row-guard-helper.py|scripts/smoke/1629-healthz-not-semaphore-gated-helper.py|scripts/smoke/1595-cloudflare-warp-mesh-helper.py|scripts/smoke/1758-trusted-routed-transport.sh|scripts/smoke/1758-trusted-routed-transport-helper.py|scripts/smoke/1701-warp-healthz-socket-held-helper.py|scripts/smoke/1697-a2a-net-status-helper.py|scripts/smoke/1685-boot-marker-helper.py|scripts/smoke/v0165-l0-reconcile-skeleton-helper.py|scripts/smoke/v0165-l2-tunnel-health-helper.py|scripts/smoke/v0165-l1-stable-addr-helper.py|scripts/smoke/v0165-l3-peer-reachability-helper.py|scripts/smoke/v0165-l4-token-join-helper.py|scripts/smoke/v0165-l4-token-join-post-hook.sh|scripts/smoke/v0165-l5-relay-roster-helper.py|scripts/smoke/v0165-l5-relay-post-hook.sh|scripts/smoke/v0165-l5-roster-post-hook.sh|scripts/smoke/v0165-l6-net-status-v2.sh|scripts/smoke/v0165-l6-net-status-v2-helper.py|scripts/smoke/v0166-la-tunnel-bounce-gate.sh|scripts/smoke/v0166-la-tunnel-bounce-gate-helper.py|scripts/smoke/v0166-lb-transient-peers.sh|scripts/smoke/v0166-lb-transient-peers-helper.py|scripts/smoke/1728-test-bind-state-path-guard.sh|scripts/smoke/1728-test-bind-state-path-guard-helper.py|scripts/smoke/1679-1680-a2a-receiver-supervisor-robustness.sh|scripts/install-handoffd-systemd.sh)
@@ -1866,7 +1979,19 @@ select_for_path() {
       # the test-only flag. 1728-test-bind-state-path-guard pins fail-closed
       # under the footgun, prod-path-unchanged, and the opt-in gating. Pull it
       # on every receiver/common move so the guard cannot regress.
-      add_required a2a-cross-bridge queue I-beta4-a2a-3-gaps J-beta4-workflow-docs beta5-2-lambda-a2a-robustness a2a-tailscale-identity-resolve a2a-daemon-selfheal-reconcile a2a-migrate-identity a2a-ip-change-announce 1405-handoffd-supervision 1679-1680-a2a-receiver-supervisor-robustness a2a-setup-wizard a2a-rooms-p1a a2a-rooms-p1b-acl a2a-rooms-1517-bootstrap 1398-a2a-inbound-stopped-target-force a2a-backpressure-openonly 1623-a2a-backpressure-failopen rooms-p4-1-cross-node-join rooms-p4-2-roster-broadcast rooms-p4-3-room-talk 1594-rooms-fanout rooms-p4-5-polish 1563-pr4-a2a-receiver-healthz 1563-pr5-fp-control-matrix 1563-pr8-a2a-diag-recovery 1575b-a2a-backoff-ceiling 1618-outbox-retry-resets-attempts 1628-a2a-deliver-per-row-guard 1595-cloudflare-warp-mesh 1758-trusted-routed-transport 1612-upgrade-restart-receiver 1630-a2a-fresh-arrival-nudge 1629-healthz-not-semaphore-gated 1701-warp-healthz-socket-held 1697-a2a-net-status 1685-receiver-staleness-selfheal v0165-l0-reconcile-skeleton v0165-l2-tunnel-health v0165-l1-stable-addr v0165-l3-peer-reachability v0165-l4-token-join v0165-l5-relay-roster v0165-l6-net-status-v2 v0166-la-tunnel-bounce-gate v0166-lb-transient-peers 1728-test-bind-state-path-guard
+      # Issue #1933: bridge-a2a.py's cmd_send resolves the sender ("from") id
+      # from --from then BRIDGE_AGENT_ID ONLY — the OS-username (os.environ
+      # ["USER"]) fallback is dropped. An OS login name is never a valid agent
+      # id, so a reply echoing it is rejected by the sender's OWN inbound
+      # allowlist (self-inflicted 403). When neither source resolves a non-empty
+      # id (subagents/cron/background bash without BRIDGE_AGENT_ID; or the
+      # --from "$UNSET" empty-string trap) cmd_send now fails fast with an
+      # actionable error instead of emitting an unroutable from-id.
+      # 1933-a2a-from-id pins: fail-fast on no-sender + empty --from, the
+      # OS username never leaking into the wire `from`, and the valid
+      # --from / BRIDGE_AGENT_ID paths stamping the real id unchanged. Pull on
+      # every bridge-a2a.py move so the USER fallback cannot regress.
+      add_required a2a-cross-bridge queue I-beta4-a2a-3-gaps J-beta4-workflow-docs beta5-2-lambda-a2a-robustness a2a-tailscale-identity-resolve a2a-daemon-selfheal-reconcile a2a-migrate-identity a2a-ip-change-announce 1405-handoffd-supervision 1679-1680-a2a-receiver-supervisor-robustness a2a-setup-wizard a2a-rooms-p1a a2a-rooms-p1b-acl a2a-rooms-1517-bootstrap 1398-a2a-inbound-stopped-target-force a2a-backpressure-openonly 1623-a2a-backpressure-failopen rooms-p4-1-cross-node-join rooms-p4-2-roster-broadcast rooms-p4-3-room-talk 1594-rooms-fanout rooms-p4-5-polish 1563-pr4-a2a-receiver-healthz 1563-pr5-fp-control-matrix 1563-pr8-a2a-diag-recovery 1575b-a2a-backoff-ceiling 1618-outbox-retry-resets-attempts 1628-a2a-deliver-per-row-guard 1595-cloudflare-warp-mesh 1758-trusted-routed-transport 1612-upgrade-restart-receiver 1630-a2a-fresh-arrival-nudge 1629-healthz-not-semaphore-gated 1701-warp-healthz-socket-held 1697-a2a-net-status 1685-receiver-staleness-selfheal v0165-l0-reconcile-skeleton v0165-l2-tunnel-health v0165-l1-stable-addr v0165-l3-peer-reachability v0165-l4-token-join v0165-l5-relay-roster v0165-l6-net-status-v2 v0166-la-tunnel-bounce-gate v0166-lb-transient-peers 1728-test-bind-state-path-guard 1933-a2a-from-id
       ;;
 
     bridge-daemon.sh|bridge-sync.sh|bridge-watchdog.sh|bridge-cron.sh|lib/bridge-cron.sh|lib/bridge-state.sh|lib/bridge-notify.sh)
@@ -2124,7 +2249,28 @@ select_for_path() {
       # can no longer rm a healthy listener's bound socket. Pull
       # 1652-queue-gateway-crashloop on every bridge-daemon.sh move so a
       # regression to the single-miss rm cannot reopen the crash-loop.
-      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir 1115-cli-usage-drift 1178-helper-contract-daemon-supp F-daemon-supp-groups-mock F-daemon-supp-groups-real δ-1234-daemon-start-policy A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs Beta-beta5-session-id-detect-sudo beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-epsilon-tmux-inject-busy beta5-2-pi-daemon-crashloop-no-set-e-leak beta5-2-kappa-state-audit-reconcile 1359-cron-create-iso-staging 1380-admin-autostart-recovery 1388-daemon-lock-fd-cloexec 1407-runtime-hardening 1405-handoffd-supervision 1679-1680-a2a-receiver-supervisor-robustness 1408-daemon-alert-nudge-hygiene 1473-agent-list-iso-state-fallback 1461-cron-max-parallel-override 1463-launchd-keepalive-singleton-thrash 1563-pr2-daemon-self-abort 1563-pr4-a2a-receiver-healthz 1563-pr5-fp-control-matrix 1563-pr6-watchdog-scan-timeout 1563-pr7-tick-cadence 1563-pr8-a2a-diag-recovery 1629-healthz-not-semaphore-gated 1685-receiver-staleness-selfheal v0165-l0-reconcile-skeleton v0165-l2-tunnel-health v0165-l1-stable-addr v0165-l3-peer-reachability v0165-l4-token-join v0165-l5-relay-roster v0165-l6-net-status-v2 v0166-la-tunnel-bounce-gate v0166-lb-transient-peers 1652-queue-gateway-crashloop 1803-orphan-dir-gc 1809-agents-md-backfill 1855-keychain-free-backfill 1833-status-gateway-timeout-not-down 1934-hook-file-self-heal
+      # Issue #1996: bridge-daemon.sh's PreCompact notice + followup send
+      # paths build the send-managed-message argv inline (bypassing
+      # bridge_channel_send_managed_message), so they each resolve and thread
+      # --teams-state-dir for teams. lib/bridge-notify.sh's bridge_notify_send
+      # also gained a teams short-circuit (teams routes via managed-send, not
+      # bridge-notify.py). Pull teams-managed-send on every daemon / notify-lib
+      # move so the SSOT handoff + the teams-kind guard cannot regress.
+      # Issue #1973 Track A: process_queue_gateway_requests now names the
+      # serve-once ceiling (BRIDGE_QUEUE_GATEWAY_SERVE_ONCE_TIMEOUT_SECONDS),
+      # stops discarding all gateway stderr, and audits queue_gateway_drain_-
+      # timeout / queue_gateway_drain_stalled with a `status --json` snapshot
+      # instead of collapsing every failure to processed=0. Pull
+      # 1973a-gateway-drain-containment on every bridge-daemon.sh move so the
+      # drain-failure instrumentation cannot silently regress.
+      # Issue #1955: bridge-daemon.sh's cmd_run now calls
+      # bridge_daemon_self_diagnose at startup — a warn-only self-diagnosis
+      # when the daemon is unsupervised (orphaned, no launchd/systemd job) or
+      # running from a non-canonical source root (a dev/operator checkout).
+      # 1955-daemon-rogue-warn (added above) pins both axes + the warn-only /
+      # never-fail contract so a refactor cannot silently drop the warn or
+      # break the canonical-source-root match.
+      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir 1115-cli-usage-drift 1178-helper-contract-daemon-supp F-daemon-supp-groups-mock F-daemon-supp-groups-real δ-1234-daemon-start-policy A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs Beta-beta5-session-id-detect-sudo beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-epsilon-tmux-inject-busy beta5-2-pi-daemon-crashloop-no-set-e-leak beta5-2-kappa-state-audit-reconcile 1359-cron-create-iso-staging 1380-admin-autostart-recovery 1388-daemon-lock-fd-cloexec 1407-runtime-hardening 1405-handoffd-supervision 1679-1680-a2a-receiver-supervisor-robustness 1408-daemon-alert-nudge-hygiene 1473-agent-list-iso-state-fallback 1461-cron-max-parallel-override 1463-launchd-keepalive-singleton-thrash 1563-pr2-daemon-self-abort 1563-pr4-a2a-receiver-healthz 1563-pr5-fp-control-matrix 1563-pr6-watchdog-scan-timeout 1563-pr7-tick-cadence 1563-pr8-a2a-diag-recovery 1629-healthz-not-semaphore-gated 1685-receiver-staleness-selfheal v0165-l0-reconcile-skeleton v0165-l2-tunnel-health v0165-l1-stable-addr v0165-l3-peer-reachability v0165-l4-token-join v0165-l5-relay-roster v0165-l6-net-status-v2 v0166-la-tunnel-bounce-gate v0166-lb-transient-peers 1652-queue-gateway-crashloop 1803-orphan-dir-gc 1809-agents-md-backfill 1855-keychain-free-backfill 1833-status-gateway-timeout-not-down 1934-hook-file-self-heal 1955-daemon-rogue-warn 1973a-gateway-drain-containment 1973c-liveness-recovery teams-managed-send 2005-managed-send-plugin-state-dir
       # Issue #1899: bridge-sync.sh's refresh_missing_session_ids backfill sweep
       # now skips dynamic vanilla Codex (it must never detect/persist an operator
       # ~/.codex session id). Pull 1899 on bridge-sync.sh moves so the daemon
@@ -2157,6 +2303,17 @@ select_for_path() {
       # smoke on every bridge-daemon.sh move so a scan refactor cannot drop the
       # storm-fuse reset/summary wiring.
       add_required 1783-picker-idle-nonpicker
+      # Issue #1991 safety floor (+ #2007 codex extension): bridge-daemon.sh hosts
+      # the all-pane blocked-prompt sweep (process_blocked_prompt_safety_floor),
+      # the daemon-owned INDEPENDENT operator notify (bridge_operator_notify_send
+      # / bridge_operator_notify_resolve), and the sweep wiring in cmd_sync_cycle.
+      # Pull the floor smoke on every bridge-daemon.sh move so a refactor cannot
+      # silently: drop the idle-path sweep (the 10-day-wedge blind spot), regress
+      # the direct-external-notify guarantee back to admin-task-only, send keys
+      # (observe-only), storm, or — #2007 — drop the claude|codex engine gate /
+      # the per-engine detector dispatch / the engine in the report+audit. Mutation-tested teeth.
+      add_required 1991-blocked-prompt-safety-floor
+      add_required 1991-agentic-resolver
       # Fleet-credential Phase 2 (#1470): bridge-daemon.sh gained the
       # periodic Codex single-source → fleet-sync tick
       # (bridge_daemon_periodic_codex_cred_sync_tick). 1470-codex-fleet-sync
@@ -2272,6 +2429,18 @@ select_for_path() {
       # the once-only body cadence, and the sweep-driven re-arm-on-state-
       # change contract are all pinned end-to-end against a real queue DB).
       add_required 1944-unclaimed-escalation-once-latch
+      # Issue #1973 Track B: bridge-daemon.sh's per-task nudge state now
+      # carries a capped exponential re-nudge backoff (base 60 -> *2 ->
+      # cap 900; urgent/high a lower cap) instead of a fixed redelivery
+      # window — closing the v0.16.15 drain-stall notification storm. The
+      # #1944 [unclaimed-task] once-latch stays the DEFAULT; only the
+      # operator-opt-in periodic mode (cooldown>0) and the attached-human
+      # followup refresh now use the same backoff (upsert-open kept).
+      # Pull 1973b-nudge-backoff on every bridge-daemon.sh move so a future
+      # PR cannot silently revert the backoff to a fixed interval, drop the
+      # reset-on-progress prune, lose the urgent lower-cap, or break the
+      # Track-C one-shot force-bypass seam.
+      add_required 1973b-nudge-backoff
       # v0.15.0-beta5-2 Track G (#1323 r3): bridge-daemon.sh's
       # nudge_agent_session verify-grace block does a two-stage check
       # (stage_2 = TOTAL elapsed-time gate, not additional sleep), and
@@ -2469,6 +2638,19 @@ select_for_path() {
       add_required 1738-config-caller-binding
       ;;
 
+    lib/daemon-helpers/unclaimed-task-filter.py)
+      # Issue #1970: this helper now ages a queued task from
+      # max(created_ts, updated_ts) instead of created_ts only, so a
+      # just-requeued / `agb update`-touched task gets a fresh grace window
+      # before the [unclaimed-task] escalation fires. Pull
+      # 1970-idle-reclaim-lease-aware (the filter's freshness boundary) AND
+      # 1944-unclaimed-escalation-once-latch (the end-to-end escalation path
+      # this helper feeds) on every move so a change to the freshness
+      # computation (or the updated_ts default for legacy rows) cannot
+      # silently re-open the post-requeue false-escalation or the #1944 churn.
+      add_required 1970-idle-reclaim-lease-aware 1944-unclaimed-escalation-once-latch
+      ;;
+
     lib/daemon-helpers/hook-file-missing-scan.py)
       # Issue #1934 (facet 2): this helper scans an agent's rendered hook command
       # paths for an absent FILE; the daemon `bridge_daemon_reheal_missing_hook_files`
@@ -2520,7 +2702,7 @@ select_for_path() {
       add_required 9770-codex-teardown-reap
       ;;
 
-    lib/bridge-daemon-control.sh|scripts/install-daemon-systemd.sh|scripts/sudoers-templates/agent-bridge-daemon-refresh.sudo.template)
+    lib/bridge-daemon-control.sh|scripts/install-daemon-systemd.sh|scripts/install-daemon-liveness-systemd.sh|scripts/sudoers-templates/agent-bridge-daemon-refresh.sudo.template)
       # v0.15.0-beta1 Lane F: the autonomous supp-groups refresh path
       # in bridge-daemon.sh dispatches a detached worker that sources
       # `lib/bridge-daemon-control.sh` and calls
@@ -2606,7 +2788,12 @@ select_for_path() {
       # serialize on every move so the direct-acquire-holds-across-section
       # guarantee, the regression witness for the old `$()` pattern, and the
       # no-`$()`-capture call-site wiring cannot silently regress.
-      add_required F-daemon-supp-groups-mock F-daemon-supp-groups-real 1178-helper-contract-daemon-supp A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle F-beta4-oauth-bootstrap 1388-daemon-lock-fd-cloexec 1463-launchd-keepalive-singleton-thrash 9882-daemon-audit-fp 1563-daemon-singleton 1563-pr2-daemon-self-abort 1563-pr5-fp-control-matrix 1563-pr6-watchdog-scan-timeout 1667-daemon-control-lock-serialize
+      # Issue #1973 (Track C): install-daemon-systemd.sh now also installs the
+      # liveness backstop timer (default-on + --skip-liveness-timer opt-out) by
+      # delegating to install-daemon-liveness-systemd.sh. Pull the Track C smoke
+      # on every install-script move so the timer-install + opt-out contract
+      # cannot silently regress.
+      add_required F-daemon-supp-groups-mock F-daemon-supp-groups-real 1178-helper-contract-daemon-supp A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle F-beta4-oauth-bootstrap 1388-daemon-lock-fd-cloexec 1463-launchd-keepalive-singleton-thrash 9882-daemon-audit-fp 1563-daemon-singleton 1563-pr2-daemon-self-abort 1563-pr5-fp-control-matrix 1563-pr6-watchdog-scan-timeout 1667-daemon-control-lock-serialize 1973c-liveness-recovery
       ;;
 
     lib/cron-helpers/*.py)
@@ -2972,6 +3159,29 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       if [[ "$path" == "lib/bridge-tmux.sh" ]]; then
         add_required 1617-pending-attention-arrival-stale 1425-spool-rederive
       fi
+      # Issue #1991 safety floor: lib/bridge-tmux.sh hosts
+      # bridge_tmux_claude_blocker_state_from_text, the coarse single-token
+      # blocker classifier the floor's typed detector is a SIBLING of (it must
+      # NEVER change the coarse tokens, callers compare them exactly). Pull the
+      # floor smoke on every bridge-tmux.sh move so its coarse-token
+      # compatibility case re-runs and a refactor cannot silently drift the
+      # token contract.
+      if [[ "$path" == "lib/bridge-tmux.sh" ]]; then
+        add_required 1991-blocked-prompt-safety-floor
+        add_required 1991-agentic-resolver
+      fi
+      # Issue #1991 AGENTIC RESOLVER (v0.16.16 canary): bridge-start.sh,
+      # bridge-run.sh, lib/bridge-tmux.sh, and agent-bridge are legacy-key-sender
+      # / dispatch surfaces the single-sender resolver gates. bridge-start's
+      # controller dev-channels watcher, bridge-run's agent backstop, the
+      # bridge-tmux primitives (central send-block guard), and the `resolver`
+      # CLI verb all live here. Pull the resolver smoke on any of them so a
+      # refactor cannot silently reintroduce a legacy key send under canary or
+      # drop the dispatch.
+      if [[ "$path" == "bridge-start.sh" || "$path" == "bridge-run.sh" \
+            || "$path" == "lib/bridge-tmux.sh" || "$path" == "agent-bridge" ]]; then
+        add_required 1991-agentic-resolver
+      fi
       # Issue #1762: lib/bridge-tmux.sh hosts the picker keystroke primitive
       # bridge_tmux_send_picker_key — the ONLY keystroke path the picker
       # resolver is allowed to use (high-risk #2). Pull the picker smoke on
@@ -3019,6 +3229,24 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # regress the auto-restart-only gate or re-leak the marker-suppression bug.
       if [[ "$path" == "bridge-run.sh" || "$path" == "bridge-start.sh" ]]; then
         add_required 1639-post-restart-auto-wake
+      fi
+      # Issue #2002: bridge-start.sh's bridge_start_should_send_onboarding_nudge
+      # now gates the fresh-install onboarding nudge on a GENUINE first launch
+      # (admin + pending + REPLACE==0 + initial-inbox marker absent), not just
+      # `onboarding_state == pending`. Pull 2002-onboarding-nudge-guard whenever
+      # bridge-start.sh moves so a refactor cannot drop the --replace or
+      # launch-history gates and re-leak the restart-re-types-onboarding bug.
+      if [[ "$path" == "bridge-start.sh" ]]; then
+        add_required 2002-onboarding-nudge-guard
+      fi
+      # Issue #2007: bridge-start.sh's static/managed Codex launch path now runs
+      # the first-party hook PRETRUST (inside bridge_ensure_codex_hooks) after
+      # the render and before the Codex process starts, so a hook-changing
+      # upgrade never wedges a managed Codex agent at the trust gate. Pull
+      # 2007-codex-hook-trust whenever bridge-start.sh moves so a refactor can't
+      # drop the launch-time pretrust seam or weaken its first-party boundary.
+      if [[ "$path" == "bridge-start.sh" ]]; then
+        add_required 2007-codex-hook-trust
       fi
       # Issue #1738 (SECURITY): bridge-start.sh publishes the config-caller
       # pane-pid binding (bridge_publish_config_caller_binding) after tmux
@@ -3304,7 +3532,7 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       add_integration integration-minimal
       ;;
 
-    lib/bridge-isolation*.sh|lib/bridge-migration.sh|bridge-migrate.sh|lib/bridge-marker-bootstrap.sh|lib/bridge-layout-resolver.sh|tests/isolation*)
+    lib/bridge-isolation*.sh|lib/bridge-migration.sh|bridge-migrate.sh|lib/bridge-marker-bootstrap.sh|lib/bridge-layout-resolver.sh|lib/upgrade-helpers/isolation-v2-migrate.sh|tests/isolation*)
       # Issue #583 closure smoke (v0.8.0 T4): the cross-class read
       # boundary depends directly on lib/bridge-isolation-v2.sh
       # primitives (group + setgid model), so cover it whenever any
@@ -3531,7 +3759,19 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # every isolation-lib move so a future revert at either gate
       # (A0-derive removal, Path B classifier removal) re-introduces the
       # every-stop warning regression at PR time.
-      add_required isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering 1495-settings-invalid-hook-key isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1077-migrate-iso-v2-data-dir 1113-watchdog-legacy-backfill 1158-marker-controller-uid-exemption 1158-marker-load-order 1161-marker-readable-by-isolated 1165-track-b-sudo-escalate-and-state 1342-write-state-marker-matrix launch isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup phase2-install-tree-reconciler phase3-agent-home-contract 1207-stale-supp-groups-allowlist A-beta4-iso-path-resolution H-beta4-iso-ownership G-beta4-watchdog-noise J-beta4-workflow-docs α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-theta-upgrade-backfill-perms 1506-isolate-normalize 1520c-create-isolate-profile-publish 1533-create-isolate-content-publish 1766-iso-settings-readable 1513-iso-teams-prune-eacces 1836-iso-first-start-queue-dir-ownership 1891-iso-create-path-completeness 1899-dynamic-vanilla-codex-v2-secret-env-repin
+      # Issue #1971: lib/bridge-isolation-v2.sh now gates the ab-* OS-group
+      # CREATE path (`bridge_isolation_v2_ensure_group`) behind the same
+      # platform predicate ENFORCE uses (`_bridge_isolation_v2_cred_platform_ok`),
+      # and adds `bridge_isolation_v2_darwin_cleanup_inert_groups` (called from
+      # lib/upgrade-helpers/isolation-v2-migrate.sh) to remove the inert macOS
+      # ab-* groups a pre-#1971 install left behind. Pull
+      # 1971-macos-group-create-gate on every isolation-lib + migrate-helper
+      # move so a future PR cannot regress (a) the Linux-only CREATE gate
+      # (re-eagering inert macOS groups, or worse gating OFF Linux provisioning),
+      # or (b) the cleanup safety contract (provenance marker + operator-only
+      # membership + macOS-only) that keeps it from ever removing a real/operator
+      # group.
+      add_required isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering 1495-settings-invalid-hook-key isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates 1971-macos-group-create-gate layout-resolver-marker-over-env 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1077-migrate-iso-v2-data-dir 1113-watchdog-legacy-backfill 1158-marker-controller-uid-exemption 1158-marker-load-order 1161-marker-readable-by-isolated 1165-track-b-sudo-escalate-and-state 1342-write-state-marker-matrix launch isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup phase2-install-tree-reconciler phase3-agent-home-contract 1207-stale-supp-groups-allowlist A-beta4-iso-path-resolution H-beta4-iso-ownership G-beta4-watchdog-noise J-beta4-workflow-docs α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-theta-upgrade-backfill-perms 1506-isolate-normalize 1520c-create-isolate-profile-publish 1533-create-isolate-content-publish 1766-iso-settings-readable 1513-iso-teams-prune-eacces 1836-iso-first-start-queue-dir-ownership 1891-iso-create-path-completeness 1899-dynamic-vanilla-codex-v2-secret-env-repin
       # Issue #1891: lib/bridge-isolation-v2.sh hosts
       # bridge_isolation_v2_normalize_memory_tree (iso-owned memory/ tree
       # repair, incl. an existing stale 2700 subtree, keeping index.sqlite
@@ -3604,7 +3844,14 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # quarantine on every lib/bridge-skills.sh move so a future PR
       # cannot silently regress the opt-in gate or the diagnostic
       # tokens back to the pre-#1333 silent skip.
-      add_required isolated-skills-sync isolation launch 1151-step-a-helper 1151-r2-sudo-escalate 1155-bootstrap-skill-guard beta5-2-nu-daemon-path-quarantine
+      # Issue #2020: lib/bridge-skills.sh's bridge_sync_claude_runtime_skills
+      # is the runtime-skill materialization arm that reads
+      # bridge_agent_skills_csv (guarded on bridge_var_is_assoc). The
+      # 2020-skills-assoc-declare smoke drives that real sync end-to-end from a
+      # bare roster source; pull it on every bridge-skills.sh move so a refactor
+      # of the sync/csv path cannot regress the "configured skill never reaches
+      # .claude/skills/" silent-drop class.
+      add_required isolated-skills-sync isolation launch 1151-step-a-helper 1151-r2-sudo-escalate 1155-bootstrap-skill-guard beta5-2-nu-daemon-path-quarantine 2020-skills-assoc-declare
       add_integration integration-minimal
       ;;
 
@@ -3655,7 +3902,15 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # notify move so a future PR cannot regress the redeliver +
       # dedup_key audit emit contract (the structured signal
       # operators correlate against `plugin_mcp_liveness_recovered`).
-      add_required channel-plugins bridge-notify-no-default-discord-875 1165-track-a-scaffold-modes 1165-track-b-sudo-escalate-and-state 1342-write-state-marker-matrix A12-beta3-1246-1252-daemon-supp-group-and-state-dir mcp-liveness-giveup-auto-clear beta5-2-iota-daemon-escalation-family
+      # Issue #1996 / #2005: lib/bridge-channels.sh's
+      # bridge_channel_send_managed_message resolves the canonical per-agent
+      # `<workdir>/.<plugin>` state dir (bridge_plugin_channel_state_dir) and
+      # threads it to bridge-channels.py as --plugin-state-dir for every
+      # managed-send adapter (discord/telegram/teams). Pull both
+      # teams-managed-send and 2005-managed-send-plugin-state-dir on every
+      # channels-lib move so the bash→python state-dir handoff and the adapter
+      # contracts cannot regress.
+      add_required channel-plugins bridge-notify-no-default-discord-875 1165-track-a-scaffold-modes 1165-track-b-sudo-escalate-and-state 1342-write-state-marker-matrix A12-beta3-1246-1252-daemon-supp-group-and-state-dir mcp-liveness-giveup-auto-clear beta5-2-iota-daemon-escalation-family teams-managed-send 2005-managed-send-plugin-state-dir
       # Issue #1762: this arm's `runtime-templates/*` glob also matches the
       # shipped picker catalog + the picker-resolve skill (case takes the first
       # matching arm, ahead of the dedicated picker arm below). Pull the picker
@@ -3671,6 +3926,13 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
           # non_picker entries; the idle-nonpicker smoke asserts they classify
           # the idle composers (and a real picker is NOT shadowed by them).
           add_required 1783-picker-idle-nonpicker
+          ;;
+        runtime-templates/shared/prompt-resolver-actions.json)
+          # Issue #1991 AGENTIC RESOLVER: the shipped closed default-deny policy
+          # (case takes this runtime-templates/* arm first, ahead of the
+          # dedicated resolver arm below). Pull the resolver smoke so a policy
+          # edit re-runs the schema + default-deny + closed-token validation.
+          add_required 1991-agentic-resolver
           ;;
       esac
       add_integration integration-minimal
@@ -3814,6 +4076,18 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # selection. Cover the exclusion regression smoke whenever the
       # ingest orchestrator moves.
       add_required 679-wiki-ingest-exclude-precompact
+      # Issue #1983: Lane B selects the [librarian-ingest] target by LIVENESS
+      # (librarian's `active` flag), not mere existence, and reports the real
+      # `task create` outcome — so a stopped librarian falls through to the
+      # live admin fallback instead of silently dropping Lane B while claiming
+      # success. Cover the liveness/honest-status regression smoke.
+      add_required 1983-wiki-ingest-lane-b-liveness
+      add_integration integration-minimal
+      ;;
+
+    scripts/wiki-ingest-librarian-live.py)
+      # Issue #1983: the Lane B librarian-liveness gate's file-as-argv helper.
+      add_required 1983-wiki-ingest-lane-b-liveness
       add_integration integration-minimal
       ;;
 
@@ -4026,7 +4300,16 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # .codex/hooks.json. 1934-hook-path-canonical-fence pins it; the
       # 1934-hook-file-self-heal smoke (daemon facet 2) rides along since the
       # renderer + the daemon re-render share the same builders.
-      add_required hooks upgrade-shared-settings-propagate managed-autocompact-window isolated-settings-rendering 1495-settings-invalid-hook-key 1453-channel-sticky-false-inbound per-agent-settings-rendering shared-settings-preserve-user-keys 1689-statusline-preserve-rerender 1756-settings-preserve-model-user-keys 11901-shared-global-settings-inherit 1759-selfref-global-loop-guard admin-hook-exemption 1067-codex-provisioning 1120-controller-ops-isolated 1139-link-shared-settings-perm 1672-link-shared-settings-idempotent 1145-ensure-dir-actually-sudo 1145-option1-deferral-guard 1151-step-a-helper 1165-track-c-hooks-and-dispatcher 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp 1205-hook-iso-fail-open 1212-bridge-hooks-marketplace 1213-iso-uid-predicate 1934-hook-path-canonical-fence 1934-hook-file-self-heal beta27-D-inject-timestamp-resolved beta27-E-hook-permission-fail-open-markers 1358-admin-credential-routine-exempt 1199-action-required-claimed-skip codex-precompact-hook codex-postcompact-hook codex-subagent-hooks codex-permission-request-hook 1890-dynamic-vanilla-claude 1899-dynamic-vanilla-codex
+      # Issue #1961 (display-only): bridge-hooks.py's `cmd_ensure_hud_usage_tap`
+      # empty-slot branch now composes `tap | <operator-global statusLine
+      # renderer>` (renderer-agnostic, no plugin-name hardcoding) instead of
+      # always installing the blank standalone tap, and lib/bridge-hooks.sh's
+      # `bridge_ensure_hud_usage_tap` passes --operator-global-settings-file.
+      # 1961-statusline-compose pins the renderer-agnostic compose, the blank
+      # standalone fallback, the no-double-tap edge, idempotency, and that a
+      # foreign per-agent statusLine is never clobbered. Pull on every
+      # bridge-hooks.py + bridge-hooks.sh move.
+      add_required hooks upgrade-shared-settings-propagate managed-autocompact-window isolated-settings-rendering 1495-settings-invalid-hook-key 1453-channel-sticky-false-inbound per-agent-settings-rendering shared-settings-preserve-user-keys 1689-statusline-preserve-rerender 1756-settings-preserve-model-user-keys 11901-shared-global-settings-inherit 1759-selfref-global-loop-guard 1961-statusline-compose admin-hook-exemption 1067-codex-provisioning 1120-controller-ops-isolated 1139-link-shared-settings-perm 1672-link-shared-settings-idempotent 1145-ensure-dir-actually-sudo 1145-option1-deferral-guard 1151-step-a-helper 1165-track-c-hooks-and-dispatcher 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp 1205-hook-iso-fail-open 1212-bridge-hooks-marketplace 1213-iso-uid-predicate 1934-hook-path-canonical-fence 1934-hook-file-self-heal beta27-D-inject-timestamp-resolved beta27-E-hook-permission-fail-open-markers 1358-admin-credential-routine-exempt 1199-action-required-claimed-skip codex-precompact-hook codex-postcompact-hook codex-subagent-hooks codex-permission-request-hook 1890-dynamic-vanilla-claude 1899-dynamic-vanilla-codex
       # Issue #1497 (P1): hooks/bridge_hook_common.py::agent_default_home now
       # reads BRIDGE_AGENT_HOME_RESOLVED first, is v2-aware, falls back to the
       # roster CLI (`agent show --json agent_home`), and no longer lets a stale
@@ -4046,6 +4329,18 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # block, never-block-when-empty), the #1199 queued-vs-claimed split, or the
       # Stop-chain ordering.
       add_required 9780-stop-inbox-drain
+      # Issue #2003: hooks/bridge_hook_common.py::_enqueue_handoff_pending now
+      # shares the ATOMIC upsert-open handoff-task contract with bridge-run.sh's
+      # restart wake (lib/bridge-state.sh bridge_run_handoff_task_find_or_create)
+      # — both create the same `[bridge:handoff-pending] <name> (<digest8>)` task
+      # via upsert-open so the SessionStart hook + the restart wake converge on
+      # ONE row (no TOCTOU duplicate). 1639-post-restart-auto-wake's source-grep
+      # gate pins the upsert-open token on BOTH files; pull it on every
+      # hooks/bridge_hook_common.py move so the hook side cannot regress to a
+      # racy find-open+create.
+      if [[ "$path" == "hooks/bridge_hook_common.py" ]]; then
+        add_required 1639-post-restart-auto-wake
+      fi
       # Issue #1766: bridge_link_claude_settings_to_shared (lib/bridge-hooks.sh)
       # now group-publishes the per-agent effective file (0640) + parent .claude/
       # (0750) for iso v2 agents so the iso UID can read its own
@@ -4114,6 +4409,29 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # the fail-loud-on-operator-data writer, or the scoped-deny final-render
       # invariant.
       add_required 1923-askuserquestion-hard-ban
+      # Issue #2007: bridge-hooks.py gained the first-party Codex hook PRETRUST
+      # surface — codex_hook_identity / codex_hook_trusted_hash / the
+      # _CODEX_FIRST_PARTY_HOOKS inventory / codex_first_party_trust_targets /
+      # the narrow config.toml [hooks.state] patcher (codex_patch_config_trust +
+      # verify-after-write) + the `ensure-codex-hook-trust` entrypoint — and
+      # lib/bridge-hooks.sh gained bridge_codex_pretrust_first_party_hooks, wired
+      # AFTER the render in bridge_ensure_codex_hooks / bridge_ensure_codex_agent_
+      # hooks. Pull 2007-codex-hook-trust on every hooks/* / bridge-hooks.py /
+      # lib/bridge-hooks.sh move so a future patch cannot regress the version-
+      # invariant hash algorithm, the STRICT first-party boundary (foreign hooks
+      # stay untrusted; never --dangerously-bypass-hook-trust), the enabled=false
+      # + unknown-field preservation, or the fail-closed skip path.
+      # Issue #1981 (SAFETY): bridge_link_claude_settings_to_shared
+      # (lib/bridge-hooks.sh) gained an operator-global hijack guard that runs
+      # FIRST — before #1945 F7's deferral/iso-UID render, the #1766 group
+      # publish, and the link-shared-settings call — refusing to symlink the
+      # operator's real `~/.claude/settings.json` when the managed workdir
+      # resolves onto it (workdir == operator HOME, or the reverse direction).
+      # Pull 1981-operator-global-hijack-guard on every hooks/* / bridge-hooks.*
+      # / lib/bridge-hooks.sh move so a future patch cannot regress the guard
+      # ordering, the realpath comparison, the operator-global-stays-a-regular-
+      # file teeth, or the normal-agent no-regression path.
+      add_required 1981-operator-global-hijack-guard 2007-codex-hook-trust
       add_integration integration-minimal
       ;;
 
@@ -4295,7 +4613,23 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # lib/upgrade-helpers/cron-unmodeled-claude-warn.py. Pull
       # 1943-cron-unmodeled-warn-on-upgrade whenever the upgrade entry moves so
       # the best-effort cron-scan invocation cannot silently regress.
-      add_required upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision telegram-relay-residue-cleanup upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering upgrade-isolated-agent-migrate 864-upgrade-perm-regressions cleanup-payload-empty-stdin-872 isolation-v2-marker-only-migrate 1067-codex-provisioning 1113-watchdog-legacy-backfill 1144-upgrade-complete-task phase2-install-tree-reconciler phase3-agent-home-contract α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-theta-upgrade-backfill-perms beta5-2-mu-cron-channel-creds codex-version-surface codex-doctor 1516-upgrade-downgrade-guard 1612-upgrade-restart-receiver upgrade-migrate-rematerialize-workdir 1602-dryrun-ref-fidelity 1601-conflicts-adopt-guard 1611-migrate-orphan-skip 1613-wiki-mention-fence-indent 1635-iso-backup-perm-skip 1638-settings-cosmetic-conflict 1636-rematerialize-scaffolding 1660-upgrade-emit-brokenpipe 1661-upgrade-singleton-lock 1662-upgrade-complete-marker 1670-rematerialize-dryrun-agent-preserved 1781-doc-migration-memory-preserve 1817-live-root-claude-stub lts-channel-sticky-resolver 1567-codex-orphan-upgrade-reaper 1675-1694-settings-homebrew-abspath-conflict 1786-tasksdb-doctor-verb 1809-agents-md-backfill 1892-doc-backfill-engine-fail-closed 1905-upgrade-systemd-quiesce-respawn 655-upgrade-launchd-quiesce-respawn 1855-keychain-free-backfill 1813-canon-links-resolve-v2 1943-cron-unmodeled-warn-on-upgrade
+      # Issue #1985: bridge-upgrade.py's cmd_cleanup_residue now runs the
+      # operator-global settings hijack detect/repair sweep (report-only by
+      # default, gated neutral repair behind --repair-operator-global-settings-
+      # hijack, backup-before-mutate, os.replace replaces the symlink). Pull
+      # 1985-operator-global-settings-hijack-cleanup on every bridge-upgrade.py
+      # move so the narrow detection, the backup-fail-closed refusal, and the
+      # report-only-never-fails-upgrade contract cannot silently regress.
+      # Issue #1991 AGENTIC RESOLVER: bridge-upgrade.sh runs the post-upgrade
+      # picker-sweep one-shot, which (via picker-sweep's resolver self-gate) must
+      # NOT key a resolver-owned canary agent's pane. Pull the resolver smoke
+      # whenever the upgrade entry moves so that contract stays pinned.
+      # Issue #1931 (DATA-LOSS): the migrate-agents rematerialize pass must never
+      # clobber an operator-customized workdir CLAUDE.md / AGENTS.md with the
+      # placeholder template (preserve + managed-block-only refresh). Pull
+      # 1931-upgrade-preserves-workdir-claudemd on every upgrade-entry move so the
+      # preserve guard stays exercised against the full migrate path.
+      add_required upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision telegram-relay-residue-cleanup upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering upgrade-isolated-agent-migrate 864-upgrade-perm-regressions cleanup-payload-empty-stdin-872 isolation-v2-marker-only-migrate 1067-codex-provisioning 1113-watchdog-legacy-backfill 1144-upgrade-complete-task phase2-install-tree-reconciler phase3-agent-home-contract α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-theta-upgrade-backfill-perms beta5-2-mu-cron-channel-creds codex-version-surface codex-doctor 1516-upgrade-downgrade-guard 1612-upgrade-restart-receiver upgrade-migrate-rematerialize-workdir 1602-dryrun-ref-fidelity 1601-conflicts-adopt-guard 1611-migrate-orphan-skip 1613-wiki-mention-fence-indent 1635-iso-backup-perm-skip 1638-settings-cosmetic-conflict 1636-rematerialize-scaffolding 1660-upgrade-emit-brokenpipe 1661-upgrade-singleton-lock 1662-upgrade-complete-marker 1670-rematerialize-dryrun-agent-preserved 1781-doc-migration-memory-preserve 1817-live-root-claude-stub lts-channel-sticky-resolver 1567-codex-orphan-upgrade-reaper 1675-1694-settings-homebrew-abspath-conflict 1786-tasksdb-doctor-verb 1809-agents-md-backfill 1892-doc-backfill-engine-fail-closed 1956-backfill-dynamic-engine 1905-upgrade-systemd-quiesce-respawn 655-upgrade-launchd-quiesce-respawn 1855-keychain-free-backfill 1813-canon-links-resolve-v2 1943-cron-unmodeled-warn-on-upgrade 1931-upgrade-preserves-workdir-claudemd 1973c-liveness-recovery 1991-agentic-resolver 1985-operator-global-settings-hijack-cleanup 2004-onboarding-marker-authority
       # Issue #1906: bridge-upgrade.py's backfill-codex-entrypoints sweep gained
       # the REPORT-ONLY engine-mismatched-doc detector (a stale Codex-contract
       # AGENTS.md on a non-codex agent -> engine_mismatch_docs + non_clean).
@@ -4303,6 +4637,21 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # backfill loop cannot silently drop the residue flag or start mutating the
       # flagged file.
       add_required 1906-flag-engine-mismatched-docs
+      # Issue #2016: migrate_agent_home now engine-gates the codex AGENTS.md
+      # emission on the ROSTER engine in BOTH home locations (the `codex/`
+      # template subtree -> home/codex/AGENTS.md AND the #1809 home-ROOT
+      # entrypoint backfill), and the backfill residue scan now flags a pre-gate
+      # `codex/AGENTS.md` copy too. Pull 2016-codex-agents-engine-gate on every
+      # bridge-upgrade.py move so a refactor of the migrate copy loop / engine
+      # gate cannot reintroduce the spurious codex contract on a claude agent or
+      # regress a genuine codex agent's legitimate AGENTS.md.
+      # Issue #1930 (+ #1928): detect_engine / detect_session_type anchor codex
+      # detection on the RESOLVED `런타임: Codex CLI` runtime declaration instead
+      # of a bare "Codex CLI" substring (the template placeholder + prose example
+      # both carry that substring on genuine claude profiles). Pull the #1930
+      # smoke on every bridge-upgrade.py move so a refactor of either heuristic
+      # cannot reintroduce the placeholder/prose false positive.
+      add_required 1930-detect-engine-placeholder 2016-codex-agents-engine-gate
       # Issue #1923: bridge-upgrade.sh's Claude hook-propagation loop now also
       # calls bridge_ensure_claude_askuserquestion_ban so existing agents
       # (incl. pre-#1923 dynamic-vanilla agents whose settings.local.json had
@@ -4315,13 +4664,19 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       add_integration integration-minimal
       ;;
 
-    lib/upgrade-helpers/rematerialize-agent-identity.sh|scripts/smoke/upgrade-migrate-rematerialize-workdir.sh|scripts/smoke/1636-rematerialize-scaffolding.sh|scripts/smoke/1670-rematerialize-dryrun-agent-preserved.sh|scripts/smoke/1781-doc-migration-memory-preserve.sh|scripts/smoke/1809-agents-md-backfill.sh)
+    lib/upgrade-helpers/rematerialize-agent-identity.sh|lib/upgrade-helpers/preserve-customized-entrypoint.py|scripts/smoke/upgrade-migrate-rematerialize-workdir.sh|scripts/smoke/1636-rematerialize-scaffolding.sh|scripts/smoke/1670-rematerialize-dryrun-agent-preserved.sh|scripts/smoke/1781-doc-migration-memory-preserve.sh|scripts/smoke/1809-agents-md-backfill.sh|scripts/smoke/1931-upgrade-preserves-workdir-claudemd.sh)
       # Issue #1809: the rematerialize helper gained the entrypoint-backfill-only
       # mode (the daemon doc-backfill mirror) + the codex AGENTS.md is one of the
       # entrypoint docs; pull the #1809 smoke whenever the helper or its smoke
       # changes so the entrypoint-only short-circuit + shared-workspace guard are
       # re-exercised alongside the full identity/scaffold suite.
-      add_required upgrade-migrate-rematerialize-workdir 1636-rematerialize-scaffolding 1670-rematerialize-dryrun-agent-preserved 1781-doc-migration-memory-preserve 1809-agents-md-backfill
+      # Issue #1931 (DATA-LOSS): the helper now refuses to clobber an operator-
+      # customized workdir entrypoint with the placeholder template (preserve +
+      # managed-block-only refresh, the #1817 contract applied to the workdir).
+      # The preserve decision lives in preserve-customized-entrypoint.py; pull the
+      # #1931 smoke whenever the helper, that decision script, or any sibling
+      # rematerialize smoke moves so the preserve guard stays exercised.
+      add_required upgrade-migrate-rematerialize-workdir 1636-rematerialize-scaffolding 1670-rematerialize-dryrun-agent-preserved 1781-doc-migration-memory-preserve 1809-agents-md-backfill 1931-upgrade-preserves-workdir-claudemd
       add_integration integration-minimal
       ;;
 
@@ -4333,6 +4688,14 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       add_required 1611-migrate-orphan-skip
       ;;
 
+    scripts/smoke/1966-orphan-walk-prune.sh|scripts/smoke/1966-orphan-walk-prune-helper.py)
+      # Issue #1966: editing the orphan keep-set walk-prune smoke or its Python
+      # correctness-teeth helper re-runs the smoke directly (the scripts/smoke/*
+      # catch-all pulls it via the full static suite; this arm keeps the
+      # selection focused when only these two files change).
+      add_required 1966-orphan-walk-prune
+      ;;
+
     lib/upgrade-helpers/codex-orphan-cleanup.sh|lib/upgrade-helpers/codex-orphan-cleanup.py|lib/upgrade-helpers/codex-orphan-cleanup-summary.py|scripts/smoke/1567-codex-orphan-upgrade-reaper.sh|scripts/smoke/1567-codex-orphan-upgrade-reaper-helper.py)
       # Issue #1567: the one-shot upgrade-time codex broker + queue-gateway
       # orphan reaper. Editing the helper shim, its Python detector/summary, or
@@ -4341,6 +4704,18 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # when only these files change). The bridge-upgrade.sh arm above also
       # selects it on every upgrade-entry move.
       add_required 1567-codex-orphan-upgrade-reaper
+      ;;
+
+    lib/upgrade-helpers/codex-hooks-propagate.sh)
+      # Issue #1067 S08: the upgrade-time codex hook propagate helper re-renders
+      # per-agent Codex hooks. Issue #2007 extended it to also PRETRUST the
+      # bridge's own first-party hooks in the sibling config.toml after each
+      # render (so the hook-changing upgrade never wedges a codex agent at the
+      # trust gate on the next restart). Pull both the provisioning smoke (T3
+      # exercises the propagate render) and the pretrust smoke when only this
+      # helper changes; the bridge-upgrade.sh arm + scripts/smoke/* catch-all
+      # also select them on the broader upgrade-entry / full-static paths.
+      add_required 1067-codex-provisioning 2007-codex-hook-trust
       ;;
 
     scripts/smoke/1635-iso-backup-perm-skip.sh|scripts/smoke/1635-iso-backup-perm-skip-helper.py)
@@ -4445,7 +4820,12 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # the cleanup lib moves so step 4 cannot regress from the policy-blessed
       # `agent-bridge doctor --detectors tasks-db` verb back to the
       # hook-blocked raw `verify-tasks-db` command.
-      add_required cleanup-payload-empty-stdin-872 upgrade telegram-relay-residue-cleanup 1786-tasksdb-doctor-verb
+      # Issue #1985: bridge_cleanup_daily_backup_residue now passes the #1984
+      # operator-global resolver + the repair/restore/backup-dir flags through to
+      # cleanup-residue. Pull the 1985 smoke on every cleanup-lib move so the
+      # report-only default, the backup-fail-closed refusal, and the neutral
+      # os.replace repair cannot silently regress.
+      add_required cleanup-payload-empty-stdin-872 upgrade telegram-relay-residue-cleanup 1786-tasksdb-doctor-verb 1985-operator-global-settings-hijack-cleanup
       add_integration integration-minimal
       ;;
 
@@ -4636,6 +5016,11 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # move so a refactor cannot drop the engine-mismatch non-clean signal or
       # the flag-only section of the [hygiene] task body.
       add_required 1906-flag-engine-mismatched-docs
+      # Issue #2016: the agent-doc-backfill-task-body renderer's Engine-mismatched
+      # section now also names the `codex/AGENTS.md` residue location (the 2nd
+      # copy the old un-gated migrate rglob left). Pull 2016-codex-agents-engine-
+      # gate on every helpers move so a refactor cannot drop that residue surface.
+      add_required 2016-codex-agents-engine-gate
       add_integration integration-minimal
       ;;
 
@@ -4646,7 +5031,19 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # containment) and — because the classifier also backs the read-only
       # detector — the doctor's behavior-preserving smoke. Pull both so a
       # change to either file is caught by the detector AND the action teeth.
-      add_required 1803-orphan-dir-gc orphan-agent-dir agent-doctor status-engine-detect
+      # Issue #1982: the registered fast-path now case-folds the name match on
+      # case-insensitive volumes (sharing the #598 retire guard's inode-aware,
+      # fail-safe-toward-KEEP approach, though against a different base — see
+      # the classifier docstring). Pull the casefold smoke so a refactor of the
+      # `_classify_child` registered short-circuit cannot regress the parallel-
+      # tree case-variant keep or the case-sensitive-FS no-collapse.
+      # Issue #1966: _enumerate_symlink_targets_under_root now PRUNES heavy
+      # non-symlink content trees (node_modules / .git / .claude/{projects,cache})
+      # and reads symlink-ness from a cached os.scandir DirEntry. The prune is
+      # speed-only — the keep-set RESULT (and thus the orphan COUNT) must be
+      # byte-identical. Pull 1966-orphan-walk-prune so a refactor that drops a
+      # real keep-set symlink from the walk (changing the result) is caught.
+      add_required 1803-orphan-dir-gc orphan-agent-dir agent-doctor status-engine-detect 1966-orphan-walk-prune 1982-orphan-classifier-casefold
       add_integration integration-minimal
       ;;
 
@@ -4826,6 +5223,13 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # for any agent whose workdir path contains "_") or narrow the
       # back-compat slash-only / slash+dot candidates.
       add_required 1015-resume-claude-config-dir 981-restart-session-resume-snapshot Beta-beta5-session-id-detect-sudo beta5-1-session-id-detect-race 1769-restart-trusted-resume 1807-resume-slug-underscore
+      # Issue #1968: resolve-claude-resume-session-id.py gained the
+      # `--list-resumable` enumeration mode that forget-session uses to
+      # quarantine the agent's own in-window transcripts (so the most-recent-
+      # .jsonl fallback has nothing stale left to re-resume). Pull the smoke on
+      # every helper move so a refactor cannot drop/skew the enumeration (re-
+      # opening the inert-forget bug where the dry-run launch keeps `--resume`).
+      add_required 1968-forget-session-fresh
       add_integration integration-minimal
       ;;
 
@@ -4859,7 +5263,10 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # outside any heredoc (post-#800 footgun #11 mitigation). Any
       # change to the fixture must re-run the empty-stdin regression
       # smoke that asserts the renderer never leaks JSONDecodeError.
-      add_required cleanup-payload-empty-stdin-872 upgrade telegram-relay-residue-cleanup
+      # Issue #1985: the renderer also emits the operator-global settings hijack
+      # block (detected/repaired/repair_failed). Pull the 1985 smoke on every
+      # renderer move so the loud-warning surface stays wired.
+      add_required cleanup-payload-empty-stdin-872 upgrade telegram-relay-residue-cleanup 1985-operator-global-settings-hijack-cleanup
       add_integration integration-minimal
       ;;
 
@@ -4960,6 +5367,13 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # via the master list; pin it explicitly so a master-list/catch-all
       # coupling change cannot silently drop it on a bridge-agents.sh move.
       add_required 1881-channel-enable-live-mcp-readiness
+      # Issue #2020: agent-roster.sh declares BRIDGE_AGENT_SKILLS associative
+      # (the only #1427 per-agent map previously missing the up-front declare).
+      # `add_all_required_static` already pulls the smoke via the master list;
+      # pin it explicitly so a master-list/catch-all coupling change cannot
+      # silently drop it on an agent-roster.sh move — same class as the #1407/
+      # #1627 assoc-declaration guards.
+      add_required 2020-skills-assoc-declare
       ;;
 
     bridge-watchdog.py)
@@ -5027,6 +5441,14 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # all-unsupported-engine mute that swallows real drift. Pull it on every
       # bridge-watchdog.py move.
       add_required watchdog-profile-contract watchdog-registry-anchored watchdog-silence-stderr-capture 1108-watchdog-v2-workdir 1119-watchdog-perm-error 1113-watchdog-legacy-backfill ε-watchdog-rescan-codex G-beta4-watchdog-noise 1520c-create-isolate-profile-publish 1801-watchdog-bounded-broken-links 1872-watchdog-unsupported-engine-info 1820-rc4-iso-stale-group-preflight codex-doctor queue
+      # Issue #2018: the missing_managed_claude_block check now treats the block
+      # as present when it lives in the agent's IDENTITY HOME (not only the
+      # scanned registry workdir), so a static Claude agent with a custom
+      # project-folder workdir stops false-flagging drift — mirroring the #1750
+      # entrypoint home fall-back. Pull 2018-watchdog-managed-block-identity-home
+      # on every watchdog move so a refactor can neither re-introduce the
+      # workdir-only false positive nor mask a block genuinely absent from BOTH.
+      add_required 2018-watchdog-managed-block-identity-home
       add_integration integration-minimal
       ;;
 
@@ -5151,7 +5573,16 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # Pull 1354-setup-teams-fd-password on every bridge-channels move
       # so a future channel-side refactor cannot silently regress the
       # wizard-to-channel credential contract.
-      add_required channel-plugins channel-env-readiness 1354-setup-teams-fd-password
+      # Issue #1996 / #2005: bridge-channels.py grew `_adapter_teams` (managed
+      # proactive-send shelling out to `bun plugins/teams/server.ts
+      # send-managed`), and #2005 generalized the bash-resolved state-dir
+      # handoff into a single `--plugin-state-dir` consumed by the
+      # discord/telegram/teams adapters (reading `<workdir>/.<plugin>` instead
+      # of the naive agents/<a>/.<plugin>). teams-managed-send pins the teams
+      # argv/env + exit-code mapping; 2005-managed-send-plugin-state-dir pins the
+      # discord/telegram state-dir read + the empty-arg fallback. Pull both on
+      # every channels move.
+      add_required channel-plugins channel-env-readiness 1354-setup-teams-fd-password teams-managed-send 2005-managed-send-plugin-state-dir
       add_integration integration-minimal
       ;;
 
@@ -5276,7 +5707,12 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # contract) plus the silence-watchdog stderr-capture regression on
       # every supervisor move so neither the routing nor the refuse-handling
       # can silently regress to the thrash-inducing direct stop+start.
-      add_required 1463-launchd-keepalive-singleton-thrash watchdog-silence-stderr-capture launch queue
+      # Issue #1973 (Track C): bridge-daemon-liveness.sh now also detects a
+      # gateway-stall (old pending/working requests while the pid is alive) and
+      # writes a recovery marker before restart. Pull the Track C smoke on every
+      # liveness-watcher move so the stall-requires-old-requests guard, the
+      # cross-poll witness, and the recovery-marker contract cannot regress.
+      add_required 1463-launchd-keepalive-singleton-thrash watchdog-silence-stderr-capture launch queue 1973c-liveness-recovery
       add_integration integration-minimal
       ;;
 
@@ -5306,6 +5742,29 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       add_integration integration-minimal
       ;;
 
+    bridge-resolver.sh|bridge-resolver-policy.py|lib/bridge-prompt-resolver.sh|runtime-templates/shared/prompt-resolver-actions.json|scripts/picker-sweep.sh)
+      # Issue #1991 AGENTIC RESOLVER (v0.16.16 canary, HIGH-RISK #1+#2 +
+      # security-sensitive). These are the resolver's own surfaces:
+      #   - bridge-resolver.sh: the single authorized key sender (attempt|drain|
+      #     status), the per-key latch, exact-key re-detect, closed-policy lookup.
+      #   - bridge-resolver-policy.py: default-deny decision + schema validation +
+      #     demote-only locals + closed-token vocabulary.
+      #   - lib/bridge-prompt-resolver.sh: canary gate, central send-block guard,
+      #     latch primitives, shipped-policy resolution.
+      #   - prompt-resolver-actions.json: the shipped closed allow-list.
+      #   - scripts/picker-sweep.sh: a legacy key sender gated for canary agents
+      #     (cron + post-upgrade one-shot). (bridge-upgrade.sh's resolver smoke
+      #     is added in its own arm above — it matches there first.)
+      # Pull the resolver smoke on any of their moves so the single-sender /
+      # default-deny / latch / prompt-injection / #879-batch teeth re-run.
+      add_required 1991-agentic-resolver
+      # picker-sweep moves also exercise the migrate paths.
+      if [[ "$path" == "scripts/picker-sweep.sh" ]]; then
+        add_required 1916-picker-sweep-migrate-atomic
+      fi
+      add_integration integration-minimal
+      ;;
+
     lib/bridge-picker.sh|lib/bridge-picker.py|runtime-templates/shared/picker-catalog.json|runtime-templates/skills/picker-resolve/SKILL.md)
       # Issue #1762: the no-LLM picker auto-resolve stage. lib/bridge-picker.sh
       # (shell orchestrator + safety rails), lib/bridge-picker.py (catalog
@@ -5313,6 +5772,11 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # picker-resolve skill all feed the same smoke. Pull it on any of their
       # moves so a refactor or a catalog schema change is caught.
       add_required 1762-picker-autoresolve
+      # Issue #1991 AGENTIC RESOLVER: lib/bridge-picker.sh's auto-resolve handler
+      # is one of the legacy key senders the single-sender resolver gates. Pull
+      # the resolver smoke so a refactor cannot drop the resolver-owned-agent
+      # report-only gate (which would reintroduce a second sender under canary).
+      add_required 1991-agentic-resolver
       # Issue #1766: the matcher also classifies the claude-settings-error
       # entry; pull the #1766 smoke so a matcher change cannot break it.
       add_required 1766-iso-settings-readable

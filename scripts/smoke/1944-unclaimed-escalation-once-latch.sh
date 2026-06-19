@@ -208,12 +208,18 @@ count_open_with_prefix() {
   python3 -c 'import json,sys; print(len(json.loads(sys.argv[1] or "[]")))' "$json"
 }
 
-# Backdate a task's created_ts so it crosses the age threshold without a sleep.
+# Backdate a task's created_ts AND updated_ts so it crosses the age threshold
+# without a sleep. Issue #1970: the unclaimed-task watchdog now ages a queued
+# task from max(created_ts, updated_ts), so a genuinely-stale unclaimed task
+# must be stale on BOTH stamps (a fresh updated_ts grants the post-requeue
+# grace window). Backdating created_ts alone would leave updated_ts at
+# creation time (~now) and the task would no longer qualify — which is the
+# intended new behavior, so the fixture ages both to model real staleness.
 backdate_task() {
   local task_id="$1" seconds_ago="${2:-600}"
   local cutoff
   cutoff="$(( $(date +%s) - seconds_ago ))"
-  sqlite3 "$DB" "UPDATE tasks SET created_ts=${cutoff} WHERE id=${task_id};"
+  sqlite3 "$DB" "UPDATE tasks SET created_ts=${cutoff}, updated_ts=${cutoff} WHERE id=${task_id};"
 }
 
 # Queue a task against TARGET and backdate it so it is an "old unclaimed" task.
@@ -371,8 +377,10 @@ smoke_run "D5 same-id handoff to a different agent re-escalates once" : ; {
   python3 "$QUEUE" handoff "$ho_id" --to "$TARGET2" --from "$TARGET" --note "reassign" >/dev/null
   status_after="$(python3 "$QUEUE" show "$ho_id" --format shell | sed -n 's/^TASK_STATUS=//p' | tr -d "'")"
   smoke_assert_eq queued "$status_after" "D5 handoff keeps the task queued (same id)"
-  # The backdated created_ts survives handoff (handoff only bumps updated_ts),
-  # so the task is still "old" — but re-confirm by backdating defensively.
+  # Handoff bumps updated_ts to now, so post-#1970 the max(created_ts,
+  # updated_ts) freshness check would grant the new assignee a grace window.
+  # Re-age both stamps so the re-assigned task models a genuinely-stale
+  # unclaimed task for the NEW assignee.
   backdate_task "$ho_id" 600
 
   # Re-tick: the latch is keyed by agent, so TARGET2 (no matching marker
@@ -433,7 +441,11 @@ smoke_run "D_teeth once-latch source shape" : ; {
     || smoke_fail "teeth: once-latch short-circuit '(( cooldown == 0 ))' must be present"
   # The (agent, task) latch key: the marker must record the agent and the
   # escalation must compare it against the current assignee (codex r1).
-  grep -qF 'printf '\''%s\n%s\n'\'' "$now_ts" "$agent"' "$daemon_sh" \
+  # Issue #1973 Track B extended the marker with a line-3 attempt count for
+  # the periodic-mode backoff; the agent must still be the line-2 field
+  # (`"$now_ts" "$agent"` immediately after the ts), so anchor on that
+  # ordering rather than the exact line count.
+  grep -qF 'printf '\''%s\n%s\n%s\n'\'' "$now_ts" "$agent" "$(( _esc_new_attempts + 1 ))"' "$daemon_sh" \
     || smoke_fail "teeth: marker must record the agent on line 2 (agent,task latch key)"
   grep -q '_marker_agent' "$daemon_sh" \
     || smoke_fail "teeth: escalation must compare the marker agent to the current assignee"

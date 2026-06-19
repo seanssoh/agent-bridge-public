@@ -355,6 +355,62 @@ bridge_ensure_claude_shared_settings_for_managed_workdir() {
   fi
 }
 
+# Issue #1981 (SAFETY): is the link target `<workdir>/.claude/settings.json`
+# actually the OPERATOR's real global `~/.claude/settings.json`? A dynamic agent
+# launched (or mis-launched) with `workdir=$HOME` would make
+# `bridge_link_claude_settings_to_shared` symlink the operator's real global over
+# to a bridge-managed `settings.effective.json`, hijacking the operator's own
+# vanilla Claude sessions (bridge hooks leak in) and stranding an orphan symlink
+# into a dead agent dir when the agent is closed. This predicate answers TRUE
+# (rc 0) when ANY of:
+#   - `<workdir>` resolves (realpath) to the operator HOME, OR
+#   - the computed `<workdir>/.claude/settings.json` resolves to the operator
+#     global `<operator_home>/.claude/settings.json`, OR
+#   - (reverse direction) the `effective_file` link source resolves to the
+#     operator global — never point the operator global AT a bridge effective
+#     file, and never use the operator global AS the link source.
+# Comparison is by realpath (handles a symlinked workdir, a `<home>` vs
+# `<home>/` trailing-slash, and a non-existent leaf — bridge_hook_paths_equal
+# uses os.path.realpath which resolves the existing prefix and appends the rest).
+# Operator HOME is resolved via the canonical #11901 resolver
+# `bridge_agent_operator_home_dir`; when it cannot resolve, fall back to a direct
+# `$HOME` comparison so a resolver-miss never silently lets the operator real
+# global be replaced by a bridge symlink (SAFE-on-miss invariant). Args:
+#   1 = workdir, 2 = effective_file (the link source bridge would point at).
+bridge_link_settings_targets_operator_global() {
+  local workdir="$1"
+  local effective_file="${2-}"
+  local operator_home=""
+  if command -v bridge_agent_operator_home_dir >/dev/null 2>&1; then
+    operator_home="$(bridge_agent_operator_home_dir 2>/dev/null || true)"
+  fi
+  # SAFE-on-miss: if the canonical resolver yielded nothing, fall back to $HOME
+  # (the operator HOME in the controller context) so we still refuse a workdir
+  # that lands on the real global. Only when BOTH are empty can we not identify
+  # the operator global — then there is no global path to protect.
+  [[ -n "$operator_home" ]] || operator_home="${HOME:-}"
+  [[ -n "$operator_home" ]] || return 1
+
+  local operator_global="$operator_home/.claude/settings.json"
+  local target="$workdir/.claude/settings.json"
+
+  # workdir == operator HOME (covers symlinked/trailing-slash/`~` forms).
+  if [[ "$(bridge_hook_paths_equal "$workdir" "$operator_home")" == "1" ]]; then
+    return 0
+  fi
+  # computed link target == operator global.
+  if [[ "$(bridge_hook_paths_equal "$target" "$operator_global")" == "1" ]]; then
+    return 0
+  fi
+  # reverse: the link SOURCE (effective_file) is the operator global — refuse so
+  # the operator global is never used as a bridge effective file either way.
+  if [[ -n "$effective_file" ]] \
+      && [[ "$(bridge_hook_paths_equal "$effective_file" "$operator_global")" == "1" ]]; then
+    return 0
+  fi
+  return 1
+}
+
 bridge_link_claude_settings_to_shared() {
   local workdir="$1"
   # Issue #570: launch_cmd is accepted for backwards compatibility but the
@@ -367,6 +423,23 @@ bridge_link_claude_settings_to_shared() {
   # managed default). When omitted (legacy callers), fall back to the
   # install-wide render so the helper remains backwards-compatible.
   local agent="${3-}"
+  # Issue #1981 (SAFETY) — operator-global hijack guard. This MUST sit FIRST,
+  # before ANY link/render side effect (before the #11901 operator-global thread,
+  # before the #1945 F7 deferral + iso-UID render, before the #1766 group-publish,
+  # before the link-shared-settings call). If the managed `workdir` is the
+  # operator's HOME (or otherwise resolves the link target onto the operator's
+  # real global `~/.claude/settings.json`), refuse the whole operation and warn
+  # loudly — never replace the operator's real global with a bridge symlink. The
+  # normal (non-operator-HOME) agent path is untouched: the predicate is FALSE for
+  # a real agent workdir, so execution falls through unchanged. (The 2-arg form
+  # also catches the reverse direction once effective_file is known; the workdir
+  # check here is the launch-time teeth and runs before effective_file is set.)
+  if bridge_link_settings_targets_operator_global "$workdir"; then
+    local _op_global_1981
+    _op_global_1981="$(bridge_agent_operator_home_dir 2>/dev/null || printf '%s' "${HOME:-}")/.claude/settings.json"
+    bridge_warn "[#1981] refusing to link shared settings for ${agent:-<no-agent>}: workdir '$workdir' resolves the managed settings target onto the operator-global '$_op_global_1981'. Skipping the link to avoid hijacking the operator's vanilla Claude sessions. Fix the agent's workdir (it must NOT be the operator HOME) and restart."
+    return 0
+  fi
   local effective_file
   local agent_class=""
   local channels_csv=""
@@ -405,6 +478,17 @@ bridge_link_claude_settings_to_shared() {
     fi
   else
     effective_file="$(bridge_hook_shared_settings_effective_file)"
+  fi
+  # Issue #1981 (SAFETY) — reverse-direction re-check now that `effective_file`
+  # is resolved: refuse if the link SOURCE itself resolves to the operator
+  # global (never use the operator's real `~/.claude/settings.json` AS a bridge
+  # effective file, in addition to never overwriting it as the target above).
+  # bridge_hook_per_agent_settings_effective_file / *_shared_settings_effective_file
+  # resolve into bridge-managed roots so this is defense-in-depth, not the normal
+  # path; a real agent's effective_file never matches, so this falls through.
+  if bridge_link_settings_targets_operator_global "$workdir" "$effective_file"; then
+    bridge_warn "[#1981] refusing to link shared settings for ${agent:-<no-agent>}: the link source '$effective_file' resolves onto the operator-global settings. Skipping to avoid contaminating the operator's vanilla Claude sessions."
+    return 0
   fi
   # #11901: thread the operator's system-global settings file so the SHARED
   # renderer inherits its safety-filtered contents as the bottom-most layer.
@@ -910,8 +994,14 @@ bridge_ensure_hud_usage_tap() {
   local workdir="$1"
   local launch_cmd="${2-}"
   local agent="${3-}"
+  # #1961 (display-only): pass the operator's system-global settings file so the
+  # Python empty-slot branch can compose `tap | <operator renderer>` instead of
+  # installing the blank standalone tap. Empty/missing => fail-safe standalone
+  # tap (pre-#1961). Same #11901 resolver the shared renderer uses.
+  local operator_global_file
+  operator_global_file="$(bridge_hook_operator_global_settings_file)"
   if [[ "$(bridge_claude_settings_mode "$workdir")" == "shared" ]]; then
-    bridge_hooks_python ensure-hud-usage-tap --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)" >/dev/null
+    bridge_hooks_python ensure-hud-usage-tap --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)" --operator-global-settings-file "$operator_global_file" >/dev/null
     bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd" "$agent"
     # bridge_link_claude_settings_to_shared skips linux-user isolated agents
     # (the mirror is under a foreign UID). Re-render the isolated home so the
@@ -921,7 +1011,7 @@ bridge_ensure_hud_usage_tap() {
     fi
   else
     local -a _ta=(); bridge_claude_local_hook_target_args "$workdir" _ta "$agent" || return 1
-    bridge_hooks_python ensure-hud-usage-tap "${_ta[@]}" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)"
+    bridge_hooks_python ensure-hud-usage-tap "${_ta[@]}" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)" --operator-global-settings-file "$operator_global_file"
   fi
 }
 
@@ -1174,8 +1264,62 @@ bridge_codex_hooks_status() {
   bridge_hooks_python status-codex-hooks --codex-hooks-file "$(bridge_codex_hooks_file)"
 }
 
+# bridge_codex_config_file_for_hooks <hooks_file>
+#
+# Issue #2007: Codex reads its trust store from `config.toml` in the SAME
+# CODEX_HOME directory as the `hooks.json` it loads. The pretrust wrapper writes
+# trust into that sibling config — `<dirname hooks.json>/config.toml` — which is
+# exactly what the launched codex will read (for `~/.codex/hooks.json` the
+# sibling is `~/.codex/config.toml`; for a per-agent `<agent_home>/.codex/
+# hooks.json` it is `<agent_home>/.codex/config.toml`).
+bridge_codex_config_file_for_hooks() {
+  local hooks_file="$1"
+  [[ -n "$hooks_file" ]] || return 1
+  printf '%s/config.toml' "$(dirname "$hooks_file")"
+}
+
+# bridge_codex_pretrust_first_party_hooks <hooks_file> [bridge_home]
+#
+# Issue #2007 (prevention layer): pre-trust ONLY the bridge's own first-party
+# Codex hooks in the sibling config.toml so a hook-changing upgrade never wedges
+# a managed Codex agent at Codex's startup hook-trust gate. STRICT first-party
+# boundary + fail-closed inside bridge-hooks.py (never
+# --dangerously-bypass-hook-trust; foreign/plugin/operator entries left
+# untrusted for the #1992/#2007 detector). Non-fatal here: a pretrust failure
+# downgrades to the detector path — it must NEVER block the launch/render.
+bridge_codex_pretrust_first_party_hooks() {
+  local hooks_file="$1"
+  local bridge_home="${2:-${BRIDGE_HOME:-$BRIDGE_SCRIPT_DIR}}"
+  local config_file=""
+  [[ -n "$hooks_file" ]] || return 0
+  config_file="$(bridge_codex_config_file_for_hooks "$hooks_file")" || return 0
+  # Suppress only the shell-parseable STDOUT fields (the caller does not consume
+  # them here); let STDERR flow so the helper's fail-closed warn line ("leaving
+  # hooks UNtrusted for the detector to surface ...") reaches the start/upgrade
+  # log — the detector relies on that signal, not the exit code alone (codex
+  # review #2007 r1, Finding 3). Non-fatal regardless.
+  bridge_hooks_python ensure-codex-hook-trust \
+    --codex-hooks-file "$hooks_file" \
+    --codex-config-file "$config_file" \
+    --bridge-home "$bridge_home" \
+    --python-bin "$(command -v python3 || printf '/usr/bin/python3')" \
+    >/dev/null || true
+  return 0
+}
+
 bridge_ensure_codex_hooks() {
-  bridge_hooks_python ensure-codex-hooks --codex-hooks-file "$(bridge_codex_hooks_file)" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)"
+  local hooks_file rc=0
+  hooks_file="$(bridge_codex_hooks_file)"
+  bridge_hooks_python ensure-codex-hooks --codex-hooks-file "$hooks_file" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)" || rc=$?
+  # The render exit code is load-bearing (the caller bridge_die's on failure),
+  # so capture it BEFORE the pretrust step and return it unchanged.
+  if [[ $rc -eq 0 ]]; then
+    # Issue #2007: pre-trust the bridge's own hooks AFTER a successful render so
+    # the managed launch does not wedge at Codex's hook-trust gate (prevention).
+    # Non-fatal: a pretrust failure downgrades to the detector path.
+    bridge_codex_pretrust_first_party_hooks "$hooks_file" "$BRIDGE_HOME"
+  fi
+  return "$rc"
 }
 
 # bridge_ensure_codex_agent_hooks <agent> <agent_home>
@@ -1213,6 +1357,9 @@ bridge_ensure_codex_agent_hooks() {
     --bridge-home "${BRIDGE_HOME:-$BRIDGE_SCRIPT_DIR}" \
     --python-bin "$(command -v python3 || printf '/usr/bin/python3')" \
     >/dev/null 2>&1 || true
+  # Issue #2007: pre-trust the per-agent first-party hooks so a fresh codex
+  # agent (or a partially-upgraded host) does not wedge at the hook-trust gate.
+  bridge_codex_pretrust_first_party_hooks "$hook_config_path" "${BRIDGE_HOME:-$BRIDGE_SCRIPT_DIR}"
 }
 
 # Issue #1899: a dynamic vanilla Codex agent runs as vanilla Codex CLI against

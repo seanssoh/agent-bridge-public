@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -1678,6 +1679,682 @@ def cmd_status_codex_project_trust(args: argparse.Namespace) -> int:
     print(shell_line("CODEX_PROJECT_TRUST_LEVEL", trust))
     print(shell_line("CODEX_PROJECT_HOOKS_COMMS_BLOCKED", blocked))
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Issue #2007 — first-party Codex hook pretrust (prevention layer)
+#
+# A hook-changing upgrade (e.g. v0.16.12 -> v0.16.15 expanded the Codex hook
+# suite from 5 to 10 events) makes Codex's startup hook-trust gate fire on the
+# next managed launch. A non-interactive managed agent then wedges at that
+# picker, never reads its inbox, and its queue stalls silently (the incident
+# this issue documents). The PREVENTION layer pre-trusts ONLY the bridge's own
+# first-party hooks by writing Codex's trust store directly with the same
+# `trusted_hash` Codex itself would compute — so a bridge-rendered hook file is
+# already trusted before the engine starts.
+#
+# This is the prevention half. The DETECTOR (separate fixer, #1992 floor
+# extension) is the safety net that still surfaces any prompt that slips
+# through. Pretrust does not have to be perfect; detection is the floor.
+#
+# STRICT first-party boundary (design §Q1): we only ever write trust for an
+# entry that the bridge renderer itself produces AND whose command exactly
+# equals the bridge-generated command for the current bridge_home/python_bin
+# AND whose target hook script resolves under canonical $BRIDGE_HOME/hooks/
+# (no symlink escape). Unknown / plugin / operator / arbitrary entries in the
+# same file are NEVER trusted — they are counted as `foreign` and left for the
+# detector. We never use `--dangerously-bypass-hook-trust` (it admits ALL
+# enabled untrusted hooks for the invocation — a security hole; probe-confirmed
+# in the #2007 design). If trust cannot be computed or verified, we FAIL CLOSED:
+# emit no trust, return nonzero only on a real write/verify failure, and let the
+# detector surface any resulting prompt.
+#
+# Hash algorithm (probe-verified invariant across codex 0.137/0.138/0.140 and
+# path-independent — design §"Verified mechanics" + cm-prod addendum):
+#   identity = {
+#     "event_name": "<snake_case event>",
+#     "matcher": "<matcher>",          # omitted when the group has no matcher
+#     "hooks": [{
+#       "type": "command",
+#       "command": "<rendered command>",
+#       "timeout": <timeout or 600>,
+#       "async": false,
+#       "statusMessage": "<message>",   # omitted when absent
+#     }],
+#   }
+#   trusted_hash = "sha256:" + sha256(canonical_json(identity))
+# where canonical_json == json.dumps(identity, sort_keys=True,
+# separators=(",", ":")).
+
+
+def codex_event_snake_case(event_name: str) -> str:
+    """CamelCase Codex event name -> Codex's snake_case key spelling.
+
+    e.g. SessionStart -> session_start, PreToolUse -> pre_tool_use,
+    UserPromptSubmit -> user_prompt_submit. Matches the `<event_name_snake>`
+    segment in Codex's `[hooks.state."<path>:<event>:<g>:<h>"]` keys.
+    """
+    s1 = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", str(event_name))
+    return re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s1).lower()
+
+
+def codex_hook_identity(
+    event_name: str,
+    hook: dict[str, Any],
+    *,
+    matcher: str | None = None,
+) -> dict[str, Any]:
+    """Build the normalized identity dict Codex hashes for one command hook.
+
+    `hook` is a single entry from a group's `hooks` list (`{type, command,
+    timeout?, statusMessage?}`). `matcher` is the owning group's matcher (None
+    when the group has none). The shape mirrors Codex's fingerprint exactly:
+    `timeout` defaults to 600, `async` is always false, and `matcher` /
+    `statusMessage` are omitted when absent.
+    """
+    handler: dict[str, Any] = {
+        "type": "command",
+        "command": str(hook.get("command") or ""),
+        "timeout": int(hook.get("timeout") or 600),
+        "async": False,
+    }
+    status_message = hook.get("statusMessage")
+    if status_message is not None:
+        handler["statusMessage"] = str(status_message)
+
+    identity: dict[str, Any] = {"event_name": codex_event_snake_case(event_name)}
+    if matcher is not None:
+        identity["matcher"] = str(matcher)
+    identity["hooks"] = [handler]
+    return identity
+
+
+def codex_hook_trusted_hash(identity: dict[str, Any]) -> str:
+    """`"sha256:" + sha256(canonical_json(identity))` — the Codex trust hash."""
+    canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+# First-party Codex hook inventory. Each row maps a rendered event to the
+# predicate that recognizes the bridge command and the command builder + the
+# render parameters (timeout / statusMessage / group matcher) — kept BYTE-FOR-
+# BYTE in sync with cmd_ensure_codex_hooks's ensure_command_hook calls so the
+# computed expected-command and identity match the renderer exactly. A drift
+# here would simply make the boundary stricter (no match -> not trusted ->
+# detector surfaces it), never looser.
+_CODEX_FIRST_PARTY_HOOKS: tuple[dict[str, Any], ...] = (
+    {
+        "event": "SessionStart",
+        "predicate": is_codex_session_start_hook,
+        "builder": lambda h, p: session_start_hook_command(h, p, "codex"),
+        "timeout": 3,
+        "status_message": "Loading Agent Bridge queue context",
+        "matcher": "startup|resume",
+    },
+    {
+        "event": "Stop",
+        "predicate": is_codex_stop_hook,
+        "builder": codex_stop_hook_command,
+        "timeout": 3,
+        "status_message": "Checking Agent Bridge inbox",
+        "matcher": None,
+    },
+    {
+        "event": "UserPromptSubmit",
+        "predicate": is_codex_prompt_hook,
+        "builder": lambda h, p: prompt_timestamp_hook_command(h, p, "codex"),
+        "timeout": 3,
+        "status_message": "Injecting Agent Bridge timestamp context",
+        "matcher": None,
+    },
+    {
+        "event": "PreToolUse",
+        "predicate": is_codex_task_mode_policy_hook,
+        "builder": codex_task_mode_policy_hook_command,
+        "timeout": 3,
+        "status_message": "Checking Codex task-mode policy",
+        "matcher": None,
+    },
+    {
+        "event": "Stop",
+        "predicate": is_codex_review_output_shape_hook,
+        "builder": codex_review_output_shape_hook_command,
+        "timeout": 3,
+        "status_message": "Validating Codex review output shape",
+        "matcher": None,
+    },
+    {
+        "event": "PreCompact",
+        "predicate": is_codex_pre_compact_hook,
+        "builder": codex_pre_compact_hook_command,
+        "timeout": 20,
+        "status_message": "Snapshotting Agent Bridge canonical context",
+        "matcher": None,
+    },
+    {
+        "event": "PostCompact",
+        "predicate": is_codex_post_compact_hook,
+        "builder": codex_post_compact_hook_command,
+        "timeout": 5,
+        "status_message": "Restoring Agent Bridge queue context",
+        "matcher": None,
+    },
+    {
+        "event": "SubagentStart",
+        "predicate": is_codex_subagent_start_hook,
+        "builder": codex_subagent_start_hook_command,
+        "timeout": 3,
+        "status_message": "Recording Agent Bridge subagent fan-out",
+        "matcher": None,
+    },
+    {
+        "event": "SubagentStop",
+        "predicate": is_codex_subagent_stop_hook,
+        "builder": codex_subagent_stop_hook_command,
+        "timeout": 3,
+        "status_message": "Recording Agent Bridge subagent completion",
+        "matcher": None,
+    },
+    {
+        "event": "PermissionRequest",
+        "predicate": is_codex_permission_request_hook,
+        "builder": codex_permission_request_hook_command,
+        "timeout": 5,
+        "status_message": "Recording Agent Bridge permission request",
+        "matcher": None,
+    },
+)
+
+
+def _codex_hook_command_under_bridge_hooks(
+    command: str, bridge_hooks_dir: Path
+) -> bool:
+    """True iff `command`'s hook-script argument resolves under the canonical
+    `<bridge_home>/hooks/` directory with no symlink escape.
+
+    The rendered command is `<python_bin> <hook_script_path> [--format codex]`.
+    We re-shell-split it, take the second token (the hook script), realpath it,
+    and confirm it sits under the realpath of `<bridge_home>/hooks`. A token we
+    cannot parse / resolve is rejected (fail closed) — an unparseable command is
+    treated as NOT first-party.
+    """
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
+    if len(parts) < 2:
+        return False
+    script = parts[1]
+    try:
+        script_real = Path(script).resolve()  # noqa: raw-pathlib-controller-only — controller-owned canonical $BRIDGE_HOME/hooks scaffold; never an isolated-agent tree
+        hooks_real = bridge_hooks_dir.resolve()  # noqa: raw-pathlib-controller-only — controller-owned canonical $BRIDGE_HOME/hooks scaffold; never an isolated-agent tree
+    except (OSError, ValueError):
+        return False
+    return script_real == hooks_real or hooks_real in script_real.parents
+
+
+def codex_first_party_trust_targets(
+    hooks_path: Path, bridge_home: Path, python_bin: str
+) -> tuple[list[dict[str, str]], int]:
+    """Compute the (state_key, trusted_hash) pairs the bridge may pre-trust.
+
+    Reads the rendered Codex hooks.json at `hooks_path`, walks each event's
+    groups in file order, and for every command hook that (a) matches a known
+    first-party predicate, (b) whose command EXACTLY equals the bridge-generated
+    command for `bridge_home`/`python_bin`, and (c) whose hook script resolves
+    under canonical `<bridge_home>/hooks/`, builds the Codex state key
+    `<hooks_path>:<event_snake>:<group_index>:<handler_index>` and the matching
+    `trusted_hash`.
+
+    Returns `(targets, foreign_count)` where `targets` is the list of dicts
+    `{"key": ..., "hash": ...}` for first-party entries and `foreign_count` is
+    the number of command hooks that were NOT first-party (left untrusted). The
+    boundary is strict: an entry that matches a predicate but whose command does
+    not byte-match the current render (e.g. a stale path from a prior install,
+    or a different python_bin) is counted as foreign, not trusted.
+    """
+    bridge_home = bridge_home.expanduser()
+    # Use the SAME stable hooks dir the command builders route through
+    # (`_stable_hooks_dir`, #1934 transient-root fence). A render started from a
+    # transient `<bridge_home>` legitimately points its hook COMMANDS at the
+    # canonical `~/.agent-bridge/hooks`, so the first-party boundary must accept
+    # exactly that directory — not the raw `<bridge_home>/hooks`. Anchoring to
+    # the same chokepoint is what keeps "the command the renderer wrote" and
+    # "the directory we trust" identical.
+    bridge_hooks_dir = _stable_hooks_dir(bridge_home)
+    # Each inventory row carries the FULL render fingerprint: predicate +
+    # expected command + the EXACT event the bridge renders it under + the EXACT
+    # group matcher. The selection below requires all four to line up before
+    # trusting, so a bridge command planted at the wrong event/matcher position
+    # (e.g. the SessionStart command pasted into a PreToolUse `Bash(*)` group) is
+    # NOT trusted — it does not match any inventory row's event+matcher (codex
+    # review #2007 r1, Finding 1).
+    expected: list[dict[str, Any]] = [
+        {
+            "predicate": row["predicate"],
+            "command": row["builder"](bridge_home, python_bin),
+            "event": row["event"],
+            "matcher": row["matcher"],
+        }
+        for row in _CODEX_FIRST_PARTY_HOOKS
+    ]
+
+    settings = ensure_settings_root(hooks_path)
+    hooks_root = settings.get("hooks")
+    targets: list[dict[str, str]] = []
+    foreign = 0
+    key_prefix = str(hooks_path)
+    if not isinstance(hooks_root, dict):
+        return targets, foreign
+
+    for event_name, groups in hooks_root.items():
+        if not isinstance(groups, list):
+            continue
+        event_snake = codex_event_snake_case(event_name)
+        for group_index, group in enumerate(groups):
+            if not isinstance(group, dict):
+                continue
+            group_matcher = group.get("matcher")
+            group_matcher = str(group_matcher) if group_matcher is not None else None
+            hooks = group.get("hooks")
+            if not isinstance(hooks, list):
+                continue
+            for handler_index, hook in enumerate(hooks):
+                if not isinstance(hook, dict) or hook.get("type") != "command":
+                    continue
+                command = str(hook.get("command") or "")
+                matched = False
+                for row in expected:
+                    if not row["predicate"](command):
+                        continue
+                    # First-party requires ALL of: the predicate match, an EXACT
+                    # command match for the current bridge_home/python_bin, the
+                    # SAME event the bridge renders this hook under, the SAME
+                    # group matcher, AND a hook script under the canonical
+                    # <bridge_home>/hooks/ (no symlink escape). Any divergence
+                    # (different path / interpreter / event position / matcher /
+                    # symlink escape) is foreign.
+                    if (
+                        command == row["command"]
+                        and str(event_name) == row["event"]
+                        and group_matcher == row["matcher"]
+                        and _codex_hook_command_under_bridge_hooks(
+                            command, bridge_hooks_dir
+                        )
+                    ):
+                        identity = codex_hook_identity(
+                            event_name, hook, matcher=group_matcher
+                        )
+                        key = f"{key_prefix}:{event_snake}:{group_index}:{handler_index}"
+                        targets.append(
+                            {"key": key, "hash": codex_hook_trusted_hash(identity)}
+                        )
+                        matched = True
+                    break
+                if not matched:
+                    foreign += 1
+    return targets, foreign
+
+
+# ---------------------------------------------------------------------------
+# Narrow Codex config.toml `[hooks.state]` patcher.
+#
+# We do NOT round-trip the whole TOML through a serializer (no stdlib TOML
+# writer exists, and a third-party one would reorder/reformat operator data).
+# Instead we surgically edit only the `[hooks.state."<key>"]` tables, preserving
+# every other byte — comments, unknown fields, and any operator-set
+# `enabled = false`. For each target key we either replace the existing
+# `trusted_hash = "..."` line in place or append a new table. The file is
+# written under an flock via temp + atomic rename, then re-read and re-parsed to
+# verify every target hash landed (verify-after-write). Fail closed: any parse /
+# write / verify failure returns an error and writes NO trust.
+
+
+def _toml_strip_inline_comment(line: str) -> str:
+    """Drop a trailing TOML `#` comment that sits OUTSIDE a quoted string.
+
+    Used only for table-HEADER boundary detection — a header line like
+    `[hooks.state."k"]  # note` must still be recognized as a table boundary.
+    Walks the line tracking basic/literal string quotes so a `#` inside a
+    quoted key (legal in a TOML string) is not mistaken for a comment start.
+    Returns the line up to the first unquoted `#` (the value/structural part).
+    """
+    in_basic = False  # inside "..."
+    in_literal = False  # inside '...'
+    i = 0
+    n = len(line)
+    while i < n:
+        ch = line[i]
+        if in_basic:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == '"':
+                in_basic = False
+        elif in_literal:
+            if ch == "'":
+                in_literal = False
+        else:
+            if ch == '"':
+                in_basic = True
+            elif ch == "'":
+                in_literal = True
+            elif ch == "#":
+                return line[:i]
+        i += 1
+    return line
+
+
+def _codex_state_key_toml(key: str) -> str:
+    """Render the TOML table header for one hooks.state key.
+
+    Codex keys are basic-string-quoted: `[hooks.state."<key>"]`. The keys we
+    emit are bridge-controlled (absolute hook path + event + indices) and never
+    contain `"` or `\\`; we still escape defensively so a pathological path can
+    never break the table header.
+    """
+    escaped = key.replace("\\", "\\\\").replace('"', '\\"')
+    return f'[hooks.state."{escaped}"]'
+
+
+def codex_patch_config_trust(
+    config_path: Path, targets: list[dict[str, str]]
+) -> tuple[int, int, list[str]]:
+    """Set/replace `trusted_hash` for each target key in `config_path`.
+
+    Returns `(trusted, unchanged, errors)`:
+      - `trusted`   — keys whose `trusted_hash` was newly written or changed;
+      - `unchanged` — keys whose `trusted_hash` already matched;
+      - `errors`    — human-readable failure strings (empty == success).
+
+    Preserves all other bytes (comments, unknown fields, `enabled = false`),
+    serializes under an flock, stages the patched body to a temp file, VERIFIES
+    that temp (re-parse + every target hash present) BEFORE the atomic rename, and
+    only then replaces the live config — so a verify failure leaves the operator's
+    config.toml byte-for-byte untouched. No-op (returns (0, 0, [])) when `targets`
+    is empty.
+    """
+    if not targets:
+        return 0, 0, []
+
+    config_path = config_path.expanduser()
+    try:
+        config_path.parent.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — controller-owned $CODEX_HOME/.codex dir; never an isolated-agent tree
+    except OSError as exc:
+        return 0, 0, [f"cannot create config dir {config_path.parent}: {exc}"]
+
+    lock_path = config_path.with_name(config_path.name + ".agb-trust.lock")
+    import fcntl
+
+    try:
+        lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as exc:
+        return 0, 0, [f"cannot open trust lock {lock_path}: {exc}"]
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        return _codex_patch_config_trust_locked(config_path, targets)
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+
+
+def _codex_patch_config_trust_locked(
+    config_path: Path, targets: list[dict[str, str]]
+) -> tuple[int, int, list[str]]:
+    try:
+        raw = (
+            config_path.read_text(encoding="utf-8")  # noqa: raw-pathlib-controller-only — controller-owned $CODEX_HOME/config.toml; never an isolated-agent tree
+            if config_path.is_file()  # noqa: raw-pathlib-controller-only — controller-owned $CODEX_HOME/config.toml; never an isolated-agent tree
+            else ""
+        )
+    except OSError as exc:
+        return 0, 0, [f"cannot read {config_path}: {exc}"]
+
+    lines = raw.splitlines()
+    trusted = 0
+    unchanged = 0
+
+    for target in targets:
+        key = target["key"]
+        want_hash = target["hash"]
+        header = _codex_state_key_toml(key)
+        table_idx = None
+        for idx, line in enumerate(lines):
+            if _toml_strip_inline_comment(line).strip() == header:
+                table_idx = idx
+                break
+
+        if table_idx is None:
+            # Append a fresh table. Ensure a blank separator before it when the
+            # file is non-empty and does not already end blank.
+            if lines and lines[-1].strip() != "":
+                lines.append("")
+            lines.append(header)
+            lines.append(f'trusted_hash = "{want_hash}"')
+            trusted += 1
+            continue
+
+        # Replace the trusted_hash line within this table (up to the next table
+        # header or EOF). Preserve every other line — including enabled=false.
+        # The next-table boundary must ignore an inline comment after the
+        # header (`[other] # note`), or a trusted_hash in a SUBSEQUENT table
+        # could be mis-targeted (codex review #2007 r1, Finding 2).
+        hash_line_idx = None
+        for idx in range(table_idx + 1, len(lines)):
+            stripped = _toml_strip_inline_comment(lines[idx]).strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                break
+            if re.match(r"^\s*trusted_hash\s*=", lines[idx]):
+                hash_line_idx = idx
+                break
+        new_line = f'trusted_hash = "{want_hash}"'
+        if hash_line_idx is None:
+            lines.insert(table_idx + 1, new_line)
+            trusted += 1
+        elif lines[hash_line_idx].strip() == new_line.strip():
+            unchanged += 1
+        else:
+            lines[hash_line_idx] = new_line
+            trusted += 1
+
+    new_text = "\n".join(lines)
+    if raw.endswith("\n") or not raw:
+        new_text += "\n"
+
+    # Stage the patched body to a temp file and VERIFY it BEFORE replacing the
+    # live config — so a verify failure leaves the operator's config.toml
+    # byte-for-byte untouched (no mutate-then-discover; codex review #2007 r1,
+    # Finding 2). Only an in-temp file that re-parses with every target hash
+    # present is allowed to become the live file.
+    tmp_path = config_path.with_name(config_path.name + ".agb-trust.tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            handle.write(new_text)
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
+    except OSError as exc:
+        try:
+            tmp_path.unlink()  # noqa: raw-pathlib-controller-only — cleanup of our own temp file
+        except OSError:
+            pass
+        return 0, 0, [f"cannot write staged config {tmp_path}: {exc}"]
+
+    errors = _codex_verify_config_trust(tmp_path, targets)
+    if errors:
+        # Discard the staged temp; the live config is unchanged.
+        try:
+            tmp_path.unlink()  # noqa: raw-pathlib-controller-only — cleanup of our own temp file
+        except OSError:
+            pass
+        return 0, 0, errors
+
+    try:
+        os.replace(tmp_path, config_path)
+    except OSError as exc:
+        try:
+            tmp_path.unlink()  # noqa: raw-pathlib-controller-only — cleanup of our own temp file
+        except OSError:
+            pass
+        return 0, 0, [f"cannot write {config_path}: {exc}"]
+
+    return trusted, unchanged, []
+
+
+def _codex_verify_config_trust(
+    config_path: Path, targets: list[dict[str, str]]
+) -> list[str]:
+    """Re-read + re-parse the patched config and confirm every target hash
+    landed. Returns a list of failure strings (empty == verified)."""
+    try:
+        raw = config_path.read_text(encoding="utf-8")  # noqa: raw-pathlib-controller-only — controller-owned $CODEX_HOME/config.toml; never an isolated-agent tree
+    except OSError as exc:
+        return [f"verify: cannot re-read {config_path}: {exc}"]
+
+    state: dict[str, Any] = {}
+    try:
+        import tomllib  # py311+
+
+        parsed = tomllib.loads(raw)
+        if isinstance(parsed, dict):
+            hooks = parsed.get("hooks")
+            if isinstance(hooks, dict) and isinstance(hooks.get("state"), dict):
+                state = hooks["state"]
+    except ModuleNotFoundError:
+        state = _codex_scan_state_hashes(raw)
+    except Exception as exc:  # noqa: BLE001 — any TOML parse error is a verify failure
+        return [f"verify: cannot parse patched {config_path}: {exc}"]
+
+    errors: list[str] = []
+    for target in targets:
+        entry = state.get(target["key"])
+        got = entry.get("trusted_hash") if isinstance(entry, dict) else entry
+        if got != target["hash"]:
+            errors.append(
+                f"verify: key {target['key']} hash {got!r} != expected {target['hash']!r}"
+            )
+    return errors
+
+
+def _codex_scan_state_hashes(raw: str) -> dict[str, dict[str, str]]:
+    """py<3.11 fallback: line-scan `[hooks.state."<key>"]` tables for
+    `trusted_hash`. Conservative — only positively-parsed tables are returned.
+
+    Each line is stripped of any unquoted trailing `#` comment before matching
+    so a `[hooks.state."k"] # note` header is still recognized (codex review
+    #2007 r1, Finding 2 — the verify fallback must not miss a commented header)."""
+    state: dict[str, dict[str, str]] = {}
+    header_re = re.compile(r'^\s*\[hooks\.state\."(.+)"\]\s*$')
+    next_table = re.compile(r"^\s*\[")
+    hash_re = re.compile(r'^\s*trusted_hash\s*=\s*"([^"]*)"\s*$')
+    current_key = None
+    for raw_line in raw.splitlines():
+        line = _toml_strip_inline_comment(raw_line)
+        m = header_re.match(line)
+        if m:
+            current_key = m.group(1).replace('\\"', '"').replace("\\\\", "\\")
+            state.setdefault(current_key, {})
+            continue
+        if current_key is not None:
+            if next_table.match(line):
+                current_key = None
+                continue
+            hm = hash_re.match(line)
+            if hm:
+                state[current_key]["trusted_hash"] = hm.group(1)
+    return state
+
+
+def cmd_ensure_codex_hook_trust(args: argparse.Namespace) -> int:
+    """Pre-trust the bridge's own first-party Codex hooks in the Codex config.
+
+    Computes the Codex-compatible `trusted_hash` for every first-party bridge
+    hook in `--codex-hooks-file` and patches `[hooks.state]` in
+    `--codex-config-file` so the managed launch never wedges at Codex's
+    hook-trust gate. STRICT first-party boundary + fail-closed: foreign entries
+    are skipped (not an error), and a real write/verify failure returns nonzero
+    while writing NO trust.
+
+    Output fields (shell-parseable with --format shell):
+      CODEX_TRUST_HOOKS_FILE / CODEX_TRUST_CONFIG_FILE
+      CODEX_TRUST_TRUSTED / CODEX_TRUST_UNCHANGED / CODEX_TRUST_SKIPPED
+      CODEX_TRUST_FOREIGN / CODEX_TRUST_STATUS (ok|nochange|skipped|error)
+    """
+    hooks_path = Path(args.codex_hooks_file).expanduser()
+    config_path = Path(args.codex_config_file).expanduser()
+    bridge_home = Path(args.bridge_home).expanduser()
+    python_bin = args.python_bin or shutil.which("python3") or "/usr/bin/python3"
+
+    skipped_reason = ""
+    targets: list[dict[str, str]] = []
+    foreign = 0
+    errors: list[str] = []
+    trusted = 0
+    unchanged = 0
+
+    if not hooks_path.is_file():  # noqa: raw-pathlib-controller-only — controller-owned codex hooks.json; never an isolated-agent tree
+        # Nothing rendered yet — nothing to pre-trust. Not an error: the launch
+        # proceeds and the detector covers any prompt.
+        skipped_reason = "hooks-file-missing"
+    else:
+        try:
+            targets, foreign = codex_first_party_trust_targets(
+                hooks_path, bridge_home, python_bin
+            )
+        except Exception as exc:  # noqa: BLE001 — fail closed on any inventory error
+            errors = [f"inventory: {exc}"]
+
+    if not errors and not skipped_reason and targets:
+        trusted, unchanged, errors = codex_patch_config_trust(config_path, targets)
+
+    if errors:
+        status = "error"
+    elif skipped_reason:
+        status = "skipped"
+    elif not targets:
+        status = "skipped"
+        skipped_reason = skipped_reason or "no-first-party-hooks"
+    elif trusted:
+        status = "ok"
+    else:
+        status = "nochange"
+
+    payload = {
+        "CODEX_TRUST_HOOKS_FILE": str(hooks_path),
+        "CODEX_TRUST_CONFIG_FILE": str(config_path),
+        "CODEX_TRUST_TRUSTED": str(trusted),
+        "CODEX_TRUST_UNCHANGED": str(unchanged),
+        "CODEX_TRUST_SKIPPED": skipped_reason,
+        "CODEX_TRUST_FOREIGN": str(foreign),
+        "CODEX_TRUST_STATUS": status,
+    }
+
+    if errors:
+        # Fail-closed audit/warn line on stderr so the start/upgrade log can
+        # surface it without polluting the shell-parseable stdout fields.
+        sys.stderr.write(
+            "[warn] bridge-hooks: codex hook pretrust could not complete for "
+            f"{config_path} — leaving hooks UNtrusted for the detector to "
+            f"surface ({'; '.join(errors)})\n"
+        )
+
+    if args.format == "shell":
+        for key, value in payload.items():
+            print(shell_line(key, value))
+    else:
+        print(f"hooks_file: {payload['CODEX_TRUST_HOOKS_FILE']}")
+        print(f"config_file: {payload['CODEX_TRUST_CONFIG_FILE']}")
+        print(f"status: {status}")
+        print(f"trusted: {trusted}")
+        print(f"unchanged: {unchanged}")
+        print(f"foreign: {foreign}")
+        if skipped_reason:
+            print(f"skipped: {skipped_reason}")
+
+    return 1 if errors else 0
 
 
 def cmd_ensure_codex_hooks(args: argparse.Namespace) -> int:
@@ -3392,6 +4069,41 @@ def _patch_hud_command(cmd: str, tap_path: str) -> str:
     return tap_prefix + cmd
 
 
+def _operator_global_status_line_command(path_arg: Any) -> str:
+    """Return the operator-global `statusLine.command`, or "" when none.
+
+    Reads the operator's system-global `~/.claude/settings.json` (resolved in
+    the shell via `bridge_agent_operator_home_dir`, the SAME #11901 inheritance
+    resolver the shared renderer uses) and returns the renderer command string.
+    Renderer-agnostic: ANY non-empty `statusLine.command` is returned verbatim
+    (claude-hud, ccstatusline, a custom script — no plugin-name knowledge).
+
+    Defensive by contract (#1961): an empty/missing path, an unreadable or
+    malformed file, a non-dict payload, an absent/non-dict `statusLine`, or a
+    non-string/empty `command` all collapse to "" so the empty-slot caller
+    degrades to the headless standalone tap exactly as before.
+    """
+    if not isinstance(path_arg, str) or not path_arg.strip():
+        return ""
+    try:
+        # `expanduser()` can raise RuntimeError ("Can't determine home
+        # directory") / ValueError on a `~`-prefixed path with no resolvable
+        # home; load_json raises OSError / JSONDecodeError. Catch them all so a
+        # bad operator-global path always degrades to the standalone tap.
+        payload = load_json(Path(path_arg).expanduser())
+    except (OSError, json.JSONDecodeError, RuntimeError, ValueError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    sl = payload.get("statusLine")
+    if not isinstance(sl, dict):
+        return ""
+    cmd = sl.get("command", "")
+    if not isinstance(cmd, str) or not cmd.strip():
+        return ""
+    return cmd
+
+
 def cmd_ensure_hud_usage_tap(args: argparse.Namespace) -> int:
     """Patch a HUD statusLine command to pipe through hud-usage-tap.py.
 
@@ -3433,13 +4145,41 @@ def cmd_ensure_hud_usage_tap(args: argparse.Namespace) -> int:
             print("hud_usage_tap: present")
         return 0
 
-    # Empty statusLine slot (absent / {} / empty command): install the tap
-    # standalone. Only a genuinely EMPTY slot qualifies — a non-dict
-    # statusLine or a non-string command is unknown config we must not
+    # Empty statusLine slot (absent / {} / empty command): the agent has no
+    # per-agent renderer of its own. Only a genuinely EMPTY slot qualifies — a
+    # non-dict statusLine or a non-string command is unknown config we must not
     # clobber (handled by the no-hud branch below).
     if sl is None or (sl_is_dict and isinstance(raw_cmd, str) and not cmd.strip()):
         python_bin = getattr(args, "python_bin", None) or "python3"
-        installed = f"{python_bin} {shlex.quote(tap_path)} > /dev/null"
+        # #1961 (display-only): when the operator has a non-empty user-global
+        # statusLine renderer, compose `tap | <that renderer>` instead of the
+        # blank standalone tap, so an operator who installed a status display
+        # (claude-hud, ccstatusline, a custom script — renderer-agnostic, no
+        # plugin-name knowledge) actually sees it inside the agent pane while
+        # the bridge keeps its usage accounting. statusLine is display-only:
+        # worst case is a cosmetic status bar, and it runs the operator's own
+        # command in the operator's own agent. Behavior/security keys (hooks /
+        # permissions / env / credentials) stay out of scope (#1964, v0.17).
+        renderer_cmd = _operator_global_status_line_command(
+            getattr(args, "operator_global_settings_file", "")
+        )
+        if renderer_cmd:
+            # If the operator already hand-composed the tap into their global
+            # renderer, install it as-is (no double-prepend); otherwise insert
+            # the tap before the renderer's exec (or generically prepend).
+            if _hud_tap_present(renderer_cmd):
+                installed = renderer_cmd
+            else:
+                installed = _patch_hud_command(renderer_cmd, tap_path)
+            note = (
+                "hud_usage_tap: installed (statusLine was empty; tap composed "
+                "with operator-global renderer)"
+            )
+        else:
+            installed = f"{python_bin} {shlex.quote(tap_path)} > /dev/null"
+            note = (
+                "hud_usage_tap: installed (statusLine was empty; tap installed standalone)"
+            )
         settings["statusLine"] = {"type": "command", "command": installed}
         save_json(settings_path, settings)
         payload = {
@@ -3451,7 +4191,7 @@ def cmd_ensure_hud_usage_tap(args: argparse.Namespace) -> int:
         }
         print_payload(payload, args.format)
         if args.format != "shell":
-            print("hud_usage_tap: installed (statusLine was empty; tap installed standalone)")
+            print(note)
         return 0
 
     if not sl_is_dict or not isinstance(raw_cmd, str) or not _is_hud_status_line(cmd):
@@ -3753,6 +4493,20 @@ def build_parser() -> argparse.ArgumentParser:
     status_codex_parser.add_argument("--format", choices=("text", "shell"), default="text")
     status_codex_parser.set_defaults(handler=cmd_status_codex_hooks)
 
+    # Issue #2007: pre-trust the bridge's own first-party Codex hooks so a
+    # hook-changing upgrade never wedges a managed Codex agent at the startup
+    # hook-trust gate. STRICT first-party boundary + fail-closed (never
+    # --dangerously-bypass-hook-trust). Companion of the #1992 detector floor.
+    ensure_codex_trust_parser = subparsers.add_parser("ensure-codex-hook-trust")
+    ensure_codex_trust_parser.add_argument("--codex-hooks-file", required=True)
+    ensure_codex_trust_parser.add_argument("--codex-config-file", required=True)
+    ensure_codex_trust_parser.add_argument("--bridge-home", required=True)
+    ensure_codex_trust_parser.add_argument("--python-bin")
+    ensure_codex_trust_parser.add_argument(
+        "--format", choices=("text", "shell"), default="text"
+    )
+    ensure_codex_trust_parser.set_defaults(handler=cmd_ensure_codex_hook_trust)
+
     # Issue #1899: detect (read-only) whether a dynamic Codex agent's project-
     # local <workdir>/.codex/hooks.json will actually run, given Codex project
     # trust in the operator-global config.toml. Reports; never establishes trust.
@@ -3869,6 +4623,11 @@ def build_parser() -> argparse.ArgumentParser:
     hud_tap_ensure_parser.add_argument("--settings-file")
     hud_tap_ensure_parser.add_argument("--bridge-home", required=True)
     hud_tap_ensure_parser.add_argument("--python-bin", required=True)
+    hud_tap_ensure_parser.add_argument(
+        "--operator-global-settings-file",
+        default="",
+        help="Operator's system-global ~/.claude/settings.json (resolved in the shell via bridge_agent_operator_home_dir, same #11901 resolver). #1961 display-only: when the per-agent statusLine slot is EMPTY and the operator set a non-empty global statusLine renderer, the tap is composed as `tap | <renderer>` instead of installed standalone, so an operator-installed status display (claude-hud / ccstatusline / custom — renderer-agnostic) renders in the agent pane. Empty / missing / unreadable / non-object / no statusLine => fail-safe blank standalone tap (pre-#1961 behavior).",
+    )
     hud_tap_ensure_parser.add_argument(
         "--format", choices=("text", "shell"), default="text"
     )

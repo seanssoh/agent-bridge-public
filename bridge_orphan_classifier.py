@@ -191,7 +191,137 @@ def samefiles_registered_agent(
     return None
 
 
+def casefold_registered_agent(
+    candidate: Path,
+    name: str,
+    home_root: Path,
+    known: set[str],
+) -> str | None:
+    """Return the registered id whose name is a case-variant of `candidate`'s
+    basename, but ONLY when the filesystem proves the collision (Issue #1982).
+
+    The `name in known` fast-path in `_classify_child` is a case-SENSITIVE set
+    membership. On a case-INSENSITIVE volume (macOS APFS default) an on-disk
+    `agents/FOO-BAR` for a registered id `foo-bar` misses that fast-path, and
+    the `samefiles_registered_agent` fallback cannot rescue it when the agent's
+    home was migrated to a parallel tree (`data/agents/<id>/home`, a different
+    inode). This shares the inode-aware, case-folding, fail-safe APPROACH of
+    the interactive retire guard (`bridge-agent.sh:6477` / #598 Track 2's
+    `retire-samefile-guard.py`) so the GC stops mis-orphaning a live agent's
+    case-variant dir.
+
+    NOTE: the comparison BASE differs from the retire guard, which compares the
+    candidate against each registered agent's resolved `default_home`/`workdir`
+    (`data/agents/<id>/home` on a v2 install). This classifier compares against
+    `home_root/<id>` — the sibling the case-SENSITIVE `name in known` fast-path
+    would itself keep. That is the right base HERE (the candidate is a child of
+    `home_root`, and the asymmetry being fixed is purely the fast-path's case
+    sensitivity), but the two surfaces can still disagree for a dir that is NOT
+    under `home_root`; full cross-surface alignment is a follow-up, not this fix.
+
+    Filesystem-aware, NOT a bare string compare: a case-insensitive name match
+    is confirmed only when `os.path.samefile(candidate, home_root/<id>)` proves
+    the candidate IS the same on-disk directory the registered id occupies
+    under the home root. On a case-SENSITIVE volume `home_root/foo-bar` is a
+    different inode from (or absent next to) `home_root/FOO-BAR`, so the probe
+    fails and genuinely-distinct dirs are NEVER collapsed.
+
+    Three-state return, fail SAFE toward KEEP (never mis-orphan a case-variant
+    of a live registered agent):
+      * the matching agent id  — a case-insensitive name match the filesystem
+                                 confirms is the same dir → KEEP as registered;
+      * `_SAMEFILE_INDETERMINATE` — a case-insensitive name candidate exists
+                                 but the confirming `samefile`/lstat probe
+                                 raised (identity UNPROVEN) → KEEP, fail-safe;
+      * `None` — no case-insensitive name match, OR the probe PROVED the
+                 candidate is a genuinely different dir (case-sensitive FS).
+    """
+    if not name:
+        return None
+    folded = name.casefold()
+    # An exact-case hit is the caller's fast-path; only act on case-VARIANTS.
+    indeterminate = False
+    for agent_id in known:
+        if agent_id == name:
+            continue
+        if agent_id.casefold() != folded:
+            continue
+        sibling = home_root / agent_id
+        try:
+            if os.path.samefile(candidate, sibling):
+                return agent_id
+        except OSError:
+            # The case-insensitive name matches a registered id but the
+            # confirming probe raised. On a case-insensitive FS the sibling
+            # would be the SAME dir as the candidate, so a raised probe here
+            # could be MASKING a live-agent collision → fail safe (KEEP).
+            # Only treat as a clean no-match when the sibling provably does
+            # not exist (a case-sensitive FS where `home_root/<id>` is absent).
+            if _path_lexists(candidate) and _path_lexists(sibling):
+                indeterminate = True
+            continue
+    if indeterminate:
+        return _SAMEFILE_INDETERMINATE
+    return None
+
+
 # --- Part B: generic resolved-symlink-target keep-set ----------------------
+
+# Real (non-symlink) subdirectory basenames the keep-set walk PRUNES — heavy
+# content trees inside an agent home (Issue #1966). The scoped trees are pruned
+# only at their FULL real Claude path (`.claude/projects` transcripts,
+# `.claude/plugins/cache` plugin cache) — anchored on the whole parent-chain
+# tail, NOT just the immediate parent basename, so an unrelated user dir like
+# `<agent>/x/plugins/cache` (whose parent is also `plugins` but which is NOT
+# `.claude/plugins/cache`) is still walked and its symlinks still counted.
+#
+# INVARIANT: the prune is ORPHAN-CLASSIFICATION-PRESERVING for every BRIDGE
+# keep relationship and for the live fleet — NOT "keep-set RESULT byte-
+# identical." On real installs the keep-set is NOT byte-identical: npm /
+# plugin-install creates `.bin` shims (e.g. `<home>/.claude/plugins/cache/
+# <plugin>/.../node_modules/.bin/tsc -> ../typescript/bin/tsc`) INSIDE these
+# pruned trees whose realpath lands under the home root — the old unpruned walk
+# recorded them; the pruned walk drops them. Dropping such keep-set members is
+# SAFE for the following reasons:
+#   1. A dropped keep-set member only changes a VERDICT if some direct child of
+#      the home root was kept SOLELY because its realpath equalled (or contained)
+#      that member. The npm `.bin` shim case is the common one: its target lives
+#      inside the SAME registered home that holds the shim, so the direct child
+#      containing it short-circuits to KIND_REGISTERED (basename / samefile match
+#      in `_classify_child`) BEFORE the keep-set loop is reached — its verdict is
+#      unchanged regardless of the keep-set.
+#   2. The prune can only REMOVE keep-set members → it can only move a candidate
+#      kept -> orphan, never orphan -> kept → it can NEVER HIDE a real orphan,
+#      and never breaks a kept dir's protection in the orphan-GC-unsafe direction.
+#   3. The bridge's own keep-links whose target resolves under the home root are
+#      SHALLOW and NOT pruned (`agents/shared` -> `../shared`, `agents/<a>/<DOC>`
+#      -> `../shared/<DOC>` via bridge-docs.py's AGENT_SHARED_LINKS), so the
+#      generic `referenced-symlink-target` keep of `agents/shared` (and any
+#      future non-`shared`-named bridge target) is unaffected. `.claude/skills/
+#      <skill>` links target the runtime `.claude/` root or the source checkout
+#      (OUTSIDE the home root) so they were never keep-set members anyway, and
+#      `.claude/skills` is deliberately NOT pruned.
+# The ONE verdict that CAN change (codex review, #1966): an UNREGISTERED top-
+# level dir protected SOLELY by a non-bridge symlink nested inside ANY pruned
+# content tree (its own, OR another registered agent's `node_modules`/`.git`/
+# `.claude/plugins/cache` — e.g. a stray plugin artifact symlinking a sibling)
+# flips `referenced-symlink-target -> orphan`. This is INTENTIONAL and safe:
+# such protection is spurious (the keep-set exists to protect bridge doc-link
+# targets like `agents/shared`, not dirs a plugin's node_modules happens to
+# point at), the flip is strictly one-directional (kept -> orphan, never the
+# reverse, so it never hides a real orphan), and the affected child is then an
+# orphan-GC CANDIDATE only — the GC still keep+notifies on any indeterminacy.
+# No live instances exist. The 867k `os.path.islink` on a long-lived host was
+# dominated by plugin-cache node_modules + transcripts; pruning collapses it.
+_PRUNE_NAMES_ANYWHERE = frozenset({"node_modules", ".git"})
+# basename -> the required parent-directory chain (immediate parent first,
+# walking up) for the scoped prune. The dir is pruned only when its ancestor
+# basenames match this chain exactly, anchoring each tree at its real `.claude`
+# location.
+_PRUNE_SCOPED_PARENT_CHAINS = {
+    "projects": (".claude",),            # .claude/projects (Claude transcripts)
+    "cache": ("plugins", ".claude"),     # .claude/plugins/cache (plugin cache)
+}
 
 
 def _safe_realpath(path: Path) -> str | None:
@@ -199,6 +329,19 @@ def _safe_realpath(path: Path) -> str | None:
         return os.path.realpath(path)
     except OSError:
         return None
+
+
+def _record_symlink_target(full: str, home_root_real: str, out: set[str]) -> None:
+    target_real = _safe_realpath(Path(full))
+    if target_real is None:
+        return
+    # Containment: only record targets that live UNDER the home root (a symlink
+    # pointing outside `agents/` is irrelevant to the keep-set — we only ever
+    # consider quarantining children of the home root).
+    if target_real == home_root_real or target_real.startswith(
+        home_root_real + os.sep
+    ):
+        out.add(target_real)
 
 
 def _enumerate_symlink_targets_under_root(
@@ -209,39 +352,84 @@ def _enumerate_symlink_targets_under_root(
     """Walk `tree`, resolve every symlink it contains, and record each
     resolved target whose realpath is under `home_root_real` into `out`.
 
+    Hand-rolled `os.scandir` recursion (Issue #1966): reads each entry's
+    symlink-ness from the cached `DirEntry.is_symlink()` (the directory read
+    already stat'd the entry — no redundant per-entry `os.path.islink` lstat),
+    and PRUNES the heavy non-symlink content trees (`node_modules`, `.git`,
+    `.claude/{projects,cache}`). A symlinked subdirectory is still RESOLVED as a
+    target (matching the prior `os.walk` behavior where symlinked dirs appeared
+    in `dirs`) — it is just not descended into.
+
+    Classification-preserving for every BRIDGE keep, not keep-set-byte-identical:
+    npm `.bin` shims buried in `node_modules` under a REGISTERED home ARE dropped
+    from the keep-set, but that changes no verdict (the registered child that
+    holds them short-circuits to KIND_REGISTERED before the keep-set is
+    consulted). The prune can only ever move a candidate kept -> orphan, never
+    orphan -> kept, so it never hides a real orphan; the only verdict it CAN flip
+    is an unregistered dir protected SOLELY by a non-bridge symlink nested inside
+    a pruned tree (intentional). See the `_PRUNE_*` constants block above for the
+    full safety argument.
+
     Best-effort: a symlink we cannot resolve safely contributes nothing (so
     the candidate it might have protected stays an orphan ONLY if no OTHER
     kept tree references it — and an unresolvable link is itself never acted
-    on because it is not a child of the home root we move). os.walk swallows
-    per-entry errors via `onerror`.
+    on because it is not a child of the home root we move). Every fs probe
+    swallows its own OSError so a single unreadable entry never aborts the walk.
     """
     if not tree.exists():
         return
+    _scan_dir_for_symlink_targets(str(tree), home_root_real, out)
+
+
+def _scan_dir_for_symlink_targets(
+    root: str,
+    home_root_real: str,
+    out: set[str],
+) -> None:
     try:
-        walker = os.walk(tree, followlinks=False, onerror=lambda _e: None)
+        scanner = os.scandir(root)
     except OSError:
         return
-    for root, dirs, files in walker:
-        # Symlinked subdirectories appear in `dirs` (os.walk does not descend
-        # into them when followlinks=False); resolve them as targets too.
-        for name in list(dirs) + list(files):
-            full = os.path.join(root, name)
+    with scanner:
+        for entry in scanner:
             try:
-                if not os.path.islink(full):
-                    continue
+                is_link = entry.is_symlink()
             except OSError:
                 continue
-            target_real = _safe_realpath(Path(full))
-            if target_real is None:
+            if is_link:
+                # Resolve the symlink (a file OR a symlinked subdir) as a
+                # target; do NOT descend into it (followlinks=False semantics).
+                _record_symlink_target(entry.path, home_root_real, out)
                 continue
-            # Containment: only record targets that live UNDER the home root
-            # (a symlink pointing outside `agents/` is irrelevant to the
-            # keep-set — we only ever consider quarantining children of the
-            # home root).
-            if target_real == home_root_real or target_real.startswith(
-                home_root_real + os.sep
-            ):
-                out.add(target_real)
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+            except OSError:
+                continue
+            if not is_dir:
+                continue
+            name = entry.name
+            if name in _PRUNE_NAMES_ANYWHERE:
+                continue
+            if _scoped_prune_matches(name, root):
+                continue
+            _scan_dir_for_symlink_targets(entry.path, home_root_real, out)
+
+
+def _scoped_prune_matches(name: str, parent_dir: str) -> bool:
+    """True if a dir named `name` whose parent is `parent_dir` is one of the
+    scoped prune trees, matched on the FULL parent chain (not just the immediate
+    parent basename). Anchors `cache` at `.claude/plugins/cache` and `projects`
+    at `.claude/projects` so an unrelated `*/plugins/cache` is NOT pruned.
+    """
+    chain = _PRUNE_SCOPED_PARENT_CHAINS.get(name)
+    if chain is None:
+        return False
+    cur = parent_dir
+    for expected in chain:
+        if os.path.basename(cur) != expected:
+            return False
+        cur = os.path.dirname(cur)
+    return True
 
 
 def referenced_symlink_target_realpaths(
@@ -368,7 +556,7 @@ def classify_agent_home_root(
         try:
             results.append(
                 _classify_child(
-                    child, name, known, registered_dirs, keepset
+                    child, name, known, registered_dirs, keepset, home_root
                 )
             )
         except Exception as exc:  # noqa: BLE001 — classifier boundary, keep safe
@@ -391,6 +579,7 @@ def _classify_child(
     known: set[str],
     registered_dirs: list[tuple[str, str]],
     keepset: set[str],
+    home_root: Path,
 ) -> dict[str, Any]:
     base = {
         "name": name,
@@ -423,6 +612,30 @@ def _classify_child(
                 ),
             }
         return {**base, "kind": KIND_REGISTERED, "agent": identity}
+
+    # registered (case-variant): on a case-INSENSITIVE volume the candidate's
+    # basename may differ from a registered id ONLY in case (`agents/FOO-BAR`
+    # for registered `foo-bar`). The exact fast-path and the samefile fallback
+    # both miss when the home migrated to a parallel `data/agents/<id>/home`
+    # tree, so case-fold the name against the registry and CONFIRM the
+    # collision via samefile against `home_root/<id>` — sharing the inode-aware,
+    # fail-safe-toward-KEEP approach of the #598 retire guard
+    # (`bridge-agent.sh:6477`), though against a different base; see the
+    # `casefold_registered_agent` docstring (Issue #1982). Case-SENSITIVE
+    # volumes never reach a match here (the sibling probe fails), so
+    # genuinely-distinct dirs are not collapsed.
+    folded = casefold_registered_agent(child, name, home_root, known)
+    if folded is not None:
+        if folded == _SAMEFILE_INDETERMINATE:
+            return {
+                **base,
+                "kind": KIND_ORPHAN_UNVERIFIABLE,
+                "reason": (
+                    "name case-matches a registered agent but the "
+                    "filesystem identity probe failed; kept (fail-safe)"
+                ),
+            }
+        return {**base, "kind": KIND_REGISTERED, "agent": folded}
 
     # referenced-symlink-target (Part B): the candidate IS, or CONTAINS, a
     # target referenced by a kept tree's symlink. A kept symlink usually points

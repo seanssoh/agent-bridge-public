@@ -292,6 +292,11 @@ DEDUP_WANTED_HELPERS=(
   bridge_daemon_nudge_state_file
   bridge_daemon_compute_nudge_fingerprint
   bridge_daemon_nudge_task_ts_var
+  # Issue #1973 Track B: should_skip / record_nudge now consult the
+  # capped-exponential backoff helpers; extract them or the sourced
+  # functions abort at runtime (command not found).
+  bridge_daemon_nudge_task_field_var
+  bridge_daemon_nudge_backoff_delay
   bridge_daemon_nudge_dedup_load
   bridge_daemon_nudge_dedup_reset_scope
   bridge_daemon_should_skip_nudge
@@ -492,15 +497,18 @@ smoke_run "T4b same-agent different-task → should_skip returns OK (fire)" : ; 
   unset BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS
 }
 
-# T4c: window expiry — after the redelivery window slides past, the same
-# (agent, task) is eligible again. Uses a real 2s sleep against a 1s
-# redelivery window so the elapsed-time math is exercised, not faked.
-# The window is 2s (not 1s): with a 1s window the record's `now=N` and an
-# immediate recheck at `now=N+1` would compute `(( 1 < 1 ))` = not-skip and
-# flake. 2s gives the in-window recheck a full second of slack; the expiry
-# sleep is then 3s (> 2s window + 1s clock granularity). The immediate
-# in-window skip is already pinned by T4a, so the load-bearing assertion
-# here is the post-expiry not-skip.
+# T4c: window expiry — after the per-task backoff window slides past, the
+# same (agent, task) is eligible again. Exercises real elapsed-time math,
+# not faked. ★Issue #1973 Track B: the FIRST record advances attempts 0->1,
+# so the recorded NUDGE_TASK_NEXT_TS = now + backoff_delay(1) = base<<1 =
+# base*2 (the blessed cadence pinned by 1973b B1 "next-window after attempt1
+# = 120s (base*2)"). So with base=BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS=2
+# the first re-nudge window is 4s, NOT 2s — the should_skip per-task path
+# consults NEXT_TS, which overrides the flat redelivery window. The expiry
+# sleep is therefore 5s (> 4s window + 1s clock granularity); a 3s sleep
+# stays INSIDE the 4s backoff window and still (correctly) skips. The
+# immediate in-window skip is already pinned by T4a, so the load-bearing
+# assertion here is the post-expiry not-skip.
 smoke_run "T4c window expiry → should_skip returns OK after window slides past" : ; {
   : >"$AUDIT_LOG"
   rm -f "$(bridge_daemon_nudge_state_file agent-t4c)"
@@ -513,8 +521,9 @@ smoke_run "T4c window expiry → should_skip returns OK after window slides past
   else
     smoke_fail "T4c should_skip must SKIP immediately after record (inside 2s window)"
   fi
-  # Wait past the 2s redelivery window (3s = window + 1s granularity).
-  sleep 3
+  # Wait past the first-record backoff window: base<<1 = 2*2 = 4s
+  # (Track B; see header). 5s = 4s window + 1s clock granularity.
+  sleep 5
   if bridge_daemon_should_skip_nudge "agent-t4c" "$fp" "1"; then
     smoke_fail "T4c should_skip must NOT skip after the redelivery window expires"
   else
@@ -666,12 +675,15 @@ smoke_run "T5 bridge-status renders nudge-recheck line + JSON counter" : ; {
   python3 "$REPO_ROOT/bridge-queue.py" cancel "$TASK_ID" --actor requester >/dev/null
   unset TASK_ID
 
+  # The nudge-recheck line is an audit-parse analytic deferred behind
+  # `--full` (status-fast-default): the default human dashboard skips it,
+  # so the line only renders with `--full`. The JSON path below stays full.
   STATUS_OUT="$(python3 "$REPO_ROOT/bridge-status.py" \
     --roster-snapshot "$ROSTER_SNAPSHOT" \
     --db "$BRIDGE_TASK_DB" \
     --daemon-pid-file "$DAEMON_PID_FILE" \
     --bridge-state-dir "$BRIDGE_STATE_DIR" \
-    --audit-log "$AUDIT_LOG" 2>&1)" || smoke_fail "T5 bridge-status.py text render failed: $STATUS_OUT"
+    --audit-log "$AUDIT_LOG" --full 2>&1)" || smoke_fail "T5 bridge-status.py text render failed: $STATUS_OUT"
   smoke_assert_contains "$STATUS_OUT" "nudge-recheck" "T5 dashboard renders nudge-recheck line"
   smoke_assert_contains "$STATUS_OUT" "drop_total=2" "T5 drop_total counter correct (both legacy + stage2)"
   smoke_assert_contains "$STATUS_OUT" "drop_stage2_used=1" "T5 stage2_used counter correct (only post-fix shape)"

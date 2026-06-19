@@ -168,8 +168,12 @@ else
 fi
 
 EXTRACTED="$TMP_DIR/extracted-functions.sh"
+# Issue #1973 Track B: the escalation now rate-limits its refresh on a
+# capped exponential backoff, so it calls bridge_daemon_nudge_backoff_delay
+# — extract that helper too or the sourced function aborts at runtime.
 python3 "$REPO_ROOT/scripts/smoke/helpers/extract-shell-fn.py" "$DAEMON" \
   bridge_daemon_attached_human_followup_marker_file \
+  bridge_daemon_nudge_backoff_delay \
   bridge_daemon_attached_human_followup_escalate >"$EXTRACTED"
 
 BRIDGE_STATE_DIR="$TMP_DIR/state"

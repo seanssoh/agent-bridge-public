@@ -1664,7 +1664,13 @@ def render_dashboard(args: argparse.Namespace) -> str:
     # Issue #1803: count unowned `agents/<name>` homes (the SSOT classifier's
     # `orphan-agent-dir` verdict) so accumulation is visible on the dashboard
     # before it grows back to triple digits. Same number the daemon GC acts on.
-    orphan_agent_dirs = orphan_agent_dir_count(roster, args.bridge_home or "")
+    # Deferred behind `--full`: the symlink keep-set fs-walk is the dominant
+    # cost on a long-lived host. Skipped → flag stays quiet (same render as a
+    # clean host); `--full` computes the real count. The `--json` machine path
+    # (render_dashboard_json) always computes it.
+    orphan_agent_dirs = (
+        orphan_agent_dir_count(roster, args.bridge_home or "") if args.full else 0
+    )
     channel_warning_rows = [
         row
         for row in roster
@@ -1756,55 +1762,69 @@ def render_dashboard(args: argparse.Namespace) -> str:
         f"health warn>={fmt_age(int(datetime.now(timezone.utc).timestamp()) - args.stale_warn_seconds) if args.stale_warn_seconds > 0 else 'off'} "
         f"crit>={fmt_age(int(datetime.now(timezone.utc).timestamp()) - args.stale_critical_seconds) if args.stale_critical_seconds > 0 else 'off'}"
     )
-    # Issue #338 Track C — observability counter for the context-pressure
-    # analyzer. Hidden when the denominator is zero (no critical task in the
-    # rolling window, nothing to report); operators on healthy hosts should
-    # not see a noisy `0/0` line. When the denominator is non-zero the line
-    # always renders, even with `0` numerator, so an analyzer that just
-    # stopped mis-firing is visibly distinct from one that never has.
-    fp_window_days = max(1, int(args.fp_window_days))
-    fp_count, critical_count = context_pressure_fp_rate(args.audit_log, fp_window_days)
-    if critical_count > 0:
-        pct = int(round(100.0 * fp_count / critical_count))
+    # The four counters below each parse the full audit log (~1.1M lines on
+    # a long-lived host) or scan the filesystem. They are diagnostics, not
+    # the "current state" a quick `agb status` wants, so the default human
+    # dashboard skips them entirely (no compute, no render). `--full`
+    # restores them. The `--json` machine path always computes them
+    # (render_dashboard_json) so JSON consumers are never silently dropped.
+    if args.full:
+        # Issue #338 Track C — observability counter for the context-pressure
+        # analyzer. Hidden when the denominator is zero (no critical task in
+        # the rolling window, nothing to report); operators on healthy hosts
+        # should not see a noisy `0/0` line. When the denominator is non-zero
+        # the line always renders, even with `0` numerator, so an analyzer
+        # that just stopped mis-firing is visibly distinct from one that
+        # never has.
+        fp_window_days = max(1, int(args.fp_window_days))
+        fp_count, critical_count = context_pressure_fp_rate(args.audit_log, fp_window_days)
+        if critical_count > 0:
+            pct = int(round(100.0 * fp_count / critical_count))
+            lines.append(
+                f"context-pressure FP rate ({fp_window_days}d): "
+                f"{fp_count}/{critical_count} ({pct}%)"
+            )
+        # Issue #345 Track C — config-drift counter. Aggregates
+        # `cron_human_config_drift` and `channel_health_miss` audit rows over
+        # the rolling `--config-drift-window-days` window so operators see
+        # human-config drift without it polluting admin's queue.
+        drift_window_days = max(1, int(args.config_drift_window_days))
+        drift_count = config_drift_count(args.audit_log, drift_window_days)
+        if drift_count > 0:
+            lines.append(
+                f"config-drift ({drift_window_days}d): {drift_count}"
+            )
+        # Issue #1323 (v0.15.0-beta5-2 Track G follow-up) — nudge verify
+        # observability counters. Pre-fix the daemon's verify grace dropped
+        # an info-level log line per false positive and never surfaced; the
+        # operator was left guessing whether the agent was actually stalled.
+        # Render the rolling-window count when ANY of the underlying audit
+        # rows fired so a healthy host (zero of every signal) stays quiet.
+        nudge_window_days = max(1, int(args.nudge_recheck_window_days))
+        nudge_recheck = nudge_recheck_observability_counts(args.audit_log, nudge_window_days)
+        if any(v > 0 for v in nudge_recheck.values()):
+            lines.append(
+                f"nudge-recheck ({nudge_window_days}d): "
+                f"drop_total={nudge_recheck['nudge_drop_total']} "
+                f"drop_stage2_used={nudge_recheck['nudge_drop_stage2_used']} "
+                f"recheck_timeout={nudge_recheck['recheck_timeout_total']}"
+            )
+        # Issue #394: pending upgrade-conflict count. The dashboard threshold
+        # defaults to 1 (any pending file → warn); operators on chronically
+        # drift-heavy hosts can raise it via
+        # BRIDGE_UPGRADE_CONFLICT_WARN_THRESHOLD or the explicit CLI flag.
+        pending_conflict_threshold = max(1, int(args.upgrade_conflict_warn_threshold))
+        pending_conflicts = pending_upgrade_conflict_count(args.bridge_home or "")
+        if pending_conflicts >= pending_conflict_threshold:
+            lines.append(
+                f"WARNING: {pending_conflicts} pending upgrade-conflict file(s); "
+                "review with 'agent-bridge upgrade conflicts list'"
+            )
+    else:
         lines.append(
-            f"context-pressure FP rate ({fp_window_days}d): "
-            f"{fp_count}/{critical_count} ({pct}%)"
-        )
-    # Issue #345 Track C — config-drift counter. Aggregates
-    # `cron_human_config_drift` and `channel_health_miss` audit rows over
-    # the rolling `--config-drift-window-days` window so operators see
-    # human-config drift without it polluting admin's queue.
-    drift_window_days = max(1, int(args.config_drift_window_days))
-    drift_count = config_drift_count(args.audit_log, drift_window_days)
-    if drift_count > 0:
-        lines.append(
-            f"config-drift ({drift_window_days}d): {drift_count}"
-        )
-    # Issue #1323 (v0.15.0-beta5-2 Track G follow-up) — nudge verify
-    # observability counters. Pre-fix the daemon's verify grace dropped
-    # an info-level log line per false positive and never surfaced; the
-    # operator was left guessing whether the agent was actually stalled.
-    # Render the rolling-window count when ANY of the underlying audit
-    # rows fired so a healthy host (zero of every signal) stays quiet.
-    nudge_window_days = max(1, int(args.nudge_recheck_window_days))
-    nudge_recheck = nudge_recheck_observability_counts(args.audit_log, nudge_window_days)
-    if any(v > 0 for v in nudge_recheck.values()):
-        lines.append(
-            f"nudge-recheck ({nudge_window_days}d): "
-            f"drop_total={nudge_recheck['nudge_drop_total']} "
-            f"drop_stage2_used={nudge_recheck['nudge_drop_stage2_used']} "
-            f"recheck_timeout={nudge_recheck['recheck_timeout_total']}"
-        )
-    # Issue #394: pending upgrade-conflict count. The dashboard threshold
-    # defaults to 1 (any pending file → warn); operators on chronically
-    # drift-heavy hosts can raise it via
-    # BRIDGE_UPGRADE_CONFLICT_WARN_THRESHOLD or the explicit CLI flag.
-    pending_conflict_threshold = max(1, int(args.upgrade_conflict_warn_threshold))
-    pending_conflicts = pending_upgrade_conflict_count(args.bridge_home or "")
-    if pending_conflicts >= pending_conflict_threshold:
-        lines.append(
-            f"WARNING: {pending_conflicts} pending upgrade-conflict file(s); "
-            "review with 'agent-bridge upgrade conflicts list'"
+            "analytics deferred (context-pressure / config-drift / "
+            "nudge-recheck / upgrade-conflicts / orphan-dirs) — "
+            "run with --full"
         )
     lines.append("")
     lines.append("Agents")
@@ -2159,6 +2179,26 @@ def main() -> int:
         help="Max Plugin Liveness rows before truncating in the text view (default 12).",
     )
     parser.add_argument("--json", action="store_true")
+    # `agb status` ran the audit-full-parse / fs-walk analytics on EVERY
+    # human dashboard render — ~30s on a long-lived host (1.1M-line audit
+    # parse + symlink keep-set fs-walk + pending-conflict fs scan). Those
+    # are diagnostics, not the "current state" a quick status wants. The
+    # default text dashboard now skips them; `--full` (alias `--analytics`)
+    # restores them. The `--json` machine path is unaffected: it always
+    # emits the full analytics fields so existing JSON consumers stay
+    # correct.
+    parser.add_argument(
+        "--full",
+        "--analytics",
+        dest="full",
+        action="store_true",
+        help=(
+            "Compute and render the expensive audit-parse / fs-scan "
+            "analytics (context-pressure FP rate, config-drift, "
+            "nudge-recheck, pending upgrade-conflicts, orphan-agent-dirs). "
+            "Skipped by default so the human dashboard stays fast."
+        ),
+    )
     args = parser.parse_args()
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     if args.json:

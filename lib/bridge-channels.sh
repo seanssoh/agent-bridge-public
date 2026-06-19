@@ -94,6 +94,20 @@ bridge_channel_send_managed_message() {
     --bridge-state-dir "$BRIDGE_STATE_DIR"
     --format shell
   )
+  # #2005 (generalizes #1996): every managed-send adapter must read per-agent
+  # plugin state from the canonical `<workdir>/.<plugin>` dir that bridge-setup
+  # writes to — NOT the Python-derived `<bridge_home>/agents/<agent>/.<plugin>`,
+  # which diverges for every iso-v2 / BRIDGE_AGENT_WORKDIR / BRIDGE_DATA_ROOT
+  # agent and causes silent missing_credentials. bridge_plugin_channel_state_dir
+  # (lib/bridge-agents.sh) is the case-validated dispatch over the plugin name
+  # that resolves the bash SSOT; pass it through as --plugin-state-dir so the
+  # adapter never re-derives the workdir. Guard the empty case so a resolution
+  # miss does not pass an empty flag the adapter would fall back from anyway.
+  local plugin_state_dir=""
+  plugin_state_dir="$(bridge_plugin_channel_state_dir "$agent" "$plugin" 2>/dev/null || true)"
+  if [[ -n "$plugin_state_dir" ]]; then
+    args+=(--plugin-state-dir "$plugin_state_dir")
+  fi
   if [[ -n "$reply_to_message_id" ]]; then
     args+=(--reply-to-message-id "$reply_to_message_id")
   fi

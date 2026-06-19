@@ -68,17 +68,43 @@ bridge_start_effective_dev_channels_csv() {
 }
 
 bridge_start_should_send_onboarding_nudge() {
-  # Fresh-install nudge gate (see usage in main flow). Returns 0 only
-  # when the agent's SESSION-TYPE.md declares `Session Type: admin` AND
-  # `Onboarding State: pending`. Static-claude and dynamic agents are
-  # NOT nudged — they have no onboarding flow tied to first user msg.
+  # Fresh-install nudge gate (see usage in main flow). Returns 0 only on a
+  # GENUINE first-ever launch of an onboarding-pending admin:
+  #   * SESSION-TYPE.md declares `Session Type: admin`, AND
+  #   * `Onboarding State: pending`, AND
+  #   * this is NOT a `--replace` launch (REPLACE==0 — a replacement is never a
+  #     first-run onboarding prompt), AND
+  #   * no prior launch-history (`initial-inbox.started` marker absent — the
+  #     once-per-lifetime first-launch breadcrumb bridge-run.sh writes).
+  # Static-claude and dynamic agents are NOT nudged — they have no onboarding
+  # flow tied to the first user msg.
+  #
+  # Issue #2002 (defense-in-depth): before, `onboarding_state == pending` was
+  # the ONLY first-launch proxy. So if the state ever drifted back to `pending`
+  # (the #2004 stale-marker incident), every subsequent RESTART re-typed the
+  # canned onboarding prompt into an already-operational session. The two new
+  # gates make a restart safe even if the state has drifted: a replacement or a
+  # second-and-later launch (marker present) is never nudged. This does NOT
+  # suppress a genuine first launch — a newly-created admin has pending state,
+  # no initial-inbox marker, and is not a replace launch.
   local agent="$1"
+  local replace="${2:-0}"
   local home_dir
   home_dir="$(bridge_agent_workdir "$agent" 2>/dev/null || true)"
   [[ -d "$home_dir" ]] || return 1
   [[ -f "$home_dir/SESSION-TYPE.md" ]] || return 1
   grep -qE '^- Session Type:[[:space:]]*admin\b' "$home_dir/SESSION-TYPE.md" 2>/dev/null || return 1
-  [[ "$(bridge_agent_onboarding_state "$agent" 2>/dev/null || printf '')" == "pending" ]]
+  [[ "$(bridge_agent_onboarding_state "$agent" 2>/dev/null || printf '')" == "pending" ]] || return 1
+  # --replace is never a genuine first-run onboarding prompt — suppress even if
+  # the marker is somehow absent (a replacement re-creates an existing agent).
+  [[ "$replace" == "0" ]] || return 1
+  # Launch-history gate: a present initial-inbox marker means this agent has
+  # already had its first-ever launch, so any pending state now is drift, not a
+  # fresh install — do not re-type onboarding.
+  local marker_file=""
+  marker_file="$(bridge_agent_initial_inbox_marker_file "$agent" 2>/dev/null || printf '')"
+  [[ -n "$marker_file" && -e "$marker_file" ]] && return 1
+  return 0
 }
 
 bridge_start_send_onboarding_nudge_async() {
@@ -313,6 +339,17 @@ bridge_start_schedule_dev_channels_accept() {
         # picker detection and send (e.g. parent bridge-run.sh crashed
         # on a follow-up plugin-cache error) should not be logged as
         # "completed".
+        # Issue #1991 single-sender (in-child guard): a watcher forked BEFORE
+        # the resolver canary was enabled for this agent could still reach this
+        # direct send. Re-check ownership here — at SEND time, not just at arm
+        # time — so the resolver stays the sole sender even across a mid-flight
+        # canary enable. No-op when the resolver is disabled (default).
+        if declare -F bridge_prompt_resolver_owns_agent >/dev/null 2>&1 \
+           && bridge_prompt_resolver_owns_agent "$agent"; then
+          printf "[%s] [info] controller auto-accept dev-channels SKIPPED at send time on session=%s agent=%s — agentic resolver (#1991) owns blocked prompts\n" \
+            "$(date "+%Y-%m-%d %H:%M:%S")" "$session" "$agent"
+          exit 0
+        fi
         if bridge_tmux_session_exists "$session" \
            && bridge_tmux_pane_has_dev_channels_picker "$session"; then
           # Direct send — no attach gate, no foreground gate, no
@@ -706,6 +743,15 @@ elif [[ "$ENGINE" == "codex" && $SAFE_MODE -eq 0 ]]; then
   elif ! bridge_ensure_codex_hooks >/dev/null; then
     bridge_die "Codex hook 설정에 실패했습니다: $WORK_DIR"
   fi
+  # Issue #2007: bridge_ensure_codex_hooks renders the static/managed Codex hook
+  # suite AND then pre-trusts the bridge's own first-party hooks in the sibling
+  # config.toml — running here, after the render and BEFORE the Codex process
+  # starts, so a hook-changing upgrade never wedges this managed agent at
+  # Codex's startup hook-trust gate. The pretrust is fail-closed + STRICT
+  # first-party (never --dangerously-bypass-hook-trust; foreign/plugin/operator
+  # hooks stay untrusted for the #1992/#2007 detector) and non-fatal — only the
+  # render failure above is load-bearing. The dynamic-vanilla branch is left
+  # report-only in rc2 (project-local hooks under the operator-global home).
 fi
 
 if [[ $FORCE_FRESH_SESSION -eq 1 ]]; then
@@ -1248,8 +1294,15 @@ unset _bridge_start_new_session_err
 bridge_tmux_bootstrap_session_options "$SESSION"
 if [[ "$ENGINE" == "claude" ]]; then
   bridge_tmux_prepare_claude_session "$SESSION" 8 >/dev/null 2>&1 || true
-  if [[ $CONTROLLER_DEV_CHANNELS_ACCEPT -eq 1 ]]; then
+  # Issue #1991 single-sender: when the agentic resolver owns this agent, the
+  # controller-side dev-channels auto-accept watcher must NOT be armed (the
+  # resolver becomes the sole key sender). No-op when the resolver is disabled.
+  if [[ $CONTROLLER_DEV_CHANNELS_ACCEPT -eq 1 ]] \
+      && ! { declare -F bridge_prompt_resolver_owns_agent >/dev/null 2>&1 \
+             && bridge_prompt_resolver_owns_agent "$AGENT"; }; then
     bridge_start_schedule_dev_channels_accept "$SESSION" "$AGENT"
+  elif [[ $CONTROLLER_DEV_CHANNELS_ACCEPT -eq 1 ]]; then
+    echo "[info] controller dev-channels auto-accept SKIPPED for '$AGENT' — agentic resolver (#1991) owns its blocked prompts"
   fi
   # Fresh-install onboarding nudge: SESSION-TYPE.md's first-session
   # checklist for admin agents triggers "when the first user message
@@ -1264,7 +1317,7 @@ if [[ "$ENGINE" == "claude" ]]; then
   # state-agent-dir row), causing bridge-start.sh to exit before
   # reaching the nudge. The nudge spawn is itself async + heavily
   # guarded against errors.
-  if bridge_start_should_send_onboarding_nudge "$AGENT"; then
+  if bridge_start_should_send_onboarding_nudge "$AGENT" "$REPLACE"; then
     bridge_start_send_onboarding_nudge_async "$SESSION" "$AGENT" || true
   fi
   bridge_agent_mark_idle_now "$AGENT" || true

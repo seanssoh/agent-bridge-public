@@ -4,6 +4,69 @@ All notable changes to Agent Bridge are documented here. This project adheres
 loosely to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and tracks
 version bumps via the `VERSION` file.
 
+## [0.16.16-rc2] — 2026-06-19 (LTS · release candidate)
+
+**v0.16.16-rc2 — the second release candidate on the v0.16.16 LTS line: it carries everything in rc1 plus the full batch of issues/PRs that arrived during the rc1 soak window, parked as draft PRs and merged together at cut time (35 PRs).** Like rc1 this is a soak vehicle, not a promotion — the `v0.16.15` tag stays the `lts` / Latest head and this prerelease is **not** marked Latest. The batch is dominated by daemon/queue reliability (the #1973 three-track stall-recovery set + the #1991 blocked-prompt safety floor), A2A room self-service onboarding, channel managed-send hardening (teams/discord/telegram), upgrade-safety guards for operator-customized files, agent onboarding/restart lifecycle, and the `agb status` fast-by-default perf work. Each PR carried its own internal codex review at park time; the rc2 cut is the integration gate. None of this batch is a daemon-down regression on top of rc1 — it is the accumulated hardening the rc-soak window was meant to collect.
+
+### Daemon & queue reliability
+
+- **Queue-gateway stall recovery — bounded drain, capped backoff, liveness-timer re-nudge (#1973, Tracks A/B/C).** Three layered fixes for the gateway-stall class. Track A (#1978) bounds the per-request drain and makes a degraded claim/done report honestly instead of faking success. Track B (#1979) replaces the fixed-interval re-nudge with a capped exponential backoff so a stuck agent no longer triggers a nudge storm. Track C (#1980) installs a liveness timer + gateway-stall detection that fires a single one-shot recovery re-nudge when the drain wedges. Track C consumes Track A's status-json signal and Track B's backoff seam — they land in A→B→C order.
+- **Blocked-prompt safety floor — a blocked agent can never silently wedge (#1991, #1992, marquee).** A long-running agent whose input pane is occupied by a blocking prompt used to go silently deaf. The new safety floor (detect-only core in #1992) guarantees an independent operator escalation that never depends on the wedged agent itself, and a patch-owned **agentic blocked-prompt resolver** rides on top of it, **canary-gated** (off by default; opt-in per install). Extended to detect codex panes as well (#2007/#1991, detect-only).
+- **Blocked-aging reminder re-fires visibly on cadence (#1986).** The blocked-task aging reminder refreshed in place silently instead of re-surfacing on its cadence; it now re-fires visibly, and the resurface no longer clobbers a reminder a human has already claimed (claimed-alert protection, with a T7 symmetry test).
+- **Idle-claim reclaim honors the task lease (#1970).** An idle reclaim now respects the task lease and a worker `update` renews it, closing the #14837 live-repro race (regression oracle added).
+- **Warn on unsupervised / non-canonical source-root daemon start (#1955).** A daemon started from a non-canonical source root (or unsupervised) now emits a startup warning instead of running silently from the wrong tree.
+
+### A2A & cross-bridge
+
+- **Discoverable room self-service onboarding + actionable `room_autojoin_disabled` 403 (#2024 A, #2027).** A fresh peer can join a discoverable room via an opt-in `BRIDGE_A2A_ROOM_AUTOJOIN` gate; with the gate off the receiver returns a **posture-only** 403 (`code: room_autojoin_disabled`) that returns *before* any token/room lookup, so it never becomes a token/room-existence oracle, and an unknown-peer invalid token stays peer-facing-opaque with precise audit. `BRIDGE_A2A_ROOM_AUTOJOIN` was also added to the `config set-env` allowlist (strict `flag_one`, only `"1"`) so the documented operator toggle actually works.
+- **Require a valid sender id — no OS-username fallback (#1933, data-integrity).** The A2A receiver no longer falls back to the OS username when a sender id is absent; an unidentified sender is rejected rather than silently attributed.
+- **Task-oriented A2A quick reference (#2025).** A new task-oriented quick-reference doc for the A2A surface (room join, whois, manual setup).
+
+### Channels
+
+- **Teams notify-kind — managed-send adapter + notify_kind/target inference (#1996/#2006).** A `_adapter_teams` managed-send path (shells the bundled `bun plugins/teams/server.ts send-managed`, body passed as argv not shell), `TEAMS_STATE_DIR` resolved in bash as the workdir SSOT and threaded via `--teams-state-dir`, teams branches in notify_kind/target inference (allowFrom[0] with explicit-map precedence preserved), and a fail-closed bridge-notify guard. The notify-target helper is heredoc-free (footgun #11 clean).
+- **Discord/Telegram managed-send reads the workdir SSOT state dir (#2005/#2010).** The discord/telegram managed-send paths resolve their state dir from the workdir SSOT (Python never re-derives the path), generalizing the #2006 `--plugin-state-dir` shape.
+- **Telegram setup/verify hardening.** Drops the mcp-list 409, adds a bun preflight, and makes `verify` truthful (no false-green).
+
+### Upgrade safety
+
+- **`detect_engine` ignores the engine placeholder (#1930, #1928).** The upgrade engine detector no longer mis-reads the `<Claude Code CLI | Codex CLI>` template placeholder as a real engine.
+- **Preserve operator-customized agent workdir CLAUDE.md (#1931, data-loss).** The upgrade no longer overwrites an operator-customized CLAUDE.md in the agent workdir.
+- **Never hijack the operator-global settings.json + repair an existing hijack (#1981, #1985).** A settings render whose workdir resolved to the operator HOME could write managed hooks into the operator-global `settings.json`; that path is now guarded, and the upgrade detects + backup-gates repair of an *existing* hijack (reversible).
+
+### Hooks, settings & layout
+
+- **Usage-tap composes with an operator statusLine renderer (#1961, display-only).** The usage-tap statusLine now composes with (rather than replaces) an operator's own statusLine renderer, renderer-agnostic. The broad propagation work is deferred to v0.17 (#1964).
+- **First-party codex hook pretrust (#2007).** A hook-changing upgrade no longer wedges a managed codex agent on the first-trust prompt — first-party codex hooks are pretrusted.
+- **Engine-gate codex `AGENTS.md` emission for claude agents (#2016).** A claude agent no longer gets a Codex-contract `AGENTS.md` emitted into its home (3rd recurrence of the cross-engine doc leak).
+- **iso: gate `ab-*` group creation to Linux + clean up inert macOS groups.** The linux-user isolation `ab-*` group create is gated to Linux and the inert macOS groups are cleaned up.
+- **Seed an absolute `autoMemoryDirectory` (no tilde) (#2014).** The auto-memory directory is seeded as an absolute path so a literal `~` is never written into settings.
+
+### Onboarding & agent runtime
+
+- **Durable onboarding-completion authority + atomic 3-layer writer (#2004).** Onboarding completion state has a single durable authority written atomically across the three layers, so a restart mid-onboarding no longer loses or double-fires completion.
+- **Deterministic, idempotent post-restart handoff wake (#2003).** A post-restart handoff wake is now deterministic and idempotent (no double-wake, no missed wake).
+- **Gate the onboarding nudge on a genuine first launch (#2002).** The onboarding nudge fires only on a genuine first launch, not on every restart.
+- **Watchdog checks the managed CLAUDE.md block against the identity home (#2018).** The managed-block watchdog matches against the identity home, fixing a false-positive for a custom-workdir claude agent.
+
+### Status performance
+
+- **`agb status` is fast by default; expensive analytics behind `--full` (#2000).** The default human dashboard defers the expensive analytics (orphan-dir fs-walk, context-pressure fp-rate, config-drift, nudge-recheck, upgrade-conflict) behind a `--full` (alias `--analytics`) flag and prints a "analytics deferred … run with --full" hint; the `--json` machine path is handled separately so no consumer silently loses fields.
+- **Orphan-walk prune is classification-preserving (#1966).** The orphan-dir keep-set walk prunes `node_modules` / `.git` / transcripts (the dominant status cost) while preserving the registered-agent classification.
+
+### Roster
+
+- **Declare `BRIDGE_AGENT_SKILLS` associative — stop silently dropping every configured skill (#2020).** `agent-roster.sh` declared every per-agent map with `declare -Ag` *except* `BRIDGE_AGENT_SKILLS`, so `agent create --skills` / `materialize-fields --skills` wrote into an undeclared name → a non-numeric subscript collapsed to index `0` → a broken indexed array → `bridge_var_is_assoc` false → `bridge_agent_skills_csv` empty → **no configured skill materialized for any agent**, silently. Now declared associative alongside the sibling maps (before `agent-roster.local.sh` is sourced).
+
+### Misc fixes
+
+- **Doc-backfill resolves a dynamic agent's engine from the registry (#1956).** No longer guesses; reads the registry.
+- **Orphan classifier case-folds on case-insensitive volumes (#1982).** The registered-agent classifier match is case-folded so a case-insensitive volume no longer mis-classifies a registered agent as orphan.
+- **`forget-session` quarantines transcripts so the resolver fallback starts fresh (#1968).** A forget-session now quarantines the agent's transcripts (HIGH-RISK session-resume surface) so the resolver fallback starts clean.
+- **Wiki-ingest Lane B targets by liveness + honest enqueue status (#1983).** No silent drop; the enqueue status is truthful.
+- **Codify the system-escalation chain as a global contract (#1998).** `COMMON-INSTRUCTIONS.md` documents the system-escalation chain as a cross-agent contract.
+- **macOS cron memory-pressure check no longer false-defers on chronic swap (#1929).** A chronically-swapping macOS host no longer perpetually defers crons.
+
 ## [0.16.16-rc1] — 2026-06-17 (LTS · release candidate)
 
 **v0.16.16-rc1 — the first release cut under the new RC-soak rule: a release candidate that soaks on the macbook + cm-prod for a few days before it is promoted, as-is, to the official `v0.16.16` LTS.** This RC batches the remaining **stability-unrelated** cm-prod v0.16.13 post-upgrade RCA findings (the reliability / iso-perm / UX residue after the F1 + F8 daemon-stability P1 pair already shipped in v0.16.14 / v0.16.15): F3, F5, F7, F6, and F4. None of these is a daemon-down regression — they are the deferred batch the v0.16.15 notes promised would go through the RC path. The `v0.16.15` tag stays the `lts` / Latest head until this RC is promoted; this prerelease is **not** marked Latest.

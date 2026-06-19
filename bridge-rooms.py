@@ -581,6 +581,52 @@ def _require_leader_conn(conn: Any, room_id: str,
     return room
 
 
+def _receiver_room_autojoin_enabled() -> bool:
+    """Best-effort: will the A2A receiver's effective env have
+    ``BRIDGE_A2A_ROOM_AUTOJOIN=1`` on its next (re)start?  (#2024 A.1)
+
+    Mirrors what `bridge_load_roster` sources at receiver startup
+    (lib/bridge-state.sh:1388-1405): the live process env first, then the
+    managed install-wide override file `$BRIDGE_HOME/agent-env.local.sh` (what
+    `agb config set-env` writes and `agb a2a daemon restart` re-sources). A
+    direct `bash bridge-handoff-daemon.sh start` does NOT source that file, so
+    this reflects the SUPPORTED lifecycle, not a raw-bash one. Returns False on
+    any read error — the warning is fail-loud (warn when in doubt)."""
+    # noqa: iso-helper-boundary - feature env gate, not a .env file
+    if os.environ.get("BRIDGE_A2A_ROOM_AUTOJOIN") == "1":
+        return True
+    env_file = rooms.bridge_home() / "agent-env.local.sh"
+    try:
+        text = env_file.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    # The managed file is one `export KEY='value'` per line (bridge-config.py
+    # render_env_export_line); match that exact shape for our key set to "1".
+    for line in text.splitlines():
+        if line.strip() == "export BRIDGE_A2A_ROOM_AUTOJOIN='1'":
+            return True
+    return False
+
+
+def _warn_if_autojoin_disabled(signed: bool) -> None:
+    """Print a leader-facing warning when a first-contact (signed cross-node)
+    invite is minted while the receiver's room auto-join gate is OFF, so the
+    leader knows the joiner will 403 until they enable it (#2024 A.1/A.2).
+
+    Only fires for SIGNED links — a legacy single-node/unsigned link is for a
+    peer that already has a node-link, where the gate is not on the path."""
+    if not signed or _receiver_room_autojoin_enabled():
+        return
+    info("note: this leader's A2A receiver has room auto-join DISABLED — a "
+         "first-contact joiner will be rejected with HTTP 403 "
+         "(code=room_autojoin_disabled) until you enable it:")
+    info("  agb config set-env BRIDGE_A2A_ROOM_AUTOJOIN=1")
+    info("  agb a2a daemon restart   # (re-sources the override; do NOT use a "
+         "direct `bash bridge-handoff-daemon.sh start`)")
+    info("the leader still approves every join, so enabling auto-join admits "
+         "nobody automatically.")
+
+
 def cmd_invite(args: argparse.Namespace) -> int:
     node = local_node()
     ttl = max(0, int(getattr(args, "ttl", 0) or 0))
@@ -592,14 +638,19 @@ def cmd_invite(args: argparse.Namespace) -> int:
     finally:
         conn.close()
     link = _make_invite_link_for(node, token, args.room_id)
+    # A v2 signed link carries `reach=` (cross-node first-contact); the legacy
+    # unsigned form does not. parse_invite_link exposes the `s=` signature param.
+    signed_link = bool(rooms.parse_invite_link(link).get("s"))
     if args.json:
         out(json.dumps({"room_id": args.room_id, "invite_link": link,
-                        "once": bool(args.once)}))
+                        "once": bool(args.once),
+                        "receiver_room_autojoin": _receiver_room_autojoin_enabled()}))
     else:
         kind = "single-use" if args.once else "reusable"
         info(f"minted {kind} invite for {args.room_id} "
              "(old token invalidated)")
         out(link)
+        _warn_if_autojoin_disabled(signed_link)
     return 0
 
 

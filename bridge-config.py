@@ -111,6 +111,12 @@ ENV_KEY_TYPE_INT_MIN2 = "int_min2"
 #                   (e.g. BRIDGE_DYNAMIC_IDLE_REAP_SECONDS=0 turns the reaper
 #                   off). Distinct from pos_int, which floors at 1.
 ENV_KEY_TYPE_NON_NEG_INT = "non_neg_int"
+#   "flag_one"   — the literal string "1" and nothing else. The consuming code
+#                  reads the var with strict `os.environ.get(...) != "1"`
+#                  equality (a feature ON/OFF gate), so the only meaningful
+#                  durable value is "1"; to turn the feature back OFF the
+#                  operator removes the key from the managed file and restarts.
+ENV_KEY_TYPE_FLAG_ONE = "flag_one"
 
 # NARROW allowlist. Each entry was confirmed to be read from `os.environ`
 # (not a JSON config field) and to be a non-secret operational timing /
@@ -130,6 +136,7 @@ ENV_KEY_TYPE_NON_NEG_INT = "non_neg_int"
 #   BRIDGE_A2A_RECEIVER_STALENESS_CLAIM_STALE_SECONDS
 #                                            lib/daemon-helpers/a2a-receiver-staleness.py:383 (int seconds)
 #   BRIDGE_DYNAMIC_IDLE_REAP_SECONDS         bridge-daemon.sh:reap_idle_dynamic_agents (int>=0; 0 disables)
+#   BRIDGE_A2A_ROOM_AUTOJOIN                 bridge-handoffd.py:_room_join_bootstrap_unknown_peer (== "1" gate)
 ENV_KEY_ALLOWLIST: dict[str, str] = {
     "BRIDGE_A2A_WARP_HANDSHAKE_STALE_SECONDS": ENV_KEY_TYPE_POS_INT,
     "BRIDGE_A2A_RECONCILE_INTERVAL": ENV_KEY_TYPE_POS_INT,
@@ -144,6 +151,12 @@ ENV_KEY_ALLOWLIST: dict[str, str] = {
     # lived dynamic must not be GC'd. Non-secret operational knob, read from
     # os.environ by the daemon each sync cycle.
     "BRIDGE_DYNAMIC_IDLE_REAP_SECONDS": ENV_KEY_TYPE_NON_NEG_INT,
+    # Issue #2024: leader-side A2A room first-contact auto-join feature gate.
+    # The receiver admits an unknown peer presenting a valid room invite token
+    # to a PENDING (still leader-approved) join only when this is exactly "1";
+    # default-OFF, discoverable via `agb config set-env` + `agb a2a daemon
+    # restart` so the receiver inherits it. Non-secret feature toggle.
+    "BRIDGE_A2A_ROOM_AUTOJOIN": ENV_KEY_TYPE_FLAG_ONE,
 }
 
 # EXPLICIT DENY — keys that must NEVER be settable through set-env even if a
@@ -1228,6 +1241,17 @@ def validate_env_value(key: str, raw: str) -> tuple[str | None, str | None]:
         if val < floor:
             return None, f"value for {key} must be >= {floor}, got {val}"
         return str(val), None
+    if expected == ENV_KEY_TYPE_FLAG_ONE:
+        # The only durable value is the literal "1" (the consuming code uses
+        # strict `!= "1"` equality). Reject everything else — "0"/"true"/"yes"
+        # would be silently treated as OFF by the gate, so accepting them here
+        # would be a confusing no-op. To disable, remove the key + restart.
+        if text == "1":
+            return "1", None
+        return None, (
+            f"value for {key} must be the literal \"1\" (the feature gate is "
+            f"strict; remove the key + restart to disable), got {raw!r}"
+        )
     if expected == ENV_KEY_TYPE_POS_FLOAT:
         try:
             val_f = float(text)

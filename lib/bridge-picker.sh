@@ -447,6 +447,15 @@ bridge_picker_handle_defer() {
 bridge_picker_handle_auto_resolve() {
   local agent="$1" session="$2" engine="$3" picker_id="$4" pane_before="$5" decision="$6"
 
+  # Issue #1991 single-sender: when the agentic resolver owns this agent, the
+  # picker auto-resolve path must NOT key the pane (the resolver is the sole
+  # sender). Report-only and return. No-op when the resolver is disabled.
+  if declare -F bridge_prompt_resolver_owns_agent >/dev/null 2>&1 \
+      && bridge_prompt_resolver_owns_agent "$agent"; then
+    bridge_warn "picker resolver: agentic resolver (#1991) owns agent '${agent}' — auto-resolve report-only, no key sent on session=${session}"
+    return 0
+  fi
+
   local keys destructive
   keys="$(bridge_picker_json_field "$decision" keys)"
   destructive="$(bridge_picker_json_field "$decision" destructive_match)"

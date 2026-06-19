@@ -25,6 +25,11 @@
 #   BRIDGE_CLEANUP_UPGRADE_RETAIN_COUNT    (default 5)
 #   BRIDGE_CLEANUP_UPGRADE_RETAIN_DAYS     (default 14)
 #   BRIDGE_CLEANUP_CLAUDE_CONFIG_PATH      (default ~/.claude.json)
+# Issue #1985 (operator-global settings hijack detect/repair) optional env:
+#   BRIDGE_CLEANUP_OPERATOR_GLOBAL_SETTINGS_FILE  (override the #1984 resolver)
+#   BRIDGE_CLEANUP_REPAIR_OPERATOR_GLOBAL_HIJACK  (1 → repair, not report-only)
+#   BRIDGE_CLEANUP_OPERATOR_GLOBAL_HIJACK_BACKUP_DIR (backup parent override)
+#   BRIDGE_CLEANUP_OPERATOR_GLOBAL_RESTORE_FILE   (trusted JSON restore source)
 bridge_cleanup_daily_backup_residue() {
   local target_root="${BRIDGE_CLEANUP_TARGET_ROOT:-}"
   local source_root="${BRIDGE_CLEANUP_SOURCE_ROOT:-}"
@@ -36,6 +41,11 @@ bridge_cleanup_daily_backup_residue() {
   local upgrade_retain_count="${BRIDGE_CLEANUP_UPGRADE_RETAIN_COUNT:-5}"
   local upgrade_retain_days="${BRIDGE_CLEANUP_UPGRADE_RETAIN_DAYS:-14}"
   local claude_config_path="${BRIDGE_CLEANUP_CLAUDE_CONFIG_PATH:-}"
+  # Issue #1985: operator-global settings hijack detect/repair.
+  local operator_global_file="${BRIDGE_CLEANUP_OPERATOR_GLOBAL_SETTINGS_FILE:-}"
+  local repair_operator_global_hijack="${BRIDGE_CLEANUP_REPAIR_OPERATOR_GLOBAL_HIJACK:-0}"
+  local operator_global_hijack_backup_dir="${BRIDGE_CLEANUP_OPERATOR_GLOBAL_HIJACK_BACKUP_DIR:-}"
+  local operator_global_restore_file="${BRIDGE_CLEANUP_OPERATOR_GLOBAL_RESTORE_FILE:-}"
 
   if [[ -z "$target_root" || -z "$source_root" ]]; then
     printf '{"cleanup_failures":[{"step":"setup","error":"target_root or source_root unset"}]}\n'
@@ -55,6 +65,20 @@ bridge_cleanup_daily_backup_residue() {
   [[ -n "$current_backup_root" ]] && args+=(--current-backup-root "$current_backup_root")
   [[ "$no_backup_mode" == "1" ]] && args+=(--no-backup-mode)
   [[ -n "$claude_config_path" ]] && args+=(--claude-config-path "$claude_config_path")
+
+  # Issue #1985: resolve the operator-global settings path via the #1984 resolver
+  # when it is available in the upgrade context (sourced bridge-hooks.sh), so the
+  # detector uses the operator/controller HOME authority — not the upgrader's own
+  # $HOME. Falls back to the Python `Path.home()` default for standalone/manual
+  # cleanup runs where the resolver is not sourced.
+  if [[ -z "$operator_global_file" ]] \
+      && command -v bridge_hook_operator_global_settings_file >/dev/null 2>&1; then
+    operator_global_file="$(bridge_hook_operator_global_settings_file 2>/dev/null || true)"
+  fi
+  [[ -n "$operator_global_file" ]] && args+=(--operator-global-settings-file "$operator_global_file")
+  [[ "$repair_operator_global_hijack" == "1" ]] && args+=(--repair-operator-global-settings-hijack)
+  [[ -n "$operator_global_hijack_backup_dir" ]] && args+=(--operator-global-settings-hijack-backup-dir "$operator_global_hijack_backup_dir")
+  [[ -n "$operator_global_restore_file" ]] && args+=(--operator-global-settings-restore-file "$operator_global_restore_file")
 
   python3 "$source_root/bridge-upgrade.py" "${args[@]}"
 }

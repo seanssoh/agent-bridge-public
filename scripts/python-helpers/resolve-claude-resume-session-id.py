@@ -150,7 +150,83 @@ def pid_is_alive(pid):
     return True
 
 
+def eligible_transcripts(input_workdir, workdir, config_root, cutoff, exclude):
+    """Return [(mtime, stem)] for every in-window transcript under the agent's
+    project dir(s). A transcript is in-window iff its `.jsonl` exists, is a
+    non-empty file, and its mtime is at/after `cutoff`. Stems already in
+    `exclude` are skipped. Shared by the resolve path (which picks the freshest)
+    and the `--list-resumable` enumeration (issue #1968) so both honour the
+    identical slug + eligibility logic with no drift."""
+    eligible = []
+    seen_stems = set()
+    for slug in ordered_slug_candidates([input_workdir, workdir]):
+        base = os.path.join(config_root, "projects", slug)
+        if not os.path.isdir(base):
+            continue
+        try:
+            entries = os.listdir(base)
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.endswith(".jsonl"):
+                continue
+            stem = entry[: -len(".jsonl")]
+            if not stem or stem in seen_stems or stem in exclude:
+                continue
+            full = os.path.join(base, entry)
+            try:
+                st = os.stat(full)
+            except OSError:
+                continue
+            if not os.path.isfile(full) or st.st_size <= 0:
+                continue
+            if st.st_mtime < cutoff:
+                continue
+            seen_stems.add(stem)
+            eligible.append((st.st_mtime, stem))
+    return eligible
+
+
+def list_resumable(argv) -> int:
+    """`--list-resumable` mode (issue #1968): print EVERY in-window transcript
+    stem (session id) under the agent's project dir, one per line, newest
+    first. No candidate / live-session / quarantine-swap logic — this is the
+    enumeration `agb agent forget-session` uses to quarantine the agent's OWN
+    transcripts so the resolver's most-recent-.jsonl fallback has nothing stale
+    left to resume. Stdout: zero or more stems (newline-separated). Always rc 0
+    (an empty workdir / missing project dir is "nothing to list", not an error).
+
+    Args (after the `--list-resumable` flag):
+        argv[0] — workdir
+        argv[1] — max_age_hours (default 48)
+        argv[2] — claude_config_dir (optional; same resolution as resolve mode)
+    """
+    if not argv:
+        return 0
+    input_workdir = argv[0]
+    workdir = os.path.realpath(input_workdir)
+    try:
+        max_age_hours = float(argv[1]) if len(argv) > 1 else 48.0
+    except ValueError:
+        max_age_hours = 48.0
+    config_root = claude_config_root(argv[2] if len(argv) > 2 else "")
+    cutoff = time.time() - max_age_hours * 3600
+    eligible = eligible_transcripts(
+        input_workdir, workdir, config_root, cutoff, set()
+    )
+    eligible.sort(key=lambda t: t[0], reverse=True)
+    for _mtime, stem in eligible:
+        print(stem)
+    return 0
+
+
 def main() -> int:
+    # Issue #1968: enumeration mode for forget-session. Kept as an explicit
+    # leading flag so the positional resolve contract below is byte-for-byte
+    # unchanged for every existing caller.
+    if len(sys.argv) > 1 and sys.argv[1] == "--list-resumable":
+        return list_resumable(sys.argv[2:])
+
     input_workdir = sys.argv[1]
     workdir = os.path.realpath(input_workdir)
     candidate = sys.argv[2] or ""
@@ -246,33 +322,9 @@ def main() -> int:
             print(candidate, end="")
             return 0
 
-    eligible = []
-    seen_stems = set()
-    for slug in ordered_slug_candidates([input_workdir, workdir]):
-        base = os.path.join(config_root, "projects", slug)
-        if not os.path.isdir(base):
-            continue
-        try:
-            entries = os.listdir(base)
-        except OSError:
-            continue
-        for entry in entries:
-            if not entry.endswith(".jsonl"):
-                continue
-            stem = entry[: -len(".jsonl")]
-            if not stem or stem in seen_stems or stem in exclude:
-                continue
-            full = os.path.join(base, entry)
-            try:
-                st = os.stat(full)
-            except OSError:
-                continue
-            if not os.path.isfile(full) or st.st_size <= 0:
-                continue
-            if st.st_mtime < cutoff:
-                continue
-            seen_stems.add(stem)
-            eligible.append((st.st_mtime, stem))
+    eligible = eligible_transcripts(
+        input_workdir, workdir, config_root, cutoff, exclude
+    )
 
     if not eligible:
         sys.stderr.write(

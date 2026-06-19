@@ -1109,11 +1109,25 @@ bridge_cron_job_always_followup() {
 #   1 — host is pressured; the caller should defer +15 min instead of spawning.
 #
 # Probes:
-#   Darwin → `sysctl vm.swapusage`. If `used / total >= BRIDGE_CRON_SWAP_PCT_LIMIT`
-#            (default 80) percent, return 1.
+#   Darwin → `sysctl kern.memorystatus_vm_pressure_level` (Apple's calibrated
+#            tier: 1=Normal, 2=Warn, 4=Critical — the same metric Activity
+#            Monitor's "Memory Pressure" graph and jetsam use). Defer only when
+#            level >= `BRIDGE_CRON_DARWIN_PRESSURE_LEVEL` (default 2 = Warn).
+#            `vm.swapusage` is NOT a pressure signal on macOS — the kernel uses
+#            swap as a normal tier of the memory hierarchy, so a healthy host
+#            commonly sits at 80-90%+ swap; gating on swap_pct chronically
+#            false-defers ALL cron dispatch (#1929 / #397). The legacy swap_pct
+#            probe stays available as an explicit fallback via
+#            `BRIDGE_CRON_DARWIN_PRESSURE_FALLBACK=swap_pct`, AND fires
+#            automatically when the sysctl is unreadable (older macOS / sandboxed
+#            test envs) so the host always has *some* signal. When the fallback
+#            runs, `used / total >= BRIDGE_CRON_SWAP_PCT_LIMIT` (default 80).
 #   Linux  → `/proc/meminfo` MemAvailable. If below `BRIDGE_CRON_MIN_AVAIL_MB`
 #            kilobytes (default 512 MB), return 1.
 #   Other  → return 0 (we don't model BSD/Windows; assume healthy).
+#
+# Mirrors `bridge-cron-runner.py::check_memory_pressure` (#397) so the Bash
+# daemon probe and the Python runner probe agree on the same operator contract.
 #
 # The probe fails open: if any read fails (sysctl unavailable, /proc not
 # mounted, malformed output), we return 0 so a probe glitch never blocks
@@ -1128,6 +1142,37 @@ bridge_check_memory_pressure() {
       local usage_line used_raw total_raw used_int total_int pct
       local limit="${BRIDGE_CRON_SWAP_PCT_LIMIT:-80}"
       [[ "$limit" =~ ^[0-9]+$ ]] || limit=80
+
+      # Issue #1929 / #397: probe the kernel pressure tier first. macOS swaps
+      # as part of normal operation, so swap_pct chronically false-defers.
+      # Whitespace-strip both env knobs to match the Python contract
+      # (bridge-cron-runner.py: `.strip()`/`.lower()`).
+      local fallback="${BRIDGE_CRON_DARWIN_PRESSURE_FALLBACK:-}"
+      fallback="${fallback#"${fallback%%[![:space:]]*}"}"   # ltrim
+      fallback="${fallback%"${fallback##*[![:space:]]}"}"   # rtrim
+      fallback="$(printf '%s' "$fallback" | tr '[:upper:]' '[:lower:]')"
+      if [[ "$fallback" != "swap_pct" ]]; then
+        local level_raw level_limit="${BRIDGE_CRON_DARWIN_PRESSURE_LEVEL:-2}"
+        level_limit="${level_limit#"${level_limit%%[![:space:]]*}"}"
+        level_limit="${level_limit%"${level_limit##*[![:space:]]}"}"
+        [[ "$level_limit" == "2" || "$level_limit" == "4" ]] || level_limit=2
+        level_raw="$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null || true)"
+        level_raw="${level_raw#"${level_raw%%[![:space:]]*}"}"
+        level_raw="${level_raw%"${level_raw##*[![:space:]]}"}"
+        if [[ -n "$level_raw" ]]; then
+          # Sysctl READ OK: this is the authoritative darwin signal — never
+          # fall back to swap on a non-empty read. Non-numeric output parses as
+          # level 0 (healthy), matching Python's `int(...) except ValueError: 0`
+          # so a garbled value can't masquerade as pressure (or trigger the
+          # swap false-defer #1929 set out to kill).
+          local level=0
+          [[ "$level_raw" =~ ^[0-9]+$ ]] && level="$level_raw"
+          (( level >= level_limit )) && return 1
+          return 0
+        fi
+        # Sysctl unreadable / empty (older macOS / sandboxed env) — fall through
+        # to the legacy swap probe so the host still has *some* pressure signal.
+      fi
 
       usage_line="$(sysctl -n vm.swapusage 2>/dev/null || true)"
       [[ -n "$usage_line" ]] || return 0

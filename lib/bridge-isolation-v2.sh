@@ -655,6 +655,172 @@ bridge_isolation_v2_darwin_ensure_user_in_group() {
   return 1
 }
 
+# ---------------------------------------------------------------------------
+# 3b. macOS inert-group cleanup (#1971)
+# ---------------------------------------------------------------------------
+#
+# History: before #1971 the group CREATE path was ungated, so a macOS
+# install eagerly provisioned ab-shared / ab-controller / ab-agent-<a>
+# OS groups even though macOS never runs v2 ENFORCE (no chgrp ever
+# targets them → 0 files owned → fully inert). The CREATE gate above now
+# prevents new ones; these helpers clean up the inert groups an earlier
+# install already left in "Users & Groups".
+#
+# Safety contract — a group is removed ONLY when ALL hold:
+#   1. Host is macOS (Darwin). No-op on every other platform — the groups
+#      are load-bearing on Linux and must never be touched there.
+#   2. Name matches a bridge-managed pattern: ab-shared, ab-controller,
+#      or the per-agent prefix (BRIDGE_AGENT_GROUP_PREFIX, default
+#      `ab-agent-`). Honors the same env overrides as the create path.
+#   3. Provenance marker present: the group's RealName begins with
+#      "Agent Bridge" — the string the bridge stamps via
+#      `dseditgroup -o create -r`. A coincidentally-named operator group
+#      lacking this marker is NEVER removed.
+#   4. No real members: the GroupMembership list is empty or contains
+#      only the current operator user (the only member a macOS
+#      shared-mode install ever adds). Any other member → skip + warn.
+# Reversible (`dseditgroup -o delete` drops the local record; the gated
+# create path no longer recreates it on macOS), idempotent (missing group
+# → skip), and never errors out the caller.
+
+bridge_isolation_v2_darwin_group_realname() {
+  # Emit the group's RealName. macOS `dscl -read` prints a multi-WORD
+  # value (which the bridge's "Agent Bridge group <name>" RealName always
+  # is) on a CONTINUATION line with a single leading space, NOT inline
+  # after `RealName: ` — so a naive `sed 's/^RealName: //'` returns empty
+  # for exactly our values (codex r2 catch: empty RealName → provenance
+  # check fails → cleanup silently skips every group). Handle both the
+  # inline single-token form and the continuation form.
+  local name="$1"
+  [[ -n "$name" ]] || return 1
+  dscl . -read "/Groups/$name" RealName 2>/dev/null | awk '
+    NR==1 { if (sub(/^RealName: /, "")) { print; inline=1 }; next }
+    NR==2 && !inline { sub(/^ /, ""); print }
+  '
+}
+
+bridge_isolation_v2_darwin_group_members() {
+  # Emit one member (user shortname) per line. Empty output = no members.
+  # Robust to the same macOS `dscl` multi-line form as RealName above:
+  # concatenate the value across the header line + any continuation lines
+  # before splitting on whitespace, so a member is NEVER silently dropped
+  # (a dropped member would wrongly pass the "no real members" safety gate
+  # and let cleanup delete a non-inert group).
+  local name="$1"
+  [[ -n "$name" ]] || return 1
+  dscl . -read "/Groups/$name" GroupMembership 2>/dev/null | awk '
+    NR==1 { sub(/^GroupMembership:[ ]?/, ""); printf "%s", $0; next }
+    { sub(/^ /, ""); printf " %s", $0 }
+    END { printf "\n" }
+  ' | tr ' ' '\n' | sed '/^$/d'
+}
+
+_bridge_isolation_v2_darwin_group_is_inert_bridge() {
+  # Returns 0 only when the named group is a safe-to-remove inert bridge
+  # group per the safety contract above. Prints nothing; warns (and
+  # returns 1) when a bridge-named group fails a safety check so the
+  # operator sees WHY it was skipped.
+  local name="$1"
+  [[ -n "$name" ]] || return 1
+
+  # (2) name must match a bridge-managed pattern.
+  local shared_grp="${BRIDGE_SHARED_GROUP:-ab-shared}"
+  local ctrl_grp="${BRIDGE_CONTROLLER_GROUP:-ab-controller}"
+  local agent_prefix="${BRIDGE_AGENT_GROUP_PREFIX:-ab-agent-}"
+  local matched=1
+  if [[ "$name" == "$shared_grp" || "$name" == "$ctrl_grp" ]]; then
+    matched=0
+  elif [[ -n "$agent_prefix" && "$name" == "$agent_prefix"* ]]; then
+    matched=0
+  fi
+  [[ "$matched" -eq 0 ]] || return 1
+
+  # Must actually exist (idempotent skip otherwise).
+  bridge_isolation_v2_darwin_group_exists "$name" || return 1
+
+  # (3) provenance marker — RealName begins with "Agent Bridge".
+  local realname
+  realname="$(bridge_isolation_v2_darwin_group_realname "$name")"
+  if [[ "$realname" != "Agent Bridge"* ]]; then
+    bridge_warn "iso v2 cleanup (#1971): group '$name' matches a bridge name but its RealName ('${realname:-<empty>}') lacks the 'Agent Bridge' provenance marker — leaving it untouched (looks operator-created)."
+    return 1
+  fi
+
+  # (4) no real members beyond the current operator.
+  local operator_user
+  operator_user="$(bridge_current_user 2>/dev/null || id -un 2>/dev/null || printf '')"
+  local member
+  while IFS= read -r member; do
+    [[ -n "$member" ]] || continue
+    if [[ -n "$operator_user" && "$member" == "$operator_user" ]]; then
+      continue
+    fi
+    bridge_warn "iso v2 cleanup (#1971): group '$name' has member '$member' (not the operator) — leaving it untouched (not provably inert)."
+    return 1
+  done < <(bridge_isolation_v2_darwin_group_members "$name")
+
+  return 0
+}
+
+bridge_isolation_v2_darwin_delete_group() {
+  local name="$1"
+  [[ -n "$name" ]] || return 1
+  if dseditgroup -o delete "$name" 2>/dev/null; then
+    return 0
+  fi
+  if command -v sudo >/dev/null 2>&1; then
+    if sudo -n dseditgroup -o delete "$name" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  bridge_warn "iso v2 cleanup (#1971): cannot delete inert group '$name' (need admin or passwordless sudo); run \`sudo dseditgroup -o delete $name\` to remove it manually."
+  return 1
+}
+
+bridge_isolation_v2_darwin_cleanup_inert_groups() {
+  # Remove the inert macOS ab-* groups an earlier (pre-#1971) install
+  # left behind. Builds the candidate set from the SAME naming the create
+  # path uses (shared + controller + per-agent for every known agent),
+  # then applies the safety contract per candidate. macOS-only; a no-op
+  # everywhere else. Returns 0 always (best-effort cleanup; never fails
+  # the caller).
+  [[ "$(uname)" == "Darwin" ]] || return 0
+
+  local shared_grp="${BRIDGE_SHARED_GROUP:-ab-shared}"
+  local ctrl_grp="${BRIDGE_CONTROLLER_GROUP:-ab-controller}"
+
+  # Candidate list: the two fixed groups + a per-agent group for each
+  # agent the roster knows about (BRIDGE_AGENT_IDS — the same array the
+  # migrate/reapply modules iterate). We never enumerate arbitrary system
+  # groups — only names the bridge itself composes — so a name we don't
+  # generate can never enter the candidate set.
+  local -a candidates=("$shared_grp" "$ctrl_grp")
+  local agent agent_grp
+  if declare -p BRIDGE_AGENT_IDS >/dev/null 2>&1; then
+    for agent in "${BRIDGE_AGENT_IDS[@]}"; do
+      [[ -n "$agent" ]] || continue
+      agent_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || true)"
+      [[ -n "$agent_grp" ]] && candidates+=("$agent_grp")
+    done
+  fi
+
+  local removed=0 grp
+  for grp in "${candidates[@]}"; do
+    [[ -n "$grp" ]] || continue
+    if _bridge_isolation_v2_darwin_group_is_inert_bridge "$grp"; then
+      if bridge_isolation_v2_darwin_delete_group "$grp"; then
+        bridge_info "iso v2 cleanup (#1971): removed inert macOS group '$grp' (no UID isolation on macOS → group was never load-bearing)."
+        removed=$(( removed + 1 ))
+      fi
+    fi
+  done
+
+  if [[ "$removed" -gt 0 ]]; then
+    bridge_info "iso v2 cleanup (#1971): removed $removed inert macOS ab-* group(s)."
+  fi
+  return 0
+}
+
 bridge_isolation_v2_user_in_group() {
   # Returns 0 if the named user is a member of the named group. Reads
   # the static nss view (does NOT see supplementary groups picked up by
@@ -671,11 +837,42 @@ bridge_isolation_v2_ensure_group() {
   # root or passwordless `sudo groupadd`; on macOS requires admin or
   # passwordless `sudo dseditgroup` (handled by darwin helper). Returns
   # 0 on success or pre-existing.
+  #
+  # Platform gate (#1971): the ab-* groups are only load-bearing where
+  # v2 ENFORCE runs (chgrp/setgid/ACL helpers all open with
+  # `bridge_isolation_v2_enforce || return 0`), and real UID/group
+  # isolation only exists on Linux. On any non-Linux host the groups
+  # would be created eagerly but never chgrp'd to anything — pure inert
+  # cruft cluttering macOS "Users & Groups".
+  #
+  # Two-part gate, both reusing the discriminator SSOT (no new divergent
+  # platform check):
+  #   1. `_bridge_isolation_discriminator_platform` == Linux — the SAME
+  #      canonical platform resolver the discriminator uses internally.
+  #      This is load-bearing on top of (2): `_cred_platform_ok` resolves
+  #      via `bridge_isolation_discriminator_auto_resolve`, which returns
+  #      "yes" for an explicit `BRIDGE_ISOLATION_REQUIRED=yes` on ANY
+  #      platform (operator opt-in is OS-agnostic). Since macOS has no
+  #      real UID isolation, even `=yes` on macOS must NOT provision the
+  #      (still-inert) groups — so the explicit Linux assertion is
+  #      required to honor the operator decision "gate CREATE to Linux"
+  #      (#1971). (codex r1 catch.)
+  #   2. `_bridge_isolation_v2_cred_platform_ok` — the platform/policy
+  #      predicate the credential ENFORCE helpers already use, so a
+  #      Linux host with `BRIDGE_ISOLATION_REQUIRED=no` (isolation opted
+  #      out, groups equally inert) also skips, matching ENFORCE.
+  # This is NOT the full `bridge_isolation_v2_enforce` — that additionally
+  # requires the canonical groups to already exist (primitives-readiness),
+  # which would deadlock the very creation path on a fresh Linux install.
+  # Skip = success no-op so callers' `|| bridge_die` does not fire on
+  # macOS/dev hosts.
   local name="$1"
   [[ -n "$name" ]] || {
     bridge_warn "bridge_isolation_v2_ensure_group: name required"
     return 1
   }
+  [[ "$(_bridge_isolation_discriminator_platform)" == "Linux" ]] || return 0
+  _bridge_isolation_v2_cred_platform_ok || return 0
   if bridge_isolation_v2_group_exists "$name"; then
     return 0
   fi

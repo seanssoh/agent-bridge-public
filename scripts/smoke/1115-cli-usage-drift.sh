@@ -90,8 +90,14 @@ smoke_assert_file_exists "$CRON_DISPATCHER" "bridge-cron.sh dispatcher present"
 #   never type it; keep it dispatchable + typo-discoverable but hide from
 #   the operator-facing usage template.
 # Future template-hidden additions land here with a comment explaining
+# `resolver`: #1991 agentic blocked-prompt resolver (canary-gated, DEFAULT
+#   OFF, patch-owned single-owner). Dispatchable (`agb resolver attempt|drain|
+#   status`, see agent-bridge:1131 + bridge-resolver.sh) + typo-discoverable,
+#   but hidden from the operator-facing usage template — a default-off canary
+#   command shouldn't appear in every operator's `--help`. Same
+#   dispatch-and-discover-but-hide-from-template pattern as `iso-run`.
 # why operators shouldn't see them in `--help`.
-TEMPLATE_ONLY_HIDDEN_TOPLEVEL=("iso-run")
+TEMPLATE_ONLY_HIDDEN_TOPLEVEL=("iso-run" "resolver")
 
 INTERNAL_AGENT_SUBCOMMANDS=()
 # `finalize-run`: bridge-daemon.sh runtime callback that finalizes a

@@ -47,7 +47,10 @@ task를 수신하면 아래 순서를 반드시 따른다:
 - queue의 open status는 `queued`, `claimed`, `blocked`만 공식 상태다. 작업 시작 표시는 별도 `in_progress`가 아니라 `claim` 또는 `--status claimed`를 사용한다.
 - `[cron-followup]` task의 처리 방식은 [Cron Followup Handling](#cron-followup-handling) 섹션을 따른다. `delivery_intent` 프론트매터가 결정 권한을 가지고, 레거시 `needs_human_followup` 본문은 fallback이다.
 - 인프라 장애 → `agent-bridge urgent <configured-admin-agent> "..."`, 비즈니스 판단 필요 → 사람 채널로 에스컬레이션.
-- 사용자 답이 필요한 질문을 두 번째로 반복하려고 하면, 다시 묻기 전에 `~/.agent-bridge/agent-bridge escalate question --agent <self> --question "<question>" --context "<why the answer is needed>"`로 관리자 외부 채널에 먼저 에스컬레이션한다.
+- **시스템 에스컬레이션 체인 (전 에이전트 공통 계약)**: 시스템/인프라 문제는 다음 고정 3-고리 체인을 따른다 — 이 체인은 암묵지가 아니라 명시적 계약이다.
+  1. **어떤 에이전트든** 스스로 해결 못 하는 시스템/인프라 문제를 만나면 → **admin 에이전트**에게 올린다 (`agent-bridge urgent <configured-admin-agent>` 또는 A2A).
+  2. **admin**이 해결한다. 해결 못 하거나 사람 판단이 필요하면 → admin이 **운영자의 구성된 라이브 채널**로 직접 알린다. admin의 운영자-도달 채널 = `bridge_agent_notify_kind`로 등록된 notify 채널(discord / telegram / teams 등)이며, 이는 선택이 아니라 **필수 셋업 항목**이다.
+  3. 이 마지막 고리(admin → 운영자 라이브 채널)가 구성돼 있지 않으면 능동 푸시가 **조용히 drop**된다 — 그러므로 admin의 notify 채널 미구성은 정상이 아니라 **셋업 갭으로 가시화**한다(`agb status` / `agent show`의 `notify_status`로 확인). 운영자 도달 경로가 표준화되지 않으면 시스템 문제가 사람에게 닿지 못한 채 사라진다.
 - 15분 이상 blocked → `agb update <task_id> --status blocked --note "사유"`.
 
 ## Background Subagent Delegation — 기본 운영 패턴

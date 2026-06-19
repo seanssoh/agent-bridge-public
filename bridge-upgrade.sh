@@ -533,6 +533,9 @@ bridge_upgrade_with_target_env() {
     BRIDGE_LAYOUT_RESOLVER_BYPASS="${BRIDGE_LAYOUT_RESOLVER_BYPASS:-}" \
     BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID="${BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID:-}" \
     BRIDGE_UPGRADE_CONTEXT="${BRIDGE_UPGRADE_CONTEXT:-}" \
+    BRIDGE_PROMPT_RESOLVER_ENABLED="${BRIDGE_PROMPT_RESOLVER_ENABLED:-}" \
+    BRIDGE_PROMPT_RESOLVER_AGENTS="${BRIDGE_PROMPT_RESOLVER_AGENTS:-}" \
+    BRIDGE_PROMPT_RESOLVER_OWNER="${BRIDGE_PROMPT_RESOLVER_OWNER:-}" \
     "$@"
 }
 
@@ -3606,6 +3609,32 @@ if [[ $DRY_RUN -eq 0 ]] \
   fi
 fi
 
+# Issue #1973 (Track C) — reapply the daemon liveness backstop timer on every
+# Linux upgrade, INDEPENDENTLY of the sudoers/systemd-unit regen above. The
+# #1973 incident host had the daemon service but NO liveness timer ("Unit not
+# found"), so a stalled-but-alive daemon had no supervisor. install-daemon-
+# systemd.sh now installs the timer by default, but its upgrade reapply is gated
+# on the sudoers-install path; this decoupled step guarantees the timer is
+# (re)installed + enabled even on legacy-direct hosts with no daemon-refresh
+# sudoers drop-in. Idempotent (the renderer re-writes the unit + enable --now is
+# a no-op when already enabled). Best-effort; a failure WARNs but does not abort
+# the upgrade. Output goes to stderr so --json callers' stdout stays parseable.
+if [[ $DRY_RUN -eq 0 ]] \
+   && [[ "$(uname -s 2>/dev/null)" == "Linux" ]] \
+   && ! bridge_host_profile_is_dev \
+   && command -v systemctl >/dev/null 2>&1 \
+   && [[ -f "$TARGET_ROOT/scripts/install-daemon-liveness-systemd.sh" ]]; then
+  _upgrade_liveness_rc=0
+  "$BRIDGE_BASH_BIN" "$TARGET_ROOT/scripts/install-daemon-liveness-systemd.sh" \
+    --bridge-home "$TARGET_ROOT" --enable >&2 \
+    || _upgrade_liveness_rc=$?
+  if (( _upgrade_liveness_rc == 0 )); then
+    echo "[bridge-upgrade] daemon liveness backstop timer reapplied (agent-bridge-daemon-liveness.timer)" >&2
+  else
+    echo "[bridge-upgrade] WARN: liveness-timer reapply returned rc=$_upgrade_liveness_rc — a stalled-but-alive daemon may lack its supervisor (#1973). Re-run: $TARGET_ROOT/scripts/install-daemon-liveness-systemd.sh --bridge-home $TARGET_ROOT --enable" >&2
+  fi
+fi
+
 # Bug #507 — auto-cleanup of daily-backup residue on every successful
 # `agb upgrade --apply`. Idempotent; reports failures via cleanup_failures
 # array. Skipped on dry-runs (no live state to mutate). Always runs before
@@ -4033,6 +4062,11 @@ if [[ $RESTART_AGENTS -eq 1 ]]; then
   # upgrade returns. This is the reactive primitive that already handles
   # BOTH engines (see scripts/picker-sweep.sh's _PICKER_CODEX_CONFIRM_RE
   # added 2026-05-16); we just invoke it earlier than the next cron tick.
+  #
+  # Issue #1991 single-sender: picker-sweep.sh self-gates resolver-owned canary
+  # agents (its _psw_resolver_owns_agent skip reads BRIDGE_PROMPT_RESOLVER_*),
+  # so this one-shot does NOT key a resolver-owned agent's pane either. The
+  # canary env flows through bridge_upgrade_with_target_env below. Default OFF.
   #
   # Skip when dry-run (no actual restart happened), when no agent reached
   # status="restarted" (avoids running against an all-attached install),

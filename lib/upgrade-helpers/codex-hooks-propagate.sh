@@ -62,7 +62,28 @@ for agent in "${BRIDGE_AGENT_IDS[@]}"; do
     --python-bin "$python_bin" \
     >/dev/null 2>&1 || rc=$?
   if [[ $rc -eq 0 ]]; then
-    printf 'codex-hooks-propagate: agent=%s hook_config=%s status=ok\n' "$agent" "$hook_config_path"
+    # Issue #2007: pre-trust the bridge's own first-party hooks in the sibling
+    # config.toml so the hook-changing upgrade (e.g. v0.16.12->v0.16.15 expanded
+    # the suite) does not wedge this codex agent at the trust gate on the next
+    # restart. STRICT first-party boundary + fail-closed inside bridge-hooks.py;
+    # non-fatal here so a pretrust hiccup never fails the upgrade run (the
+    # detector still surfaces any prompt).
+    trust_rc=0
+    # Suppress only the shell-parseable STDOUT fields; let STDERR flow so the
+    # helper's fail-closed warn line reaches the upgrade log (the detector
+    # relies on that signal, not the exit code alone — codex review #2007 r1,
+    # Finding 3). Still non-fatal: pretrust never fails the upgrade run.
+    "$python_bin" "$source_root/bridge-hooks.py" ensure-codex-hook-trust \
+      --codex-hooks-file "$hook_config_path" \
+      --codex-config-file "$(dirname "$hook_config_path")/config.toml" \
+      --bridge-home "$target_root" \
+      --python-bin "$python_bin" \
+      >/dev/null || trust_rc=$?
+    if [[ $trust_rc -eq 0 ]]; then
+      printf 'codex-hooks-propagate: agent=%s hook_config=%s status=ok pretrust=ok\n' "$agent" "$hook_config_path"
+    else
+      printf 'codex-hooks-propagate: agent=%s hook_config=%s status=ok pretrust=skipped(rc=%d)\n' "$agent" "$hook_config_path" "$trust_rc"
+    fi
   else
     printf 'codex-hooks-propagate: agent=%s hook_config=%s status=error(rc=%d)\n' "$agent" "$hook_config_path" "$rc" >&2
   fi

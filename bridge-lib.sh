@@ -918,6 +918,14 @@ bridge_source_module "bridge-agents.sh"
 bridge_source_module "bridge-isolation-helpers.sh"
 bridge_source_module "bridge-guard.sh"
 bridge_source_module "bridge-tmux.sh"
+# Issue #1991: agentic blocked-prompt resolver control plane (canary gate,
+# single-sender composition guard, per-key attempt latch, shipped-policy
+# resolution). Sourced right after bridge-tmux.sh because bridge-tmux's
+# low-level send primitives consult its central send-block guard; function-name
+# resolution is at call time, so this placement only needs to land before the
+# daemon tick / any keystroke send runs. Reverse session->agent mapping uses
+# bridge_agent_session from bridge-agents.sh (sourced above). DEFAULT OFF.
+bridge_source_module "bridge-prompt-resolver.sh"
 bridge_source_module "bridge-skills.sh"
 bridge_source_module "bridge-hooks.sh"
 bridge_source_module "bridge-channels.sh"

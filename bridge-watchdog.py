@@ -2188,9 +2188,34 @@ def scan_agent(
         # field — #907 keeps the field truthful and suppresses only the
         # classification *signal*, which ``classify_status`` gates through
         # ``has_home_profile_contract``.
+        #
+        # Issue #2018: the managed block is authoritatively materialized into
+        # the agent's IDENTITY HOME, not the scanned workdir. A static Claude
+        # agent whose registry `workdir` is a real project folder (e.g. chosen
+        # to keep Claude `/resume` history keyed on that folder) has a workdir
+        # CLAUDE.md that legitimately carries only the project-guidance block,
+        # never the identity managed block — so scanning the workdir alone
+        # produced a permanent false `missing_managed_claude_block` (and a
+        # re-created drift task every cycle, while `migrate docs audit`, which
+        # checks the identity home, reported the same agent clean). Mirror the
+        # entrypoint home fall-back above (#1750): the block counts as present
+        # when it exists in EITHER the scanned dir OR the agent_home identity
+        # source. A block genuinely absent from BOTH still surfaces as drift.
         if is_claude_engine(engine):
             claude_text = read_text(agent_dir / "CLAUDE.md") if (agent_dir / "CLAUDE.md").exists() else ""
             missing_block = MANAGED_START not in claude_text or MANAGED_END not in claude_text
+            if missing_block and agent_home_dir is not None and agent_home_dir != agent_dir:
+                # noqa rationale: same controller-side metadata fall-back as the
+                # entrypoint probe above — runs inside scan_agent's try/except
+                # that maps any PermissionError to a structured scan_error row
+                # (#1119), so the fail-soft "never crash the pass" contract holds.
+                home_claude = agent_home_dir / "CLAUDE.md"
+                if home_claude.exists():  # noqa: raw-pathlib-controller-only
+                    home_text = read_text(home_claude)
+                    if MANAGED_START in home_text and MANAGED_END in home_text:
+                        # Present in the agent_home identity source (the
+                        # authoritative materialization target) — not drift.
+                        missing_block = False
         else:
             missing_block = False
         session_type, onboarding_state = parse_session_type(agent_dir)

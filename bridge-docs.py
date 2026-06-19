@@ -482,6 +482,7 @@ def render_shared_tools_md(bridge_home: Path) -> str:
 - 태스크 상세: `{home}/agb show <task-id>`
 - claim / done: `{home}/agb claim <task-id> --agent <agent>` / `{home}/agb done <task-id> --agent <agent>`
 - durable A2A: `{home}/agent-bridge task create --to <agent> --title "..." --body-file {home}/shared/report.md`
+- cross-bridge A2A (send to an agent on another machine / find its node / rooms): `{home}/agent-bridge a2a ...` — task-oriented quickref in `docs/a2a-quickref.md`
 - urgent interrupt: `{home}/agent-bridge urgent <agent> "..."`
 - handoff: `{home}/agent-bridge handoff <task-id> --to <agent> --note "..."`
 

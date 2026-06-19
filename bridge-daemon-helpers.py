@@ -1638,14 +1638,18 @@ def cmd_agent_doc_backfill_task_body(args: argparse.Namespace) -> int:
             f"({len(engine_mismatch_docs)})"
         )
         lines.append(
-            "These non-codex agents carry a stale Codex-contract `AGENTS.md` "
-            "(a pre-#1896 mis-scaffold residue). Runtime-harmless — a Claude "
-            "session never reads `AGENTS.md` — but it is misleading residue and "
-            "an audit smell. The pass reports it ONLY; nothing was deleted, "
-            "renamed, or edited (#1906). **Action**: an operator may "
-            "reversible-backup-rename the stray doc (e.g. "
-            "`mv AGENTS.md AGENTS.md.bak-<date>`); removal stays a deliberate "
-            "operator action, never an automatic sweep."
+            "These non-codex agents carry a stale Codex-contract AGENTS.md "
+            "residue (a pre-#1896 mis-scaffold, or a pre-#2016 un-gated migrate "
+            "copy). The `doc` per-row names the exact location — it may be the "
+            "home-ROOT `AGENTS.md` OR the `codex/AGENTS.md` the old un-gated "
+            "migrate rglob left in the agent home (#2016: gated now, so it "
+            "stops recurring, but an EXISTING copy is not auto-removed). "
+            "Runtime-harmless — a Claude session never reads either path — but "
+            "it is misleading residue and an audit smell. The pass reports it "
+            "ONLY; nothing was deleted, renamed, or edited (#1906). **Action**: "
+            "an operator may reversible-backup-rename the stray doc at the "
+            "per-row path (e.g. `mv <path> <path>.removed-<date>`); removal "
+            "stays a deliberate operator action, never an automatic sweep."
         )
         for d in engine_mismatch_docs:
             if isinstance(d, dict):

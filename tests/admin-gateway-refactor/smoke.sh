@@ -472,12 +472,16 @@ ROSTER_SNAPSHOT="$TMP_ROOT/roster-snapshot.tsv"
 : > "$ROSTER_SNAPSHOT"
 DAEMON_PID_FILE="$BRIDGE_STATE_DIR/daemon.pid"
 [[ -f "$DAEMON_PID_FILE" ]] || : > "$DAEMON_PID_FILE"
+# The config-drift line is an audit-parse analytic deferred behind `--full`
+# (status-fast-default): the default human dashboard skips it, so it only
+# renders with `--full`.
 STATUS_OUTPUT="$(python3 "$REPO_ROOT/bridge-status.py" \
   --roster-snapshot "$ROSTER_SNAPSHOT" \
   --db "$BRIDGE_TASK_DB" \
   --daemon-pid-file "$DAEMON_PID_FILE" \
   --audit-log "$BRIDGE_AUDIT_LOG" \
-  --config-drift-window-days 7)" \
+  --config-drift-window-days 7 \
+  --full)" \
   || die "bridge-status.py render failed"
 
 expected_drift="$(audit_count_action cron_human_config_drift)"

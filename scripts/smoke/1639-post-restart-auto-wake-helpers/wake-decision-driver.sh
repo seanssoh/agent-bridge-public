@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/smoke/1639-post-restart-auto-wake-helpers/wake-decision-driver.sh
 #
-# Issue #1639 — driver for the post-restart auto-wake decision smoke.
+# Issue #1639 + #2003 — driver for the post-restart auto-wake decision smoke.
 #
 # The production decision lives inside the backgrounded `bash -lc '...'`
 # subshell of bridge_run_schedule_idle_marker_and_inbox_bootstrap()
@@ -10,8 +10,9 @@
 # privileged credential-scrub shell — and its real body backgrounds a
 # subshell that waits on a live tmux prompt. This driver re-traces the EXACT
 # decision branch (the gate + which inject fires + the #1199 nudge record +
-# the once-per-loop marker write) against the REAL production bridge-lib.sh
-# helpers (bridge_inject_metadata_only_enabled, bridge_format_injection_meta),
+# the per-session restart-wake latch) against the REAL production bridge-lib.sh
+# helpers (bridge_inject_metadata_only_enabled, bridge_format_injection_meta,
+# bridge_agent_restart_wake_marker_file, bridge_run_handoff_task_find_or_create),
 # with argv-recording stubs for the tmux send + queue lookup so the smoke can
 # assert exactly one wake per scenario with no live tmux/queue dependency.
 #
@@ -26,8 +27,9 @@
 #
 # Invocation:
 #   bash wake-decision-driver.sh <repo_root> <state_dir> <agent> \
-#       <auto_restart_wake:0|1> <queue_has_open:0|1> \
-#       <marker_present:0|1> <next_session_present:0|1>
+#       <auto_restart_wake:0|1> <queue_state:queued|claimed|cron|empty> \
+#       <marker_present:0|1> <next_session_present:0|1> \
+#       [queue_available:0|1] [session_identity]
 #
 # Output (stdout), one KEY=VALUE per line:
 #   SEND_COUNT=<n>          number of bridge_tmux_send_and_submit calls
@@ -44,18 +46,24 @@ agent="$3"
 auto_restart_wake="$4"
 # queue_state: one of
 #   queued  — at least one genuinely-queued task (nudge-live-state top + key set)
-#   claimed — only claimed/blocked OPEN work, NO queued task (#1639 codex r3 [P2]:
-#             nudge-live-state returns a row with empty top/key, but find-open
-#             still surfaces the open task; wake fires, NO dedup key recorded)
-#   cron    — ONLY [cron-dispatch] rows open, NO queued/claimed/blocked non-cron
-#             work (#1639 Phase-4 codex r4: nudge-live-state reports 0 and the
-#             scoped find-open excludes cron, so NO wake fires)
+#   claimed — only claimed/blocked OPEN work, NO queued task (#1639 codex r3 [P2])
+#   cron    — ONLY [cron-dispatch] rows open, NO non-cron work (#1639 r4 → no wake)
 #   empty   — no open work at all
 queue_state="$5"
 marker_present="$6"
 next_session_present="$7"
+# queue_available (#2003): 0 means the handoff find/create path fails (queue
+# outage), exercising the queue-less restart-wake marker fallback. Default 1.
+queue_available="${8:-1}"
+# session_identity override (#2003): when set, the production code resolves the
+# Claude session id via the stub below so two driver runs can model the SAME or
+# DIFFERENT launched session (re-wake idempotency across sessions).
+session_identity_override="${9:-}"
 
-# Hermetic temp tree for this driver run.
+# Hermetic temp tree for this driver run. NOTE: the restart-wake marker latch
+# (#2003) is written under bridge_agent_idle_marker_dir = $BRIDGE_ACTIVE_AGENT_DIR
+# /<agent>; the parent smoke points BRIDGE_ACTIVE_AGENT_DIR at its own state tree
+# so the latch persists across driver runs that share a session_identity.
 work_root="$state_dir/$agent"
 mkdir -p "$work_root"
 next_file="$work_root/NEXT-SESSION.md"
@@ -66,15 +74,16 @@ nudge_file="$work_root/nudge.txt"
 : >"$nudge_file"
 
 [[ "$marker_present" == "1" ]] && printf '0\n' >"$marker_file"
-[[ "$next_session_present" == "1" ]] && printf 'handoff\n' >"$next_file"
+[[ "$next_session_present" == "1" ]] && printf 'handoff-body\n' >"$next_file"
 
-# Source the production library for the REAL injection-payload formatters.
+# Source the production library for the REAL injection-payload formatters +
+# the #2003 restart-wake marker + handoff find/create helpers.
 # shellcheck source=../../../bridge-lib.sh disable=SC1091
 source "$repo_root/bridge-lib.sh"
 
 # Argv-recording stubs, defined AFTER the source so they override the real
-# tmux/queue helpers. These are the only two external effects of the wake
-# decision; everything else (format, gate) runs the production code path.
+# tmux/queue helpers. Everything else (format, gate, marker math) runs the
+# production code path.
 # shellcheck disable=SC2317
 bridge_tmux_send_and_submit() {
   # args: <session> <engine> <text> <agent>
@@ -86,19 +95,48 @@ bridge_task_note_nudge() {
   printf '%s\n' "${2:-}" >>"$nudge_file"
 }
 # shellcheck disable=SC2317
+bridge_agent_session_id() {
+  # #2003 session_identity source. Empty → production falls back to tmux:<s>:<nonce>.
+  printf '%s' "$session_identity_override"
+}
+# shellcheck disable=SC2317
+bridge_agent_workdir() {
+  # Point the next-session digest/file resolver at this driver's hermetic tree
+  # so bridge_agent_next_session_digest hashes OUR NEXT-SESSION.md (production:
+  # WORK_DIR == workdir, so next_file and the digest file are the same).
+  printf '%s' "$work_root"
+}
+# shellcheck disable=SC2317
 bridge_queue_cli() {
+  # #2003 handoff find-or-create: production now routes through the ATOMIC
+  # `upsert-open` (BEGIN IMMEDIATE) instead of racy find-open+create. It emits
+  # `TASK_ID=<n>` (shell format) for the existing-or-created row, or fails on a
+  # queue outage. Model that here so the smoke exercises the same id-extraction.
+  if [[ "${1:-}" == "upsert-open" ]]; then
+    [[ "$queue_available" == "1" ]] || return 1   # queue outage → caller falls back
+    # Already-queued handoff (the SessionStart-hook ran first): existing id 55.
+    # Otherwise the upsert created it: id 77. TASK_CREATED is informational.
+    if [[ "$queue_state" == "queued" ]]; then
+      printf "TASK_ID=55\nTASK_CREATED=0\n"
+    else
+      printf "TASK_ID=77\nTASK_CREATED=1\n"
+    fi
+    return 0
+  fi
   # find-open is the scoped OPEN-set probe production reaches ONLY when
   # nudge-live-state surfaced no queued top — claimed/blocked-only open work
-  # (#1639 codex r3 [P2]) or a helper-unavailable fallback. #1639 Phase-4 codex
-  # r4: production scopes it to NON-CRON claimed|blocked (`--status-filter
-  # claimed --status-filter blocked --exclude-title-prefix '[cron-dispatch]'`),
-  # so a cron-dispatch-ONLY queue must yield no fallback wake. Model that here so
-  # the smoke has teeth: only honor the cron exclusion when the caller actually
-  # passes the r4 scoping flags — a regression to the unscoped `find-open
-  # --agent` form drops `scoped`, surfaces the cron row, and trips the cron-only
-  # SEND_COUNT=0 case below.
+  # (#1639 codex r3 [P2]). The r4 cron exclusion is honored only when the caller
+  # passes the scoping flags. (The handoff path no longer uses find-open.)
   if [[ "${1:-}" == "find-open" ]]; then
-    local args="$*" scoped=0
+    local args="$*"
+    # Robust fallback the production helper uses if TASK_ID parse ever fails:
+    # re-find the handoff by exact title. Mirror the upsert ids.
+    if [[ "$args" == *"[bridge:handoff-pending]"* ]]; then
+      [[ "$queue_available" == "1" ]] || return 0
+      if [[ "$queue_state" == "queued" ]]; then printf '%s\n' 55; else printf '%s\n' 77; fi
+      return 0
+    fi
+    local scoped=0
     [[ "$args" == *"--status-filter claimed"* \
        && "$args" == *"--status-filter blocked"* \
        && "$args" == *"--exclude-title-prefix"*"[cron-dispatch]"* ]] && scoped=1
@@ -106,6 +144,7 @@ bridge_queue_cli() {
       claimed) printf '%s\n' 99 ;;
       cron) [[ "$scoped" -eq 0 ]] && printf '%s\n' 1234 ;;
     esac
+    return 0
   fi
   return 0
 }
@@ -113,32 +152,41 @@ bridge_queue_cli() {
 # without spawning python3 / reading a real DB. Production calls it with
 # with_top_task=1, so emit the 6-column row:
 #   queued_count <TAB> claimed_count <TAB> csv_ids <TAB> top_id <TAB> top_priority <TAB> top_title
-# - queued : top_id=7 is a QUEUED id, key 7,11 is the full queued set (codex r2
-#            [P2]: top + dedup key both from the same queued set).
-# - claimed: a row exists (claimed_count>0) but queued cols are EMPTY, so the
-#            decision must fall through to the find-open open-set probe (codex r3
-#            [P2]) and record NO dedup key.
-# - empty  : all columns empty.
 # shellcheck disable=SC2317
 bridge_with_timeout() {
   # args: <seconds> <label> <cmd...>
-  if [[ "$queue_state" == "queued" ]]; then
+  if [[ "$queue_state" == "queued" && "$next_session_present" != "1" ]]; then
+    # A genuinely-queued NON-handoff task.
     printf '2\t0\t7,11\t7\tnormal\ttask seven\n'
-  elif [[ "$queue_state" == "claimed" ]]; then
-    printf '0\t1\t\t\t\t\n'
   else
-    printf '0\t0\t\t\t\t\n'
+    # claimed/cron/empty, OR a NEXT-SESSION present with no separately-queued
+    # task (the handoff itself is surfaced via find/create, not nudge-live-state).
+    if [[ "$queue_state" == "claimed" ]]; then
+      printf '0\t1\t\t\t\t\n'
+    else
+      printf '0\t0\t\t\t\t\n'
+    fi
   fi
   return 0
 }
 
+# Provide a launch nonce identical in spirit to production.
+launch_nonce="driver-${RANDOM}${RANDOM}"
+session="smoke-session"
+
 # ---------------------------------------------------------------------------
 # Decision branch — a faithful mirror of bridge-run.sh's inner subshell body
-# from the `bridge_agent_mark_idle_now` line onward (#1639). Keep in sync; the
-# parent smoke's source-grep gate locks the production guard tokens.
+# from the `bridge_agent_mark_idle_now` line onward (#1639 + #2003). Keep in
+# sync; the parent smoke's source-grep gate locks the production guard tokens.
 # ---------------------------------------------------------------------------
-if [[ ! -f "$next_file" ]] \
-    && { [[ ! -f "$marker_file" ]] || [[ "$auto_restart_wake" == "1" ]]; }; then
+if [[ ! -f "$marker_file" ]] || [[ "$auto_restart_wake" == "1" ]]; then
+  session_identity="$(bridge_agent_session_id "$agent" 2>/dev/null || true)"
+  if [[ -n "$session_identity" ]]; then
+    session_identity="claude:${session_identity}"
+  else
+    session_identity="tmux:${session}:${launch_nonce}"
+  fi
+
   queued_top=""
   queue_key=""
   if command -v bridge_with_timeout >/dev/null 2>&1; then
@@ -150,35 +198,77 @@ if [[ ! -f "$next_file" ]] \
       queued_top="$(printf "%s" "$nudge_state" | cut -f4)"
     fi
   fi
+
   task_id=""
+  wake_kind=""
+  payload_digest="none"
+  fallback_kick=0
   if [[ -n "$queued_top" ]]; then
     task_id="$queued_top"
+    wake_kind="queued"
+    payload_digest="$queue_key"
   else
-    # No queued top — probe the open set for NON-CRON claimed/blocked work
-    # (#1639 codex r3 [P2]); record NO dedup key (daemon nudges only queued).
-    # #1639 Phase-4 codex r4: scope to claimed|blocked AND exclude cron-dispatch
-    # so a cron-only queue does not trigger a spurious fallback wake — kept
-    # byte-aligned with bridge-run.sh's production fallback.
-    queue_key=""
     task_id="$(bridge_queue_cli find-open --agent "$agent" --status-filter claimed --status-filter blocked --exclude-title-prefix '[cron-dispatch]' 2>/dev/null | head -n 1 || true)"
+    if [[ -n "$task_id" ]]; then
+      wake_kind="claimed-blocked"
+      queue_key=""
+      payload_digest="none"
+    elif [[ -f "$next_file" ]]; then
+      wake_kind="handoff"
+      payload_digest="$(bridge_agent_next_session_digest "$agent" 2>/dev/null || printf "none")"
+      handoff_id="$(bridge_run_handoff_task_find_or_create "$agent" "$next_file" 2>/dev/null || true)"
+      if [[ -n "$handoff_id" ]]; then
+        task_id="$handoff_id"
+        queue_key="$handoff_id"
+      else
+        queue_key=""
+        fallback_kick=1
+      fi
+    elif [[ "$auto_restart_wake" == "1" && ! -f "$marker_file" ]]; then
+      wake_kind="first-launch-empty"
+      payload_digest="none"
+      fallback_kick=1
+    fi
   fi
+
+  restart_wake_marker=""
+  if (( fallback_kick == 1 )); then
+    restart_wake_marker="$(bridge_agent_restart_wake_marker_file "$agent" "$session_identity" "$wake_kind" "$payload_digest")"
+    if [[ -f "$restart_wake_marker" ]]; then
+      fallback_kick=0
+      task_id=""
+    fi
+  fi
+
   if [[ -n "$task_id" ]]; then
     if bridge_inject_metadata_only_enabled; then
       inject_text="$(bridge_format_injection_meta inbox-bootstrap agent="$agent" top="$task_id")"
     else
       inject_text="[Agent Bridge] ACTION REQUIRED — open tasks detected. Run exactly: ~/.agent-bridge/agb inbox $agent"
     fi
-    bridge_tmux_send_and_submit "session" claude "$inject_text" "$agent"
+    bridge_tmux_send_and_submit "$session" claude "$inject_text" "$agent"
     if [[ -n "$queue_key" ]]; then
       bridge_task_note_nudge "$agent" "$queue_key" >/dev/null 2>&1 || true
     fi
-  elif [[ "$auto_restart_wake" == "1" && ! -f "$marker_file" ]]; then
-    if bridge_inject_metadata_only_enabled; then
-      inject_text="$(bridge_format_injection_meta session-resumed agent="$agent" reason=auto-restart)"
+  elif (( fallback_kick == 1 )); then
+    if [[ "$wake_kind" == "handoff" ]]; then
+      if bridge_inject_metadata_only_enabled; then
+        inject_text="$(bridge_format_injection_meta handoff-resume agent="$agent" reason=auto-restart)"
+      else
+        inject_text="[Agent Bridge] session resumed after an automatic restart — a NEXT-SESSION.md handoff is pending."
+      fi
     else
-      inject_text="[Agent Bridge] session resumed after an automatic restart — re-read your session onboarding (SOUL.md / CLAUDE.md / NEXT-SESSION.md) and check your queue: ~/.agent-bridge/agb inbox $agent"
+      if bridge_inject_metadata_only_enabled; then
+        inject_text="$(bridge_format_injection_meta session-resumed agent="$agent" reason=auto-restart)"
+      else
+        inject_text="[Agent Bridge] session resumed after an automatic restart."
+      fi
     fi
-    bridge_tmux_send_and_submit "session" claude "$inject_text" "$agent"
+    bridge_tmux_send_and_submit "$session" claude "$inject_text" "$agent"
+    if [[ -n "$restart_wake_marker" ]]; then
+      mkdir -p "$(dirname "$restart_wake_marker")" 2>/dev/null || true
+      printf "%s\n" "$(date +%s)" >"$restart_wake_marker" 2>/dev/null || true
+    fi
   fi
   if [[ ! -f "$marker_file" ]]; then
     mkdir -p "$(dirname "$marker_file")"

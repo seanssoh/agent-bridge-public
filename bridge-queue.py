@@ -568,6 +568,15 @@ def should_proxy_via_queue_gateway(argv: list[str]) -> bool:
     return bool(queue_gateway_proxy_agent())
 
 
+# #1973 Track A — EX_TEMPFAIL (sysexits.h). The queue gateway server returns
+# this code when it KILLED a hung queue child on the per-request timeout, or
+# retired a stale in-flight request: the outcome is genuinely unknown (the write
+# may or may not have committed). MUST match bridge-queue-gateway.py's
+# GATEWAY_TEMPFAIL_EXIT_CODE. The proxy surfaces it as actionable retry guidance
+# for claim/done and NEVER masks it into a success.
+GATEWAY_TEMPFAIL_EXIT_CODE = 75
+
+
 def proxy_via_queue_gateway(argv: list[str]) -> int:
     agent = queue_gateway_proxy_agent()
     if not agent:
@@ -599,7 +608,25 @@ def proxy_via_queue_gateway(argv: list[str]) -> int:
             queue_gateway_float_env("BRIDGE_QUEUE_GATEWAY_POLL_SECONDS", "0.2"),
             *argv,
         ]
-    return int(subprocess.run(command, check=False).returncode)
+    rc = int(subprocess.run(command, check=False).returncode)
+    # #1973 Track A: degraded claim/done messaging. When the gateway server
+    # bounded the request (killed-on-timeout / stale-retired -> EX_TEMPFAIL) the
+    # outcome is UNKNOWN. We must NOT fabricate success: the nonzero rc is
+    # preserved verbatim. For the operator-critical claim/done ops we add a
+    # one-line guidance pointing at the safe recovery command. claim is safe to
+    # retry (re-claiming a task already assigned to the same agent is idempotent)
+    # and done is idempotent (already-done -> success), so retry-after-recovery
+    # is safe; a non-idempotent create is NOT auto-retried and gets no such hint.
+    op = argv[0] if argv else ""
+    if rc == GATEWAY_TEMPFAIL_EXIT_CODE and op in {"claim", "done"}:
+        task_ref = argv[1] if len(argv) > 1 and not argv[1].startswith("-") else ""
+        verify = f"agb show {task_ref}".rstrip()
+        sys.stderr.write(
+            f"queue gateway: '{op}' outcome UNKNOWN (drain stalled, request bounded); "
+            f"not retried automatically. Verify with `{verify}` / `agb inbox`, "
+            f"then re-run `agb {op}{(' ' + task_ref) if task_ref else ''}` if still needed.\n"
+        )
+    return rc
 
 
 def get_cron_state_dir() -> Path:
@@ -2034,6 +2061,40 @@ def cmd_update(args: argparse.Namespace) -> int:
             body_text = stabilized_text
             body_path = note_path
 
+        # Issue #1970: an explicit worker-progress update renews the task
+        # lease so the daemon's lease-aware idle stale-claim reclaim does not
+        # yank a long multi-turn claim mid-work. Renew ONLY when:
+        #   - the task is currently claimed AND stays claimed after this update
+        #     (an update that moves the task out of `claimed` must not extend a
+        #     lease — handoff/blocked/done own that transition); and
+        #   - the actor is the current claimant or assignee.
+        # Actor guard (security): a creator/admin metadata update may edit
+        # fields but must NOT extend the claimant's lease — no lease spoofing.
+        lease_until_ts = task["lease_until_ts"]
+        try:
+            lease_seconds = int(getattr(args, "lease_seconds", None) or 0)
+        except (TypeError, ValueError):
+            lease_seconds = 0
+        if lease_seconds <= 0:
+            try:
+                lease_seconds = int(os.environ.get("BRIDGE_TASK_LEASE_SECONDS", "900"))
+            except (TypeError, ValueError):
+                lease_seconds = 900
+        lease_owners = {
+            str(task["claimed_by"] or ""),
+            str(task["assigned_to"] or ""),
+        }
+        lease_owners.discard("")
+        if (
+            task["status"] == "claimed"
+            and status == "claimed"
+            and actor in lease_owners
+        ):
+            renewed_until = current_ts + lease_seconds
+            existing_lease = int(task["lease_until_ts"] or 0)
+            if existing_lease < renewed_until:
+                lease_until_ts = renewed_until
+
         conn.execute(
             """
             UPDATE tasks
@@ -2042,10 +2103,20 @@ def cmd_update(args: argparse.Namespace) -> int:
                 status = ?,
                 body_text = ?,
                 body_path = ?,
+                lease_until_ts = ?,
                 updated_ts = ?
             WHERE id = ?
             """,
-            (title, priority, status, body_text, body_path, current_ts, args.task_id),
+            (
+                title,
+                priority,
+                status,
+                body_text,
+                body_path,
+                lease_until_ts,
+                current_ts,
+                args.task_id,
+            ),
         )
         event_note = args.body or args.note
         emit_event(
@@ -2690,6 +2761,57 @@ def blocked_task_escalation_body(
     return "\n".join(lines).rstrip() + "\n"
 
 
+def resurface_open_alert(conn: sqlite3.Connection, *, agent: str, task_id: int) -> None:
+    # #1986: make a re-bound daemon alert (blocked-aging reminder/escalation)
+    # VISIBLE again on its cadence without re-minting a fresh id. `upsert_open_task`
+    # re-binds the SAME open task (KNOWN_ISSUES §30: open re-binds, `done` re-mints)
+    # via an in-place UPDATE that bumps body/priority but never re-enters the nudge
+    # pool — so an agent who leaves the alert open (claimed/blocked, or queued but
+    # already in `last_nudge_key`) gets a silent refresh and no new notification.
+    # Re-surface the re-bound task through the EXISTING nudge machinery: (1) put it
+    # back to `queued` so the maintain nudge-scan considers it, and (2) drop its id
+    # from the assignee's `last_nudge_key` so the scan treats it as a fresh queued
+    # trigger (`has_new_queue_ids` → re-nudge). This fires only on the cadence gate
+    # the caller already enforces (`reminder_seconds` / `escalation_seconds`), never
+    # per tick, and never re-mints — §30 dedupe ("one open alert per condition,
+    # `done` re-mints") stays intact.
+    # Claimed-alert guard (patch adversarial seed, #1986 review): if the
+    # assignee has CLAIMED the alert (status='claimed', claimed_by/lease set),
+    # they are actively working it — flipping it back to 'queued' here would
+    # clobber the claim (orphan claimed_by/claimed_ts/lease_until_ts) and
+    # re-nudge a task already in progress. Re-surface ONLY a not-yet-claimed
+    # open alert: a 'blocked' alert is flipped to 'queued'; a 'queued' alert
+    # stays 'queued' (the nudge-key eviction below re-surfaces it); a 'claimed'
+    # alert is left entirely untouched (no status flip, no key eviction, no
+    # re-nudge — the admin already has it open and in hand).
+    status_row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if status_row is None or str(status_row["status"]) == "claimed":
+        return
+    conn.execute(
+        "UPDATE tasks SET status = 'queued' WHERE id = ? AND status = 'blocked'",
+        (task_id,),
+    )
+    row = conn.execute(
+        "SELECT last_nudge_key FROM agent_state WHERE agent = ?",
+        (agent,),
+    ).fetchone()
+    if row is None:
+        return
+    current_key = str(row["last_nudge_key"] or "")
+    if not current_key:
+        return
+    remaining = [item for item in current_key.split(",") if item and item != str(task_id)]
+    new_key = ",".join(remaining)
+    if new_key != current_key:
+        conn.execute(
+            "UPDATE agent_state SET last_nudge_key = ? WHERE agent = ?",
+            (new_key, agent),
+        )
+
+
 def process_blocked_task_aging(
     conn: sqlite3.Connection,
     *,
@@ -2733,6 +2855,13 @@ def process_blocked_task_aging(
                 current_ts=current_ts,
                 refresh_note="daemon refreshed blocked-aging reminder",
             )
+            if not created:
+                # #1986: a re-bound (existing-open) reminder would otherwise refresh
+                # silently. On this cadence gate, re-surface it so the assignee gets a
+                # fresh visible nudge instead of an invisible in-place refresh.
+                resurface_open_alert(
+                    conn, agent=str(task["assigned_to"]), task_id=reminder_task_id
+                )
             emit_event(
                 conn,
                 task_id,
@@ -2751,8 +2880,16 @@ def process_blocked_task_aging(
         if not admin_agent:
             continue
 
+        # #1986 (b): relax the strict one-shot escalation to a BOUNDED periodic
+        # re-escalation. Previously `last_escalated_ts != 0 → continue` meant a
+        # long-blocked task escalated to admin exactly once, ever. Re-escalate at
+        # most once per `escalation_seconds` (the same cadence-gate shape the
+        # reminder uses), so a task that stays blocked re-surfaces to admin
+        # periodically instead of silently. The cadence gate bounds it — no
+        # per-tick churn — and §30 dedupe holds (we re-bind the SAME open
+        # escalation task, never re-mint).
         last_escalated_ts = latest_event_ts(conn, task_id, "blocked_escalated")
-        if last_escalated_ts != 0:
+        if last_escalated_ts != 0 and current_ts - last_escalated_ts < escalation_seconds:
             continue
 
         title_prefix = f"{BLOCKED_ESCALATION_TITLE_PREFIX}{task_id} "
@@ -2767,6 +2904,10 @@ def process_blocked_task_aging(
             current_ts=current_ts,
             refresh_note="daemon refreshed blocked-aging escalation",
         )
+        if not created:
+            # Re-bound (existing-open) escalation → re-surface visibly to admin on
+            # the escalation cadence instead of a silent in-place refresh.
+            resurface_open_alert(conn, agent=admin_agent, task_id=escalation_task_id)
         emit_event(
             conn,
             task_id,
@@ -3048,7 +3189,7 @@ def cmd_daemon_step(args: argparse.Namespace) -> int:
         # on anything — its claimed tasks should be released.
         stale_claimed = conn.execute(
             """
-            SELECT id, claimed_by
+            SELECT id, claimed_by, lease_until_ts
             FROM tasks
             WHERE status = 'claimed'
               AND claimed_ts IS NOT NULL
@@ -3060,9 +3201,28 @@ def cmd_daemon_step(args: argparse.Namespace) -> int:
             agent_name = str(row["claimed_by"])
             note_text = ""
             if agent_name not in active_agents:
+                # Inactive (down) claimant: NOT lease-aware. A down agent's
+                # claim must release on claimed_ts age even if its lease is
+                # still in the future — nothing is going to renew it.
                 note_text = f"claimed for >{max_claim_age}s by inactive agent"
             elif agent_name in idle_agents:
-                note_text = f"claimed for >{max_claim_age}s by idle agent"
+                # Issue #1970: a LIVE-but-prompt-idle claimant is a long
+                # multi-turn task between turns, not an abandoned claim. Skip
+                # the requeue while its lease is still valid — the renewal
+                # path (recent session_activity_ts) and explicit `agb update
+                # --lease-seconds` keep a working agent's lease alive, and the
+                # lease-expiry path above reclaims a genuinely-abandoned claim.
+                # Boundary matches lease-expiry (`>= current_ts` still valid).
+                # A NULL lease stays reclaimable: legacy / hand-built rows and
+                # the bash↔python upgrade window have no lease to honor, so
+                # they still release here via stale_claim_requeued.
+                lease_until = int(row["lease_until_ts"] or 0)
+                if lease_until and lease_until >= current_ts:
+                    continue
+                note_text = (
+                    f"claimed for >{max_claim_age}s by idle agent "
+                    "with expired/missing lease"
+                )
             else:
                 continue
             conn.execute(
@@ -3534,6 +3694,12 @@ def build_parser() -> argparse.ArgumentParser:
     update_parser.add_argument("--status", choices=UPDATE_STATUS_CHOICES)
     update_parser.add_argument("--priority", choices=PRIORITY_CHOICES)
     update_parser.add_argument("--note")
+    # Issue #1970: renew the task lease on explicit worker progress. Only the
+    # current claimant/assignee renews, and only while the task stays claimed.
+    update_parser.add_argument(
+        "--lease-seconds",
+        default=os.environ.get("BRIDGE_TASK_LEASE_SECONDS", "900"),
+    )
     update_body_group = update_parser.add_mutually_exclusive_group()
     update_body_group.add_argument("--body")
     update_body_group.add_argument("--body-file")

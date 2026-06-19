@@ -60,13 +60,36 @@ daemon process is alive but its main loop has frozen. It restarts the
 daemon when the heartbeat mtime exceeds
 `BRIDGE_DAEMON_LIVENESS_THRESHOLD_SECONDS` (default 600s) and honours
 `BRIDGE_DAEMON_LIVENESS_COOLDOWN_SECONDS` (default 600s) to avoid
-restart loops on a broken daemon. Pass `--skip-liveness` to `bootstrap`
-to opt out, or invoke the installer directly:
+restart loops on a broken daemon.
+
+On Linux the systemd daemon installer (`scripts/install-daemon-systemd.sh
+--apply` / `--enable`) now installs this timer **by default**, `agb upgrade`
+reapplies it on every upgrade, and `agb daemon ensure` self-installs it when
+it is missing — because an absent timer was the #1973 production failure mode
+(a stalled-but-alive daemon with no supervisor to recover it). Pass
+`--skip-liveness` to `bootstrap` or `--skip-liveness-timer` to
+`install-daemon-systemd.sh` to opt out (a loud warning is emitted), or invoke
+the timer installer directly:
 
 ```bash
 ./scripts/install-daemon-liveness-launchagent.sh --apply --load    # macOS
 ./scripts/install-daemon-liveness-systemd.sh --apply --enable      # Linux
 ```
+
+The watcher also detects a **queue-gateway stall** (issue #1973): when the
+file-transport gateway has pending/working requests whose oldest age exceeds
+`BRIDGE_DAEMON_GATEWAY_STALL_SECONDS` (default 300s) AND the request is still
+old on the next poll (a cross-poll witness in
+`state/daemon-gateway-stall.ts`), it restarts the daemon even though the
+heartbeat is fresh — the #1973 wedge had a ticking heartbeat but a stalled
+drain. An *idle* gateway (no old requests) never triggers a restart. Set
+`BRIDGE_DAEMON_GATEWAY_STALL_DISABLE=1` for heartbeat-only behaviour. Before
+any restart the watcher writes `state/daemon-recovery-renudge.env`; the fresh
+daemon consumes it once and runs a one-shot re-nudge pass for agents with
+queued tasks (bypassing the per-task redelivery backoff for that single pass,
+gated by `BRIDGE_DAEMON_RECOVERY_RENUDGE_COOLDOWN_SECONDS`, default 300s),
+so agents the stall left silently stuck (`notify=miss`) are re-nudged without
+a manual `agb urgent`.
 
 `BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS` (default 60s, issue #767) is the
 minimum interval between identical-fingerprint inbox nudges to the same
@@ -1064,12 +1087,22 @@ compatibility; any of the three explicitly set to `0` disables automatic
 enqueue.
 
 A pre-flight memory guard (#263 Track B) probes host memory before spawning
-the cron disposable child. On Darwin the probe rejects dispatch when swap
-usage meets or exceeds `BRIDGE_CRON_SWAP_PCT_LIMIT` (default `80`). On Linux
-it rejects when `MemAvailable` drops below `BRIDGE_CRON_MIN_AVAIL_MB`
-megabytes (default `512`). A deferred run writes `state=deferred` to the run's
-`status.json`, emits a `cron_dispatch_deferred` audit row, and pings the
-admin agent; the next scheduler tick re-fires the slot.
+the cron disposable child. On Darwin the probe reads the kernel pressure tier
+`sysctl kern.memorystatus_vm_pressure_level` (`1`=Normal, `2`=Warn,
+`4`=Critical — Apple's calibrated metric, the same one Activity Monitor's
+"Memory Pressure" graph uses) and rejects dispatch only when the level meets
+or exceeds `BRIDGE_CRON_DARWIN_PRESSURE_LEVEL` (default `2` = Warn).
+`vm.swapusage` is **not** a pressure signal on macOS — the kernel uses swap as
+a normal tier of the memory hierarchy, so a healthy host routinely sits at
+80–90 %+ swap, and gating on swap-percent chronically false-defers all cron
+dispatch (#1929 / #397). The legacy swap-percent probe
+(`used / total >= BRIDGE_CRON_SWAP_PCT_LIMIT`, default `80`) stays available as
+an explicit fallback via `BRIDGE_CRON_DARWIN_PRESSURE_FALLBACK=swap_pct`, and
+fires automatically only when the kernel sysctl is unreadable (older macOS /
+sandboxed test env). On Linux the probe rejects when `MemAvailable` drops below
+`BRIDGE_CRON_MIN_AVAIL_MB` megabytes (default `512`). A deferred run writes
+`state=deferred` to the run's `status.json`, emits a `cron_dispatch_deferred`
+audit row, and pings the admin agent; the next scheduler tick re-fires the slot.
 
 ### cron-dispatch worker-pool size (`BRIDGE_CRON_DISPATCH_MAX_PARALLEL`, issue #1461)
 

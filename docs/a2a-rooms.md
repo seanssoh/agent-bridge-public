@@ -93,6 +93,14 @@ membership. Join attempts are rate-limited per token + source, and the token is
 verified by hash compare — an invalid token is rejected. The request lands as
 `pending`.
 
+> **Cross-node first-contact** (joining from a node the leader has never paired
+> with) additionally needs the leader to have **room auto-join enabled** — see
+> [Enabling first-contact room auto-join](#enabling-first-contact-room-auto-join-bridge_a2a_room_autojoin--runbook-2024).
+> Without it the join returns `403 code=room_autojoin_disabled`. That response
+> only proves the leader's auto-join gate is off (it is returned *before* any
+> token check) — so do not rotate the invite for it; have the leader enable +
+> restart, then retry.
+
 ### 3. Leader approves (or denies)
 
 ```bash
@@ -320,6 +328,53 @@ adapters, so the control-loop logic itself stays transport-agnostic:
 - **Roster anti-entropy (P2)** — member nodes converge on the leader's canonical
   roster epoch automatically; a node that missed a membership change catches up
   on the next reconcile pass instead of drifting.
+
+### Enabling first-contact room auto-join (`BRIDGE_A2A_ROOM_AUTOJOIN`) — runbook (#2024)
+
+Token-bootstrap join (above) is **gated OFF by default** on the leader's A2A
+receiver. With the gate off, a brand-new node's first `agb room join '<signed
+invite>'` is rejected with **HTTP 403 `code=room_autojoin_disabled`** — the
+leader has not opted in to first-contact auto-join. This code is **posture
+only**: the gate fires *before* any token or room check, so it tells you the
+gate is off but says **nothing** about whether the invite itself is valid (an
+expired/revoked/wrong-room invite gets the same code while the gate is off).
+Opt-in is deliberate: auto-join only ever creates a **pending, leader-approved**
+join (it admits nobody automatically), but it is the only place the receiver
+does any pre-auth work for an *unknown* peer.
+
+`agb room invite` and `agb a2a setup --show-state` both warn the leader when
+this gate is off. To turn it on:
+
+**Leader** (enable once, then hand out invites):
+
+```bash
+agb config set-env BRIDGE_A2A_ROOM_AUTOJOIN=1   # writes $BRIDGE_HOME/agent-env.local.sh
+agb a2a daemon restart                          # re-sources the override into the receiver
+agb room invite <room_id>                       # mint the signed invite to hand out
+```
+
+> Use `agb a2a daemon restart`, **not** a direct `bash bridge-handoff-daemon.sh
+> start`. Only the `agb` lifecycle path sources the install-wide
+> `agent-env.local.sh` override; a direct bash start launches the receiver
+> without `BRIDGE_A2A_ROOM_AUTOJOIN` and the gate stays off. To turn the gate
+> back **off**, remove the key from `agent-env.local.sh` and restart.
+
+**Joiner** (single signed link completes onboarding):
+
+```bash
+agb room join '<signed invite link>'
+```
+
+**If the joiner gets `room_autojoin_disabled`**: this response proves *only*
+that the leader's auto-join gate is disabled (it is returned before any token
+check, so it does not confirm the invite is valid). Ask the leader to run the
+two commands above and restart the receiver, then retry. **Do not rotate the
+invite** for this error; rotation does not change the leader's gate posture. If
+the retry *still* fails after the leader has enabled + restarted, then
+troubleshoot token validity / leader routing — once the gate is on, a genuinely
+invalid/expired token or a non-leader node is rejected with the opaque
+`unknown peer` (the gate only ever reveals the leader's posture, never room
+existence or token validity).
 
 ### `agb a2a net-status` — the control-loop status window (v2, #1708)
 

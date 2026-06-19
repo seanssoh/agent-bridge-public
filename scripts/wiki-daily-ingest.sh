@@ -574,6 +574,32 @@ lane_b_same_install() {
     "$BRIDGE_HOME" "$BRIDGE_AGB" "$task_db" "$BRIDGE_STATE_DIR"
 }
 
+# Gate 3 — librarian LIVENESS, not mere existence (issue #1983).
+#
+# `agb agent show librarian` succeeding only proves the role *exists*. A
+# stopped-but-present librarian still satisfies it, so keying target selection
+# on existence chose `librarian` even when it was down — the subsequent
+# `agb task create --to librarian` then failed (an inactive agent needs
+# `--force`) and the failure was swallowed by `|| true`, defeating the designed
+# `$BRIDGE_ADMIN_AGENT` fallback. This gate reports liveness from librarian's
+# `active` flag in `agb agent list --json` — the canonical liveness signal the
+# rest of the bridge uses (bridge_agent_is_active). Returns 0 only when a
+# roster entry named `librarian` is present AND active. Best-effort: a missing
+# CLI / python / helper, or a failed/malformed `agent list`, returns non-zero
+# so the admin fallback engages rather than routing at a librarian that cannot
+# be proven live. Parsing runs in the standalone file-as-argv helper
+# scripts/wiki-ingest-librarian-live.py — a heredoc-stdin python3 invocation
+# here would be a banned footgun-#11 site.
+lane_b_librarian_is_live() {
+  command -v "$BRIDGE_PYTHON" >/dev/null 2>&1 || return 1
+  local _live_helper="$_WDI_SCRIPT_DIR/wiki-ingest-librarian-live.py"
+  [[ -r "$_live_helper" ]] || return 1
+  local agent_list_json=""
+  agent_list_json="$("$BRIDGE_AGB" agent list --json 2>/dev/null)" || return 1
+  [[ -n "$agent_list_json" ]] || return 1
+  "$BRIDGE_PYTHON" "$_live_helper" "$agent_list_json"
+}
+
 # Queue librarian task only for non-daily work. Lane A already handled
 # daily notes and did not produce a task. Falls back to the admin agent
 # (default: patch) only if the librarian is not provisioned on this
@@ -604,14 +630,38 @@ if [ "$non_daily_total" -gt 0 ]; then
       echo "work into a different install's queue (#1042)."
     } >> "$LOG"
   else
+    # Select the target by LIVENESS, not mere existence (#1983). A
+    # stopped-but-present librarian must fall through to the live admin
+    # fallback ($BRIDGE_ADMIN_AGENT) so the ingest is actually serviceable —
+    # routing at a down librarian only manufactures a failed `task create`.
     target="$BRIDGE_ADMIN_AGENT"
-    if "$BRIDGE_AGB" agent show librarian >/dev/null 2>&1; then
+    if lane_b_librarian_is_live; then
       target="librarian"
     fi
+    # Capture the real create outcome — do NOT mask it with `|| true` and a
+    # blind `enqueued-$target`. A swallowed failure silently drops Lane B
+    # while the run/audit log claims success (the #1983 false positive).
+    create_exit=0
     "$BRIDGE_AGB" task create --to "$target" --priority normal --from "$BRIDGE_ADMIN_AGENT" \
       --title "[librarian-ingest] $non_daily_total 파일 ingest 필요 — $DATE" \
-      --body-file "$LOG" >/dev/null 2>&1 || true
-    lane_b_enqueue_status="enqueued-$target"
+      --body-file "$LOG" >/dev/null 2>&1 || create_exit=$?
+    if [ "$create_exit" -eq 0 ]; then
+      lane_b_enqueue_status="enqueued-$target"
+    else
+      # The chosen target's create genuinely failed — surface it as a visible
+      # signal instead of a false success, so the silent drop becomes loud.
+      lane_b_enqueue_status="enqueue-failed-$target"
+      {
+        echo ""
+        echo "## Lane B enqueue FAILED"
+        echo ""
+        echo "reason: \`agb task create --to $target\` exited $create_exit —"
+        echo "$non_daily_total non-daily file(s) detected but no [librarian-ingest]"
+        echo "task was created. Lane B captures were NOT enqueued; this run did"
+        echo "NOT silently succeed. Check that '$target' is live and accepting"
+        echo "tasks (a stopped agent needs \`--force\`, or restart it)."
+      } >> "$LOG"
+    fi
   fi
 fi
 
