@@ -2101,6 +2101,30 @@ sys.stdout.write(latest)
 # How often the supervisor parent polls the child + progress freshness.
 : "${BRIDGE_DAEMON_TICK_POLL_SECONDS:=2}"
 
+# Issue #2030 — suspend-aware no-progress deadline. The wedge backstop measures
+# in-tick "no progress" with a WALL-CLOCK delta (now - last progress stamp).
+# On a host that SLEEPS (laptop / non-always-on Mac), system sleep suspends the
+# whole daemon process AND freezes its progress-heartbeat mtime; on wake the
+# wall clock has jumped forward by the entire sleep duration, so the supervisor
+# reads e.g. "no progress for 910s >= deadline 720s" and false-aborts (exit 99)
+# though nothing actually hung. We discriminate suspend-from-hang by the SHAPE
+# of the wall-clock gap observed BETWEEN two consecutive supervisor polls:
+#   - a genuine in-tick HANG produces MANY small per-poll gaps (each ~= the
+#     poll interval) that accumulate to the deadline — the supervisor keeps
+#     observing forward time at its normal cadence;
+#   - a SUSPEND produces ONE huge gap (the whole sleep duration) across a single
+#     poll, because the supervisor itself was frozen and did not run for that
+#     entire span.
+# So: if a single inter-poll gap is far larger than the poll interval (>= the
+# suspend threshold below), we CREDIT that gap as suspended time and subtract it
+# from the no-progress age before the deadline comparison. Only the single huge
+# gap is forgiven; a hang's small accumulating gaps are NEVER credited, so a
+# real hang STILL fires the wedge. The threshold is max(absolute floor, poll *
+# multiplier) so it scales with an operator-raised poll interval and never trips
+# on ordinary poll jitter / a slow `sleep`.
+: "${BRIDGE_DAEMON_TICK_SUSPEND_GAP_FLOOR_SECONDS:=120}"
+: "${BRIDGE_DAEMON_TICK_SUSPEND_GAP_POLL_MULT:=10}"
+
 # The operator-tunable synchronous bridge_with_timeout step ceilings reachable
 # from cmd_sync_cycle, paired with their documented defaults. The effective
 # max-step is the MAX of the floor and EVERY one of these, so raising ANY of
@@ -2264,22 +2288,46 @@ _bridge_daemon_tick_last_step() {
 }
 
 # _bridge_daemon_tick_progress_age — seconds since the last progress stamp.
-# Prints a large sentinel when the file is missing/unreadable so the
-# supervisor treats "never wrote progress" as a wedge candidate only after
-# the deadline (the first stamp happens at tick start, so a healthy child
-# establishes the baseline immediately).
+# Prints the BRIDGE_DAEMON_TICK_PROGRESS_AGE_SENTINEL when the file is
+# missing/unreadable. The sentinel is a fixed out-of-band marker far above any
+# normal deadline (NOT a real elapsed age), so the supervisor treats a
+# missing/never-written progress file as an immediate wedge candidate (it
+# exceeds the deadline on the first poll that observes it). A healthy child
+# stamps progress at tick start, so the baseline is established immediately and
+# the sentinel only appears when the file is genuinely absent/unreadable. The
+# #2030 suspend-credit path MUST exclude the sentinel — see
+# bridge_daemon_run_tick_supervised: a sentinel age fed into the age-jump credit
+# would forgive itself and suppress the wedge forever on a missing/deleted
+# progress file (codex #2030 r4).
+BRIDGE_DAEMON_TICK_PROGRESS_AGE_SENTINEL=999999
 _bridge_daemon_tick_progress_age() {
-  local pf now_ts last_ts
+  local pf now_ts last_ts=""
   pf="$(bridge_daemon_tick_progress_file)"
   now_ts="$(date +%s 2>/dev/null || printf '0')"
   if [[ -r "$pf" ]]; then
     last_ts="$(tr -dc '0-9' <"$pf" 2>/dev/null | head -c 18)"
   fi
-  [[ "$last_ts" =~ ^[0-9]+$ ]] || { printf '%s' "999999"; return 0; }
-  [[ "$now_ts" =~ ^[0-9]+$ ]] || { printf '%s' "999999"; return 0; }
+  [[ "$last_ts" =~ ^[0-9]+$ ]] || { printf '%s' "$BRIDGE_DAEMON_TICK_PROGRESS_AGE_SENTINEL"; return 0; }
+  [[ "$now_ts" =~ ^[0-9]+$ ]] || { printf '%s' "$BRIDGE_DAEMON_TICK_PROGRESS_AGE_SENTINEL"; return 0; }
   local age=$(( now_ts - last_ts ))
   (( age < 0 )) && age=0
   printf '%s' "$age"
+}
+
+# _bridge_daemon_tick_progress_ts — the raw epoch in the progress file (the
+# last stamp the child wrote), or 0 when missing/unreadable. Issue #2030: the
+# supervisor reads this each poll to detect when the CHILD made forward
+# progress (the stamp advanced) so it can reset its accumulated suspend credit
+# — a credit earned in one no-progress interval must NOT carry into a LATER
+# no-progress interval after the child resumed and re-stamped.
+_bridge_daemon_tick_progress_ts() {
+  local pf last_ts=""
+  pf="$(bridge_daemon_tick_progress_file)"
+  if [[ -r "$pf" ]]; then
+    last_ts="$(tr -dc '0-9' <"$pf" 2>/dev/null | head -c 18)"
+  fi
+  [[ "$last_ts" =~ ^[0-9]+$ ]] || last_ts=0
+  printf '%s' "$last_ts"
 }
 
 # ---------------------------------------------------------------------------
@@ -2356,6 +2404,81 @@ bridge_daemon_state_counter_reset() {
   bridge_daemon_state_counter_set "${1:-}" 0
 }
 
+# _bridge_daemon_tick_suspend_threshold <poll> — issue #2030. The minimum
+# single inter-poll wall-clock gap that we treat as an OS suspend/resume (vs
+# ordinary poll cadence). max(absolute floor, poll * multiplier) so it scales
+# with an operator-raised poll interval and never trips on poll jitter. Pure
+# arithmetic; set -u safe (poll defaults, env knobs validated).
+_bridge_daemon_tick_suspend_threshold() {
+  local poll="${1:-2}"
+  [[ "$poll" =~ ^[0-9]+$ ]] && (( poll > 0 )) || poll=2
+  local floor="${BRIDGE_DAEMON_TICK_SUSPEND_GAP_FLOOR_SECONDS:-120}"
+  local mult="${BRIDGE_DAEMON_TICK_SUSPEND_GAP_POLL_MULT:-10}"
+  [[ "$floor" =~ ^[0-9]+$ ]] || floor=120
+  [[ "$mult" =~ ^[0-9]+$ ]] || mult=10
+  local by_poll=$(( poll * mult ))
+  local thr="$floor"
+  (( by_poll > thr )) && thr="$by_poll"
+  printf '%s' "$thr"
+}
+
+# _bridge_daemon_tick_suspend_credit_gap <gap> <poll> — issue #2030 suspend-vs-
+# hang discriminator. Given the wall-clock seconds observed across ONE
+# supervisor poll iteration (<gap>) and the poll interval, return the number of
+# seconds to CREDIT as suspended (subtract from the no-progress age). A single
+# gap >= the suspend threshold is a suspend/resume jump: credit the WHOLE gap
+# minus one expected poll step (the time the supervisor would normally have
+# advanced), so only the FROZEN span is forgiven. A gap below the threshold is
+# ordinary poll cadence (or a hang's small per-poll increment): credit 0. This
+# is the mutation point — removing the credit makes a single huge suspend gap
+# count toward the deadline and false-wedge on wake. Pure; set -u safe.
+_bridge_daemon_tick_suspend_credit_gap() {
+  local gap="${1:-0}" poll="${2:-2}"
+  [[ "$gap" =~ ^[0-9]+$ ]] || gap=0
+  [[ "$poll" =~ ^[0-9]+$ ]] && (( poll > 0 )) || poll=2
+  local thr
+  thr="$(_bridge_daemon_tick_suspend_threshold "$poll")"
+  if (( gap >= thr )); then
+    local credit=$(( gap - poll ))
+    (( credit < 0 )) && credit=0
+    printf '%s' "$credit"
+    return 0
+  fi
+  printf '0'
+  return 0
+}
+
+# _bridge_daemon_restarter_present — issue #2030 defense-in-depth probe. The
+# T1 self-abort (exit 99) is SAFE only because it assumes an OS-init restarter
+# (launchd KeepAlive / systemd Restart=always) will bring up a FRESH daemon.
+# The #2030 incident host had the LaunchAgent enabled-but-NOT-loaded, so the
+# self-abort became a permanent multi-hour outage with no operator alert.
+# Returns 0 when a restarter is POSITIVELY confirmed loaded/active:
+#   - Darwin: our launchd label resolves AND launchd reports a live job pid
+#     (the plist is bootstrapped into the gui domain, not merely on disk);
+#   - Linux: the systemd-user unit is `is-active`.
+# Returns 1 when no restarter can be confirmed (unknown / nohup / not loaded) —
+# the caller WARNs loudly before exiting so a false-or-real abort on a host
+# with no live restarter is at least operator-visible. This probe NEVER
+# installs or repairs a restarter (install-time concern, out of scope).
+_bridge_daemon_restarter_present() {
+  if [[ "$(uname 2>/dev/null)" == "Darwin" ]]; then
+    command -v launchctl >/dev/null 2>&1 || return 1
+    local label
+    label="$(_bridge_daemon_launchd_label 2>/dev/null || true)"
+    [[ -n "$label" ]] || return 1
+    local job_pid
+    job_pid="$(_bridge_daemon_launchd_job_pid "$label" 2>/dev/null || true)"
+    [[ "$job_pid" =~ ^[0-9]+$ ]] && return 0
+    return 1
+  fi
+  # Linux / other: a live systemd-user unit is the confirmable restarter.
+  if _bridge_daemon_control_systemd_active 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
 # bridge_daemon_run_tick_supervised — the runner-process T1.
 #
 # Runs the tick function ("$@", normally `cmd_sync_cycle`) as a CHILD in its
@@ -2419,6 +2542,32 @@ bridge_daemon_run_tick_supervised() {
     fi
   } 2>/dev/null
 
+  # Issue #2030 suspend accounting. `_prev_age` is the no-progress AGE observed
+  # at the previous poll (for the current interval). `_suspend_credit` accumulates
+  # the seconds the host spent SUSPENDED *during the current no-progress interval*,
+  # which we subtract from the no-progress age so a wake-from-sleep RESUMES the
+  # step instead of false-wedging.
+  #
+  # The discriminator keys on the per-poll JUMP IN no-progress AGE
+  # (age = now - last_progress_stamp), NOT the raw inter-poll wall gap. This is
+  # what makes it correct across the suspend/progress interleavings:
+  #   - the age is ALWAYS measured from the latest progress stamp, so a suspend
+  #     that happened BEFORE a fresh stamp is already excluded (the new age is
+  #     small) and a suspend that happened AFTER the stamp shows up as a large
+  #     age — exactly the span we must forgive;
+  #   - a genuine HANG grows age by ~poll each iteration (never crossing the
+  #     suspend threshold) → no credit → the wedge fires on schedule;
+  #   - a SUSPEND grows age by one huge jump in a single poll (the supervisor
+  #     itself was frozen) → credit (jump - poll).
+  # On a NEW no-progress interval (the progress stamp advanced) the credit is
+  # reset to 0 and the age-baseline re-anchored, but if the new age is itself
+  # huge (the child progressed and THEN the host slept, same poll) that
+  # post-stamp suspend is credited from the new age — so a legitimate
+  # progress-then-sleep is forgiven, not false-wedged.
+  local _suspend_credit=0 _last_progress_ts _prev_age
+  _last_progress_ts="$(_bridge_daemon_tick_progress_ts)"
+  _prev_age=0
+
   local child_status=0
   while true; do
     # Has the child finished? `kill -0` is true while alive.
@@ -2429,9 +2578,66 @@ bridge_daemon_run_tick_supervised() {
       return "$child_status"
     fi
 
-    local age
+    local age _cur_progress_ts _progressed=0
     age="$(_bridge_daemon_tick_progress_age)"
     [[ "$age" =~ ^[0-9]+$ ]] || age=0
+    _cur_progress_ts="$(_bridge_daemon_tick_progress_ts)"
+    if [[ "$_cur_progress_ts" =~ ^[0-9]+$ && "$_last_progress_ts" =~ ^[0-9]+$ ]] \
+       && (( _cur_progress_ts > _last_progress_ts )); then
+      _progressed=1
+    fi
+    [[ "$_cur_progress_ts" =~ ^[0-9]+$ ]] && _last_progress_ts="$_cur_progress_ts"
+
+    # Compute the suspend credit for THIS poll from the age JUMP. On a fresh
+    # interval (progress advanced) the relevant jump is the whole new age (any
+    # suspend that postdates the new stamp); otherwise it is the per-poll
+    # delta age - _prev_age. A jump >= the suspend threshold is a single OS
+    # suspend span → credit (jump - poll). A hang's ~poll jumps never qualify.
+    #
+    # SENTINEL GUARD (codex #2030 r4): when the progress file is missing/
+    # unreadable, _bridge_daemon_tick_progress_age returns the fixed sentinel
+    # (a NO-BASELINE marker, not a real elapsed age). That is exactly the
+    # #1563 "never wrote progress" wedge candidate — it must NOT be credited as
+    # suspend time (a sentinel age fed into the jump would forgive itself and
+    # suppress the wedge forever on a deleted/never-written progress file).
+    # Skip all crediting this poll and DROP any carried credit so the raw
+    # sentinel reaches the deadline comparison and wedges after the deadline.
+    local _age_jump _credit
+    local _sentinel="${BRIDGE_DAEMON_TICK_PROGRESS_AGE_SENTINEL:-999999}"
+    if (( age >= _sentinel )); then
+      _suspend_credit=0
+    else
+      if (( _progressed == 1 )); then
+        _suspend_credit=0
+        _age_jump="$age"
+      else
+        _age_jump=$(( age - _prev_age ))
+        (( _age_jump < 0 )) && _age_jump=0
+      fi
+      _credit="$(_bridge_daemon_tick_suspend_credit_gap "$_age_jump" "$poll")"
+      [[ "$_credit" =~ ^[0-9]+$ ]] || _credit=0
+      if (( _credit > 0 )); then
+        _suspend_credit=$(( _suspend_credit + _credit ))
+        if command -v bridge_audit_log >/dev/null 2>&1; then
+          bridge_audit_log daemon daemon_tick_suspend_credited daemon \
+            --detail tick_id="$tick_id" \
+            --detail age_jump_seconds="$_age_jump" \
+            --detail credited_seconds="$_credit" \
+            --detail progressed="$_progressed" \
+            --detail suspend_credit_total_seconds="$_suspend_credit" >/dev/null 2>&1 || true
+        fi
+      fi
+    fi
+    _prev_age="$age"
+
+    # Subtract suspended time: the deadline measures IN-TICK no-progress, not
+    # wall-clock-including-sleep. Credit can never exceed the current interval's
+    # age (it is the sum of age-jumps within this interval), so the floor is a
+    # belt-and-suspenders guard, not load-bearing.
+    if (( _suspend_credit > 0 )); then
+      age=$(( age - _suspend_credit ))
+      (( age < 0 )) && age=0
+    fi
     if (( age >= deadline )); then
       # WEDGE. Kill the child's process group (TERM, grace, KILL) so a hung
       # grandchild cannot orphan, then emit the structured audit + signal a
@@ -2478,10 +2684,26 @@ bridge_daemon_run_tick_supervised() {
           --detail duration_seconds="$duration" \
           --detail deadline_seconds="$deadline" \
           --detail progress_age_seconds="$age" \
+          --detail suspend_credit_seconds="$_suspend_credit" \
           --detail pid="$$" >/dev/null 2>&1 || true
       fi
       if command -v bridge_warn >/dev/null 2>&1; then
         bridge_warn "daemon-tick: WEDGE detected at step=$last_step (no progress for ${age}s >= deadline ${deadline}s) — self-aborting for OS-init restart (issue #1563)"
+      fi
+      # Issue #2030 defense-in-depth: the self-abort assumes an OS-init
+      # restarter (launchd KeepAlive / systemd Restart=always) will respawn a
+      # fresh daemon. If we cannot CONFIRM one is loaded/active, exiting here
+      # risks a permanent outage — emit a loud, operator-visible WARN (the
+      # abort still proceeds; we never auto-install a restarter from this path).
+      if ! _bridge_daemon_restarter_present; then
+        if command -v bridge_audit_log >/dev/null 2>&1; then
+          bridge_audit_log daemon daemon_tick_wedge_no_restarter daemon \
+            --detail tick_id="$tick_id" \
+            --detail last_step="$last_step" >/dev/null 2>&1 || true
+        fi
+        if command -v bridge_warn >/dev/null 2>&1; then
+          bridge_warn "daemon-tick: self-aborting (#1563) but NO OS-init restarter is confirmed loaded (launchd KeepAlive / systemd Restart=always) — the daemon may NOT auto-restart. If this host sleeps, see issue #2030. Operator action: ensure the daemon LaunchAgent/unit is bootstrapped (e.g. 'launchctl bootstrap gui/\$UID ~/Library/LaunchAgents/ai.agent-bridge.daemon.plist' on macOS, or 'systemctl --user enable --now agent-bridge-daemon.service' on Linux)."
+        fi
       fi
       return "$BRIDGE_DAEMON_TICK_WEDGE_RC"
     fi
