@@ -860,6 +860,37 @@ def _parse_roster_tsv_ids(path: Path) -> set[str]:
     return ids
 
 
+def _parse_roster_tsv_engines(path: Path) -> dict[str, str]:
+    """Issue #2016: per-agent engine declarations from ``state/active-roster.tsv``.
+
+    The live active-roster TSV carries the engine in column 2 (header
+    ``agent\\tengine\\tsession\\t…`` — see lib/bridge-state.sh
+    bridge_render_active_roster). A dynamic / active claude agent that exists
+    ONLY in this TSV (never written into a shell roster file) is otherwise
+    invisible to ``collect_roster_engines`` (shell-only), so the codex
+    AGENTS.md emission gate would fall back to the detect_engine heuristic and
+    could still re-emit on it. Parse it here so the gate is roster-authoritative
+    for dynamic agents too. Header row + malformed/short rows are skipped;
+    read-as-existence (the OSError IS the probe) keeps the #1175 audit ceiling.
+    """
+    engines: dict[str, str] = {}
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return engines
+    for idx, line in enumerate(text.splitlines()):
+        if idx == 0 and line.startswith("agent\t"):
+            continue
+        cols = line.split("\t")
+        if len(cols) < 2:
+            continue
+        agent_id = cols[0].strip()
+        engine = cols[1].strip().lower()
+        if agent_id and engine:
+            engines[agent_id] = engine
+    return engines
+
+
 def _parse_roster_engines(text: str) -> dict[str, str]:
     """Best-effort extraction of per-agent engine declarations from a roster
     shell file. Static parse only — never sources the file. Returns an
@@ -1244,7 +1275,13 @@ def backfill_codex_agents_md_home(
     return "refreshed"
 
 
-def migrate_agent_home(agent_dir: Path, template_root: Path, admin_agent: str, dry_run: bool) -> AgentMigrationResult:
+def migrate_agent_home(
+    agent_dir: Path,
+    template_root: Path,
+    admin_agent: str,
+    dry_run: bool,
+    roster_engine: str | None = None,
+) -> AgentMigrationResult:
     agent = agent_dir.name
     session_type = detect_session_type(agent_dir, admin_agent)
     engine = detect_engine(agent_dir, session_type)
@@ -1254,9 +1291,30 @@ def migrate_agent_home(agent_dir: Path, template_root: Path, admin_agent: str, d
     created_dirs: list[str] = []
     updated_files: list[str] = []
 
+    # Issue #2016: codex AGENTS.md is emitted onto the agent home in TWO places
+    # during migrate — the `codex/` template subtree the rglob below copies
+    # (`home/codex/AGENTS.md`) AND the home-ROOT `AGENTS.md` the #1809 entrypoint
+    # backfill writes at the tail. BOTH are CODEX-ONLY; on a claude agent they
+    # produce a self-contradictory file (codex identity line, claude runtime)
+    # that then keeps the doc-backfill `detect_engine` heuristic flagging the
+    # agent as codex — a benign-but-permanent `[hygiene] engine disagreement`
+    # hold re-firing every upgrade/backfill pass. The engine SIGNAL for both
+    # codex-emission gates must be ROSTER-authoritative (independent of the
+    # `detect_engine` filesystem heuristic that incidental "Codex CLI" prose
+    # trips and that #1930/#1975 hardens separately); fall back to the heuristic
+    # `engine` only when the roster does not declare one. (The render `engine`
+    # used for placeholder substitution above stays the heuristic value — that is
+    # #1930/#1975's domain, not this gate's.)
+    codex_emit_engine = (roster_engine or engine or "").strip().lower()
+    skip_codex_subtree = codex_emit_engine != "codex"
+
     for path in sorted(template_root.rglob("*")):
         rel = path.relative_to(template_root)
         if rel.parts and rel.parts[0] == "session-types":
+            continue
+        # Issue #2016: never materialize the codex-only `codex/` subtree
+        # (codex AGENTS.md contract) onto a non-codex agent home.
+        if skip_codex_subtree and rel.parts and rel.parts[0] == "codex":
             continue
         # v0.8.2 (#652): skip the `memory/` subtree. The per-agent memory
         # wiki is the agent's working data, not template content — it is
@@ -1329,8 +1387,13 @@ def migrate_agent_home(agent_dir: Path, template_root: Path, admin_agent: str, d
     # refresh. Folded into the shared helper so the daemon doc-backfill hygiene
     # pass (cmd_backfill_codex_entrypoints) applies the IDENTICAL create-if-
     # absent + marker-splice refresh between upgrades.
+    # Issue #2016: gate on the roster-authoritative `codex_emit_engine`, not the
+    # `detect_engine` heuristic — a claude agent whose CLAUDE.md prose trips the
+    # bare-substring heuristic would otherwise get a home-ROOT codex AGENTS.md
+    # here (the 2nd of the two re-emit locations). The helper is a no-op for any
+    # non-codex engine, so a claude/unknown signal cleanly backfills nothing.
     entrypoint_action = backfill_codex_agents_md_home(
-        agent_dir, template_root, agent, display_name, role_text, engine,
+        agent_dir, template_root, agent, display_name, role_text, codex_emit_engine,
         session_type, dry_run,
     )
     if entrypoint_action == "backfilled":
@@ -1521,6 +1584,17 @@ def cmd_migrate_agents(args: argparse.Namespace) -> int:
     # (the safe fallback — never skip when the roster is unknown).
     migrate_all = bool(getattr(args, "migrate_all_agents", False))
     roster_ids, roster_sources = collect_roster_ids(target_root, admin_agent)
+    # Issue #2016: roster-declared engine is the authoritative signal for the
+    # codex-emission gate in migrate_agent_home (do not rely on the detect_engine
+    # filesystem heuristic, which incidental "Codex CLI" prose can trip). Merge
+    # both roster surfaces the migrate filter already honors: the shell rosters
+    # (authoritative static SSOT) layered OVER state/active-roster.tsv (which
+    # carries the engine in column 2 for ACTIVE/dynamic agents that may exist
+    # only there, never in a shell roster). Shell wins on conflict; the TSV fills
+    # the dynamic-agent gap so the gate is authoritative for them too, not just
+    # static shell-roster agents.
+    roster_engines = _parse_roster_tsv_engines(target_root / "state" / "active-roster.tsv")
+    roster_engines.update(collect_roster_engines(target_root))
     if migrate_all:
         roster_filtering = "disabled"
     elif not roster_sources or not roster_ids:
@@ -1540,7 +1614,10 @@ def cmd_migrate_agents(args: argparse.Namespace) -> int:
             skipped_orphans.append(path.name)
             continue
         try:
-            result = migrate_agent_home(path, template_root, admin_agent, args.dry_run)
+            result = migrate_agent_home(
+                path, template_root, admin_agent, args.dry_run,
+                roster_engine=roster_engines.get(path.name),
+            )
             result.rematerialize = rematerialize_agent_identity(source_root, target_root, result, args.dry_run)
             results.append(result)
         except PermissionError as exc:
@@ -1752,15 +1829,25 @@ def cmd_backfill_codex_entrypoints(args: argparse.Namespace) -> int:
                 # scope.
                 roster = (roster_engine or "").strip().lower()
                 if roster and roster != "codex":
-                    agents_md = path / "AGENTS.md"
-                    if agents_md_is_codex_contract(agents_md):
-                        engine_mismatch_docs.append({
-                            "agent": path.name,
-                            "roster_engine": roster,
-                            "doc": "AGENTS.md",
-                            "detected_contract": "codex",
-                            "path": str(agents_md),
-                        })
+                    # Issue #2016: scan BOTH spurious-codex-contract locations a
+                    # pre-gate install could carry on a non-codex agent — the
+                    # home-ROOT `AGENTS.md` (#1906) AND the `codex/AGENTS.md` the
+                    # old un-gated migrate rglob copied (the latent 2nd copy the
+                    # cm-prod 2-location finding surfaced; nothing flagged it, so
+                    # it survived past workdir-only cleanups). Report-only for
+                    # both: the residue is runtime-harmless and removal stays a
+                    # deliberate operator action (the #1906 contract), but the
+                    # operator now SEES the surviving copy instead of it lurking.
+                    for residue_rel in ("AGENTS.md", "codex/AGENTS.md"):
+                        residue_md = path / residue_rel
+                        if agents_md_is_codex_contract(residue_md):
+                            engine_mismatch_docs.append({
+                                "agent": path.name,
+                                "roster_engine": roster,
+                                "doc": residue_rel,
+                                "detected_contract": "codex",
+                                "path": str(residue_md),
+                            })
                 continue
             # Roster is authoritative: materialize the codex template under the
             # roster-declared engine (`codex`), never the filesystem heuristic.
