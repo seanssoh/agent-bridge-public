@@ -825,6 +825,22 @@ select_for_path() {
       # so a future PR cannot regress a verb's --help path via the
       # underlying helper.
       add_required 1117-cli-help-universal-gate
+      if [[ "$path" == "lib/bridge-cron.sh" ]]; then
+        # Issue #1929: lib/bridge-cron.sh hosts bridge_check_memory_pressure,
+        # whose Darwin branch must probe the kernel pressure TIER
+        # (kern.memorystatus_vm_pressure_level) rather than vm.swapusage —
+        # gating on swap-percent chronically false-defers ALL cron dispatch on
+        # macOS (a healthy host routinely sits at 80-90%+ swap). Pull the smoke
+        # on every bridge-cron.sh move so a refactor cannot revert to the
+        # swap-only gate or disable the real-pressure (level>=Warn) defer.
+        add_required 1929-macos-memory-pressure
+        # Incident #8807: bridge_check_memory_pressure is the primitive the
+        # resource-guard (lib/bridge-resource-guard.sh) delegates its mem-pressure
+        # check to (bridge_resource_guard_mem_pressured). Pull the guard smoke on
+        # every bridge-cron.sh move so a change to the pressure primitive cannot
+        # silently break the daemon-facing defer/fail-open/throttle contract.
+        add_required 8807-resource-guard-defer
+      fi
       # Issue #1378: lib/bridge-state.sh hosts bridge_agent_session_lock_file,
       # which must anchor the per-agent session.lock on the controller-owned
       # state leaf (state/agents/<a>/) and NOT on the iso data tree
