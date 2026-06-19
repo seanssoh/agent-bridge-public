@@ -192,6 +192,15 @@ add_required 1881-channel-enable-live-mcp-readiness
 # surfaces). In the full static suite so any scripts/smoke/* move re-runs the
 # detection + status-surface contract.
 add_required 1181-modal-blocker-detect
+# Issue #1973 (Track C): the daemon liveness backstop is now part of install/
+# upgrade/ensure (scripts/install-daemon-systemd.sh +
+# scripts/install-daemon-liveness-systemd.sh + bridge-upgrade.sh +
+# bridge-daemon.sh `ensure`), the liveness watcher gained gateway-stall
+# detection + a recovery marker (scripts/bridge-daemon-liveness.sh), and the
+# daemon consumes that marker for a one-shot re-nudge pass (bridge-daemon.sh
+# cmd_run, arming Track B's BRIDGE_DAEMON_NUDGE_FORCE_AGENTS seam). In the full
+# static suite so any of those surfaces re-runs the C1-C3 acceptance teeth.
+add_required 1973c-liveness-recovery
 # Issue #1820: layout-v2 four-writer migration + gated v1->v2 reconciliation.
 # All eight verdict gates as smokes — cron/precompact/settings/doc-sync writer
 # fixes, the reconcile conflict policy + idempotence, the dry-run inventory and
@@ -2237,7 +2246,7 @@ select_for_path() {
       # 1955-daemon-rogue-warn (added above) pins both axes + the warn-only /
       # never-fail contract so a refactor cannot silently drop the warn or
       # break the canonical-source-root match.
-      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir 1115-cli-usage-drift 1178-helper-contract-daemon-supp F-daemon-supp-groups-mock F-daemon-supp-groups-real δ-1234-daemon-start-policy A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs Beta-beta5-session-id-detect-sudo beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-epsilon-tmux-inject-busy beta5-2-pi-daemon-crashloop-no-set-e-leak beta5-2-kappa-state-audit-reconcile 1359-cron-create-iso-staging 1380-admin-autostart-recovery 1388-daemon-lock-fd-cloexec 1407-runtime-hardening 1405-handoffd-supervision 1679-1680-a2a-receiver-supervisor-robustness 1408-daemon-alert-nudge-hygiene 1473-agent-list-iso-state-fallback 1461-cron-max-parallel-override 1463-launchd-keepalive-singleton-thrash 1563-pr2-daemon-self-abort 1563-pr4-a2a-receiver-healthz 1563-pr5-fp-control-matrix 1563-pr6-watchdog-scan-timeout 1563-pr7-tick-cadence 1563-pr8-a2a-diag-recovery 1629-healthz-not-semaphore-gated 1685-receiver-staleness-selfheal v0165-l0-reconcile-skeleton v0165-l2-tunnel-health v0165-l1-stable-addr v0165-l3-peer-reachability v0165-l4-token-join v0165-l5-relay-roster v0165-l6-net-status-v2 v0166-la-tunnel-bounce-gate v0166-lb-transient-peers 1652-queue-gateway-crashloop 1803-orphan-dir-gc 1809-agents-md-backfill 1855-keychain-free-backfill 1833-status-gateway-timeout-not-down 1934-hook-file-self-heal 1955-daemon-rogue-warn 1973a-gateway-drain-containment
+      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir 1115-cli-usage-drift 1178-helper-contract-daemon-supp F-daemon-supp-groups-mock F-daemon-supp-groups-real δ-1234-daemon-start-policy A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs Beta-beta5-session-id-detect-sudo beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-epsilon-tmux-inject-busy beta5-2-pi-daemon-crashloop-no-set-e-leak beta5-2-kappa-state-audit-reconcile 1359-cron-create-iso-staging 1380-admin-autostart-recovery 1388-daemon-lock-fd-cloexec 1407-runtime-hardening 1405-handoffd-supervision 1679-1680-a2a-receiver-supervisor-robustness 1408-daemon-alert-nudge-hygiene 1473-agent-list-iso-state-fallback 1461-cron-max-parallel-override 1463-launchd-keepalive-singleton-thrash 1563-pr2-daemon-self-abort 1563-pr4-a2a-receiver-healthz 1563-pr5-fp-control-matrix 1563-pr6-watchdog-scan-timeout 1563-pr7-tick-cadence 1563-pr8-a2a-diag-recovery 1629-healthz-not-semaphore-gated 1685-receiver-staleness-selfheal v0165-l0-reconcile-skeleton v0165-l2-tunnel-health v0165-l1-stable-addr v0165-l3-peer-reachability v0165-l4-token-join v0165-l5-relay-roster v0165-l6-net-status-v2 v0166-la-tunnel-bounce-gate v0166-lb-transient-peers 1652-queue-gateway-crashloop 1803-orphan-dir-gc 1809-agents-md-backfill 1855-keychain-free-backfill 1833-status-gateway-timeout-not-down 1934-hook-file-self-heal 1955-daemon-rogue-warn 1973a-gateway-drain-containment 1973c-liveness-recovery
       # Issue #1899: bridge-sync.sh's refresh_missing_session_ids backfill sweep
       # now skips dynamic vanilla Codex (it must never detect/persist an operator
       # ~/.codex session id). Pull 1899 on bridge-sync.sh moves so the daemon
@@ -2658,7 +2667,7 @@ select_for_path() {
       add_required 9770-codex-teardown-reap
       ;;
 
-    lib/bridge-daemon-control.sh|scripts/install-daemon-systemd.sh|scripts/sudoers-templates/agent-bridge-daemon-refresh.sudo.template)
+    lib/bridge-daemon-control.sh|scripts/install-daemon-systemd.sh|scripts/install-daemon-liveness-systemd.sh|scripts/sudoers-templates/agent-bridge-daemon-refresh.sudo.template)
       # v0.15.0-beta1 Lane F: the autonomous supp-groups refresh path
       # in bridge-daemon.sh dispatches a detached worker that sources
       # `lib/bridge-daemon-control.sh` and calls
@@ -2744,7 +2753,12 @@ select_for_path() {
       # serialize on every move so the direct-acquire-holds-across-section
       # guarantee, the regression witness for the old `$()` pattern, and the
       # no-`$()`-capture call-site wiring cannot silently regress.
-      add_required F-daemon-supp-groups-mock F-daemon-supp-groups-real 1178-helper-contract-daemon-supp A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle F-beta4-oauth-bootstrap 1388-daemon-lock-fd-cloexec 1463-launchd-keepalive-singleton-thrash 9882-daemon-audit-fp 1563-daemon-singleton 1563-pr2-daemon-self-abort 1563-pr5-fp-control-matrix 1563-pr6-watchdog-scan-timeout 1667-daemon-control-lock-serialize
+      # Issue #1973 (Track C): install-daemon-systemd.sh now also installs the
+      # liveness backstop timer (default-on + --skip-liveness-timer opt-out) by
+      # delegating to install-daemon-liveness-systemd.sh. Pull the Track C smoke
+      # on every install-script move so the timer-install + opt-out contract
+      # cannot silently regress.
+      add_required F-daemon-supp-groups-mock F-daemon-supp-groups-real 1178-helper-contract-daemon-supp A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle F-beta4-oauth-bootstrap 1388-daemon-lock-fd-cloexec 1463-launchd-keepalive-singleton-thrash 9882-daemon-audit-fp 1563-daemon-singleton 1563-pr2-daemon-self-abort 1563-pr5-fp-control-matrix 1563-pr6-watchdog-scan-timeout 1667-daemon-control-lock-serialize 1973c-liveness-recovery
       ;;
 
     lib/cron-helpers/*.py)
@@ -4478,7 +4492,7 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # placeholder template (preserve + managed-block-only refresh). Pull
       # 1931-upgrade-preserves-workdir-claudemd on every upgrade-entry move so the
       # preserve guard stays exercised against the full migrate path.
-      add_required upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision telegram-relay-residue-cleanup upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering upgrade-isolated-agent-migrate 864-upgrade-perm-regressions cleanup-payload-empty-stdin-872 isolation-v2-marker-only-migrate 1067-codex-provisioning 1113-watchdog-legacy-backfill 1144-upgrade-complete-task phase2-install-tree-reconciler phase3-agent-home-contract α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-theta-upgrade-backfill-perms beta5-2-mu-cron-channel-creds codex-version-surface codex-doctor 1516-upgrade-downgrade-guard 1612-upgrade-restart-receiver upgrade-migrate-rematerialize-workdir 1602-dryrun-ref-fidelity 1601-conflicts-adopt-guard 1611-migrate-orphan-skip 1613-wiki-mention-fence-indent 1635-iso-backup-perm-skip 1638-settings-cosmetic-conflict 1636-rematerialize-scaffolding 1660-upgrade-emit-brokenpipe 1661-upgrade-singleton-lock 1662-upgrade-complete-marker 1670-rematerialize-dryrun-agent-preserved 1781-doc-migration-memory-preserve 1817-live-root-claude-stub lts-channel-sticky-resolver 1567-codex-orphan-upgrade-reaper 1675-1694-settings-homebrew-abspath-conflict 1786-tasksdb-doctor-verb 1809-agents-md-backfill 1892-doc-backfill-engine-fail-closed 1956-backfill-dynamic-engine 1905-upgrade-systemd-quiesce-respawn 655-upgrade-launchd-quiesce-respawn 1855-keychain-free-backfill 1813-canon-links-resolve-v2 1943-cron-unmodeled-warn-on-upgrade 1931-upgrade-preserves-workdir-claudemd
+      add_required upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision telegram-relay-residue-cleanup upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering upgrade-isolated-agent-migrate 864-upgrade-perm-regressions cleanup-payload-empty-stdin-872 isolation-v2-marker-only-migrate 1067-codex-provisioning 1113-watchdog-legacy-backfill 1144-upgrade-complete-task phase2-install-tree-reconciler phase3-agent-home-contract α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-theta-upgrade-backfill-perms beta5-2-mu-cron-channel-creds codex-version-surface codex-doctor 1516-upgrade-downgrade-guard 1612-upgrade-restart-receiver upgrade-migrate-rematerialize-workdir 1602-dryrun-ref-fidelity 1601-conflicts-adopt-guard 1611-migrate-orphan-skip 1613-wiki-mention-fence-indent 1635-iso-backup-perm-skip 1638-settings-cosmetic-conflict 1636-rematerialize-scaffolding 1660-upgrade-emit-brokenpipe 1661-upgrade-singleton-lock 1662-upgrade-complete-marker 1670-rematerialize-dryrun-agent-preserved 1781-doc-migration-memory-preserve 1817-live-root-claude-stub lts-channel-sticky-resolver 1567-codex-orphan-upgrade-reaper 1675-1694-settings-homebrew-abspath-conflict 1786-tasksdb-doctor-verb 1809-agents-md-backfill 1892-doc-backfill-engine-fail-closed 1956-backfill-dynamic-engine 1905-upgrade-systemd-quiesce-respawn 655-upgrade-launchd-quiesce-respawn 1855-keychain-free-backfill 1813-canon-links-resolve-v2 1943-cron-unmodeled-warn-on-upgrade 1931-upgrade-preserves-workdir-claudemd 1973c-liveness-recovery
       # Issue #1906: bridge-upgrade.py's backfill-codex-entrypoints sweep gained
       # the REPORT-ONLY engine-mismatched-doc detector (a stale Codex-contract
       # AGENTS.md on a non-codex agent -> engine_mismatch_docs + non_clean).
@@ -5527,7 +5541,12 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # contract) plus the silence-watchdog stderr-capture regression on
       # every supervisor move so neither the routing nor the refuse-handling
       # can silently regress to the thrash-inducing direct stop+start.
-      add_required 1463-launchd-keepalive-singleton-thrash watchdog-silence-stderr-capture launch queue
+      # Issue #1973 (Track C): bridge-daemon-liveness.sh now also detects a
+      # gateway-stall (old pending/working requests while the pid is alive) and
+      # writes a recovery marker before restart. Pull the Track C smoke on every
+      # liveness-watcher move so the stall-requires-old-requests guard, the
+      # cross-poll witness, and the recovery-marker contract cannot regress.
+      add_required 1463-launchd-keepalive-singleton-thrash watchdog-silence-stderr-capture launch queue 1973c-liveness-recovery
       add_integration integration-minimal
       ;;
 

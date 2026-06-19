@@ -36,16 +36,30 @@ SUDO_PATH=""
 # first and systemd is strictly the slower ring.
 WATCHDOG=0
 WATCHDOG_SEC="${BRIDGE_DAEMON_SYSTEMD_WATCHDOG_SEC:-900}"
+# Issue #1973 (Track C): the daemon liveness backstop timer
+# (agent-bridge-daemon-liveness.timer) is the independent supervisor that
+# recovers a stalled-but-alive daemon. On the #1973 incident host it was never
+# installed ("Unit not found"), so a gateway-stall outage had nothing to detect
+# or recover it. The default is now to ALSO render/apply/enable the liveness
+# timer alongside the daemon service. --skip-liveness-timer is a LOUD operator
+# opt-out for hosts that intentionally run only the service.
+SKIP_LIVENESS_TIMER=0
 
 usage() {
   cat <<EOF
 Usage: $0 [--bridge-home <dir>] [--unit <service-name>] [--service-path <path>] [--log-path <path>]
        [--apply] [--enable] [--sudo-self | --no-sudo-self] [--controller-user <user>]
-       [--watchdog] [--watchdog-sec <seconds>]
+       [--watchdog] [--watchdog-sec <seconds>] [--skip-liveness-timer]
 
 Without --apply, prints the systemd user unit file.
 With --apply, writes the unit to ~/.config/systemd/user (or --service-path target).
 With --enable, also runs systemctl --user daemon-reload and enable --now.
+
+By default --apply / --enable ALSO install / enable the daemon liveness
+backstop timer (agent-bridge-daemon-liveness.timer) via
+install-daemon-liveness-systemd.sh, because an absent timer was the #1973
+production failure mode (a stalled-but-alive daemon with no supervisor).
+Pass --skip-liveness-timer to install only the daemon service.
 
 Beta20 L2 Variant 3A r4 — sudo-wrapped ExecStart:
   Auto-renders sudo-wrapped ExecStart when the daemon-refresh sudoers
@@ -130,6 +144,11 @@ while [[ $# -gt 0 ]]; do
       WATCHDOG=1
       WATCHDOG_SEC="$2"
       shift 2
+      ;;
+    --skip-liveness-timer)
+      # Issue #1973 (Track C): loud opt-out from the default liveness-timer install.
+      SKIP_LIVENESS_TIMER=1
+      shift
       ;;
     -h|--help)
       usage
@@ -575,6 +594,32 @@ if [[ $ENABLE -eq 1 ]]; then
   fi
   echo "[info] enabled systemd user unit: $UNIT_NAME" >&2
   echo "[info] inspect with: systemctl --user status $UNIT_NAME" >&2
+fi
+
+# Issue #1973 (Track C): install the daemon liveness backstop timer alongside
+# the service so a stalled-but-alive daemon has an independent supervisor. The
+# renderer is a separate script (install-daemon-liveness-systemd.sh); we mirror
+# the apply/enable level of this invocation. Default-on — an absent timer was
+# the #1973 prod failure mode — with a loud --skip-liveness-timer opt-out. All
+# output goes to stderr so a --json caller's stdout stays parseable.
+if [[ $SKIP_LIVENESS_TIMER -eq 1 ]]; then
+  echo "[warn] --skip-liveness-timer set: NOT installing agent-bridge-daemon-liveness.timer. A stalled-but-alive daemon will have no independent supervisor (the #1973 failure mode). Re-run scripts/install-daemon-liveness-systemd.sh --enable to add it." >&2
+elif [[ $APPLY -eq 1 ]]; then
+  _LIVENESS_INSTALLER="$(dirname "$0")/install-daemon-liveness-systemd.sh"
+  if [[ -f "$_LIVENESS_INSTALLER" ]]; then
+    _liveness_mode="--apply"
+    [[ $ENABLE -eq 1 ]] && _liveness_mode="--enable"
+    _liveness_rc=0
+    "$BASH_PATH" "$_LIVENESS_INSTALLER" --bridge-home "$BRIDGE_HOME_TARGET" "$_liveness_mode" >&2 \
+      || _liveness_rc=$?
+    if (( _liveness_rc == 0 )); then
+      echo "[info] installed daemon liveness backstop timer (agent-bridge-daemon-liveness.timer)" >&2
+    else
+      echo "[warn] liveness-timer install returned rc=$_liveness_rc — the daemon service is up but the stall backstop may be absent. Re-run: $_LIVENESS_INSTALLER --bridge-home $BRIDGE_HOME_TARGET $_liveness_mode" >&2
+    fi
+  else
+    echo "[warn] liveness-timer installer not found at $_LIVENESS_INSTALLER — skipping backstop timer install (#1973)." >&2
+  fi
 fi
 
 echo "[info] bridge_home: $BRIDGE_HOME_TARGET" >&2
