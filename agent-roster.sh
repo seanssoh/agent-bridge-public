@@ -97,6 +97,18 @@ declare -Ag BRIDGE_AGENT_WEBHOOK_PORT=()
 # shellcheck disable=SC2034
 declare -Ag BRIDGE_AGENT_SKILLS=()
 
+# #2051: per-agent restart-peer. Declares which agent supervises <agent>'s
+# restart (e.g. BRIDGE_AGENT_RESTART_PEER["patch"]="patch-dev"). The self-restart
+# guard reads it to redirect/delegate a refused self-restart to a surviving
+# supervisor; unset falls back to "restart manually". Same #2020 hazard as the
+# maps above — a per-agent assoc map declared without `declare -Ag` collapses to
+# a broken INDEXED array (non-numeric subscript → arithmetic index 0), so the
+# accessor's bridge_var_is_assoc guard would read back empty for every agent.
+# Declare it associative up front, BEFORE agent-roster.local.sh is sourced,
+# exactly like the sibling maps. (bridge_reset_roster_maps mirrors this in lib.)
+# shellcheck disable=SC2034
+declare -Ag BRIDGE_AGENT_RESTART_PEER=()
+
 # shellcheck disable=SC2034
 declare -Ag BRIDGE_LEGACY_AGENT_TARGET=()
 declare -Ag BRIDGE_OPENCLAW_AGENT_TARGET=()

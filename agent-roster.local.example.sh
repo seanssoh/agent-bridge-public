@@ -101,6 +101,15 @@ BRIDGE_AGENT_SESSION["codex-developer"]="codex-developer"
 # BRIDGE_AGENT_SKILLS["tester"]="shopify-api tracx-logis-api"
 # BRIDGE_AGENT_SKILLS["developer"]="agent-db"
 #
+# Optional: restart-peer for supervised mutual-restart (#2051). `agent restart
+# <self>` (caller BRIDGE_AGENT_ID == target) is a split-brain foot-gun — the
+# controller dies mid-restart, so two live instances of one identity can race.
+# The guard REFUSES a self-restart and redirects to the peer named here (or
+# tells the operator to restart manually when unset). Paired admin/dev agents
+# restart EACH OTHER, never themselves (e.g. patch <-> patch-dev).
+# BRIDGE_AGENT_RESTART_PEER["patch"]="patch-dev"
+# BRIDGE_AGENT_RESTART_PEER["patch-dev"]="patch"
+#
 # Optional/backlog: dormant custom channel port. The runtime path does not use
 # this today because development channels require an interactive trust prompt.
 # Keep it unset on normal installs.

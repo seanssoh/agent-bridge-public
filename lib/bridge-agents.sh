@@ -10309,6 +10309,28 @@ bridge_agent_restart_self_unsupported_guidance() {
   printf "\nRun the restart from OUTSIDE the session instead — from a controller/admin shell or another agent:\n  agent-bridge agent restart %s" "$agent"
 }
 
+# #2051 — refuse message when an agent tries to restart its OWN session by
+# caller identity (BRIDGE_AGENT_ID == target). "Restart" = kill old + launch
+# new; running that from inside the doomed process leaves the kill→relaunch
+# handoff unsupervised and can yield two live instances of one identity
+# (split-brain: double-claimed tasks, conflicting memory/state writes, dup
+# operator sends). The fix is supervised mutual-restart by a paired agent, never
+# self. The redirect names the configured restart-peer when one is set, else
+# points at the manual fallback. This is a foot-gun guard for an admin who
+# accidentally self-restarts, not a security boundary — BRIDGE_AGENT_ID is a
+# trusted caller-supplied value, not an unspoofable identity.
+bridge_agent_restart_self_refused_guidance() {
+  local agent="$1"
+  local peer="${2:-}"
+
+  printf "'%s' cannot restart its own session (split-brain risk: the controller dies mid-restart, so the kill→relaunch races and two live instances of '%s' can exist at once)." "$agent" "$agent"
+  if [[ -n "$peer" ]]; then
+    printf "\nAsk its restart-peer '%s' to restart it (supervised by a surviving process):\n  agent-bridge agent restart %s   # run as %s, from outside %s's session" "$peer" "$agent" "$peer" "$agent"
+  else
+    printf "\nNo restart-peer is configured for '%s'. Restart it manually from a controller/admin shell or another agent:\n  agent-bridge agent restart %s\nTo enable supervised mutual-restart, set its peer in agent-roster.local.sh:\n  BRIDGE_AGENT_RESTART_PEER[\"%s\"]=\"<peer-agent>\"" "$agent" "$agent" "$agent"
+  fi
+}
+
 # --------------------------------------------------------------------------
 # Issue #1251 — restart marker + snapshot + auto-rollback (v0.15.0-beta3
 # Track C1). The marker file under `state/agents/<a>/restart.in-progress`
@@ -12205,6 +12227,26 @@ bridge_agent_skills_csv() {
   done
 
   printf '%s' "$normalized"
+}
+
+# #2051: restart-peer accessor — the agent that supervises <agent>'s restart
+# (its codex/dev pair, e.g. patch ←→ patch-dev). The self-restart guard reads
+# this to redirect/delegate a refused self-restart to a surviving process.
+# Returns the configured peer on stdout, empty when unset (caller falls back to
+# the "restart manually" message). Same arithmetic-index guard as
+# bridge_agent_skills_csv so an undeclared/scalar map yields empty instead of
+# aborting under `set -u`.
+bridge_agent_restart_peer() {
+  local agent="$1"
+  local peer=""
+  if bridge_var_is_assoc BRIDGE_AGENT_RESTART_PEER; then
+    peer="${BRIDGE_AGENT_RESTART_PEER[$agent]-}"
+  fi
+  peer="$(bridge_trim_whitespace "$peer")"
+  # A peer that points back at the agent itself is not a supervisor — drop it
+  # so the message never tells the operator to ask the doomed session.
+  [[ "$peer" == "$agent" ]] && peer=""
+  printf '%s' "$peer"
 }
 
 bridge_list_actions() {

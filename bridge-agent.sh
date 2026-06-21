@@ -6880,6 +6880,25 @@ run_restart() {
       bridge_die "isolated agent '$agent' cannot restart itself from inside its linux-user session. Ask a controller/admin agent to run: agent-bridge agent restart $agent"
     fi
   fi
+  # #2051: self-restart split-brain guard (shared + iso, caller-identity based).
+  # When the caller IS the target (BRIDGE_AGENT_ID == agent), REFUSE before any
+  # kill/launch and redirect to the restart-peer (or manual fallback). "Restart"
+  # = kill old + launch new; running it from inside the doomed process leaves the
+  # handoff unsupervised → two live instances of one identity. We refuse here —
+  # ahead of dry-run, preflight, and the #1853 detached-relaunch survival path —
+  # so the foot-gun cannot proceed via any leg. The #1853 detached survivor sets
+  # BRIDGE_RESTART_DETACHED=1; it is never reached for the identity case now (the
+  # original session refuses first), but we exempt it defensively so the existing
+  # tmux-session-only self path (BRIDGE_AGENT_ID unset) keeps its survival
+  # behavior. This is a foot-gun guard (an admin accidentally self-restarting),
+  # not a security boundary — BRIDGE_AGENT_ID is trusted caller input, not an
+  # unspoofable identity. Auto-delegate (enqueue the restart to the peer) is a
+  # deferred follow-up; the REFUSE + named-peer redirect is the safety contract.
+  if [[ "${BRIDGE_AGENT_ID:-}" == "$agent" && "${BRIDGE_RESTART_DETACHED:-0}" != "1" ]]; then
+    local restart_peer=""
+    restart_peer="$(bridge_agent_restart_peer "$agent" 2>/dev/null || true)"
+    bridge_die "$(bridge_agent_restart_self_refused_guidance "$agent" "$restart_peer")"
+  fi
   session="$(bridge_agent_session "$agent")"
   [[ -n "$session" ]] || bridge_die "세션 이름이 없습니다: $agent"
   engine="$(bridge_agent_engine "$agent")"
