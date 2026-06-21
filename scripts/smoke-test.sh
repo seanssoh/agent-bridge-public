@@ -12068,6 +12068,28 @@ bash "$REPO_ROOT/scripts/smoke/upgrade-migrate-rematerialize-workdir.sh"
 log "running 1781-doc-migration-memory-preserve smoke (issue #1781)"
 bash "$REPO_ROOT/scripts/smoke/1781-doc-migration-memory-preserve.sh"
 
+# Issue #1814 (DATA-LOSS) — MEMORY-SCHEMA.md SSOT unify + symlink-clobber guard.
+# The canon body (docs/agent-runtime/memory-schema.md) is propagated into
+# shared/ and symlinked from each home; the legacy template-sync must refuse to
+# write through a symlink (the old write_bytes followed the link and would
+# clobber the canon doc fleet-wide in one apply). Mutation-proven: the guard
+# preserves the canon, the same write WITHOUT the guard destroys it.
+log "running 1814-memory-schema-symlink-clobber-guard smoke (issue #1814 DATA-LOSS)"
+bash "$REPO_ROOT/scripts/smoke/1814-memory-schema-symlink-clobber-guard.sh"
+
+# Issue #1815 — managed-block ghost references. The block/template must not tell
+# every agent to read HEARTBEAT.md (a daemon workdir artifact, absent in homes);
+# HEARTBEAT.md/CHECKLIST.md are dropped from AGENT_RUNTIME_REWRITE_FILES; the
+# ACTIVE-PREFERENCES existence-gate precedent must not regress.
+log "running 1815-managed-block-ghost-ref-gate smoke (issue #1815)"
+bash "$REPO_ROOT/scripts/smoke/1815-managed-block-ghost-ref-gate.sh"
+
+# Issue #1816 — pointer-only managed block completion: version-stamped BEGIN
+# marker, unbalanced-marker guard (orphaned BEGIN => skip+report, not corrupt),
+# and changed-only backups (no-op apply deposits no new CLAUDE.md backup).
+log "running 1816-managed-block-marker-stamp-backup smoke (issue #1816)"
+bash "$REPO_ROOT/scripts/smoke/1816-managed-block-marker-stamp-backup.sh"
+
 # Issue #1238 — v0.15.0-beta1 fresh `agent create --isolate` scaffolded
 # the per-agent home tree (`SOUL.md`, `CLAUDE.md`, `.claude/`, etc.)
 # under the controller's umask and `bridge_linux_prepare_agent_isolation`
