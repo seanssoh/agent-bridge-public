@@ -83,8 +83,15 @@ for j in (jobs or []):
     if not kind:
         kind = j.get("payload_kind") or "text"
     job_id = j.get("id") or ""
+    # The cron agent (run-target) — the #2041/#2042 non-iso branch needs it to
+    # tell an admin-targeted (working) text row from a legacy `<admin>-dev`
+    # codex-pair text row (which cannot exec a bash payload, #833). An agent id
+    # never contains a tab/newline (slug). Empty when the list shape omits it.
+    job_agent = j.get("agent") or j.get("execution", {}).get("agent") or ""
+    if not isinstance(job_agent, str):
+        job_agent = ""
     # Tab-separated: a job id never contains a tab/newline (slug + hex token).
-    sys.stdout.write("%s\t%s\n" % (job_id, kind))
+    sys.stdout.write("%s\t%s\t%s\n" % (job_id, kind, job_agent))
 sys.exit(0)
 PY
   if "$BRIDGE_BASH_BIN" "$agent_bridge_cli" cron list --json >"$list_tmp" 2>/dev/null; then
@@ -93,10 +100,107 @@ PY
   printf '%s' "$out"
 }
 
+# Returns 0 iff a SHELL-kind picker-sweep cron would be ACCEPTED for this admin
+# run-as-agent on this host — i.e. the exact gate `bridge_cron_validate_shell_
+# run_config` (bridge-cron.sh) applies before a `cron create --kind shell`:
+#
+#   shell-kind is accepted  ⟺  run-as resolves to the controller UID
+#                              OR the agent has effective linux-user iso (iso v2)
+#
+# This is the SAME platform/iso predicate the rest of the code gates iso-only
+# behavior with — NOT a hard-coded `uname` check. On a non-iso install (macOS
+# or any host where the admin neither resolves to the controller UID nor has
+# iso v2 effective) this returns non-zero, and the caller registers the
+# supported TEXT-kind picker-sweep instead of looping on a create the CLI will
+# always reject (#2041 / #2042).
+#
+# The iso half delegates to `bridge_agent_linux_user_isolation_effective`
+# (lib/bridge-agents.sh) directly. The controller-UID half mirrors
+# `bridge_cron_shell_run_as_is_controller` (bridge-cron.sh) line-for-line —
+# that function lives in the root CLI script, which init does NOT source, so we
+# reproduce its 3-line UID resolution here rather than add a fragile cross-file
+# function dependency. Keep the two in sync if either changes.
+_bridge_init_picker_sweep_shell_kind_supported() {
+  local admin_agent="$1"
+  [[ -n "$admin_agent" ]] || return 1
+
+  # Controller-UID branch (the #833/#1052 controller-direct shape): the
+  # run-as-agent's roster os_user (or, when absent, the agent name) resolves to
+  # a UID equal to the controller's own. No iso v2 required — the runner
+  # executes the script directly as the controller.
+  local os_user current_uid target_uid
+  os_user="$(bridge_agent_os_user "$admin_agent" 2>/dev/null || printf '')"
+  [[ -n "$os_user" ]] || os_user="$admin_agent"
+  current_uid="$(id -u 2>/dev/null || printf '')"
+  target_uid="$(id -u "$os_user" 2>/dev/null || printf '')"
+  if [[ -n "$current_uid" && -n "$target_uid" && "$current_uid" == "$target_uid" ]]; then
+    return 0
+  fi
+
+  # iso v2 branch: isolation_mode==linux-user + Linux host + resolved os_user.
+  if declare -F bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$admin_agent" 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+# Register the TEXT-kind picker-sweep cron — the supported form on a non-iso /
+# macOS host where `--kind shell` is structurally unavailable (#2041 / #2042).
+# This is the legacy text payload form (#833 predecessor): the cron runner wraps
+# the payload in `claude -p` / `codex exec`, so a disposable cron CHILD (NOT the
+# live interactive session — so it is not itself blocked by the picker the sweep
+# clears) runs `bash $BRIDGE_HOME/scripts/picker-sweep.sh`. scripts/picker-sweep.sh
+# reads the BRIDGE_PICKER_SWEEP_* env the payload carries. Targets the admin so
+# no codex pair is required; an upgraded host where #2042 confirmed text-kind
+# works already runs this shape. `$BRIDGE_HOME` is expanded by the cron runner at
+# dispatch time, so the registration text carries the literal `$BRIDGE_HOME`.
+#
+# Captures the CLI's stderr (no `2>&1` swallow — #2041): on a real failure the
+# reason is surfaced so a genuine error is distinguishable from the expected
+# non-iso path. Returns the CLI exit status.
+_bridge_init_picker_sweep_register_text_kind() {
+  local agent_bridge_cli="$1"
+  local admin_agent="$2"
+  local err_tmp=""
+  err_tmp="$(mktemp 2>/dev/null)" || err_tmp=""
+  local payload
+  payload="BRIDGE_PICKER_SWEEP_ENABLED=1 BRIDGE_PICKER_SWEEP_SELF=${admin_agent} BRIDGE_PICKER_SWEEP_NOTIFY=${admin_agent} bash \$BRIDGE_HOME/scripts/picker-sweep.sh"
+  # `if ! cmd; then` keeps this errexit-safe (init runs the registration under
+  # `set -euo pipefail` from the bridge-upgrade.sh backfill — a bare `cmd; rc=$?`
+  # would abort the function on a non-zero create before the diagnostic +
+  # tempfile cleanup). stderr is captured to the tmpfile (or /dev/null when
+  # mktemp failed) instead of being swallowed (#2041).
+  if "$BRIDGE_BASH_BIN" "$agent_bridge_cli" cron create \
+      --agent "$admin_agent" \
+      --schedule "*/10 * * * *" \
+      --title "picker-sweep" \
+      --payload "$payload" >/dev/null 2>"${err_tmp:-/dev/null}"; then
+    [[ -n "$err_tmp" ]] && rm -f -- "$err_tmp"
+    printf '[init] picker-sweep cron registered (*/10 * * * *, text-kind, agent=%s, self/notify=%s) — shell-kind unavailable on this host (non-iso / no controller-UID run-as)\n' "$admin_agent" "$admin_agent" >&2
+    return 0
+  fi
+  local reason=""
+  [[ -n "$err_tmp" && -s "$err_tmp" ]] && reason="$(tr '\n' ' ' <"$err_tmp" 2>/dev/null)"
+  [[ -n "$err_tmp" ]] && rm -f -- "$err_tmp"
+  printf '[init] picker-sweep cron registration failed (text-kind, agent=%s) — operator can register manually per OPERATIONS.md%s\n' \
+    "$admin_agent" "$([[ -n "$reason" ]] && printf ': %s' "$reason")" >&2
+  return 1
+}
+
 # Idempotent + migrating: registers the picker-sweep bridge-native cron as a
 # SHELL-kind controller-direct job when no shell-kind `picker-sweep` job is
 # already present, deleting any legacy TEXT-kind job first. Failures are
 # non-fatal — init must not be blocked by cron registration plumbing.
+#
+# PLATFORM/ISO-AWARE (#2041 / #2042): shell-kind is only registered when this
+# host accepts it (iso v2 effective OR run-as resolves to the controller UID —
+# `_bridge_init_picker_sweep_shell_kind_supported`). On a non-iso / macOS host
+# where `--kind shell` is structurally rejected, the desired/converged form is
+# the TEXT-kind cron: a pre-existing text-kind row is the converged state (skip,
+# NO re-`failed` line every upgrade), and a fresh install registers text-kind.
+# This is a platform BRANCH, not a blanket revert — the iso/Linux shell-kind
+# path is unchanged.
 #
 # Args:
 #   $1 = agent-bridge CLI path (the live CLI under $BRIDGE_HOME)
@@ -142,22 +246,36 @@ bridge_init_register_default_picker_sweep() {
   # `cron list --json` exits non-zero on a fresh install where jobs.json does not
   # exist yet — the enumerate treats that as "no job, proceed".
   local enum_lines shell_seen=0 legacy_ids=() legacy_titleonly=0
+  # #2041/#2042 non-iso branch state: is an ADMIN-targeted text row already
+  # present (the working/converged form), and the non-admin (legacy `<admin>-dev`
+  # codex-pair) text row ids that must be migrated off rather than treated as
+  # converged.
+  local admin_text_seen=0 noniso_legacy_ids=() noniso_legacy_titleonly=0
   enum_lines="$(_bridge_init_picker_sweep_enumerate "$agent_bridge_cli")"
-  local _line _id _kind
+  local _line _id _rest _kind _agent
   while IFS= read -r _line; do
     # Split on the FIRST tab WITHOUT IFS whitespace-stripping. `IFS=$'\t' read`
-    # would strip a *leading* tab, so an id-less `\t<kind>` row (older `cron
-    # list` shape / mock without ids) collapses the kind into _id and the id-less
-    # leave/warn path below goes dead (codex #1919 r1 finding). Parameter
-    # expansion preserves the empty id field.
+    # would strip a *leading* tab, so an id-less `\t<kind>\t<agent>` row (older
+    # `cron list` shape / mock without ids) collapses the kind into _id and the
+    # id-less leave/warn path below goes dead (codex #1919 r1 finding). Parameter
+    # expansion preserves the empty id field. Line shape is `<id>\t<kind>\t<agent>`
+    # (the agent field added for #2041/#2042; absent on a legacy 2-field line, in
+    # which case _agent is empty).
     _id="${_line%%$'\t'*}"
-    _kind="${_line#*$'\t'}"
+    _rest="${_line#*$'\t'}"
+    _kind="${_rest%%$'\t'*}"
+    if [[ "$_rest" == *$'\t'* ]]; then
+      _agent="${_rest#*$'\t'}"
+    else
+      _agent=""
+    fi
     [[ -n "$_kind" || -n "$_id" ]] || continue
     if [[ "$_kind" == "shell" ]]; then
       shell_seen=1
       continue
     fi
-    # Any non-shell row (text, or unknown legacy) is a migration target.
+    # Any non-shell row (text, or unknown legacy) is a migration target for the
+    # shell-kind path (Case A/B below).
     if [[ -n "$_id" ]]; then
       legacy_ids+=("$_id")
     else
@@ -165,7 +283,61 @@ bridge_init_register_default_picker_sweep() {
       # leave/warn path (a title delete is ambiguous once a shell row coexists).
       legacy_titleonly=1
     fi
+    # #2041/#2042: for the NON-iso branch, a text row TARGETING THE ADMIN is the
+    # working/converged form; a row targeting anything else (legacy `<admin>-dev`
+    # codex pair) is broken and must be migrated, not skipped.
+    if [[ "$_agent" == "$admin_agent" ]]; then
+      admin_text_seen=1
+    elif [[ -n "$_id" ]]; then
+      noniso_legacy_ids+=("$_id")
+    else
+      noniso_legacy_titleonly=1
+    fi
   done <<< "$enum_lines"
+
+  # PLATFORM/ISO BRANCH (#2041 / #2042). On a host that does NOT accept
+  # `--kind shell` (non-iso / macOS, where the admin neither resolves to the
+  # controller UID nor has iso v2 effective), the shell-kind create is
+  # STRUCTURALLY rejected by the CLI every time. The pre-#2041 code attempted it
+  # unconditionally, swallowed the rejection, and re-logged `failed` on EVERY
+  # upgrade without ever converging (#2042) — and on a fresh non-iso install left
+  # the host with NO working picker-sweep (#2041). Here the supported/converged
+  # form is the ADMIN-targeted TEXT-kind cron instead:
+  #   - a shell-kind row somehow exists (host migrated off iso) → fall through to
+  #     Case A below, which keeps it and cleans up legacy (harmless).
+  #   - an ADMIN-targeted text row already exists → that IS the converged state.
+  #     Skip (idempotent; NO `failed` line — the #2042 fix). Any coexisting
+  #     legacy `<admin>-dev` codex-pair text row(s) are removed by id.
+  #   - only a legacy `<admin>-dev` text row exists (codex pair CANNOT exec a
+  #     bash payload — #833) → register the working admin text row FIRST, then
+  #     remove the legacy row(s) by id (recreate-first, same #1916 ordering).
+  #   - no row at all → register the admin text-kind cron (the #2041 fix: a
+  #     working job instead of a silent no-op).
+  if [[ "$shell_seen" -ne 1 ]] \
+      && ! _bridge_init_picker_sweep_shell_kind_supported "$admin_agent"; then
+    if [[ "$admin_text_seen" -eq 1 ]]; then
+      # Converged: a working admin-targeted text row is present. Clean up any
+      # coexisting legacy codex-pair text row(s) by id (precise — the create is
+      # skipped, so there is no recreate-first ordering concern here).
+      _bridge_init_picker_sweep_remove_legacy_by_id "$agent_bridge_cli" "${noniso_legacy_ids[@]:-}"
+      if [[ "$noniso_legacy_titleonly" -eq 1 ]]; then
+        printf '[init] picker-sweep cron migrate — legacy id-less non-admin text-kind row remains (cannot title-delete alongside the admin row); operator can remove it manually per OPERATIONS.md\n' >&2
+      fi
+      printf '[init] picker-sweep cron already registered (text-kind, admin-targeted) — skip; --kind shell is unavailable on this host (non-iso / no controller-UID run-as), so admin text-kind is the supported converged form (no re-migration)%s\n' \
+        "$([[ "${#noniso_legacy_ids[@]}" -gt 0 ]] && printf ' (removed %s legacy non-admin row(s))' "${#noniso_legacy_ids[@]}")" >&2
+      return 0
+    fi
+    # No working admin text row yet. Register it FIRST; on success remove any
+    # legacy `<admin>-dev` text row(s) by id (recreate-first — never strand the
+    # host with zero working picker-sweep, the #1916 invariant).
+    if _bridge_init_picker_sweep_register_text_kind "$agent_bridge_cli" "$admin_agent"; then
+      _bridge_init_picker_sweep_remove_legacy_by_id "$agent_bridge_cli" "${noniso_legacy_ids[@]:-}"
+      if [[ "$noniso_legacy_titleonly" -eq 1 ]]; then
+        printf '[init] picker-sweep cron migrate — legacy id-less non-admin text-kind row remains (cannot title-delete alongside the new admin row); operator can remove it manually per OPERATIONS.md\n' >&2
+      fi
+    fi
+    return 0
+  fi
 
   # #1916 FAIL-SAFE migration ordering (recreate-first / verify-before-delete).
   # The legacy text-kind row is deleted ONLY after a shell-kind row is confirmed
@@ -201,26 +373,43 @@ bridge_init_register_default_picker_sweep() {
   # The knobs are carried as SCRIPT_-prefixed env (the shell runner rejects
   # BRIDGE_-prefixed payload env); scripts/picker-sweep.sh reads
   # SCRIPT_PICKER_SWEEP_* as fallbacks.
+  #
+  # Stderr is captured (#2041): on this branch the host DOES accept shell-kind
+  # (we gated above), so a non-zero create here is a REAL failure (daemon-restart
+  # race, jobs-file lock, …) — surface its reason rather than swallow it. The
+  # `if ! cmd; then` form keeps this errexit-safe: init runs the registration
+  # under `set -euo pipefail` (bridge-upgrade.sh picker-sweep backfill), where a
+  # bare `cmd; rc=$?` would abort the function on a non-zero create before the
+  # fail-safe diagnostic + tempfile cleanup. stderr goes to the tmpfile (or
+  # /dev/null when mktemp failed).
+  local _shell_err_tmp=""
+  _shell_err_tmp="$(mktemp 2>/dev/null)" || _shell_err_tmp=""
   if ! "$BRIDGE_BASH_BIN" "$agent_bridge_cli" cron create \
-        --kind shell \
-        --agent "$admin_agent" \
-        --run-as-agent "$admin_agent" \
-        --schedule "*/10 * * * *" \
-        --title "picker-sweep" \
-        --script '$BRIDGE_HOME/scripts/picker-sweep.sh' \
-        --script-env "SCRIPT_PICKER_SWEEP_ENABLED=1" \
-        --script-env "SCRIPT_PICKER_SWEEP_SELF=${admin_agent}" \
-        --script-env "SCRIPT_PICKER_SWEEP_NOTIFY=${admin_agent}" >/dev/null 2>&1; then
+      --kind shell \
+      --agent "$admin_agent" \
+      --run-as-agent "$admin_agent" \
+      --schedule "*/10 * * * *" \
+      --title "picker-sweep" \
+      --script '$BRIDGE_HOME/scripts/picker-sweep.sh' \
+      --script-env "SCRIPT_PICKER_SWEEP_ENABLED=1" \
+      --script-env "SCRIPT_PICKER_SWEEP_SELF=${admin_agent}" \
+      --script-env "SCRIPT_PICKER_SWEEP_NOTIFY=${admin_agent}" >/dev/null 2>"${_shell_err_tmp:-/dev/null}"; then
+    local _shell_reason=""
+    [[ -n "$_shell_err_tmp" && -s "$_shell_err_tmp" ]] && _shell_reason="$(tr '\n' ' ' <"$_shell_err_tmp" 2>/dev/null)"
+    [[ -n "$_shell_err_tmp" ]] && rm -f -- "$_shell_err_tmp"
     # FAIL-SAFE: the shell-kind register failed → do NOT delete any legacy row.
     # The host keeps its existing (text-kind) picker-sweep; the next upgrade pass
     # retries the migration. This is the #1916 fix — no window with neither.
     if [[ "${#legacy_ids[@]}" -gt 0 || "$legacy_titleonly" -eq 1 ]]; then
-      printf '[init] picker-sweep cron registration failed — legacy text-kind job LEFT IN PLACE so the host keeps a working picker-sweep; the next upgrade retries the shell-kind migration\n' >&2
+      printf '[init] picker-sweep cron registration failed — legacy text-kind job LEFT IN PLACE so the host keeps a working picker-sweep; the next upgrade retries the shell-kind migration%s\n' \
+        "$([[ -n "$_shell_reason" ]] && printf ': %s' "$_shell_reason")" >&2
     else
-      printf '[init] picker-sweep cron registration failed — operator can register manually per OPERATIONS.md\n' >&2
+      printf '[init] picker-sweep cron registration failed — operator can register manually per OPERATIONS.md%s\n' \
+        "$([[ -n "$_shell_reason" ]] && printf ': %s' "$_shell_reason")" >&2
     fi
     return 0
   fi
+  [[ -n "$_shell_err_tmp" ]] && rm -f -- "$_shell_err_tmp"
   printf '[init] picker-sweep cron registered (*/10 * * * *, shell-kind, run-as=%s, self/notify=%s)\n' "$admin_agent" "$admin_agent" >&2
 
   # Verify-before-delete: re-enumerate and confirm the shell row is actually
@@ -268,11 +457,15 @@ _bridge_init_picker_sweep_remove_legacy_by_id() {
 _bridge_init_picker_sweep_shell_present() {
   local agent_bridge_cli="$1" _out
   _out="$(_bridge_init_picker_sweep_enumerate "$agent_bridge_cli")"
-  # enumerate emits one `<id>\t<kind>` line per picker-sweep job; kind is exactly
-  # "text" or "shell". Wrap with newlines so every line (including the last, whose
-  # trailing newline `$()` stripped) is bounded, then glob for a `\tshell\n` token.
+  # enumerate emits one `<id>\t<kind>\t<agent>` line per picker-sweep job; kind is
+  # exactly "text" or "shell". The kind is always followed by a tab (the agent
+  # field, possibly empty), so glob for the `\tshell\t` token. Wrap with newlines
+  # so every line (including the last, whose trailing newline `$()` stripped) is
+  # bounded. NOT a `<<<` here-string / `< <()` process substitution (both trip
+  # lint-heredoc-ban H3), and NOT a `| grep -q` pipe (a pipefail SIGPIPE could
+  # false-negative, the #1813 class).
   case $'\n'"$_out"$'\n' in
-    *$'\tshell\n'*) return 0 ;;
+    *$'\tshell\t'*) return 0 ;;
   esac
   return 1
 }

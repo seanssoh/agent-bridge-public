@@ -239,6 +239,15 @@ add_required 655-upgrade-launchd-quiesce-respawn
 # picker-sweep crons. In the full static suite so any init-cron migration edit
 # re-runs the ordering guard.
 add_required 1916-picker-sweep-migrate-atomic
+# Issues #2041 + #2042: bridge_init_register_default_picker_sweep is now
+# PLATFORM/ISO-AWARE — it only registers the SHELL-kind cron where the host
+# accepts it (iso v2 effective OR run-as resolves to the controller UID) and
+# otherwise registers the supported TEXT-kind cron, so a non-iso / macOS install
+# gets a WORKING picker-sweep (#2041) and the shell-kind migration CONVERGES
+# instead of re-logging `failed` on every upgrade (#2042). In the full static
+# suite so any init-cron registration edit re-runs the platform-branch +
+# idempotent-convergence + iso-path-unchanged + mutation gates.
+add_required 2041-2042-picker-sweep-noniso-cron
 # rc2 fleet-soak observability hardening for the #1820 reconcile/upgrade path:
 # the reconcile ALWAYS writes a structured result at the canonical
 # state/migration/layout-v2-reconcile/last-apply.json (status noop|applied,
@@ -5290,7 +5299,7 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # identity. Pull 1750-admin-workdir-identity-not-pair-template on every
       # pair-provisioning / init move so the fail-safe foreign-owner guard
       # stays wired to the topology that produced the drift.
-      add_required admin-pair-server-auto-provision agent-create-caller-trust-gate upgrade-shared-settings-propagate managed-autocompact-window per-agent-settings-rendering I-agent-description-roster β-1231-1236-fresh-install-seed-sudoers F-beta4-oauth-bootstrap G-beta4-watchdog-noise beta5-2-epsilon-tmux-inject-busy 1492-admin-dev-pair-workspace-v2 1750-admin-workdir-identity-not-pair-template 1916-picker-sweep-migrate-atomic
+      add_required admin-pair-server-auto-provision agent-create-caller-trust-gate upgrade-shared-settings-propagate managed-autocompact-window per-agent-settings-rendering I-agent-description-roster β-1231-1236-fresh-install-seed-sudoers F-beta4-oauth-bootstrap G-beta4-watchdog-noise beta5-2-epsilon-tmux-inject-busy 1492-admin-dev-pair-workspace-v2 1750-admin-workdir-identity-not-pair-template 1916-picker-sweep-migrate-atomic 2041-2042-picker-sweep-noniso-cron
       add_integration integration-minimal
       ;;
 

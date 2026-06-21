@@ -156,10 +156,21 @@ run_ordering_probe() {
   # picker-sweep `bridge_agent_exists patch` gate failing
   # (`admin agent patch not in roster`). Write the BRIDGE_AGENT_SESSION entry the
   # admin `agent create` actually persists so the gate sees a real admin.
+  #
+  # #2041/#2042: `bridge_init_register_default_picker_sweep` now gates the
+  # SHELL-kind registration on the admin resolving to the controller UID (or iso
+  # v2 effective); otherwise it registers the TEXT-kind cron. This smoke pins the
+  # SHELL-kind (controller-direct) server contract, so the admin's os_user must
+  # resolve to the controller's own UID — model the controller-direct run-as by
+  # mapping it to the current login user. (The non-iso / text-kind branch is
+  # covered by scripts/smoke/2041-2042-picker-sweep-noniso-cron.sh.)
+  local ctrl_login
+  ctrl_login="$(id -un 2>/dev/null || printf '')"
   local roster_local="$probe_dir/agent-roster.local.sh"
   {
     printf 'bridge_add_agent_id_if_missing %q\n' "$admin"
     printf 'BRIDGE_AGENT_SESSION[%q]=%q\n' "$admin" "$admin"
+    [[ -n "$ctrl_login" ]] && printf 'BRIDGE_AGENT_OS_USER[%q]=%q\n' "$admin" "$ctrl_login"
   } >"$roster_local"
 
   # CLI shim: handles the two subcommands the helpers invoke.
