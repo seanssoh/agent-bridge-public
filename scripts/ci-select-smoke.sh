@@ -2824,7 +2824,14 @@ select_for_path() {
       # delegating to install-daemon-liveness-systemd.sh. Pull the Track C smoke
       # on every install-script move so the timer-install + opt-out contract
       # cannot silently regress.
-      add_required F-daemon-supp-groups-mock F-daemon-supp-groups-real 1178-helper-contract-daemon-supp A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle F-beta4-oauth-bootstrap 1388-daemon-lock-fd-cloexec 1463-launchd-keepalive-singleton-thrash 9882-daemon-audit-fp 1563-daemon-singleton 1563-pr2-daemon-self-abort 1563-pr5-fp-control-matrix 1563-pr6-watchdog-scan-timeout 1667-daemon-control-lock-serialize 1973c-liveness-recovery
+      # Issue #2030: lib/bridge-daemon-control.sh's T1 supervisor now makes its
+      # no-progress deadline SUSPEND-AWARE (credits a single huge inter-poll
+      # wall-clock gap as OS-sleep time instead of false-wedging on wake) and
+      # WARNs from the self-abort path when no OS-init restarter is confirmable.
+      # Pull 2030-wedge-sleep-aware-deadline on every control-lib move so the
+      # suspend-vs-hang discriminator (a real hang STILL wedges), the mutation
+      # control, and the restarter-presence probe cannot silently regress.
+      add_required F-daemon-supp-groups-mock F-daemon-supp-groups-real 1178-helper-contract-daemon-supp A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle F-beta4-oauth-bootstrap 1388-daemon-lock-fd-cloexec 1463-launchd-keepalive-singleton-thrash 9882-daemon-audit-fp 1563-daemon-singleton 1563-pr2-daemon-self-abort 1563-pr5-fp-control-matrix 1563-pr6-watchdog-scan-timeout 1667-daemon-control-lock-serialize 1973c-liveness-recovery 2030-wedge-sleep-aware-deadline
       ;;
 
     lib/cron-helpers/*.py)
