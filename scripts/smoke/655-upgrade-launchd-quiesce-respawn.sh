@@ -61,17 +61,38 @@ grep -q '_bridge_upgrade_launchd_quiesce_daemon()' "$HELPERS" \
   || smoke_fail "could not extract the #655 helpers from $UPGRADE_SRC"
 
 # A `launchctl` shim that appends each invocation (args joined by spaces) to a
-# log file, then exits 0. Drop it on a PATH-front dir so the helpers resolve
-# THIS one. The launchctl subcommands the helpers drive (disable/bootout/enable/
-# bootstrap/kickstart) all "succeed" so the test asserts on the recorded
-# call sequence, not on launchctl behavior.
+# log file. Drop it on a PATH-front dir so the helpers resolve THIS one. The
+# mutating subcommands (disable/bootout/enable/bootstrap/kickstart) all "succeed".
+#
+# Issue #2040: the restart helper now drives `launchctl print` as a LOAD probe
+# (poll-until-not-loaded before bootstrap + verify-loaded after). Model that
+# faithfully: `print` reports NOT-loaded (rc 1) until a `bootstrap` succeeds, then
+# LOADED (rc 0) — so the restore takes the real bootstrap path and the post-
+# bootstrap verify reports loaded. The booted-out job starts not-loaded.
 SHIM_DIR="$SMOKE_TMP_ROOT/bin"
 mkdir -p "$SHIM_DIR"
 LAUNCHCTL_LOG="$SMOKE_TMP_ROOT/launchctl-calls.log"
+LAUNCHCTL_LOADED_FILE="$SMOKE_TMP_ROOT/launchctl-job-loaded"
+printf '0' >"$LAUNCHCTL_LOADED_FILE"
 cat >"$SHIM_DIR/launchctl" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >>"$LAUNCHCTL_LOG"
-exit 0
+case "\${1:-}" in
+  print)
+    loaded=0; [[ -s "$LAUNCHCTL_LOADED_FILE" ]] && loaded="\$(cat "$LAUNCHCTL_LOADED_FILE")"
+    [[ "\$loaded" == "1" ]] && exit 0
+    exit 1
+    ;;
+  bootstrap)
+    printf '1' >"$LAUNCHCTL_LOADED_FILE"   # bootstrap loads the job
+    exit 0
+    ;;
+  bootout)
+    printf '0' >"$LAUNCHCTL_LOADED_FILE"   # bootout unloads it
+    exit 0
+    ;;
+  *) exit 0 ;;
+esac
 EOF
 chmod +x "$SHIM_DIR/launchctl"
 
@@ -192,20 +213,26 @@ smoke_assert_contains "$Q_SECOND" "bootout gui/${SMOKE_UID}/${TEST_LABEL}" "T1 s
 smoke_log "T1 PASS: launchd quiesce disables THEN boots out the KeepAlive job"
 
 # --- T2: launchd restart ENABLEs, BOOTSTRAPs the plist, THEN kickstarts ------
+# Issue #2040: the restore now interleaves read-only `print` LOAD probes (the
+# poll-until-not-loaded before bootstrap + the verify-loaded after kickstart), so
+# the assertion is on the MUTATING-call order (enable -> bootstrap -> kickstart),
+# not an exact total count. The shim starts the job not-loaded so the restore
+# takes the real bootstrap path; the post-bootstrap verify then sees it loaded.
+printf '0' >"$LAUNCHCTL_LOADED_FILE"
 : >"$LAUNCHCTL_LOG"
 run_helper "$TEST_LABEL" "Darwin" _bridge_upgrade_launchd_restart_daemon
 R_CALLS="$(cat "$LAUNCHCTL_LOG")"
-R_FIRST="$(sed -n '1p' "$LAUNCHCTL_LOG")"
-R_SECOND="$(sed -n '2p' "$LAUNCHCTL_LOG")"
-R_THIRD="$(sed -n '3p' "$LAUNCHCTL_LOG")"
-R_COUNT="$(count_calls "$LAUNCHCTL_LOG")"
-smoke_assert_eq "3" "$R_COUNT" "T2 restart makes exactly 3 launchctl calls (got: $R_CALLS)"
-smoke_assert_contains "$R_FIRST" "enable gui/${SMOKE_UID}/${TEST_LABEL}" "T2 first call ENABLEs the launchd job"
-smoke_assert_contains "$R_SECOND" "bootstrap gui/${SMOKE_UID} $TEST_PLIST" "T2 second call BOOTSTRAPs the resolved plist"
-smoke_assert_contains "$R_THIRD" "kickstart -k gui/${SMOKE_UID}/${TEST_LABEL}" "T2 third call kickstarts the job"
-[[ "$R_FIRST" == *"enable"* && "$R_SECOND" == *"bootstrap"* && "$R_THIRD" == *"kickstart"* ]] \
-  || smoke_fail "T2 FAIL: must enable -> bootstrap -> kickstart in order. calls=$R_CALLS"
-smoke_log "T2 PASS: launchd restart enables, bootstraps the plist, then kickstarts"
+# Extract the mutating subcommands (enable/bootstrap/kickstart) in order.
+R_MUT_SEQ="$(grep -oE '^(enable|bootstrap|kickstart)' "$LAUNCHCTL_LOG" | tr '\n' ' ' | sed 's/ *$//')"
+R_FIRST_MUT="$(grep -m1 -E '^enable ' "$LAUNCHCTL_LOG")"
+smoke_assert_contains "$R_CALLS" "enable gui/${SMOKE_UID}/${TEST_LABEL}" "T2 ENABLEs the launchd job"
+smoke_assert_contains "$R_CALLS" "bootstrap gui/${SMOKE_UID} $TEST_PLIST" "T2 BOOTSTRAPs the resolved plist"
+smoke_assert_contains "$R_CALLS" "kickstart -k gui/${SMOKE_UID}/${TEST_LABEL}" "T2 kickstarts the job"
+smoke_assert_eq "enable bootstrap kickstart" "$R_MUT_SEQ" "T2 mutating-call order is enable -> bootstrap -> kickstart (got: $R_MUT_SEQ; full: $R_CALLS)"
+[[ -n "$R_FIRST_MUT" ]] || smoke_fail "T2 FAIL: enable not called. calls=$R_CALLS"
+# The #2040 verify probe runs: at least one `print` LOAD probe must have fired.
+grep -qE '^print ' "$LAUNCHCTL_LOG" || smoke_fail "T2 FAIL: no #2040 load-verify probe (print) ran. calls=$R_CALLS"
+smoke_log "T2 PASS: launchd restart enables, bootstraps the plist, then kickstarts (with #2040 load-verify probes)"
 
 # --- T3: NON-launchd (uname → Linux) makes ZERO launchctl calls --------------
 # uname → Linux. Run with the launchctl shim STILL on PATH to prove the quiesce
