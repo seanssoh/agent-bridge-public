@@ -102,6 +102,7 @@ scripts/smoke/1985-operator-global-settings-hijack-cleanup.sh=8
 scripts/smoke/1991-agentic-resolver.sh=3
 scripts/smoke/2005-managed-send-plugin-state-dir.sh=4
 scripts/smoke/2029-cron-child-relay-guard.sh=3
+scripts/smoke/2048-ms365-xproc-refresh-lock.sh=4
 scripts/smoke/857-pr1-isolation-write-helper.sh=9
 scripts/smoke/857-pr6-isolation-v3-channel-dotenv-migrate.sh=25
 scripts/smoke/989-isolated-agent-env-state-dir.sh=2

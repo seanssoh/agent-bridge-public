@@ -155,7 +155,7 @@ add_live() {
 
 add_all_required_static() {
 
-add_required queue daemon daemon-periodic-token-sync launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering 1495-settings-invalid-hook-key 1453-channel-sticky-false-inbound 1455-settings-two-tree-doctor isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env bsd-mktemp-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-create-caller-trust-gate agent-create-idle-timeout 1105-agent-add-audit 1100-audit-since-tz agent-update agent-update-launch-cmd-redaction 1122-admin-auto-caller-source 1136-always-on-no agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner 1114-cli-help-contract upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering 1120-controller-ops-isolated 1139-link-shared-settings-perm 1144-upgrade-complete-task 1145-ensure-dir-actually-sudo 1145-option1-deferral-guard 1151-step-a-helper 1151-r2-sudo-escalate 1155-bootstrap-skill-guard 1158-marker-controller-uid-exemption 1158-marker-load-order 1161-marker-readable-by-isolated 1165-track-a-scaffold-modes 1165-track-b-sudo-escalate-and-state 1165-track-c-hooks-and-dispatcher 1342-write-state-marker-matrix 1170-safe-path-check-sudo-escalate 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp shared-settings-preserve-user-keys 1689-statusline-preserve-rerender 1756-settings-preserve-model-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1028-isolated-workdir-check 1118-v2-engine-binary-path admin-protocol-shared-link bridge-notify-no-default-discord-875 cleanup-payload-empty-stdin-872 dynamic-agent-shared-mode-workdir v2-scaffold-home-and-workdir 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair agent-env-no-stale-bridge-layout 1015-resume-claude-config-dir 1073-fresh-channel-first-run-seed 1753-hud-config-seed isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup 1400-purge-home-degrade-no-sudo nudge-task-age-gate 1106-nudge-shell-recheck nudge-redundant-active-agent 1323-nudge-eligibility-recheck-twostage 1199-action-required-claimed-skip tool-policy-roster-read-classify 1690-tasksdb-read-carveout 1692-admin-bash-symmetry 1709-shared-secret-suffix-guard 679-wiki-ingest-exclude-precompact a2a-cross-bridge 1405-handoffd-supervision 1058-bootstrap-tmux-ux legacy-install-migrator 1117-cli-help-universal-gate 1087-migrator-apply-contract 1067-codex-provisioning 1077-migrate-iso-v2-data-dir 1108-watchdog-v2-workdir 1119-watchdog-perm-error 1113-watchdog-legacy-backfill 1115-cli-usage-drift phase2-install-tree-reconciler phase3-agent-home-contract 1201-1202-directory-marketplace-seed 1205-hook-iso-fail-open 1207-stale-supp-groups-allowlist 1208-lock-metadata-normalize 1209-ms365-redirect-resolver 1210-ms365-scope-normalize 1212-bridge-hooks-marketplace 1213-iso-uid-predicate 1214-channel-validator-iso-fallback 1215-ms365-dir-mode beta27-D-inject-timestamp-resolved beta27-E-hook-permission-fail-open-markers G-channel-spec-resolution F-daemon-supp-groups-mock F-daemon-supp-groups-real H-bootstrap-memory-iso-rebuild I-agent-description-roster ζ-1236-plugins-list-marketplaces β-1231-1236-fresh-install-seed-sudoers 6607-hook-admin-allowlist γ-cli-consistency δ-1234-daemon-start-policy B-beta3-1249-1250-plugin-ux C1-beta3-1251-restart-preflight-rollback A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir C-beta4-logger-and-spec B-beta4-setup-wizard A-beta4-iso-path-resolution D-beta4-daemon-lifecycle E-beta4-fresh-install-gate-state-dir H-beta4-iso-ownership F-beta4-oauth-bootstrap G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs K-beta4-nits Beta-beta5-session-id-detect-sudo α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-epsilon-tmux-inject-busy beta5-2-zeta-teams-mcp-dedup beta5-2-pi-daemon-crashloop-no-set-e-leak beta5-2-eta-cron-iso-uid-preflight beta5-2-delta-nudge-session-empty beta5-2-theta-upgrade-backfill-perms beta5-2-nu-daemon-path-quarantine beta5-2-kappa-state-audit-reconcile beta5-2-iota-daemon-escalation-family beta5-2-lambda-a2a-robustness beta5-2-mu-cron-channel-creds beta5-2-xi-misc-fixes 1359-cron-create-iso-staging 1379-iso-cron-staging-group 1383-iso-cron-result-json-group 1354-setup-teams-fd-password 1360-onboarding-next-actions-persona 1353-setup-pending-grace 1355-1356-ms365-wizard 1357-iso-boundary-quickref 1358-admin-credential-routine-exempt 1352-shared-codex-pair-path 1343-ms365-token-refresh 1378-iso-session-lock-fresh-start 1388-daemon-lock-fd-cloexec 1416-onboarding-state-field-anchor a2a-setup-wizard 1408-daemon-alert-nudge-hygiene 1944-unclaimed-escalation-once-latch 1409-claude-midturn-busy-gate 1427-A-roster-materialize 1427-B-template-sync-wizard 1426-cron-shell-noniso-help 1437-reactive-cron-rotation 1425-spool-rederive 1617-pending-attention-arrival-stale 1437-native-usage-probe 1468-usage-429-positive-signal usage-probe-edge-classification 1464-cron-aware-stale-health 1497-v2-dynamic-handoff 1497-p1-home-resolver 1506-isolate-normalize 1497-p2-operator-home 1513-iso-teams-prune-eacces 1516-upgrade-downgrade-guard 1612-upgrade-restart-receiver plugin-requires-resolver 1520-shared-claude-config-dir 1520b-create-time-creds-sync 1520c-create-isolate-profile-publish 1533-create-isolate-content-publish 1766-iso-settings-readable 1402-stat-platform-order 1398-a2a-inbound-stopped-target-force 1463-launchd-keepalive-singleton-thrash 1470-engine-auth-seam 1470-codex-fleet-sync 1459-cron-dispatch-recovery 1417-identity-sync-on-start 1750-admin-workdir-identity-not-pair-template upgrade-migrate-rematerialize-workdir 1367-auth-sealed-paste 1563-daemon-singleton 9882-daemon-audit-fp 9981-iso-urgent-instant-wake 9981-iso-pending-attention-readable 1563-pr2-daemon-self-abort 1563-pr3-daemon-escalation 1563-pr4-a2a-receiver-healthz 1563-pr5-fp-control-matrix 1563-pr6-watchdog-scan-timeout 1563-pr7-tick-cadence 1563-pr8-a2a-diag-recovery 1602-dryrun-ref-fidelity 1601-conflicts-adopt-guard 1569-askuserquestion-bound 1611-migrate-orphan-skip 1613-wiki-mention-fence-indent 1623-a2a-backpressure-failopen 1628-a2a-deliver-per-row-guard 1631-nudge-helper-db-guard 1630-a2a-fresh-arrival-nudge 1637-agb-list-iso-marker 1635-iso-backup-perm-skip 1629-healthz-not-semaphore-gated 1640-urgent-from-override 1639-post-restart-auto-wake 1638-settings-cosmetic-conflict 1650-ms365-get-valid-token 1636-rematerialize-scaffolding 1659-cron-status-walk-perf 1663-plugin-cache-sidecar-skip 1660-upgrade-emit-brokenpipe 1661-upgrade-singleton-lock 1662-upgrade-complete-marker 1667-daemon-control-lock-serialize 1672-link-shared-settings-idempotent 1671-teams-eaddrinuse-diagnostic 1670-rematerialize-dryrun-agent-preserved 1677-cron-summary-short-derive lts-channel-sticky-resolver 1685-receiver-staleness-selfheal 1701-warp-healthz-socket-held 1697-a2a-net-status 1693-read-viewers v0165-l0-reconcile-skeleton v0165-l2-tunnel-health v0165-l1-stable-addr v0165-l3-peer-reachability v0165-l4-token-join v0165-l5-relay-roster v0165-l6-net-status-v2 v0166-la-tunnel-bounce-gate v0166-lb-transient-peers v0166-lc-config-set-env 1567-codex-orphan-upgrade-reaper 1675-1694-settings-homebrew-abspath-conflict 1652-queue-gateway-crashloop 11901-shared-global-settings-inherit 1759-selfref-global-loop-guard 1679-1680-a2a-receiver-supervisor-robustness 1762-picker-autoresolve 1783-picker-idle-nonpicker 1764-ratchet-anchoring 1769-freshness-gate-resume 1763-static-model-effort 1781-doc-migration-memory-preserve 1786-tasksdb-doctor-verb 1795-reaper-ephemeral-policy 1803-orphan-dir-gc 1801-watchdog-bounded-broken-links 1872-watchdog-unsupported-engine-info 1809-agents-md-backfill 1806-admin-guard-allow-audit 1823-v2-peer-home-containment 1852-dynamic-agent-restart 1855-keychain-free-backfill 1860-smoke-daemon-stub-temp-guard 1853-self-restart-footgun 1797-reaper-keep-audit-latch 1857-recreate-provisioning-preserve 1844-plugin-liveness-probe 1826-cron-at-naive-tz 1842-cron-tamper-iso-groupwrite 1833-status-gateway-timeout-not-down 1837-gateway-exit-code-on-commit 1825-ms365-token-key-by-claim 2035-ms365-token-freshness 1836-iso-first-start-queue-dir-ownership dynamic-agent-resume-config-dir-scope 1891-iso-create-path-completeness 1892-doc-backfill-engine-fail-closed 1956-backfill-dynamic-engine 1906-flag-engine-mismatched-docs 1890-dynamic-vanilla-claude 1900-dynamic-vanilla-refresh-noop 1900-dynamic-vanilla-v2-secret-env-scrub 1899-dynamic-vanilla-codex 1899-dynamic-vanilla-codex-v2-secret-env-repin 1923-askuserquestion-hard-ban 1934-hook-path-canonical-fence 1934-hook-file-self-heal 1955-daemon-rogue-warn 1970-idle-reclaim-lease-aware 1931-upgrade-preserves-workdir-claudemd 1986-blocked-aging-visible-refire 2014-auto-memory-absolute-seed 1971-macos-group-create-gate 2020-skills-assoc-declare 1981-operator-global-hijack-guard 1985-operator-global-settings-hijack-cleanup 2002-onboarding-nudge-guard 2004-onboarding-marker-authority 2007-codex-hook-trust 2036-daemon-nudge-cadence
+add_required queue daemon daemon-periodic-token-sync launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering 1495-settings-invalid-hook-key 1453-channel-sticky-false-inbound 1455-settings-two-tree-doctor isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env bsd-mktemp-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-create-caller-trust-gate agent-create-idle-timeout 1105-agent-add-audit 1100-audit-since-tz agent-update agent-update-launch-cmd-redaction 1122-admin-auto-caller-source 1136-always-on-no agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner 1114-cli-help-contract upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering 1120-controller-ops-isolated 1139-link-shared-settings-perm 1144-upgrade-complete-task 1145-ensure-dir-actually-sudo 1145-option1-deferral-guard 1151-step-a-helper 1151-r2-sudo-escalate 1155-bootstrap-skill-guard 1158-marker-controller-uid-exemption 1158-marker-load-order 1161-marker-readable-by-isolated 1165-track-a-scaffold-modes 1165-track-b-sudo-escalate-and-state 1165-track-c-hooks-and-dispatcher 1342-write-state-marker-matrix 1170-safe-path-check-sudo-escalate 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp shared-settings-preserve-user-keys 1689-statusline-preserve-rerender 1756-settings-preserve-model-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1028-isolated-workdir-check 1118-v2-engine-binary-path admin-protocol-shared-link bridge-notify-no-default-discord-875 cleanup-payload-empty-stdin-872 dynamic-agent-shared-mode-workdir v2-scaffold-home-and-workdir 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair agent-env-no-stale-bridge-layout 1015-resume-claude-config-dir 1073-fresh-channel-first-run-seed 1753-hud-config-seed isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup 1400-purge-home-degrade-no-sudo nudge-task-age-gate 1106-nudge-shell-recheck nudge-redundant-active-agent 1323-nudge-eligibility-recheck-twostage 1199-action-required-claimed-skip tool-policy-roster-read-classify 1690-tasksdb-read-carveout 1692-admin-bash-symmetry 1709-shared-secret-suffix-guard 679-wiki-ingest-exclude-precompact a2a-cross-bridge 1405-handoffd-supervision 1058-bootstrap-tmux-ux legacy-install-migrator 1117-cli-help-universal-gate 1087-migrator-apply-contract 1067-codex-provisioning 1077-migrate-iso-v2-data-dir 1108-watchdog-v2-workdir 1119-watchdog-perm-error 1113-watchdog-legacy-backfill 1115-cli-usage-drift phase2-install-tree-reconciler phase3-agent-home-contract 1201-1202-directory-marketplace-seed 1205-hook-iso-fail-open 1207-stale-supp-groups-allowlist 1208-lock-metadata-normalize 1209-ms365-redirect-resolver 1210-ms365-scope-normalize 1212-bridge-hooks-marketplace 1213-iso-uid-predicate 1214-channel-validator-iso-fallback 1215-ms365-dir-mode beta27-D-inject-timestamp-resolved beta27-E-hook-permission-fail-open-markers G-channel-spec-resolution F-daemon-supp-groups-mock F-daemon-supp-groups-real H-bootstrap-memory-iso-rebuild I-agent-description-roster ζ-1236-plugins-list-marketplaces β-1231-1236-fresh-install-seed-sudoers 6607-hook-admin-allowlist γ-cli-consistency δ-1234-daemon-start-policy B-beta3-1249-1250-plugin-ux C1-beta3-1251-restart-preflight-rollback A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir C-beta4-logger-and-spec B-beta4-setup-wizard A-beta4-iso-path-resolution D-beta4-daemon-lifecycle E-beta4-fresh-install-gate-state-dir H-beta4-iso-ownership F-beta4-oauth-bootstrap G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs K-beta4-nits Beta-beta5-session-id-detect-sudo α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-epsilon-tmux-inject-busy beta5-2-zeta-teams-mcp-dedup beta5-2-pi-daemon-crashloop-no-set-e-leak beta5-2-eta-cron-iso-uid-preflight beta5-2-delta-nudge-session-empty beta5-2-theta-upgrade-backfill-perms beta5-2-nu-daemon-path-quarantine beta5-2-kappa-state-audit-reconcile beta5-2-iota-daemon-escalation-family beta5-2-lambda-a2a-robustness beta5-2-mu-cron-channel-creds beta5-2-xi-misc-fixes 1359-cron-create-iso-staging 1379-iso-cron-staging-group 1383-iso-cron-result-json-group 1354-setup-teams-fd-password 1360-onboarding-next-actions-persona 1353-setup-pending-grace 1355-1356-ms365-wizard 1357-iso-boundary-quickref 1358-admin-credential-routine-exempt 1352-shared-codex-pair-path 1343-ms365-token-refresh 1378-iso-session-lock-fresh-start 1388-daemon-lock-fd-cloexec 1416-onboarding-state-field-anchor a2a-setup-wizard 1408-daemon-alert-nudge-hygiene 1944-unclaimed-escalation-once-latch 1409-claude-midturn-busy-gate 1427-A-roster-materialize 1427-B-template-sync-wizard 1426-cron-shell-noniso-help 1437-reactive-cron-rotation 1425-spool-rederive 1617-pending-attention-arrival-stale 1437-native-usage-probe 1468-usage-429-positive-signal usage-probe-edge-classification 1464-cron-aware-stale-health 1497-v2-dynamic-handoff 1497-p1-home-resolver 1506-isolate-normalize 1497-p2-operator-home 1513-iso-teams-prune-eacces 1516-upgrade-downgrade-guard 1612-upgrade-restart-receiver plugin-requires-resolver 1520-shared-claude-config-dir 1520b-create-time-creds-sync 1520c-create-isolate-profile-publish 1533-create-isolate-content-publish 1766-iso-settings-readable 1402-stat-platform-order 1398-a2a-inbound-stopped-target-force 1463-launchd-keepalive-singleton-thrash 1470-engine-auth-seam 1470-codex-fleet-sync 1459-cron-dispatch-recovery 1417-identity-sync-on-start 1750-admin-workdir-identity-not-pair-template upgrade-migrate-rematerialize-workdir 1367-auth-sealed-paste 1563-daemon-singleton 9882-daemon-audit-fp 9981-iso-urgent-instant-wake 9981-iso-pending-attention-readable 1563-pr2-daemon-self-abort 1563-pr3-daemon-escalation 1563-pr4-a2a-receiver-healthz 1563-pr5-fp-control-matrix 1563-pr6-watchdog-scan-timeout 1563-pr7-tick-cadence 1563-pr8-a2a-diag-recovery 1602-dryrun-ref-fidelity 1601-conflicts-adopt-guard 1569-askuserquestion-bound 1611-migrate-orphan-skip 1613-wiki-mention-fence-indent 1623-a2a-backpressure-failopen 1628-a2a-deliver-per-row-guard 1631-nudge-helper-db-guard 1630-a2a-fresh-arrival-nudge 1637-agb-list-iso-marker 1635-iso-backup-perm-skip 1629-healthz-not-semaphore-gated 1640-urgent-from-override 1639-post-restart-auto-wake 1638-settings-cosmetic-conflict 1650-ms365-get-valid-token 1636-rematerialize-scaffolding 1659-cron-status-walk-perf 1663-plugin-cache-sidecar-skip 1660-upgrade-emit-brokenpipe 1661-upgrade-singleton-lock 1662-upgrade-complete-marker 1667-daemon-control-lock-serialize 1672-link-shared-settings-idempotent 1671-teams-eaddrinuse-diagnostic 1670-rematerialize-dryrun-agent-preserved 1677-cron-summary-short-derive lts-channel-sticky-resolver 1685-receiver-staleness-selfheal 1701-warp-healthz-socket-held 1697-a2a-net-status 1693-read-viewers v0165-l0-reconcile-skeleton v0165-l2-tunnel-health v0165-l1-stable-addr v0165-l3-peer-reachability v0165-l4-token-join v0165-l5-relay-roster v0165-l6-net-status-v2 v0166-la-tunnel-bounce-gate v0166-lb-transient-peers v0166-lc-config-set-env 1567-codex-orphan-upgrade-reaper 1675-1694-settings-homebrew-abspath-conflict 1652-queue-gateway-crashloop 11901-shared-global-settings-inherit 1759-selfref-global-loop-guard 1679-1680-a2a-receiver-supervisor-robustness 1762-picker-autoresolve 1783-picker-idle-nonpicker 1764-ratchet-anchoring 1769-freshness-gate-resume 1763-static-model-effort 1781-doc-migration-memory-preserve 1786-tasksdb-doctor-verb 1795-reaper-ephemeral-policy 1803-orphan-dir-gc 1801-watchdog-bounded-broken-links 1872-watchdog-unsupported-engine-info 1809-agents-md-backfill 1806-admin-guard-allow-audit 1823-v2-peer-home-containment 1852-dynamic-agent-restart 1855-keychain-free-backfill 1860-smoke-daemon-stub-temp-guard 1853-self-restart-footgun 1797-reaper-keep-audit-latch 1857-recreate-provisioning-preserve 1844-plugin-liveness-probe 1826-cron-at-naive-tz 1842-cron-tamper-iso-groupwrite 1833-status-gateway-timeout-not-down 1837-gateway-exit-code-on-commit 1825-ms365-token-key-by-claim 2035-ms365-token-freshness 1836-iso-first-start-queue-dir-ownership dynamic-agent-resume-config-dir-scope 1891-iso-create-path-completeness 1892-doc-backfill-engine-fail-closed 1956-backfill-dynamic-engine 1906-flag-engine-mismatched-docs 1890-dynamic-vanilla-claude 1900-dynamic-vanilla-refresh-noop 1900-dynamic-vanilla-v2-secret-env-scrub 1899-dynamic-vanilla-codex 1899-dynamic-vanilla-codex-v2-secret-env-repin 1923-askuserquestion-hard-ban 1934-hook-path-canonical-fence 1934-hook-file-self-heal 1955-daemon-rogue-warn 1970-idle-reclaim-lease-aware 1931-upgrade-preserves-workdir-claudemd 1986-blocked-aging-visible-refire 2014-auto-memory-absolute-seed 1971-macos-group-create-gate 2020-skills-assoc-declare 1981-operator-global-hijack-guard 1985-operator-global-settings-hijack-cleanup 2002-onboarding-nudge-guard 2004-onboarding-marker-authority 2007-codex-hook-trust 2036-daemon-nudge-cadence 2043-picker-autoresolve-active-fp 2045-2046-selftask-wake 2044-engine-detect-roster-authority 2051-selfrestart-guard
 add_required 1425-cron-dispatch-nudge-scope
 # Issue #1966: the orphan keep-set walk now PRUNES heavy non-symlink content
 # trees (node_modules / .git / .claude/{projects,cache}) and reads symlink-ness
@@ -232,6 +232,17 @@ add_required 1905-upgrade-systemd-quiesce-respawn
 # upgrade-quiesce/restart-phase edit re-runs the launchd-aware guard alongside
 # the systemd one.
 add_required 655-upgrade-launchd-quiesce-respawn
+# Issue #2040: the launchd restore now poll-until-not-loads BEFORE bootstrap
+# (defeats the async-bootout race), retries the transient launchd errors,
+# captures launchctl stderr, and VERIFIES the job loaded — emitting a loud WARN +
+# remediation + a load_state in the upgrade summary on failure (systemd parity
+# verifies is-active for both units). Part B: the INDEPENDENT liveness watcher
+# (scripts/bridge-daemon-liveness.sh) re-bootstraps an enabled-but-unloaded
+# launchd/systemd daemon BEFORE the skip_not_running deferral — cooldown-gated,
+# audited, and ★airtight on the operator-disabled SKIP. In the full static suite
+# so any upgrade-restore or liveness-watcher edit re-runs both halves (incl. the
+# disabled-skip + enabled-but-unloaded-recover + mutation gates).
+add_required 2040-upgrade-restore-verify 2040-daemon-enabled-but-unloaded
 # Issue #1916: bridge_init_register_default_picker_sweep now migrates the legacy
 # text-kind picker-sweep cron to shell-kind FAIL-SAFE (recreate-first /
 # verify-before-delete) — the legacy row is deleted only after a shell row is
@@ -239,6 +250,15 @@ add_required 655-upgrade-launchd-quiesce-respawn
 # picker-sweep crons. In the full static suite so any init-cron migration edit
 # re-runs the ordering guard.
 add_required 1916-picker-sweep-migrate-atomic
+# Issues #2041 + #2042: bridge_init_register_default_picker_sweep is now
+# PLATFORM/ISO-AWARE — it only registers the SHELL-kind cron where the host
+# accepts it (iso v2 effective OR run-as resolves to the controller UID) and
+# otherwise registers the supported TEXT-kind cron, so a non-iso / macOS install
+# gets a WORKING picker-sweep (#2041) and the shell-kind migration CONVERGES
+# instead of re-logging `failed` on every upgrade (#2042). In the full static
+# suite so any init-cron registration edit re-runs the platform-branch +
+# idempotent-convergence + iso-path-unchanged + mutation gates.
+add_required 2041-2042-picker-sweep-noniso-cron
 # rc2 fleet-soak observability hardening for the #1820 reconcile/upgrade path:
 # the reconcile ALWAYS writes a structured result at the canonical
 # state/migration/layout-v2-reconcile/last-apply.json (status noop|applied,
@@ -338,6 +358,11 @@ add_required 9780-stop-inbox-drain
 # cron tasks it owns/closes no longer wake the model. In the static suite and
 # pulled per-file below on hooks/* / bridge-queue.py / bridge-hooks.py moves.
 add_required 1596-stop-drain-cron-dispatch
+# Issue #2047: a non-consuming producer-only leg (BRIDGE_AGENT_LEG marker) skips
+# the consumer inbox-auto-drain Stop hook while a real consumer main session is
+# still told to drain. In the static suite and pulled per-file below on hooks/*
+# / bridge-queue.py / bridge-hooks.py moves.
+add_required 2047-producer-leg-drain-skip
 # #10222: A2A receiver backpressure must count currently OPEN tasks
 # (queued/claimed/blocked) by joining inbox_dedupe to tasks.db, not all-time
 # accepted rows. Keep this in the static suite and pull it on receiver changes.
@@ -755,6 +780,13 @@ select_for_path() {
       if [[ "$path" == "agent-bridge" ]]; then
         add_required 1795-reaper-ephemeral-policy
       fi
+      # Issue #2046: bridge-bundle.sh's handoff create dropped the same
+      # from!=to create-time push guard cmd_create did, so a self/loopback
+      # handoff bundle wakes its idle target in seconds (busy target spools).
+      # Pull the self/loopback wake smoke on every bridge-bundle.sh move.
+      if [[ "$path" == "bridge-bundle.sh" ]]; then
+        add_required 2045-2046-selftask-wake
+      fi
       # Issue #1427 Lane A: bridge-agent.sh hosts the template-sync
       # Contract-II `roster materialize-fields` writer + the gated
       # `roster write-template-profile` verb + the `agent create`
@@ -808,6 +840,13 @@ select_for_path() {
         # lost). Pull the smoke on every bridge-agent.sh move so a refactor
         # cannot drop the self-restart detect+detach guard.
         add_required 1853-self-restart-footgun
+        # Issue #2051: bridge-agent.sh's run_restart REFUSES a caller-identity
+        # self-restart (BRIDGE_AGENT_ID == target) before any kill/launch and
+        # redirects to the restart-peer (split-brain foot-gun: the controller
+        # dies mid-restart → two live instances of one identity). Pull the smoke
+        # on every bridge-agent.sh move so a refactor cannot drop the early
+        # refuse guard or let a self-restart slip through to the kill.
+        add_required 2051-selfrestart-guard
         # Issue #1753: bridge-agent.sh's run_create calls
         # bridge_seed_operator_plugin_config after the first-run-config seed,
         # to seed-if-absent the operator's allowlisted plugin display config
@@ -1497,7 +1536,21 @@ select_for_path() {
       # marker flips when the fix is removed). Pull on every ms365/server.ts
       # move so a refactor cannot silently drop the ms→sec normalize or the
       # proactive-margin param back to the never-refresh / 300s-only state.
-      add_required 1209-ms365-redirect-resolver 1210-ms365-scope-normalize 1215-ms365-dir-mode 1343-ms365-token-refresh 1650-ms365-get-valid-token 1825-ms365-token-key-by-claim 2035-ms365-token-freshness beta5-2-zeta-teams-mcp-dedup beta5-2-xi-misc-fixes
+      # Issue #2048 (cross-process refresh_token double-consume): getAccessToken
+      # now serializes the rotating-grant POST ACROSS processes (MCP server,
+      # get-valid-token CLI, any caller) with a dependency-free O_EXCL lockfile
+      # keyed on the token path, and RE-READS the token after acquiring — so a
+      # holder that already rotated the RT short-circuits the redundant grant
+      # (the double-consume fix). The 2048 smoke spawns N concurrent CLI
+      # refreshers against a single UPN with an RT-rotating stub and asserts
+      # exactly 1 grant / 0 invalid_grant; a lock-disabled mutant reproduces the
+      # double-consume (>= 1 invalid_grant), so the pass is mutation-proven. It
+      # also pins the bounded acquisition timeout (no Graph-call hang), dead-PID
+      # stale-lock reclaim (no permanent deadlock), and that the lockfile carries
+      # no token material. Pull on every ms365/server.ts move so a refactor
+      # cannot silently drop the cross-process serialization back to the
+      # in-process-only SingleFlight that double-consumes across processes.
+      add_required 1209-ms365-redirect-resolver 1210-ms365-scope-normalize 1215-ms365-dir-mode 1343-ms365-token-refresh 1650-ms365-get-valid-token 1825-ms365-token-key-by-claim 2035-ms365-token-freshness 2048-ms365-xproc-refresh-lock beta5-2-zeta-teams-mcp-dedup beta5-2-xi-misc-fixes
       add_integration integration-minimal
       ;;
 
@@ -1567,6 +1620,15 @@ select_for_path() {
       # queue/task move so a refactor cannot reopen the ~60s age-gate hole
       # (T1) or regress the no-marker/idle-gate invariants (T2/T5).
       add_required 1630-a2a-fresh-arrival-nudge
+      # Issues #2045 + #2046: the LOCAL self/loopback create wake path.
+      # bridge-task.sh cmd_create dropped the from!=to guard so the create-time
+      # push fires for a self-task (idle target wakes in seconds; a busy target
+      # spools via the inject-busy gate -- no self-nudge-mid-turn), and
+      # bridge-queue.py cmd_create now posts the fresh-arrival marker on every
+      # local enqueue so a loopback task fast-wakes on the daemon's next tick.
+      # Pull the smoke on every queue/task move so a refactor cannot re-add the
+      # guard, drop the marker post, or regress the cross-agent parity.
+      add_required 2045-2046-selftask-wake
       # Issue #1425: find-open exclusion and cron-ready overfetch keep
       # cron-dispatch worker backlog out of human nudge/unclaimed alarms.
       add_required 1425-cron-dispatch-nudge-scope
@@ -1622,6 +1684,12 @@ select_for_path() {
       # to the find-open `--all` payload (title / created_by / status / id) or
       # the cron-dispatch SQL exclusions cannot silently break the filter.
       add_required 1596-stop-drain-cron-dispatch
+      # Issue #2047: the producer-leg drain-skip smoke drives the queue CLI to
+      # stage a genuinely-actionable row for both the producer and consumer
+      # legs. Pull 2047-producer-leg-drain-skip on every bridge-queue.py move so
+      # a create/claim/done payload change cannot silently make the producer-vs-
+      # consumer fixture vacuous.
+      add_required 2047-producer-leg-drain-skip
       # Issue #1792: bridge-queue.py's cmd_create now records an `origin`
       # attribution stamp (additive nullable column; cron:<run_id> from
       # BRIDGE_CRON_RUN_ID, else session:<id>) and cmd_show surfaces it. Pull
@@ -2331,6 +2399,13 @@ select_for_path() {
       # the next-tick wake for a fresh inbound A2A task cannot regress back
       # to the ~60s age-gate hole.
       add_required 1630-a2a-fresh-arrival-nudge
+      # Issues #2045 + #2046: lib/bridge-notify.sh hosts
+      # bridge_dispatch_notification (the create-time push the self/loopback fix
+      # now fires unconditionally, gated at push time by the TARGET-session
+      # inject-busy spool). Pull the self/loopback wake smoke on every daemon /
+      # notify / state-lib move so a refactor cannot regress the wake parity or
+      # the no-self-nudge-mid-turn busy gate.
+      add_required 2045-2046-selftask-wake
       # Issue #1762: bridge-daemon.sh hosts the cadence-gated picker
       # auto-resolve scan (bridge_picker_scan_all_sessions, pass
       # picker_autoresolve) wired into cmd_sync_cycle. Pull the smoke on every
@@ -2344,6 +2419,12 @@ select_for_path() {
       # smoke on every bridge-daemon.sh move so a scan refactor cannot drop the
       # storm-fuse reset/summary wiring.
       add_required 1783-picker-idle-nonpicker
+      # Issue #2043: the same daemon-driven scan reaches bridge_picker_handle_unknown,
+      # which now excludes an actively-working roster-claude turn (live "Working" /
+      # "esc to interrupt" mid-turn banner) from unknown_stuck escalation. Pull the
+      # active-fp smoke on every bridge-daemon.sh move so a scan refactor cannot
+      # re-open the #2043 false-positive escalation on a live assistant turn.
+      add_required 2043-picker-autoresolve-active-fp
       # Issue #1991 safety floor (+ #2007 codex extension): bridge-daemon.sh hosts
       # the all-pane blocked-prompt sweep (process_blocked_prompt_safety_floor),
       # the daemon-owned INDEPENDENT operator notify (bridge_operator_notify_send
@@ -3257,6 +3338,13 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
         # modal signature, regress the trailing none default, or let the
         # is_block list drift from the snapshot/wake surfaces.
         add_required 1181-modal-blocker-detect
+        # Issue #2043: lib/bridge-tmux.sh owns bridge_tmux_claude_capture_is_midturn
+        # (the #1409 active-work signal). The picker unknown_stuck path reuses it to
+        # exclude an actively-working roster-claude turn from escalation. Pull the
+        # active-fp smoke on every bridge-tmux.sh move so a refactor of the mid-turn
+        # detector cannot re-open the #2043 false-positive (or silently neuter the
+        # real stuck-picker escalation it gates).
+        add_required 2043-picker-autoresolve-active-fp
       fi
       # Fleet-credential Phase 2 (#1470, Q6): bridge-run.sh's entry envelope
       # now active-scrubs the OpenAI-key / Codex-token ambient env vars and
@@ -4386,6 +4474,16 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # block, never-block-when-empty), the #1199 queued-vs-claimed split, or the
       # Stop-chain ordering.
       add_required 9780-stop-inbox-drain
+      # Issue #2047: hooks/bridge_hook_common.py::compute_drain_decision now
+      # early-returns None for a non-consuming producer-only leg (the
+      # BRIDGE_AGENT_LEG marker via producer_only_leg()) so a producer sub-session
+      # that inherited the main's consumer Stop hooks + BRIDGE_AGENT_ID Stops
+      # quietly instead of looping on a drain it can't perform — while a real
+      # consumer main session is STILL told to drain. Pull
+      # 2047-producer-leg-drain-skip on every hooks/* / bridge-hooks.py move so a
+      # future patch cannot regress the producer-skip (false drain loop) OR the
+      # never-mis-skip-a-consumer invariant (dropped drain).
+      add_required 2047-producer-leg-drain-skip
       # Issue #2003: hooks/bridge_hook_common.py::_enqueue_handoff_pending now
       # shares the ATOMIC upsert-open handoff-task contract with bridge-run.sh's
       # restart wake (lib/bridge-state.sh bridge_run_handoff_task_find_or_create)
@@ -4715,6 +4813,15 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # smoke on every bridge-upgrade.py move so a refactor of either heuristic
       # cannot reintroduce the placeholder/prose false positive.
       add_required 1930-detect-engine-placeholder 2016-codex-agents-engine-gate
+      # Issue #2044: resolve_backfill_engine_decision now distinguishes a
+      # roster-AUTHORITATIVE non-codex agent with codex residue (hold-quiet ->
+      # held_quiet, never non-clean, so it stops regenerating a recurring
+      # [hygiene] task) from a genuinely engine-unknown agent (still the
+      # task-generating hold). Pull 2044-engine-detect-roster-authority on every
+      # bridge-upgrade.py move so a refactor of the decision/holds split cannot
+      # re-collapse the quiet path back into the task-generating one (the 4x
+      # recurrence) or break real codex detection.
+      add_required 2044-engine-detect-roster-authority
       # Issue #1923: bridge-upgrade.sh's Claude hook-propagation loop now also
       # calls bridge_ensure_claude_askuserquestion_ban so existing agents
       # (incl. pre-#1923 dynamic-vanilla agents whose settings.local.json had
@@ -4829,6 +4936,17 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # (marker writer) and bridge-queue.py daemon-step (marker consumer +
       # age-gate exemption), so those arms above also select this smoke.
       add_required 1630-a2a-fresh-arrival-nudge
+      ;;
+
+    scripts/smoke/2045-2046-selftask-wake.sh)
+      # Issues #2045 + #2046: editing the self/loopback wake smoke re-runs it
+      # directly (the scripts/smoke/* catch-all also pulls it via the full
+      # static suite; this arm keeps the selection focused when only this file
+      # changes). The behavior spans bridge-task.sh / bridge-bundle.sh (the
+      # dropped from!=to create-time push guard) and bridge-queue.py cmd_create
+      # (the local fresh-arrival marker post), so those arms above also select
+      # this smoke.
+      add_required 2045-2046-selftask-wake
       ;;
 
     scripts/smoke/1618-outbox-retry-resets-attempts.sh|scripts/smoke/1618-outbox-retry-resets-attempts-helper.py)
@@ -5084,6 +5202,13 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # copy the old un-gated migrate rglob left). Pull 2016-codex-agents-engine-
       # gate on every helpers move so a refactor cannot drop that residue surface.
       add_required 2016-codex-agents-engine-gate
+      # Issue #2044: the agent-doc-backfill-non-clean helper now DELIBERATELY
+      # excludes held_quiet (roster-authoritative non-codex agent with codex
+      # residue) from the non-clean keys, and the -task-body renderer adds a
+      # transparency-only "Held (quiet)" footnote. Pull 2044-engine-detect-roster-
+      # authority on every helpers move so a refactor cannot re-fold held_quiet
+      # into non-clean (reviving the recurring [hygiene] task).
+      add_required 2044-engine-detect-roster-authority
       add_integration integration-minimal
       ;;
 
@@ -5192,7 +5317,7 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # identity. Pull 1750-admin-workdir-identity-not-pair-template on every
       # pair-provisioning / init move so the fail-safe foreign-owner guard
       # stays wired to the topology that produced the drift.
-      add_required admin-pair-server-auto-provision agent-create-caller-trust-gate upgrade-shared-settings-propagate managed-autocompact-window per-agent-settings-rendering I-agent-description-roster β-1231-1236-fresh-install-seed-sudoers F-beta4-oauth-bootstrap G-beta4-watchdog-noise beta5-2-epsilon-tmux-inject-busy 1492-admin-dev-pair-workspace-v2 1750-admin-workdir-identity-not-pair-template 1916-picker-sweep-migrate-atomic
+      add_required admin-pair-server-auto-provision agent-create-caller-trust-gate upgrade-shared-settings-propagate managed-autocompact-window per-agent-settings-rendering I-agent-description-roster β-1231-1236-fresh-install-seed-sudoers F-beta4-oauth-bootstrap G-beta4-watchdog-noise beta5-2-epsilon-tmux-inject-busy 1492-admin-dev-pair-workspace-v2 1750-admin-workdir-identity-not-pair-template 1916-picker-sweep-migrate-atomic 2041-2042-picker-sweep-noniso-cron
       add_integration integration-minimal
       ;;
 
@@ -5849,6 +5974,14 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # idle-nonpicker smoke on any picker source move so a heuristic/catalog/
       # fuse refactor cannot reopen the #1783 fleet-wide false-positive wave.
       add_required 1783-picker-idle-nonpicker
+      # Issue #2043: bridge_picker_handle_unknown re-asserts the #1409/#1991-family
+      # active-work signal (bridge_tmux_claude_capture_is_midturn) before escalating
+      # unknown_stuck — a roster-claude agent whose live tail is the "Working" /
+      # "esc to interrupt" spinner is mid-turn (active), not stuck. Pull the
+      # active-fp smoke on any picker source move so a refactor cannot drop the
+      # active exclusion (FP direction) or neuter real stuck-picker escalation
+      # (REAL direction).
+      add_required 2043-picker-autoresolve-active-fp
       add_integration integration-minimal
       ;;
 

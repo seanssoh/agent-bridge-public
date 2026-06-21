@@ -55,14 +55,18 @@ import {
 } from '@modelcontextprotocol/sdk/types.js'
 import {
   chmodSync,
+  closeSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
   renameSync,
+  statSync,
   unlinkSync,
   writeFileSync,
+  writeSync,
 } from 'fs'
-import { homedir } from 'os'
+import { homedir, hostname } from 'os'
 import { join } from 'path'
 import { randomUUID } from 'crypto'
 import {
@@ -392,6 +396,14 @@ function statusPath(upn: string): string {
 // rotating refresh_token is consumed exactly once (no double-grant race).
 const refreshInFlight = new SingleFlight<TokenFile>()
 
+// Issue #2048: coalesce the ENTIRE locked-refresh path (cross-process lock +
+// re-read + grant) per UPN within this process, so two concurrent in-process
+// getAccessToken callers do NOT each independently take the cross-process
+// lock — only the flight leader does; the follower awaits its result. Distinct
+// from refreshInFlight (which coalesces just the doRefresh POST) so the leader
+// can still call refreshToken() inside without self-deadlocking this flight.
+const lockedRefreshInFlight = new SingleFlight<TokenFile>()
+
 function loadStatus(upn: string): StatusFile | null {
   return loadJson<StatusFile>(statusPath(upn))
 }
@@ -435,6 +447,217 @@ function loadJson<T>(path: string): T | null {
     return JSON.parse(readFileSync(path, 'utf8')) as T
   } catch {
     return null
+  }
+}
+
+// Issue #2048 — cross-process refresh lock --------------------------------
+//
+// The in-process `SingleFlight` (token-refresh.ts) coalesces concurrent
+// refreshes WITHIN one Node process. But the SAME per-UPN token file is
+// rotated by SEPARATE processes — the MCP server, the `get-valid-token`
+// CLI one-shot, and any other concurrent caller. AAD `refresh_token` is
+// single-use rotating: process A reads RT1 and POSTs → Entra rotates to
+// RT2 and invalidates RT1; process B (which read RT1 concurrently) POSTs
+// the now-spent RT1 → `invalid_grant` / `AADSTS70000` (permanent) → the
+// loser marks the token expired → the operator must re-authorize (~every
+// 3h under concurrent Graph+bearer load).
+//
+// A cross-process lock keyed on the token file serializes the grant across
+// processes. Combined with a RE-READ after acquiring (see getAccessToken),
+// exactly one process performs the grant and the rest observe the freshly
+// rotated token and skip the redundant POST.
+//
+// Primitive: a dependency-free `O_EXCL` lockfile (sibling to the token
+// file). `openSync(lockPath, 'wx')` is atomic create-or-fail across
+// processes on POSIX. The ms365 plugin is TypeScript/bun and must run on
+// macOS (no `flock(1)`); a Node/bun `fs` O_EXCL lockfile is portable and
+// needs no extra dependency (no `proper-lockfile` in package.json).
+//
+// Lock hygiene:
+//   - Bounded acquisition timeout — a Graph pre-call must NEVER hang
+//     forever on a held lock. On timeout the lock is treated as
+//     unavailable and the caller proceeds WITHOUT the cross-process guard
+//     (the in-process SingleFlight + the post-grant re-read still bound
+//     the damage), rather than deadlocking the Graph call.
+//   - Stale-lock reclaim — a crashed holder must not deadlock the file
+//     permanently. A held lock is reclaimed when the recorded PID is dead
+//     on THIS host (process.kill(pid, 0) → ESRCH) OR the lockfile mtime is
+//     older than a TTL (covers a holder on a different host / an
+//     unreadable lockfile).
+//   - No token material in the lockfile — it records only { pid, host,
+//     acquired_at }. The token file itself stays the only secret surface.
+// A finite, non-negative config value or the fallback. An operator that sets
+// MS365_REFRESH_LOCK_TIMEOUT_MS to a non-numeric string would otherwise yield
+// NaN, and `Date.now() >= NaN` is always false → an unbounded acquisition spin.
+// Clamp to a finite >= 0 number so the deadline arithmetic always terminates.
+function clampLockMs(raw: string | undefined, fallback: number): number {
+  if (raw === undefined) return fallback
+  const n = Number(raw)
+  return Number.isFinite(n) && n >= 0 ? n : fallback
+}
+const REFRESH_LOCK_TTL_MS = clampLockMs(process.env.MS365_REFRESH_LOCK_TTL_MS, 30_000)
+const REFRESH_LOCK_TIMEOUT_MS = clampLockMs(process.env.MS365_REFRESH_LOCK_TIMEOUT_MS, 8_000)
+const REFRESH_LOCK_POLL_MS = 50
+const SELF_HOST = hostname()
+
+function lockPathFor(upn: string): string {
+  return `${tokenPath(upn)}.lock`
+}
+
+// Is the recorded lockfile a stale lock we may reclaim? True when the
+// holder PID is provably dead on THIS host, or the lockfile is older than
+// the TTL (different-host holder / unreadable / clock skew safety net).
+function isStaleLock(lockPath: string): boolean {
+  let raw: string
+  try {
+    raw = readFileSync(lockPath, 'utf8')
+  } catch {
+    // Vanished between the EEXIST and the read — not stale, just gone; the
+    // next O_EXCL attempt will (re)acquire it.
+    return false
+  }
+  let meta: { pid?: number; host?: string; acquired_at?: number } = {}
+  try {
+    meta = JSON.parse(raw)
+  } catch {
+    meta = {}
+  }
+  // Same-host dead-PID reclaim: kill(pid, 0) throws ESRCH when no such
+  // process exists. EPERM means the process IS alive (owned by another
+  // uid) — NOT stale. A malformed/missing pid falls through to the TTL.
+  if (meta.host === SELF_HOST && typeof meta.pid === 'number' && meta.pid > 0) {
+    try {
+      process.kill(meta.pid, 0)
+      return false // holder alive
+    } catch (e: any) {
+      if (e && e.code === 'ESRCH') return true // holder dead → reclaim
+      if (e && e.code === 'EPERM') return false // alive (other uid)
+      // any other error → fall through to the mtime TTL
+    }
+  }
+  // mtime TTL: covers a holder on another host, an unparseable lockfile, or
+  // a same-host pid we could not classify. A lock older than the TTL is
+  // assumed abandoned.
+  try {
+    const ageMs = Date.now() - statSync(lockPath).mtimeMs
+    return ageMs > REFRESH_LOCK_TTL_MS
+  } catch {
+    return false
+  }
+}
+
+// Serialize the reclaim of a stale lock so two waiters cannot BOTH decide the
+// lock is stale and then race rename/unlink — the second delete would land on a
+// THIRD process's freshly-created live lock (the TOCTOU codex r2 flagged). A
+// dedicated O_EXCL reclaim guard (`<lockPath>.reclaim`) admits exactly one
+// reclaimer; INSIDE the guard we RE-VERIFY staleness against the current lock
+// (it may have been replaced by a live lock since the outer check) and only
+// unlink if it is STILL stale. The guard is held for a single read+unlink, so a
+// crashed reclaimer is bounded by an mtime TTL on the guard itself (re-using the
+// same stale-reclaim logic, recursion-free) plus a hard one-shot fallback.
+function reclaimStaleLock(lockPath: string): void {
+  const guard = `${lockPath}.reclaim`
+  let guardFd: number
+  try {
+    guardFd = openSync(guard, 'wx', 0o600)
+  } catch (e: any) {
+    if (e && e.code === 'EEXIST') {
+      // Another reclaimer holds the guard, OR a previous one crashed. If the
+      // guard is older than the TTL it is abandoned — best-effort clear it so a
+      // crashed reclaimer cannot wedge reclaim forever; then return and let the
+      // caller loop (it will retry the O_EXCL acquire or re-enter reclaim).
+      try {
+        if (Date.now() - statSync(guard).mtimeMs > REFRESH_LOCK_TTL_MS) {
+          unlinkSync(guard)
+        }
+      } catch {
+        /* guard vanished or unreadable — the next loop iteration retries */
+      }
+    }
+    // Any other error (perm/ENOENT on the dir): skip reclaim this round; the
+    // outer loop's bounded timeout still prevents a hang.
+    return
+  }
+  try {
+    // RE-VERIFY under the guard: the lock may have been reclaimed + re-created
+    // as a LIVE lock by another waiter between the outer isStaleLock() and now.
+    // Only remove it if it is STILL stale.
+    if (isStaleLock(lockPath)) {
+      try {
+        unlinkSync(lockPath)
+      } catch {
+        /* already gone — another guarded reclaimer won; nothing to do */
+      }
+    }
+  } finally {
+    closeSync(guardFd)
+    try {
+      unlinkSync(guard)
+    } catch {
+      /* guard already cleared (TTL sweep) — harmless */
+    }
+  }
+}
+
+// Acquire the per-UPN cross-process refresh lock. Returns a release handle
+// on success, or null on timeout (the caller proceeds WITHOUT the lock —
+// see getAccessToken's degraded path; it never hangs the Graph call). The
+// O_EXCL create is the cross-process atomic primitive; on contention we
+// poll with a bounded total budget, reclaiming a provably-stale lock.
+function acquireRefreshLock(upn: string): (() => void) | null {
+  const lockPath = lockPathFor(upn)
+  const deadline = Date.now() + Math.max(0, REFRESH_LOCK_TIMEOUT_MS)
+  // Best-effort body — NEVER any token material, only liveness metadata.
+  const body = JSON.stringify({
+    pid: process.pid,
+    host: SELF_HOST,
+    acquired_at: Date.now(),
+  })
+  for (;;) {
+    try {
+      // O_CREAT | O_EXCL | O_WRONLY — atomic "create iff absent".
+      const fd = openSync(lockPath, 'wx', 0o600)
+      try {
+        writeSync(fd, body)
+      } catch {
+        /* metadata is best-effort; the lock is held by the file's existence */
+      } finally {
+        closeSync(fd)
+      }
+      let released = false
+      return () => {
+        if (released) return
+        released = true
+        try {
+          unlinkSync(lockPath)
+        } catch {
+          /* already gone (reclaimed by a stale-sweep) — nothing to do */
+        }
+      }
+    } catch (e: any) {
+      if (!e || e.code !== 'EEXIST') {
+        // A non-contention error (e.g. ENOENT on a missing tokens/ dir, or
+        // a permission error). Don't hang the Graph call on it — proceed
+        // unlocked; the post-grant re-read still bounds the double-consume.
+        return null
+      }
+      // Held. Reclaim if stale (serialized + re-verified under a reclaim guard
+      // so two waiters cannot both remove the lock and clobber a third
+      // process's freshly-created live lock), else wait within the bounded
+      // budget. After a reclaim attempt we loop back to retry the O_EXCL create.
+      if (isStaleLock(lockPath)) {
+        reclaimStaleLock(lockPath)
+        if (Date.now() >= deadline) return null // bounded even across reclaims
+        continue
+      }
+      if (Date.now() >= deadline) return null // bounded timeout — never hang
+      Atomics.wait(
+        new Int32Array(new SharedArrayBuffer(4)),
+        0,
+        0,
+        Math.min(REFRESH_LOCK_POLL_MS, Math.max(0, deadline - Date.now())),
+      )
+    }
   }
 }
 
@@ -806,8 +1029,63 @@ async function getAccessToken(upn: string, freshness: TokenFreshness = {}): Prom
   // already-expired token slip past the check.
   const margin = Math.max(0, freshness.minRemaining ?? NEAR_EXPIRY_SECONDS)
   if (!freshness.force && cur.expires_at - now > margin) return cur.access_token
+
+  // The refresh_token THIS caller would submit. The skip-redundant-grant
+  // decision below keys off whether this value has been ROTATED by another
+  // holder while we waited for the lock — a value comparison, so it is immune
+  // to same-second `saved_at` collisions (every successful grant rotates the
+  // refresh_token to a new opaque value).
+  const prevRefreshToken = cur.refresh_token
+
+  // Issue #2048: a refresh is needed. Serialize the rotating-grant POST ACROSS
+  // processes (the MCP server, the get-valid-token CLI, any other caller share
+  // this token file). Coalesce WITHIN this process via lockedRefreshInFlight (a
+  // SingleFlight keyed by UPN, distinct from refreshInFlight) so two concurrent
+  // in-process getAccessToken callers do not each take the cross-process lock —
+  // only the flight leader does; the follower awaits its result. Then ACROSS
+  // processes via the cross-process lock + a RE-READ: if another holder already
+  // rotated the refresh_token (and the token is still usable / meets our margin)
+  // skip the redundant grant and return the shared fresh token. Serialize +
+  // re-read ⇒ exactly one grant, one rotation, no spent-RT replay → no
+  // invalid_grant. A null lock handle means the lock timed out / was unavailable;
+  // we proceed unlocked (the SingleFlight + this re-read still bound the race)
+  // rather than hang the Graph call.
   try {
-    const refreshed = await refreshToken(upn)
+    const refreshed = await lockedRefreshInFlight.run(upn, async () => {
+      const release = acquireRefreshLock(upn)
+      try {
+        const fresh = normalizeTokenExpiry(loadJson<TokenFile>(tokenPath(upn)))
+        if (
+          fresh &&
+          fresh.access_token &&
+          fresh.refresh_token &&
+          fresh.refresh_token !== prevRefreshToken
+        ) {
+          // Another holder rotated the refresh_token while we waited on the
+          // lock. Reuse the shared fresh token instead of POSTing the spent
+          // pre-lock refresh_token (the double-consume).
+          const reNow = Math.floor(Date.now() / 1000)
+          if (freshness.force) {
+            // A concurrent rotation satisfies a force too, as long as the
+            // re-issued token is still usable — so two racing `force` callers
+            // produce exactly one POST. A LONE force caller sees no rotation
+            // (refresh_token unchanged) and falls through to grant.
+            if (fresh.expires_at - reNow > 0) return fresh
+          } else if (fresh.expires_at - reNow > margin) {
+            // Reactive / proactive path: rotated AND within our margin → reuse.
+            return fresh
+          }
+        }
+        // Perform the grant via refreshToken (its own SingleFlight is the
+        // within-process fast path; here it is reached only by the flight
+        // leader). Distinct flight key (lockedRefreshInFlight) so this is safe.
+        return await refreshToken(upn)
+      } finally {
+        // Release the cross-process lock on every flight exit. No-op when the
+        // lock was unavailable (release === null).
+        release?.()
+      }
+    })
     return refreshed.access_token
   } catch (e) {
     if (e instanceof RefreshError && e.kind === 'transient' && cur.expires_at - now > 0) {

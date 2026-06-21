@@ -1303,11 +1303,18 @@ matches a closed pattern allow-list, and presses Enter on the default option.
 The utility is **auto-registered on every fresh install** (server and dev,
 as of #833): `bridge-init.sh` registers a `*/10 * * * *` bridge-native cron
 whose payload sets `BRIDGE_PICKER_SWEEP_ENABLED=1`, so the sweep runs out of
-the box. Manual invocations (operator running `scripts/picker-sweep.sh` by
-hand, outside the cron payload) still respect the host_profile=dev
-default-skip — set `BRIDGE_PICKER_SWEEP_ENABLED=1` in the calling environment
-to override that path. To disable the cron on a given install, run
-`agb cron update picker-sweep --disable` after init.
+the box. The registered **cron kind is platform-aware** (#2041/#2042): on a
+host that supports `--kind shell` — iso v2 effective, or a run-as-agent that
+resolves to the controller UID — it registers the controller-direct **shell-kind**
+cron (engine-independent). On a **non-iso / macOS** install (where `--kind shell`
+is structurally unavailable), it registers the **text-kind** cron instead (the
+disposable cron child runs `bash $BRIDGE_HOME/scripts/picker-sweep.sh`), so the
+host still gets a working picker-sweep; this form is the converged state on such
+hosts and is not re-migrated on every upgrade. Manual invocations (operator
+running `scripts/picker-sweep.sh` by hand, outside the cron payload) still
+respect the host_profile=dev default-skip — set `BRIDGE_PICKER_SWEEP_ENABLED=1`
+in the calling environment to override that path. To disable the cron on a given
+install, run `agb cron update picker-sweep --disable` after init.
 
 ### Required environment
 

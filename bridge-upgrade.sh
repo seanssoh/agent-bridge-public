@@ -1223,6 +1223,10 @@ _bridge_upgrade_write_complete_marker() {
 # systemd-active check and is best-effort, so non-systemd installs (macOS
 # launchd, plain-bash) are byte-for-byte unchanged.
 
+# Issue #2040: post-restore load-state surfaced in the upgrade summary
+# ("active" / "inactive" / "unknown" — see _bridge_upgrade_systemd_restart_daemon).
+_BRIDGE_UPGRADE_SYSTEMD_LOAD_STATE="unknown"
+
 # Issue #1905 r2 (cm-prod real-host catch): `systemctl --user` talks to the
 # per-user systemd bus, which needs XDG_RUNTIME_DIR (DBUS_SESSION_BUS_ADDRESS is
 # derived from it). In the upgrader's environment — whether triggered from an
@@ -1321,8 +1325,30 @@ _bridge_upgrade_systemd_restart_daemon() {
     return 0
   fi
   echo "[bridge-upgrade] restoring systemd-managed daemon — starting agent-bridge-daemon.service + agent-bridge-daemon-liveness.timer." >&2
-  systemctl --user start agent-bridge-daemon.service >/dev/null 2>&1 || true
-  systemctl --user start agent-bridge-daemon-liveness.timer >/dev/null 2>&1 || true
+  # Issue #2040: the rc2 restore fired both starts as unverified
+  # `>/dev/null 2>&1 || true`, so a start that silently failed (a bad ExecStart,
+  # a masked unit, a transient bus hiccup) left the daemon down with no signal.
+  # Capture stderr and VERIFY `is-active` for BOTH units; on inactive emit a
+  # loud, non-swallowed WARN with the exact remediation and record the
+  # load-state (_BRIDGE_UPGRADE_SYSTEMD_LOAD_STATE) for the upgrade summary.
+  local svc_err timer_err
+  svc_err="$(systemctl --user start agent-bridge-daemon.service 2>&1 >/dev/null)" || true
+  timer_err="$(systemctl --user start agent-bridge-daemon-liveness.timer 2>&1 >/dev/null)" || true
+  local svc_active=1 timer_active=1
+  systemctl --user is-active agent-bridge-daemon.service >/dev/null 2>&1 || svc_active=0
+  systemctl --user is-active agent-bridge-daemon-liveness.timer >/dev/null 2>&1 || timer_active=0
+  if (( svc_active == 1 && timer_active == 1 )); then
+    _BRIDGE_UPGRADE_SYSTEMD_LOAD_STATE="active"
+    echo "[bridge-upgrade] systemd daemon restored — agent-bridge-daemon.service + agent-bridge-daemon-liveness.timer are active." >&2
+  else
+    _BRIDGE_UPGRADE_SYSTEMD_LOAD_STATE="inactive"
+    if (( svc_active == 0 )); then
+      echo "[bridge-upgrade] WARN: agent-bridge-daemon.service did not become active after restore — the daemon is DOWN. Remediate: systemctl --user start agent-bridge-daemon.service${svc_err:+ (start error: ${svc_err})}." >&2
+    fi
+    if (( timer_active == 0 )); then
+      echo "[bridge-upgrade] WARN: agent-bridge-daemon-liveness.timer did not become active after restore — the standing liveness recovery is disarmed. Remediate: systemctl --user start agent-bridge-daemon-liveness.timer${timer_err:+ (start error: ${timer_err})}." >&2
+    fi
+  fi
   return 0
 }
 # END: Issue #1905 systemd-aware quiesce/restart helpers
@@ -1386,6 +1412,113 @@ _bridge_upgrade_launchd_quiesce_daemon() {
   return 0
 }
 
+# BEGIN: Issue #2040 launchd restore verification helpers
+# The #655 quiesce step's `bootout` is ASYNC on macOS — `launchctl bootout`
+# returns immediately while launchd tears the job down out-of-band. If the
+# restore's `bootstrap` races ahead of that teardown, launchd answers with a
+# transient error ("Boot-out already in progress" / "Operation now in progress"
+# / EIO(5) / "service already loaded"), the old `>/dev/null 2>&1 || true`
+# swallowed it, and the job was left ENABLED-BUT-UNLOADED: KeepAlive=true is moot
+# because there is no loaded job for launchd to supervise, so the daemon stays
+# permanently down (observed ~64h on a non-sleeping host — #2040). These helpers
+# (a) poll until the booted-out job is actually gone before bootstrap, (b) retry
+# bootstrap on the transient races, and (c) verify the job loaded afterward so a
+# silent failure becomes a loud, remediable WARN instead of a quiet outage.
+
+# True (returns 0) when launchd reports a job for gui/$uid/$label — i.e. the job
+# is LOADED. `launchctl print` exits non-zero when the job is not loaded. We do
+# not parse the body; the exit code is the load signal.
+_bridge_upgrade_launchd_job_loaded() {
+  local uid="$1" label="$2"
+  launchctl print "gui/${uid}/${label}" >/dev/null 2>&1
+}
+
+# Poll until the job is NOT loaded (bounded). Defeats the async-bootout race:
+# the quiesce `bootout` may still be tearing the job down when restore runs, and
+# bootstrapping over a half-removed job triggers the transient errors below.
+# Returns 0 once the job is gone (or was never loaded); returns 1 if it is still
+# loaded after the bound elapses (caller proceeds to retry-bootstrap anyway, but
+# now with eyes open). ~5s bound (10 x 0.5s) — long enough for launchd's async
+# teardown, short enough not to stall the upgrade.
+_bridge_upgrade_launchd_wait_unloaded() {
+  local uid="$1" label="$2"
+  local i
+  for (( i = 0; i < 10; i++ )); do
+    if ! _bridge_upgrade_launchd_job_loaded "$uid" "$label"; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+# Classify a launchctl stderr blob as a TRANSIENT bootstrap race worth retrying.
+# These are the known transient launchd errors when bootstrapping over a job that
+# is still being booted out, or that launchd thinks is already present. Anything
+# else (e.g. a genuinely malformed plist) is NOT retried — a retry would just
+# burn the backoff budget on a permanent failure.
+_bridge_upgrade_launchd_transient_err() {
+  local err="$1"
+  case "$err" in
+    *"Boot-out already in progress"*) return 0 ;;
+    *"Operation now in progress"*)    return 0 ;;
+    *"already loaded"*)               return 0 ;;
+    *"already bootstrapped"*)         return 0 ;;
+    *"Input/output error"*)           return 0 ;;
+    *) ;;
+  esac
+  # EIO numeric form: retry. Anchor to the errno/mach-code SHAPES launchctl
+  # actually emits ("error 5" / "errno 5" / "Bootstrap failed: 5:" / "(os/kern)
+  # ... 5" / "=5"), NOT a bare ` 5` substring (which would false-match any
+  # unrelated " 5" in a label/path). The textual EIO is already caught above;
+  # this is a backstop and the verify + loud-WARN is the ultimate backstop.
+  case "$err" in
+    *"error 5"*|*"errno 5"*|*": 5:"*|*"=5"*|*"= 5"*|*"(os/kern)"*" 5"*) return 0 ;;
+  esac
+  return 1
+}
+
+# bootstrap with bounded retry on the transient races. Captures launchctl stderr
+# (NOT swallowed); the last captured stderr is exposed via the global
+# _BRIDGE_UPGRADE_LAST_LAUNCHCTL_ERR for the caller's WARN/remediation text.
+# Returns 0 if bootstrap succeeded OR the job is already loaded (idempotent
+# success); 1 if every attempt failed with a non-transient error or the retry
+# budget was exhausted.
+_BRIDGE_UPGRADE_LAST_LAUNCHCTL_ERR=""
+_bridge_upgrade_launchd_bootstrap_retry() {
+  local uid="$1" label="$2" plist="$3"
+  local attempt err rc
+  _BRIDGE_UPGRADE_LAST_LAUNCHCTL_ERR=""
+  for (( attempt = 1; attempt <= 4; attempt++ )); do
+    # Already loaded (e.g. a prior attempt won, or KeepAlive re-grabbed it) →
+    # idempotent success, nothing more to do.
+    if _bridge_upgrade_launchd_job_loaded "$uid" "$label"; then
+      return 0
+    fi
+    rc=0
+    err="$(launchctl bootstrap "gui/${uid}" "$plist" 2>&1 >/dev/null)" || rc=$?
+    if (( rc == 0 )); then
+      return 0
+    fi
+    _BRIDGE_UPGRADE_LAST_LAUNCHCTL_ERR="$err"
+    # A non-transient failure is permanent — bail rather than burning the backoff
+    # budget (the verify step will WARN). If the job ended up loaded despite the
+    # error, treat it as success.
+    if ! _bridge_upgrade_launchd_transient_err "$err"; then
+      _bridge_upgrade_launchd_job_loaded "$uid" "$label" && return 0
+      return 1
+    fi
+    echo "[bridge-upgrade] launchd bootstrap transient race (attempt ${attempt}/4): ${err} — re-polling for unload and retrying." >&2
+    # Re-poll for the async bootout to finish before the next attempt.
+    _bridge_upgrade_launchd_wait_unloaded "$uid" "$label" || true
+    sleep 0.5
+  done
+  # Exhausted retries — loaded check one more time (a late KeepAlive grab counts).
+  _bridge_upgrade_launchd_job_loaded "$uid" "$label" && return 0
+  return 1
+}
+# END: Issue #2040 launchd restore verification helpers
+
 # Restore the launchd KeepAlive job after the reconcile. Re-enable, bootstrap the
 # plist back, then kickstart so the supervised instance comes up immediately.
 # Mirrors the installer's --load path (scripts/install-daemon-launchagent.sh).
@@ -1394,9 +1527,20 @@ _bridge_upgrade_launchd_quiesce_daemon() {
 # `then`-branch, where a non-zero return WOULD trip set -e. If launchctl has
 # somehow vanished, or the plist cannot be resolved, WARN and leave the operator
 # to re-load by hand (the daemon stays down rather than the upgrade aborting).
+#
+# Issue #2040: this used to fire `enable; bootstrap >/dev/null 2>&1 || true;
+# kickstart` with no verification — a bootstrap that lost the async-bootout race
+# (or hit any other launchd error) left the job enabled-but-unloaded and the
+# daemon permanently down. Now: poll-until-not-loaded BEFORE bootstrap, retry the
+# transient races, capture launchctl stderr, and VERIFY the job actually loaded;
+# on failure emit a loud (non-swallowed) WARN with exact remediation and record
+# the load-state (_BRIDGE_UPGRADE_LAUNCHD_LOAD_STATE) for the upgrade summary.
+_BRIDGE_UPGRADE_LAUNCHD_LOAD_STATE="unknown"
 _bridge_upgrade_launchd_restart_daemon() {
+  _BRIDGE_UPGRADE_LAUNCHD_LOAD_STATE="unknown"
   if ! command -v launchctl >/dev/null 2>&1; then
     echo "[bridge-upgrade] WARN: launchctl not found at restart time on a launchd-managed install — re-load the LaunchAgent by hand (launchctl bootstrap gui/\$(id -u) <plist>)." >&2
+    _BRIDGE_UPGRADE_LAUNCHD_LOAD_STATE="skipped_no_launchctl"
     return 0
   fi
   local uid label
@@ -1410,6 +1554,7 @@ _bridge_upgrade_launchd_restart_daemon() {
   fi
   if [[ -z "$uid" || -z "$label" ]]; then
     echo "[bridge-upgrade] WARN: could not resolve uid/label to restore the launchd job — re-load the LaunchAgent by hand (launchctl bootstrap gui/\$(id -u) <plist>)." >&2
+    _BRIDGE_UPGRADE_LAUNCHD_LOAD_STATE="skipped_no_label"
     return 0
   fi
   # Resolve the plist path from the installer-written marker so bootstrap names
@@ -1429,11 +1574,29 @@ _bridge_upgrade_launchd_restart_daemon() {
   echo "[bridge-upgrade] restoring launchd-managed daemon — re-enabling + bootstrapping gui/${uid}/${label}." >&2
   launchctl enable "gui/${uid}/${label}" >/dev/null 2>&1 || true
   if [[ -f "$plist" ]]; then
-    launchctl bootstrap "gui/${uid}" "$plist" >/dev/null 2>&1 || true
+    # Issue #2040: defeat the async-bootout race — poll until the quiesce's
+    # `bootout` has fully removed the job before we bootstrap over it, then
+    # bootstrap with bounded retry on the transient launchd errors.
+    _bridge_upgrade_launchd_wait_unloaded "$uid" "$label" || \
+      echo "[bridge-upgrade] launchd job still loaded after the unload-poll bound — attempting bootstrap anyway (will retry transient races)." >&2
+    if ! _bridge_upgrade_launchd_bootstrap_retry "$uid" "$label" "$plist"; then
+      echo "[bridge-upgrade] WARN: launchd bootstrap did not load gui/${uid}/${label} after retries${_BRIDGE_UPGRADE_LAST_LAUNCHCTL_ERR:+ (last error: ${_BRIDGE_UPGRADE_LAST_LAUNCHCTL_ERR})}." >&2
+    fi
   else
     echo "[bridge-upgrade] WARN: launchd plist not found at '$plist' — cannot bootstrap; kickstart-only restore (KeepAlive will re-supervise if the job is still loaded)." >&2
   fi
   launchctl kickstart -k "gui/${uid}/${label}" >/dev/null 2>&1 || true
+  # Issue #2040: VERIFY the job actually loaded. If it did not, the daemon is
+  # down and KeepAlive can't help (no loaded job to supervise) — emit a loud,
+  # non-swallowed WARN with the exact remediation command and record the
+  # load-state so the upgrade summary surfaces it.
+  if _bridge_upgrade_launchd_job_loaded "$uid" "$label"; then
+    _BRIDGE_UPGRADE_LAUNCHD_LOAD_STATE="loaded"
+    echo "[bridge-upgrade] launchd daemon restored — gui/${uid}/${label} is loaded." >&2
+  else
+    _BRIDGE_UPGRADE_LAUNCHD_LOAD_STATE="not_loaded"
+    echo "[bridge-upgrade] WARN: launchd daemon is ENABLED-BUT-UNLOADED after restore (gui/${uid}/${label}) — the daemon is DOWN and KeepAlive cannot recover it (no loaded job to supervise). Remediate by hand: launchctl bootstrap gui/$(id -u) '${plist}'${_BRIDGE_UPGRADE_LAST_LAUNCHCTL_ERR:+ (last launchctl error: ${_BRIDGE_UPGRADE_LAST_LAUNCHCTL_ERR})}." >&2
+  fi
   return 0
 }
 # END: Issue #655 launchd-aware quiesce/restart helpers
@@ -3481,6 +3644,16 @@ if [[ $RESTART_DAEMON -eq 1 && $DRY_RUN -eq 0 ]]; then
     # => run_without is a transparent pass-through, pre-#1661 behavior).
     bridge_scoped_lock_run_without "${_BRIDGE_UPGRADE_LOCK_TOKEN:-}" \
       bash "$TARGET_ROOT/bridge-daemon.sh" ensure >/dev/null
+  fi
+  # Issue #2040: surface the post-restore daemon load-state in the upgrade
+  # summary so an enabled-but-unloaded launchd job (or an inactive systemd unit)
+  # is visible at a glance instead of buried in a swallowed launchctl error. The
+  # helpers above already WARN with exact remediation on failure; this is the
+  # one-line at-a-glance summary that rides the upgrade output.
+  if [[ "${_UPGRADE_DAEMON_LAUNCHD_MANAGED:-0}" == "1" ]]; then
+    echo "[bridge-upgrade] daemon load-state (launchd): ${_BRIDGE_UPGRADE_LAUNCHD_LOAD_STATE:-unknown}" >&2
+  elif [[ "${_UPGRADE_DAEMON_SYSTEMD_MANAGED:-0}" == "1" ]]; then
+    echo "[bridge-upgrade] daemon load-state (systemd): ${_BRIDGE_UPGRADE_SYSTEMD_LOAD_STATE:-unknown}" >&2
   fi
 fi
 

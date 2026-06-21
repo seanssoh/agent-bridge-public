@@ -349,6 +349,27 @@ bridge_picker_handle_unknown() {
     return 1
   fi
 
+  # Hard exclusion (#2043): a claude session whose captured tail shows the LIVE
+  # mid-turn spinner ("Working" / "esc to interrupt") banner is ACTIVELY producing
+  # output — it is not stuck on a novel interactive prompt, it is mid-assistant-turn.
+  # The top-of-tick busy-skip (bridge_tmux_session_inject_busy) already covers this
+  # for most ticks, but a momentarily-static capture (between spinner frames, or a
+  # tool call whose tail does not surface the banner at busy-check time) can slip
+  # through and, if its pane happens to hash stably across the 2-tick budget, escalate
+  # an actively-working roster-claude agent as unknown_stuck (the #2043 false-positive).
+  # Re-assert the SAME #1409/#1991-family active-work signal on the exact snapshot
+  # we are about to escalate: reuse bridge_tmux_claude_capture_is_midturn, which only
+  # reports mid-turn when the banner is the LIVE tail (no clean composer prompt below
+  # it) — so a genuinely-stuck unknown picker (a static prompt with no live banner)
+  # is NOT excluded and still escalates. Reset the timer so a budget that elapsed
+  # under an active turn does not carry over into a later genuine stuck screen.
+  if [[ "$engine" == "claude" ]] \
+      && declare -F bridge_tmux_claude_capture_is_midturn >/dev/null 2>&1 \
+      && bridge_tmux_claude_capture_is_midturn "$pane"; then
+    bridge_picker_py clear-unknown --session "$session" --state-dir "$(bridge_picker_state_dir)" >/dev/null 2>&1 || true
+    return 1
+  fi
+
   # Not prompt-like → ordinary output; reset the timer so a real prompt later
   # starts its budget fresh.
   if ! bridge_picker_pane_looks_prompt_like "$pane"; then

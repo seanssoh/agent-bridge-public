@@ -180,18 +180,23 @@ smoke_log "T1 PASS: systemd quiesce stops liveness.timer THEN daemon.service"
 # --- T2: systemd restart starts service THEN re-arms timer -------------------
 # The restart helper is systemctl-presence-gated (not is-active), so the
 # detector override is irrelevant here — pass 0 for symmetry.
+# Issue #2040: the restore now also VERIFIES is-active for both units after
+# starting them, so the assertion is on the MUTATING-call order (start service ->
+# start timer), not an exact total count. The default shim reports is-active=0
+# (active) so the verify passes cleanly.
 : >"$SYSTEMCTL_LOG"
 run_helper 0 _bridge_upgrade_systemd_restart_daemon
 R_CALLS="$(cat "$SYSTEMCTL_LOG")"
-R_FIRST="$(sed -n '1p' "$SYSTEMCTL_LOG")"
-R_SECOND="$(sed -n '2p' "$SYSTEMCTL_LOG")"
-R_COUNT="$(count_calls "$SYSTEMCTL_LOG")"
-smoke_assert_eq "2" "$R_COUNT" "T2 restart makes exactly 2 systemctl calls (got: $R_CALLS)"
-smoke_assert_contains "$R_FIRST" "start agent-bridge-daemon.service" "T2 first call starts the SERVICE"
-smoke_assert_contains "$R_SECOND" "start agent-bridge-daemon-liveness.timer" "T2 second call re-arms the liveness TIMER"
-[[ "$R_FIRST" == *"daemon.service"* && "$R_SECOND" == *"liveness.timer"* ]] \
-  || smoke_fail "T2 FAIL: service must be started BEFORE the timer. calls=$R_CALLS"
-smoke_log "T2 PASS: systemd restart starts daemon.service THEN re-arms liveness.timer"
+# Mutating starts in order (excludes the read-only is-active verify probes).
+R_START_SEQ="$(grep -oE 'start agent-bridge-daemon(\.service|-liveness\.timer)' "$SYSTEMCTL_LOG" | tr '\n' '|' | sed 's/|$//')"
+smoke_assert_contains "$R_CALLS" "start agent-bridge-daemon.service" "T2 starts the SERVICE"
+smoke_assert_contains "$R_CALLS" "start agent-bridge-daemon-liveness.timer" "T2 re-arms the liveness TIMER"
+smoke_assert_eq "start agent-bridge-daemon.service|start agent-bridge-daemon-liveness.timer" "$R_START_SEQ" \
+  "T2 start order is service -> timer (got: $R_START_SEQ; full: $R_CALLS)"
+# The #2040 verify probe must run is-active for both units.
+smoke_assert_contains "$R_CALLS" "is-active agent-bridge-daemon.service" "T2 verifies is-active for the SERVICE (#2040)"
+smoke_assert_contains "$R_CALLS" "is-active agent-bridge-daemon-liveness.timer" "T2 verifies is-active for the TIMER (#2040)"
+smoke_log "T2 PASS: systemd restart starts daemon.service THEN re-arms liveness.timer (with #2040 is-active verify)"
 
 # --- T3: NON-systemd (canonical detector → false) makes ZERO systemctl calls -
 # Detector → false. Run with the systemctl shim STILL on PATH to prove the

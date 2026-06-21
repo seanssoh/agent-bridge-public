@@ -16,8 +16,10 @@
 # disagreement HOLDS (operator-visible warning) instead of materializing.
 #
 #   T1  claude-roster agent whose CLAUDE.md trips the codex heuristic ("Codex
-#       CLI"), agent-meta.env ABSENT -> HELD, no AGENTS.md written, non-clean=1,
-#       and the [hygiene] task body names the held agent + the disagreement.
+#       CLI"), agent-meta.env ABSENT -> HELD QUIETLY (#2044): no AGENTS.md
+#       written (fail-closed preserved), but the roster engine is AUTHORITATIVE
+#       so the pass is CLEAN (non-clean=0) — the agent is not re-classified codex
+#       and does NOT regenerate a recurring [hygiene] task every pass.
 #   T2  claude-roster agent with a clean CLAUDE.md (heuristic agrees claude) ->
 #       skipped, no AGENTS.md, clean (non-clean=0, no spurious task).
 #   T3  NEGATIVE CONTROL: a real codex-roster agent missing AGENTS.md still
@@ -140,7 +142,9 @@ non_clean_of() {
 
 # ===========================================================================
 # T1 — claude-roster agent, codex-tripping CLAUDE.md, agent-meta.env ABSENT:
-#      HELD, NOT materialized; non-clean=1; task body names the held agent.
+#      HELD QUIETLY (#2044), NOT materialized; non-clean=0 (roster is
+#      authoritative — no recurring [hygiene] task). The agent is recorded under
+#      held_quiet for transparency but never re-classified codex.
 # ===========================================================================
 test_claude_roster_codex_heuristic_is_held() {
   setup_bridge_fixture
@@ -156,25 +160,21 @@ test_claude_roster_codex_heuristic_is_held() {
   # CRITICAL: no spurious codex AGENTS.md materialized on the claude agent.
   [[ ! -f "$profile/AGENTS.md" ]] \
     || smoke_fail "T1: claude-roster agent got a spurious codex AGENTS.md (fail-closed breach)"
-  # Held, NOT backfilled.
-  smoke_assert_contains "$summary" "\"held\"" "T1: summary missing the held list"
-  smoke_assert_contains "$summary" "$agent" "T1: held summary did not name the claude agent"
-  local backfilled_count=""
+  # Held QUIETLY (#2044), NOT backfilled and NOT in the task-generating `held`.
+  smoke_assert_contains "$summary" "\"held_quiet\"" "T1: summary missing the held_quiet list"
+  smoke_assert_contains "$summary" "$agent" "T1: held_quiet summary did not name the claude agent"
+  local backfilled_count="" held_count="" held_quiet_count=""
   backfilled_count="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("backfilled_count",0))' "$SMOKE_TMP_ROOT/t1.json")"
-  smoke_assert_eq "0" "$backfilled_count" "T1: a claude agent was backfilled (must be held)"
+  held_count="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("held_count",0))' "$SMOKE_TMP_ROOT/t1.json")"
+  held_quiet_count="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("held_quiet_count",0))' "$SMOKE_TMP_ROOT/t1.json")"
+  smoke_assert_eq "0" "$backfilled_count" "T1: a claude agent was backfilled (must be held quietly)"
+  smoke_assert_eq "0" "$held_count" "T1: a roster-authoritative claude agent landed in the task-generating held list (must be held_quiet)"
+  smoke_assert_eq "1" "$held_quiet_count" "T1: the roster-authoritative claude agent was not recorded under held_quiet"
 
-  # Non-clean so the operator gets the warning task.
-  smoke_assert_eq "1" "$(non_clean_of "$SMOKE_TMP_ROOT/t1.json")" \
-    "T1: a held disagreement was not reported non-clean (operator would never see it)"
-
-  # The [hygiene] task body names the held agent + the disagreement.
-  local body=""
-  body="$(python3 "$REPO_ROOT/bridge-daemon-helpers.py" agent-doc-backfill-task-body \
-    "$SMOKE_TMP_ROOT/t1.json" testhost)"
-  smoke_assert_contains "$body" "Held" "T1: task body missing the Held section"
-  smoke_assert_contains "$body" "$agent" "T1: task body did not name the held agent"
-  smoke_assert_contains "$body" "roster_engine=claude" \
-    "T1: task body did not surface the roster engine for the held agent"
+  # CLEAN (#2044): a roster-authoritative claude agent must NOT make the pass
+  # non-clean — otherwise it regenerates an identical [hygiene] task every pass.
+  smoke_assert_eq "0" "$(non_clean_of "$SMOKE_TMP_ROOT/t1.json")" \
+    "T1: a roster-authoritative claude agent was reported non-clean (recurring hygiene task would re-fire)"
 }
 
 # ===========================================================================

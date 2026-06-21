@@ -1579,6 +1579,55 @@ def stop_drain_enabled() -> bool:
     return raw not in {"1", "true", "yes", "on"}
 
 
+# Issue #2047 — non-consuming "producer-only" legs. A disposable sub/thread
+# session that only ENQUEUES to its parent main session (and is intentionally
+# transport-guarded off from `agb`/`agent-bridge` queue consumption) inherits
+# the main session's consumer Stop hooks when it shares the main's
+# CLAUDE_CONFIG_DIR. It also shares the main's BRIDGE_AGENT_ID, so the
+# BRIDGE_AGENT_ID-keyed drain decision fires and demands `agb` actions the
+# producer leg structurally cannot perform → it loops with "I can't drain"
+# prose instead of finishing quietly.
+#
+# The recognized signal is BRIDGE_AGENT_LEG (the marker named in the issue):
+# the sub-session dispatcher stamps it into the producer leg's process env so
+# the whole consumer-hook set is correct-by-default, rather than each
+# dispatcher having to know every individual consumer hook's kill-switch. A
+# normal consumer main session does NOT set it (or sets `consumer`/`main`) and
+# so is NEVER skipped — only an explicitly non-consuming leg is.
+_PRODUCER_LEG_VALUES = frozenset(
+    {
+        "producer",
+        "producer-only",
+        "producer_only",
+        "non-consuming",
+        "non_consuming",
+        "noconsume",
+        "enqueue-only",
+        "enqueue_only",
+    }
+)
+
+
+def producer_only_leg() -> bool:
+    """Whether this session is a non-consuming producer-only leg (#2047).
+
+    True ONLY when ``BRIDGE_AGENT_LEG`` names a known non-consuming value. The
+    default (unset / ``consumer`` / ``main`` / anything unrecognized) is False so
+    a real consumer main session is NEVER mis-skipped — a producer-only leg has
+    to opt in explicitly via its dispatcher-set env, and the consumer drain is
+    left fully intact.
+
+    ``BRIDGE_AGENT_LEG`` is set by the sub-session DISPATCHER (a
+    deployment-specific producer-leg launcher — the same layer that installs the
+    leg's ``agb`` transport guard), NOT by tracked source. This consumer Stop
+    hook only HONOURS the marker — the same contract as
+    ``BRIDGE_STOP_DRAIN_DISABLE`` (an operator/dispatcher-set kill-switch the
+    hook honours but never writes). See ARCHITECTURE.md §Stop inbox auto-drain.
+    """
+    raw = os.environ.get("BRIDGE_AGENT_LEG", "").strip().lower()
+    return raw in _PRODUCER_LEG_VALUES
+
+
 def stop_drain_cap() -> int:
     """Max consecutive auto-continues on the SAME unchanged task key.
 
@@ -1975,6 +2024,21 @@ def compute_drain_decision(
     Codex) over the same shared guard + same shared actionable predicate.
     """
     if not agent or not stop_drain_enabled():
+        return None
+    # Issue #2047 — a non-consuming producer-only leg shares the main session's
+    # BRIDGE_AGENT_ID but is transport-guarded off from `agb`, so demanding a
+    # drain would loop. Skip the drain for it (let it Stop quietly) and emit a
+    # one-line observable audit row. Best-effort: an audit failure must never
+    # turn the skip into a Stop-hook error.
+    if producer_only_leg():
+        try:
+            write_audit(
+                "stop_drain_producer_leg_skip",
+                agent,
+                {"agent_leg": os.environ.get("BRIDGE_AGENT_LEG", "").strip()},
+            )
+        except Exception:  # noqa: BLE001 — audit is best-effort, never block
+            pass
         return None
     # A prior chain hook already blocked this turn → never stack.
     if event and bool(event.get("stop_hook_active")):

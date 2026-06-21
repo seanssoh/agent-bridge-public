@@ -170,6 +170,272 @@ record_cooldown() {
   printf '%s\n' "$(now_ts)" 2>/dev/null >"$BRIDGE_DAEMON_LIVENESS_COOLDOWN_FILE" || true
 }
 
+# ── Issue #2040: standing recovery for an enabled-but-unloaded daemon ──────────
+#
+# The daemon can end up ENABLED-BUT-UNLOADED via ANY quiesce/restart path (a lost
+# async-bootout race during upgrade, an ensure_singleton restart storm, a
+# watchdog-disable that never re-bootstrapped). In that state launchd's
+# KeepAlive / systemd's Restart= is MOOT — there is no loaded job to supervise —
+# so the daemon stays down indefinitely (~64h observed). cron self-heal is
+# impossible (cron dispatch needs the daemon). This INDEPENDENT liveness watcher
+# (its own launchd job / systemd timer, survives the daemon's death) is the only
+# viable recovery: when the heartbeat is stale AND no daemon pid is alive AND the
+# job is PROVEN should-be-running-but-unloaded, re-bootstrap it (bounded +
+# cooldown-gated + audited). It must NEVER fight an operator `agb daemon stop` /
+# an intentionally-disabled job — the durable "should be running" signal is the
+# launchd `disabled=false` + plist/config presence, or systemd `is-enabled`.
+
+# Resolve the launchd uid for the current process. Empty on failure.
+rebootstrap_launchd_uid() {
+  id -u 2>/dev/null || printf '%s' "${UID:-}"
+}
+
+# Read the installer-written launchagent.config to learn the label + plist. Sets
+# REBOOTSTRAP_LABEL / REBOOTSTRAP_PLIST globals. Returns 1 when the config is
+# absent or the label cannot be resolved (→ not a launchd-managed install we can
+# recover). Self-contained — the watcher deliberately does not source bridge-lib.
+REBOOTSTRAP_LABEL=""
+REBOOTSTRAP_PLIST=""
+rebootstrap_launchd_resolve() {
+  REBOOTSTRAP_LABEL=""
+  REBOOTSTRAP_PLIST=""
+  local config_path="${BRIDGE_LAUNCHAGENT_CONFIG_FILE:-$BRIDGE_STATE_DIR/launchagent.config}"
+  [[ -f "$config_path" ]] || return 1
+  local label plist
+  label="$(
+    # shellcheck disable=SC1090
+    source "$config_path" 2>/dev/null
+    printf '%s' "${BRIDGE_LAUNCHAGENT_LABEL:-}"
+  )"
+  plist="$(
+    # shellcheck disable=SC1090
+    source "$config_path" 2>/dev/null
+    printf '%s' "${BRIDGE_LAUNCHAGENT_PLIST:-}"
+  )"
+  [[ -n "$label" ]] || return 1
+  REBOOTSTRAP_LABEL="$label"
+  REBOOTSTRAP_PLIST="$plist"
+  return 0
+}
+
+# True (returns 0) when launchd has a LOADED job for gui/$uid/$label. `launchctl
+# print` exits non-zero when the job is not loaded — the exit code is the signal.
+rebootstrap_launchd_job_loaded() {
+  local uid="$1" label="$2"
+  launchctl print "gui/${uid}/${label}" >/dev/null 2>&1
+}
+
+# Report the launchd disabled-state for $label. `launchctl print-disabled
+# gui/$uid` emits a label line whose value is the disabled flag. Modern macOS
+# prints `"<label>" => disabled` / `"<label>" => enabled`; older releases print
+# `=> true` (disabled) / `=> false` (enabled). The grep below matches BOTH the
+# real `disabled` word and the legacy `true` (defensive). Prints one of:
+#   disabled — the label line says `=> disabled` (or legacy `=> true`)
+#   enabled  — the label line says `=> enabled` (or legacy `=> false`; or, absent
+#              any line, the default is enabled — launchd only lists labels with
+#              an explicit override)
+#   unknown  — `print-disabled` itself failed (domain unreachable / unsupported)
+# We FAIL CLOSED on `unknown`: the caller skips recovery, because we cannot prove
+# the job is NOT operator-disabled, and the operator-stop guarantee outranks
+# auto-recovery (★ never fight an `agb daemon stop`).
+rebootstrap_launchd_disabled_state() {
+  local uid="$1" label="$2" out
+  out="$(launchctl print-disabled "gui/${uid}" 2>/dev/null)" || { printf 'unknown'; return 0; }
+  if printf '%s\n' "$out" | grep -E "\"${label}\"[[:space:]]*=>[[:space:]]*(true|disabled)" >/dev/null 2>&1; then
+    printf 'disabled'
+  else
+    printf 'enabled'
+  fi
+}
+
+# Re-bootstrap an enabled-but-unloaded launchd daemon. Pre-gated by the caller
+# (Darwin + launchctl + resolved label + plist exists + NOT disabled + NOT
+# loaded). Cooldown-recorded BEFORE the attempt (storm control). bootstrap +
+# kickstart, capture stderr, verify loaded. Audits attempt/success/failed.
+# Returns 0 on success, 1 on failure.
+rebootstrap_launchd_daemon() {
+  local uid="$1" label="$2" plist="$3" age="$4"
+  emit_audit daemon_liveness_rebootstrap_attempt \
+    --detail platform="launchd" \
+    --detail label="$label" \
+    --detail heartbeat_age_seconds="$age"
+  record_cooldown
+  if [[ "$BRIDGE_DAEMON_LIVENESS_DRY_RUN" == "1" ]]; then
+    printf '[liveness] DRY_RUN — would re-bootstrap enabled-but-unloaded launchd job gui/%s/%s\n' "$uid" "$label"
+    return 0
+  fi
+  local err=""
+  err="$(launchctl bootstrap "gui/${uid}" "$plist" 2>&1 >/dev/null)" || true
+  launchctl kickstart -k "gui/${uid}/${label}" >/dev/null 2>&1 || true
+  if rebootstrap_launchd_job_loaded "$uid" "$label"; then
+    emit_audit daemon_liveness_rebootstrap_success \
+      --detail platform="launchd" \
+      --detail label="$label"
+    printf '[liveness] re-bootstrapped enabled-but-unloaded launchd daemon gui/%s/%s\n' "$uid" "$label"
+    return 0
+  fi
+  emit_audit daemon_liveness_rebootstrap_failed \
+    --detail platform="launchd" \
+    --detail label="$label" \
+    --detail launchctl_error="${err:-}"
+  printf '[liveness] WARN: launchd daemon still UNLOADED after re-bootstrap (gui/%s/%s) — remediate by hand: launchctl bootstrap gui/%s %s%s\n' \
+    "$uid" "$label" "$uid" "$plist" "${err:+ (last launchctl error: $err)}" >&2
+  return 1
+}
+
+# Darwin entry point. Returns 0 when it HANDLED the not-running case (acted or
+# deliberately skipped with its own audit) so main() must NOT fall through to
+# daemon_liveness_skip_not_running; returns 1 when this is not a recoverable
+# launchd situation and main() should emit the standard skip.
+maybe_rebootstrap_launchd() {
+  local age="$1"
+  [[ "$(uname -s 2>/dev/null)" == "Darwin" ]] || return 1
+  command -v launchctl >/dev/null 2>&1 || return 1
+  rebootstrap_launchd_resolve || return 1
+  local uid
+  uid="$(rebootstrap_launchd_uid)"
+  [[ -n "$uid" ]] || return 1
+  # Require the plist on disk — bootstrap needs the file, and its presence is
+  # half of the "we are launchd-managed" signal.
+  [[ -n "$REBOOTSTRAP_PLIST" && -f "$REBOOTSTRAP_PLIST" ]] || return 1
+  # ★ Operator-intent guard: a DISABLED job is an intentional stop. SKIP + audit,
+  # never re-enable/re-bootstrap. FAIL CLOSED on `unknown` (print-disabled
+  # unreadable) — we cannot prove the job is not operator-disabled, and the
+  # operator-stop guarantee outranks auto-recovery.
+  local disabled_state
+  disabled_state="$(rebootstrap_launchd_disabled_state "$uid" "$REBOOTSTRAP_LABEL")"
+  if [[ "$disabled_state" != "enabled" ]]; then
+    emit_audit daemon_liveness_rebootstrap_skip_disabled \
+      --detail platform="launchd" \
+      --detail label="$REBOOTSTRAP_LABEL" \
+      --detail disabled_state="$disabled_state" \
+      --detail heartbeat_age_seconds="$age"
+    printf '[liveness] launchd job gui/%s/%s disabled-state=%s — skipping re-bootstrap (operator stop / cannot confirm enabled).\n' \
+      "$uid" "$REBOOTSTRAP_LABEL" "$disabled_state"
+    return 0
+  fi
+  # If the job IS loaded, this is not the enabled-but-unloaded case — let the
+  # normal skip path handle it (a loaded-but-no-pid job is launchd's to respawn).
+  if rebootstrap_launchd_job_loaded "$uid" "$REBOOTSTRAP_LABEL"; then
+    emit_audit daemon_liveness_rebootstrap_skip_loaded \
+      --detail platform="launchd" \
+      --detail label="$REBOOTSTRAP_LABEL" \
+      --detail heartbeat_age_seconds="$age"
+    return 1
+  fi
+  # Enabled-but-unloaded confirmed. Storm control: respect the cooldown.
+  if cooldown_active; then
+    emit_audit daemon_liveness_rebootstrap_skip_cooldown \
+      --detail platform="launchd" \
+      --detail label="$REBOOTSTRAP_LABEL" \
+      --detail heartbeat_age_seconds="$age" \
+      --detail cooldown_seconds="$BRIDGE_DAEMON_LIVENESS_COOLDOWN_SECONDS"
+    return 0
+  fi
+  rebootstrap_launchd_daemon "$uid" "$REBOOTSTRAP_LABEL" "$REBOOTSTRAP_PLIST" "$age" || true
+  return 0
+}
+
+# Linux entry point. The watcher runs from its own systemd --user timer
+# (independent of the daemon service), so it survives the daemon's death and can
+# restart an enabled-but-inactive `agent-bridge-daemon.service`. Recover ONLY
+# when the service is-enabled=enabled/enabled-runtime AND is-active=inactive/
+# failed. disabled/static/masked/not-found/bus-unreachable → SKIP, never enable.
+# Returns 0 when HANDLED (acted or skipped-with-audit), 1 when main() should emit
+# the standard skip.
+maybe_rebootstrap_systemd() {
+  local age="$1"
+  [[ "$(uname -s 2>/dev/null)" == "Linux" ]] || return 1
+  command -v systemctl >/dev/null 2>&1 || return 1
+  local svc="${BRIDGE_DAEMON_SYSTEMD_SERVICE:-agent-bridge-daemon.service}"
+  local enabled_state
+  # is-enabled prints enabled/enabled-runtime/disabled/static/masked/... on
+  # stdout. A non-zero rc with empty output means the user bus is unreachable or
+  # the unit is unknown → not recoverable here.
+  enabled_state="$(systemctl --user is-enabled "$svc" 2>/dev/null)" || true
+  case "$enabled_state" in
+    enabled|enabled-runtime) ;;
+    "")
+      # No output → bus unreachable or unit not found. Skip + audit; never enable.
+      emit_audit daemon_liveness_rebootstrap_skip_unavailable \
+        --detail platform="systemd" \
+        --detail service="$svc" \
+        --detail heartbeat_age_seconds="$age"
+      return 1
+      ;;
+    disabled|masked)
+      # Operator/intentional stop. SKIP + audit, never re-enable.
+      emit_audit daemon_liveness_rebootstrap_skip_disabled \
+        --detail platform="systemd" \
+        --detail service="$svc" \
+        --detail enabled_state="$enabled_state" \
+        --detail heartbeat_age_seconds="$age"
+      printf '[liveness] systemd unit %s is %s (operator stop) — skipping re-start.\n' "$svc" "$enabled_state"
+      return 0
+      ;;
+    *)
+      # static / indirect / generated / unknown — not a unit we manage as a
+      # standing daemon. Defer to the normal skip path.
+      return 1
+      ;;
+  esac
+  # Enabled. Recover only when NOT active (inactive/failed). An active service
+  # with no pidfile is the daemon's own concern, not ours.
+  if systemctl --user is-active "$svc" >/dev/null 2>&1; then
+    emit_audit daemon_liveness_rebootstrap_skip_loaded \
+      --detail platform="systemd" \
+      --detail service="$svc" \
+      --detail heartbeat_age_seconds="$age"
+    return 1
+  fi
+  if cooldown_active; then
+    emit_audit daemon_liveness_rebootstrap_skip_cooldown \
+      --detail platform="systemd" \
+      --detail service="$svc" \
+      --detail heartbeat_age_seconds="$age" \
+      --detail cooldown_seconds="$BRIDGE_DAEMON_LIVENESS_COOLDOWN_SECONDS"
+    return 0
+  fi
+  emit_audit daemon_liveness_rebootstrap_attempt \
+    --detail platform="systemd" \
+    --detail service="$svc" \
+    --detail heartbeat_age_seconds="$age"
+  record_cooldown
+  if [[ "$BRIDGE_DAEMON_LIVENESS_DRY_RUN" == "1" ]]; then
+    printf '[liveness] DRY_RUN — would re-start enabled-but-inactive systemd unit %s\n' "$svc"
+    return 0
+  fi
+  local err=""
+  # reset-failed clears a prior failed state so `start` is not refused.
+  systemctl --user reset-failed "$svc" >/dev/null 2>&1 || true
+  err="$(systemctl --user start "$svc" 2>&1 >/dev/null)" || true
+  if systemctl --user is-active "$svc" >/dev/null 2>&1; then
+    emit_audit daemon_liveness_rebootstrap_success \
+      --detail platform="systemd" \
+      --detail service="$svc"
+    printf '[liveness] re-started enabled-but-inactive systemd daemon %s\n' "$svc"
+    return 0
+  fi
+  emit_audit daemon_liveness_rebootstrap_failed \
+    --detail platform="systemd" \
+    --detail service="$svc" \
+    --detail systemctl_error="${err:-}"
+  printf '[liveness] WARN: systemd daemon %s still inactive after re-start — remediate: systemctl --user start %s%s\n' \
+    "$svc" "$svc" "${err:+ (start error: $err)}" >&2
+  return 0
+}
+
+# Standing-recovery dispatcher called from main() when the heartbeat is stale and
+# no daemon pid is alive, BEFORE the daemon_liveness_skip_not_running fallback.
+# Returns 0 when it HANDLED the case (so main must not also emit skip_not_running);
+# 1 to fall through to the standard skip.
+maybe_rebootstrap_unloaded_daemon() {
+  local age="$1"
+  maybe_rebootstrap_launchd "$age" && return 0
+  maybe_rebootstrap_systemd "$age" && return 0
+  return 1
+}
+
 # Issue #1973 (Track C). Write the recovery marker the freshly-started daemon
 # consumes once to run a bounded re-nudge pass. The daemon path
 # (bridge-daemon.sh cmd_run) deletes the file after one read, so it is a single
@@ -436,9 +702,19 @@ main() {
   fi
 
   if ! pid="$(daemon_pid_alive)"; then
-    # No live process to kill. launchd's KeepAlive / systemd's Restart=always
-    # handles the "process gone" case; the liveness watcher exists for the
-    # silent-hang case. Be conservative and stay out of the way.
+    # Issue #2040: before deferring to KeepAlive / Restart=, check the
+    # enabled-but-unloaded case those policies CANNOT recover. If the job is
+    # proven should-be-running-but-unloaded (launchd: enabled, not disabled, not
+    # loaded, plist present / systemd: is-enabled, inactive), re-bootstrap it
+    # (cooldown-gated + audited). A DISABLED / operator-stopped job is skipped
+    # with its own audit — we never fight an intentional stop.
+    if maybe_rebootstrap_unloaded_daemon "$age"; then
+      return 0
+    fi
+    # No live process to kill and nothing recoverable. launchd's KeepAlive /
+    # systemd's Restart=always handles the genuine "process gone, job loaded"
+    # case; the liveness watcher exists for the silent-hang case. Be
+    # conservative and stay out of the way.
     emit_audit daemon_liveness_skip_not_running \
       --detail heartbeat_age_seconds="$age" \
       --detail threshold_seconds="$BRIDGE_DAEMON_LIVENESS_THRESHOLD_SECONDS"

@@ -317,7 +317,21 @@ error, or a marker write failure **FAILS OPEN** (exit 0, no block) so a
 marker I/O bug can never become an infinite Stop→block→Stop loop. The
 cap/cooldown are env-overridable (`BRIDGE_STOP_DRAIN_CAP`,
 `BRIDGE_STOP_DRAIN_COOLDOWN`); `BRIDGE_STOP_DRAIN_DISABLE` is the operator
-kill-switch. On a self-continue the hook also writes a non-failure
+kill-switch. A **non-consuming producer-only leg** — a disposable sub/thread
+session that only ENQUEUES to its parent main session and is transport-guarded
+off from `agb`/`agent-bridge`, sharing the main's `CLAUDE_CONFIG_DIR` and
+`BRIDGE_AGENT_ID` — is detected via `BRIDGE_AGENT_LEG`
+(`producer`/`producer-only`/`non-consuming`/`enqueue-only`; unset/`consumer`/
+`main` stay a normal consumer) and **skips the drain entirely** (the leg can't
+claim/done, so blocking it would loop). `BRIDGE_AGENT_LEG` is set by the
+sub-session DISPATCHER (a deployment-specific producer-leg launcher — the same
+layer that installs the leg's `agb` transport guard); it is NOT set by tracked
+source, the consumer Stop hook only HONOURS it. That makes a producer leg
+correct-by-default across the whole consumer-hook set without each dispatcher
+having to know every individual hook's kill-switch (#2047). The skip emits a
+`stop_drain_producer_leg_skip` audit row. Smoke:
+`scripts/smoke/2047-producer-leg-drain-skip.sh`. On a self-continue the hook
+also writes a non-failure
 "attention delivered" stamp (`bridge-queue.py note-self-continue` —
 updates `agent_state.last_nudge_ts`/`last_nudge_key` for the current
 queued set WITHOUT incrementing `nudge_fail_count`) so a concurrent daemon
