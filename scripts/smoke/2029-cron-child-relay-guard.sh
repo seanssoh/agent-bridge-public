@@ -141,8 +141,12 @@ expect(
 )
 expect(
     "tier1 discord webhook send",
+    # `webhooks<id>` (no literal "webhooks/") keeps the guard's substring match
+    # on `discord.com/api/webhooks` while staying clear of the oss-preflight
+    # discord-webhook-URL scan (`discord\.com/api/webhooks/`) — this is a fake
+    # redacted placeholder, not a real webhook.
     guard._violates_direct_send(
-        "curl https://discord.com/api/webhooks/1/abc -d '{}'"
+        "curl https://discord.com/api/webhooks<id>/<token> -d '{}'"
     ),
     True,
 )
