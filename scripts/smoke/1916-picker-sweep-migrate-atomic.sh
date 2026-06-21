@@ -36,7 +36,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
-ADMIN="patch"
+# The admin must be one for which `bridge_init_register_default_picker_sweep`
+# takes the SHELL-kind path — i.e. shell-kind is supported for it. Since #2041/
+# #2042 the helper gates shell-kind on `_bridge_init_picker_sweep_shell_kind_
+# supported` (run-as resolves to the controller UID OR iso v2 effective);
+# otherwise it registers the TEXT-kind cron instead. A bare "patch" does not
+# resolve to an OS UID on a non-iso macOS / CI host, so it would now take the
+# text-kind path and this migration-ordering smoke would assert nothing. Use the
+# current login user, which resolves to the controller's own UID → the
+# controller-direct shell-kind shape this smoke is about. (#2041/#2042 platform
+# branch is covered by scripts/smoke/2041-2042-picker-sweep-noniso-cron.sh.)
+ADMIN="$(id -un 2>/dev/null || printf 'patch')"
 
 # Run the picker-sweep migration helper against a stateful recorder shim.
 #   $1 = scenario tag (temp-dir suffix)

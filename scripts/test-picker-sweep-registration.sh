@@ -282,12 +282,22 @@ PY
 # (defined in lib/bridge-agents.sh, which this test does not source) so the
 # admin-existence guard passes, set BRIDGE_BASH_BIN, then call the registration
 # function and report the resulting jobs.json state.
+#
+# #2041/#2042: registration is now platform/iso-aware — it only registers the
+# SHELL-kind cron on a host that ACCEPTS `--kind shell` (iso v2 effective OR the
+# run-as-agent resolves to the controller UID), and registers a TEXT-kind cron
+# otherwise. This test pins the #833 SHELL-kind controller-direct contract, so
+# stub `_bridge_init_picker_sweep_shell_kind_supported` to "supported" (the
+# server / controller-UID host class). The non-iso TEXT-kind branch is covered
+# by scripts/smoke/2041-2042-picker-sweep-noniso-cron.sh.
 run_register() {
   local mock_cli="$1"
   # shellcheck disable=SC1091
   ( source "$ROOT_DIR/lib/bridge-init-default-crons.sh"
     # shellcheck disable=SC2329 # invoked indirectly from the sourced helper
     bridge_agent_exists() { [[ "$1" == "patch" ]]; }
+    # shellcheck disable=SC2329 # invoked indirectly from the sourced helper
+    _bridge_init_picker_sweep_shell_kind_supported() { return 0; }
     export BRIDGE_BASH_BIN="${BRIDGE_BASH_BIN:-bash}"
     bridge_init_register_default_picker_sweep "$mock_cli" "patch" )
 }
