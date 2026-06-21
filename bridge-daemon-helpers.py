@@ -1545,11 +1545,15 @@ def cmd_agent_doc_backfill_non_clean(args: argparse.Namespace) -> int:
     summary = _load_json_file(args.summary_json) or {}
     non_clean = False
     if isinstance(summary, dict):
-        # #1892: `held` (roster/heuristic engine disagreement) is non-clean too,
-        # so the operator gets a visible warning instead of a silent skip.
-        # #1906: `engine_mismatch_docs` (a stale Codex-contract AGENTS.md on a
-        # non-codex agent) is non-clean too — the same [hygiene] surface flags
-        # the residue so an operator can reversible-backup-rename it.
+        # #1892: `held` (engine could not be authoritatively resolved) is
+        # non-clean too, so the operator gets a visible warning instead of a
+        # silent skip. #1906: `engine_mismatch_docs` (a stale Codex-contract
+        # AGENTS.md on a non-codex agent) is non-clean too — the same [hygiene]
+        # surface flags the residue so an operator can reversible-backup-rename
+        # it. #2044: `held_quiet` (roster-AUTHORITATIVE non-codex agent with codex
+        # residue) is DELIBERATELY ABSENT from this list — it must never make the
+        # pass non-clean, or the same authoritatively-claude agent regenerates an
+        # identical recurring hygiene task every pass. Do NOT add it here.
         for key in ("backfilled", "refreshed", "held", "engine_mismatch_docs", "errors"):
             if summary.get(key):
                 non_clean = True
@@ -1575,6 +1579,7 @@ def cmd_agent_doc_backfill_task_body(args: argparse.Namespace) -> int:
     backfilled = summary.get("backfilled") or []
     refreshed = summary.get("refreshed") or []
     held = summary.get("held") or []
+    held_quiet = summary.get("held_quiet") or []
     engine_mismatch_docs = summary.get("engine_mismatch_docs") or []
     errors = summary.get("errors") or []
     checked = summary.get("codex_agents_checked", "?")
@@ -1671,6 +1676,37 @@ def cmd_agent_doc_backfill_task_body(args: argparse.Namespace) -> int:
                 lines.append(f"- `{e.get('agent', '')}`: {e.get('error', '')}")
             else:
                 lines.append(f"- {e}")
+        lines.append("")
+
+    # Issue #2044: `held_quiet` is roster-AUTHORITATIVE non-codex agents with
+    # codex residue. It never makes the pass non-clean (no task is filed on its
+    # account), so this section appears ONLY as an informational footnote when
+    # the task is already being filed for another reason above. Listing it is
+    # transparency — NO operator action is required (the roster is authoritative;
+    # the agent stays its declared engine).
+    if held_quiet:
+        lines.append(
+            f"## Held (quiet) — roster-authoritative, NO action needed "
+            f"({len(held_quiet)})"
+        )
+        lines.append(
+            "These agents are AUTHORITATIVELY their roster-declared (non-codex) "
+            "engine, but carry filesystem codex residue (a stale `Codex CLI` "
+            "runtime line, or live codex-delegation tooling). The roster wins: "
+            "the codex AGENTS.md backfill is held fail-closed and these agents "
+            "are NOT re-classified codex and do NOT generate a recurring hygiene "
+            "task (#2044). Listed for transparency only — no operator action is "
+            "required."
+        )
+        for h in held_quiet:
+            if isinstance(h, dict):
+                lines.append(
+                    f"- `{h.get('agent', '')}` — roster_engine="
+                    f"{h.get('roster_engine', 'unknown')}, "
+                    f"detected={h.get('detected_engine', '')} (residue, ignored)"
+                )
+            else:
+                lines.append(f"- {h}")
         lines.append("")
 
     lines.append(

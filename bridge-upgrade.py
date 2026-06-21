@@ -1834,14 +1834,21 @@ def resolve_backfill_engine_decision(
     absence of a claude one.
 
     Returns ``(decision, hold_reason)`` where ``decision`` is one of:
-      * ``"backfill"`` — roster says codex (or roster-unknown but the heuristic
+      * ``"backfill"``   — roster says codex (or roster-unknown but the heuristic
         positively detected codex AND nothing contradicts it).
-      * ``"skip"``     — roster says a non-codex engine; never materialize a
+      * ``"skip"``       — roster says a non-codex engine; never materialize a
         codex template on it. Absence of metadata is NOT a codex signal.
-      * ``"hold"``     — roster engine and the filesystem heuristic disagree
-        (roster=claude-or-other vs heuristic=codex, or vice-versa in a way that
-        could destructively materialize the wrong template). Emit an
-        operator-visible warning instead of backfilling. ``hold_reason`` carries
+      * ``"hold-quiet"`` — roster AUTHORITATIVELY declares a non-codex engine
+        (claude/other) but the filesystem heuristic detected codex. The roster
+        wins: the agent stays its declared engine and the codex signal is treated
+        as residue / live codex-delegation tooling, NOT an engine reassignment.
+        Held fail-closed (no destructive materialization) but RECORDED QUIETLY —
+        it never makes the pass non-clean, so the same roster-authoritative agent
+        does NOT regenerate an identical ``[hygiene]`` task every pass (#2044).
+      * ``"hold"``       — roster engine could NOT be authoritatively resolved
+        (no roster declaration) yet the filesystem heuristic detected codex. This
+        is genuinely ambiguous, so it stays operator-visible (task-generating):
+        the engine must be resolved before any backfill. ``hold_reason`` carries
         the human-readable cause.
 
     Truth table (roster \\ heuristic):
@@ -1849,25 +1856,47 @@ def resolve_backfill_engine_decision(
       roster=codex,  heuristic!=codex -> backfill (roster authoritative; the
                                           heuristic is the weaker signal)
       roster=claude/other, any        -> skip if heuristic agrees (non-codex),
-                                          HOLD if heuristic=codex (disagreement)
+                                          HOLD-QUIET if heuristic=codex (roster is
+                                          authoritative; quiet/no recurring task)
       roster=unknown, heuristic=codex -> HOLD (no positive roster signal; do not
-                                          materialize on a filesystem guess)
+                                          materialize on a filesystem guess, stay
+                                          operator-visible until resolved)
       roster=unknown, heuristic!=codex-> skip (no codex signal anywhere)
     """
     roster = (roster_engine or "").strip().lower()
     detected = (detected_engine or "").strip().lower()
+
+    # The ``unknown`` sentinel (bridge_agent_engine's miss value) is NOT a
+    # positive engine declaration — normalize it to absent so it falls through to
+    # the fail-closed unknown path below. Without this, a literal
+    # ``BRIDGE_AGENT_ENGINE["x"]="unknown"`` (or any ``unknown`` that reaches the
+    # resolver) would wrongly enter the roster-authoritative non-codex branch and
+    # get the #2044 QUIET hold, suppressing the task-generating warning a
+    # genuinely-unresolved engine must keep. (collect_registry_engines already
+    # drops this sentinel; this is the symmetric guard for the shell-roster
+    # parser + any future caller, applied at the single decision chokepoint.)
+    if roster == "unknown":
+        roster = ""
 
     if roster == "codex":
         return ("backfill", None)
     if roster and roster != "codex":
         # Roster positively declares a non-codex engine. Never materialize a
         # codex template here. If the filesystem heuristic disagrees (thinks
-        # codex), that is a real conflict the operator should see — hold/warn.
+        # codex), the ROSTER is authoritative — the agent IS its declared engine
+        # and the codex signal is stale residue or live codex-delegation tooling
+        # (a claude agent's CLAUDE.md legitimately referencing codex CLI), NOT an
+        # engine reassignment. Hold fail-closed but QUIETLY (#2044): a recurring
+        # task-generating warning on an authoritatively-claude agent re-fires
+        # every pass and never converges. The operator already knows the engine
+        # (they declared it); there is nothing to action.
         if detected == "codex":
             return (
-                "hold",
-                f"roster engine={roster} but filesystem heuristic detected codex; "
-                "holding codex AGENTS.md backfill (no destructive materialization)",
+                "hold-quiet",
+                f"roster engine={roster} is authoritative; filesystem heuristic "
+                "detected codex residue (not an engine reassignment). Holding "
+                "codex AGENTS.md backfill fail-closed; recorded quietly so it "
+                "does not regenerate a recurring hygiene task (#2044)",
             )
         return ("skip", None)
     # roster engine unknown (no roster declaration parsed / agent-meta.env absent).
@@ -1928,6 +1957,13 @@ def cmd_backfill_codex_entrypoints(args: argparse.Namespace) -> int:
     backfilled: list[str] = []
     refreshed: list[str] = []
     held: list[dict[str, str]] = []
+    # Issue #2044: QUIET holds — a roster-AUTHORITATIVE non-codex agent (claude)
+    # whose filesystem heuristic still detects codex residue. The roster wins, so
+    # this is held fail-closed (no destructive materialization) but recorded here
+    # SEPARATELY from `held`: it must NOT make the pass non-clean, otherwise the
+    # same authoritatively-claude agent regenerates an identical `[hygiene]` task
+    # every pass (the recurring-4x bug). Kept in the summary for transparency only.
+    held_quiet: list[dict[str, str]] = []
     # Issue #1906: REPORT-ONLY residue list. A correct non-codex agent that
     # still carries a stale Codex-contract AGENTS.md (a pre-#1896 mis-scaffold
     # residue) is invisible to the `skip` path — `detect_engine` keys on
@@ -1960,6 +1996,17 @@ def cmd_backfill_codex_entrypoints(args: argparse.Namespace) -> int:
                     "roster_engine": (roster_engine or "unknown"),
                     "detected_engine": detected_engine,
                     "reason": hold_reason or "engine disagreement; held",
+                })
+                continue
+            if decision == "hold-quiet":
+                # Issue #2044: roster-authoritative claude vs detected codex.
+                # Held fail-closed but QUIET — recorded for transparency, never
+                # contributes to non-clean (no recurring hygiene task).
+                held_quiet.append({
+                    "agent": path.name,
+                    "roster_engine": (roster_engine or "unknown"),
+                    "detected_engine": detected_engine,
+                    "reason": hold_reason or "roster-authoritative; held quietly",
                 })
                 continue
             if decision != "backfill":
@@ -2039,11 +2086,15 @@ def cmd_backfill_codex_entrypoints(args: argparse.Namespace) -> int:
         except OSError as exc:
             errors.append({"agent": path.name, "error": f"OSError: {exc}"})
 
-    # #1892: a held agent (roster/heuristic engine disagreement) is non-clean so
-    # the daemon files the operator-visible `[hygiene]` warning task instead of
-    # silently materializing the wrong template. #1906: an engine-mismatched doc
-    # (stale Codex-contract AGENTS.md on a non-codex agent) is non-clean too, so
-    # the same `[hygiene]` surface flags the residue for an operator to remove.
+    # #1892: a held agent (engine could not be authoritatively resolved) is
+    # non-clean so the daemon files the operator-visible `[hygiene]` warning task
+    # instead of silently materializing the wrong template. #1906: an
+    # engine-mismatched doc (stale Codex-contract AGENTS.md on a non-codex agent)
+    # is non-clean too, so the same `[hygiene]` surface flags the residue for an
+    # operator to remove. #2044: `held_quiet` (roster-AUTHORITATIVE non-codex
+    # agent with codex residue) is DELIBERATELY excluded — it must never make the
+    # pass non-clean, or the same authoritatively-claude agent regenerates an
+    # identical recurring hygiene task every pass (idempotent convergence).
     non_clean = bool(
         backfilled or refreshed or held or engine_mismatch_docs or errors
     )
@@ -2058,6 +2109,8 @@ def cmd_backfill_codex_entrypoints(args: argparse.Namespace) -> int:
         "refreshed_count": len(refreshed),
         "held": sorted(held, key=lambda h: h["agent"]),
         "held_count": len(held),
+        "held_quiet": sorted(held_quiet, key=lambda h: h["agent"]),
+        "held_quiet_count": len(held_quiet),
         "engine_mismatch_docs": sorted(
             engine_mismatch_docs, key=lambda d: d["agent"]
         ),
