@@ -47,9 +47,11 @@ awk "
 [[ -s "$WORK/block.txt" ]] || fail "T1: could not isolate the get_valid_token tool block"
 
 # T2 — the handler reuses getAccessToken (the refresh path), not a bespoke read.
+# (#2035 widened the match to allow an optional second arg: getAccessToken(upn,
+# freshness) threads the proactive-refresh margin through the same path.)
 log "T2: handler reuses getAccessToken (refresh path)"
-grep -Eq "getAccessToken\(upn\)" "$WORK/block.txt" \
-  || fail "T2: get_valid_token handler does not call getAccessToken(upn) (must reuse the refresh + SingleFlight path)"
+grep -Eq "getAccessToken\(upn[,)]" "$WORK/block.txt" \
+  || fail "T2: get_valid_token handler does not call getAccessToken(upn...) (must reuse the refresh + SingleFlight path)"
 
 # T3 — returns the access_token to the caller.
 log "T3: returns access_token + expiry"
@@ -100,7 +102,7 @@ awk "
   cap && /process.exit\(0\)/ {print buf; exit}
 " "$MS365_TS" >"$WORK/cli.txt"
 [[ -s "$WORK/cli.txt" ]] || fail "T6: could not isolate the get-valid-token CLI branch body"
-grep -Eq "getAccessToken\(upn\)" "$WORK/cli.txt" || fail "T6: CLI branch does not reuse getAccessToken(upn)"
+grep -Eq "getAccessToken\(upn[,)]" "$WORK/cli.txt" || fail "T6: CLI branch does not reuse getAccessToken(upn...)"
 grep -Eq "access_token" "$WORK/cli.txt" || fail "T6: CLI branch does not emit access_token"
 grep -vE "^[[:space:]]*//|^[[:space:]]*\*" "$WORK/cli.txt" >"$WORK/clicode.txt" || true
 if grep -Eq "refresh_token" "$WORK/clicode.txt"; then
@@ -112,17 +114,22 @@ fi
 # before `try {`, resolveUpn throws to the global uncaughtException handler which
 # only logs and the process exits 0 (false success), breaking the proxy contract.
 # Capture the FULL branch (through the catch's exit 1) and assert ordering + exit.
+# (#2035 generalized the matched form from `resolveUpn(process.argv[3])` to the
+# assignment `upn = resolveUpn(...)`, since the upn positional is now parsed as
+# the first non-flag argv tail entry to support flag-only invocations. The
+# assignment anchor avoids matching the `resolveUpn()` mention in the leading
+# comment.)
 log "T7: resolveUpn inside try, failure exits non-zero (no-upn regression guard)"
 awk "
   /process.argv\[2\] === 'get-valid-token'/ {cap=1}
-  cap {n++; if (\$0 ~ /try \{/ && !tryline) tryline=n; if (\$0 ~ /resolveUpn\(process.argv\[3\]\)/ && !upnline) upnline=n; print}
+  cap {n++; if (\$0 ~ /try \{/ && !tryline) tryline=n; if (\$0 ~ /upn = resolveUpn\(/ && !upnline) upnline=n; print}
   cap && /process.exit\(1\)/ {exit}
 " "$MS365_TS" >"$WORK/full.txt"
 [[ -s "$WORK/full.txt" ]] || fail "T7: could not isolate the full CLI branch (through the catch)"
 TRY_AT="$(grep -nE 'try \{' "$WORK/full.txt" | head -n1 | cut -d: -f1)"
-UPN_AT="$(grep -nE 'resolveUpn\(process.argv\[3\]\)' "$WORK/full.txt" | head -n1 | cut -d: -f1)"
-[[ -n "$TRY_AT" && -n "$UPN_AT" ]] || fail "T7: cannot locate try ($TRY_AT) or resolveUpn ($UPN_AT) in the CLI branch"
-(( TRY_AT < UPN_AT )) || fail "T7: resolveUpn(process.argv[3]) (line $UPN_AT) must be INSIDE the try (try at line $TRY_AT) so a no-upn failure exits non-zero"
+UPN_AT="$(grep -nE 'upn = resolveUpn\(' "$WORK/full.txt" | head -n1 | cut -d: -f1)"
+[[ -n "$TRY_AT" && -n "$UPN_AT" ]] || fail "T7: cannot locate try ($TRY_AT) or upn-assignment resolveUpn ($UPN_AT) in the CLI branch"
+(( TRY_AT < UPN_AT )) || fail "T7: upn = resolveUpn(...) (line $UPN_AT) must be INSIDE the try (try at line $TRY_AT) so a no-upn failure exits non-zero"
 grep -Eq "process\.exit\(1\)" "$WORK/full.txt" || fail "T7: CLI branch has no process.exit(1) failure path"
 
 log "passed"
