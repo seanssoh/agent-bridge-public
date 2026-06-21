@@ -1497,7 +1497,21 @@ select_for_path() {
       # marker flips when the fix is removed). Pull on every ms365/server.ts
       # move so a refactor cannot silently drop the ms→sec normalize or the
       # proactive-margin param back to the never-refresh / 300s-only state.
-      add_required 1209-ms365-redirect-resolver 1210-ms365-scope-normalize 1215-ms365-dir-mode 1343-ms365-token-refresh 1650-ms365-get-valid-token 1825-ms365-token-key-by-claim 2035-ms365-token-freshness beta5-2-zeta-teams-mcp-dedup beta5-2-xi-misc-fixes
+      # Issue #2048 (cross-process refresh_token double-consume): getAccessToken
+      # now serializes the rotating-grant POST ACROSS processes (MCP server,
+      # get-valid-token CLI, any caller) with a dependency-free O_EXCL lockfile
+      # keyed on the token path, and RE-READS the token after acquiring — so a
+      # holder that already rotated the RT short-circuits the redundant grant
+      # (the double-consume fix). The 2048 smoke spawns N concurrent CLI
+      # refreshers against a single UPN with an RT-rotating stub and asserts
+      # exactly 1 grant / 0 invalid_grant; a lock-disabled mutant reproduces the
+      # double-consume (>= 1 invalid_grant), so the pass is mutation-proven. It
+      # also pins the bounded acquisition timeout (no Graph-call hang), dead-PID
+      # stale-lock reclaim (no permanent deadlock), and that the lockfile carries
+      # no token material. Pull on every ms365/server.ts move so a refactor
+      # cannot silently drop the cross-process serialization back to the
+      # in-process-only SingleFlight that double-consumes across processes.
+      add_required 1209-ms365-redirect-resolver 1210-ms365-scope-normalize 1215-ms365-dir-mode 1343-ms365-token-refresh 1650-ms365-get-valid-token 1825-ms365-token-key-by-claim 2035-ms365-token-freshness 2048-ms365-xproc-refresh-lock beta5-2-zeta-teams-mcp-dedup beta5-2-xi-misc-fixes
       add_integration integration-minimal
       ;;
 
