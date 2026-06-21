@@ -55,6 +55,31 @@ assert_block_has_no_heartbeat_ghost() {
     "managed block must NOT emit a HEARTBEAT.md ghost reference (#1815)"
 }
 
+assert_shared_common_instructions_has_no_heartbeat_ghost() {
+  # Issue #1814 propagates docs/agent-runtime/common-instructions.md VERBATIM
+  # into <bridge_home>/shared/COMMON-INSTRUCTIONS.md and symlinks it into every
+  # home — so the canon body is a second surface where a HEARTBEAT.md ghost
+  # reference would reach all agents. The #1815 ghost-ref fix is only complete
+  # if the rendered shared doc (and thus the home symlink target) is clean too.
+  local shared_doc="$BRIDGE_HOME/shared/COMMON-INSTRUCTIONS.md"
+  smoke_assert_file_exists "$shared_doc" \
+    "shared COMMON-INSTRUCTIONS.md must be rendered from the canon body (#1814)"
+  local body
+  body="$(cat "$shared_doc")"
+  smoke_assert_not_contains "$body" "HEARTBEAT.md" \
+    "rendered shared COMMON-INSTRUCTIONS.md must carry no HEARTBEAT.md ghost reference (#1815 + #1814 propagation)"
+  # The home symlink resolves to this shared doc, so an agent reading
+  # COMMON-INSTRUCTIONS.md in its home gets the same clean body. Assert the
+  # resolved content directly to pin the end-to-end contract.
+  local agent_home="$BRIDGE_AGENT_HOME_ROOT/tester"
+  if [[ -e "$agent_home/COMMON-INSTRUCTIONS.md" ]]; then
+    local resolved_body
+    resolved_body="$(cat "$agent_home/COMMON-INSTRUCTIONS.md")"
+    smoke_assert_not_contains "$resolved_body" "HEARTBEAT.md" \
+      "home COMMON-INSTRUCTIONS.md (resolved via symlink) must carry no HEARTBEAT.md ghost reference"
+  fi
+}
+
 assert_rewrite_tuple_pruned() {
   # AGENT_RUNTIME_REWRITE_FILES must no longer carry HEARTBEAT.md / CHECKLIST.md.
   local probe
@@ -90,6 +115,8 @@ main() {
     run_bridge_docs_apply
   smoke_run "managed block carries no HEARTBEAT.md ghost reference" \
     assert_block_has_no_heartbeat_ghost
+  smoke_run "rendered shared COMMON-INSTRUCTIONS.md carries no HEARTBEAT.md ghost reference" \
+    assert_shared_common_instructions_has_no_heartbeat_ghost
   smoke_run "AGENT_RUNTIME_REWRITE_FILES drops HEARTBEAT.md and CHECKLIST.md" \
     assert_rewrite_tuple_pruned
   smoke_run "ACTIVE-PREFERENCES existence-gate precedent is intact" \

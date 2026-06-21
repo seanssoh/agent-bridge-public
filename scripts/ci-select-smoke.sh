@@ -672,7 +672,11 @@ select_for_path() {
       # shared/COMMON-INSTRUCTIONS.md (canon body, not a hand summary). Rerun
       # the local-override no-op-when-absent smoke so the propagation + override
       # appendix stay correct on a canon edit.
-      add_required common-instructions-local-override
+      # Issue #1815: the rendered shared COMMON-INSTRUCTIONS.md is a second
+      # surface a HEARTBEAT.md ghost reference could reach the fleet through;
+      # rerun the ghost-ref gate (which now asserts the rendered shared doc is
+      # clean) on any canon-body edit so a ghost cannot be reintroduced.
+      add_required common-instructions-local-override 1815-managed-block-ghost-ref-gate
       ;;
     agents/_template/MEMORY-SCHEMA.md)
       # Issue #1814: the template MEMORY-SCHEMA.md is a POINTER stub, not an
