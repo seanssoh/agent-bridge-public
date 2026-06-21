@@ -654,6 +654,7 @@ bridge_daemon_pass_due() {
   local key=""
   local now=0
   local last=0
+  local last_line=""
   local tmp=""
 
   [[ -n "$pass" ]] || return 0
@@ -666,18 +667,54 @@ bridge_daemon_pass_due() {
   key="$(printf '%s' "$pass" | tr -c 'A-Za-z0-9._-' '_')"
   cadence_dir="${BRIDGE_STATE_DIR:-${BRIDGE_HOME:-/tmp}/state}/daemon-pass-cadence"
   file="$cadence_dir/${key}.ts"
-  now="$(date +%s)"
+  # #2036: fully FAIL-OPEN under `set -euo pipefail`. This gate runs inside the
+  # serial daemon cycle (cmd_sync_cycle); it must NEVER abort the daemon and
+  # NEVER skip-forever (latch a step off). Any cadence-IO failure (clock,
+  # unreadable/corrupt stamp, mkdir/mktemp/write/mv) degrades to "run now"
+  # (return 0). A fresh/missing/corrupt stamp behaves as last=0. The worst
+  # realistic case is that an expensive step runs every tick (the pre-#2036
+  # behavior we are improving on) — never the inverse (a starved nudge cycle).
+  now="$(date +%s 2>/dev/null || true)"
+  # A failed/garbled clock read => treat as "due now" rather than risk a
+  # `(( now - last ))` abort on a non-numeric operand under set -e.
+  [[ "$now" =~ ^[0-9]+$ ]] || return 0
 
   if [[ -f "$file" ]]; then
-    last="$(tr -dc '0-9' <"$file" 2>/dev/null | head -c 18)"
-    [[ "$last" =~ ^[0-9]+$ ]] || last=0
-    # Not yet due — leave the stamp untouched (the pass does NOT run).
+    # An unreadable/corrupt stamp must not abort (the read is guarded
+    # `2>/dev/null` and re-validated). Read the RAW first line and require the
+    # WHOLE value to be numeric — do NOT salvage digits out of corrupt content.
+    # A naive `tr -dc '0-9'` would turn `999999999999999999garbage` into a
+    # valid-looking FAR-FUTURE timestamp, and `(( now - last < interval ))` would
+    # then return 1 (skip) on every tick forever — the exact skip-forever the
+    # #2036 fail-open contract forbids. Reject (=> last=0, due-now) when the line
+    # is empty, contains ANY non-digit, is over-long (>18 digits, an overflow /
+    # corruption guard), OR is a FUTURE stamp (last > now: clock skew / a planted
+    # future value). last=0 means due-now, so a damaged stamp can never starve.
+    last_line=""
+    IFS= read -r last_line <"$file" 2>/dev/null || last_line=""
+    if [[ "$last_line" =~ ^[0-9]{1,18}$ ]] && (( last_line <= now )); then
+      last="$last_line"
+    else
+      last=0
+    fi
+    # Not yet due — leave the stamp untouched (the pass does NOT run). The
+    # `&&` short-circuit is mid-function (a later statement follows) so a
+    # false `(( ))` here does not trip set -e.
     (( now - last < interval )) && return 1
   fi
 
   # Due (or fresh daemon with no stamp): record this run atomically, then run.
+  # Every write step below is best-effort: a stamp-write failure must still
+  # `return 0` (run now), never abort and never skip-forever. Stamp-BEFORE-step
+  # is acceptable (a failing step retries next interval, not every tick).
   mkdir -p "$cadence_dir" 2>/dev/null || true
-  tmp="$(mktemp "${file}.XXXXXX" 2>/dev/null)" || { printf '%s\n' "$now" >"$file" 2>/dev/null || true; return 0; }
+  tmp="$(mktemp "${file}.XXXXXX" 2>/dev/null || true)"
+  if [[ -z "$tmp" ]]; then
+    # mktemp failed (dir unwritable / disk full): try a direct best-effort
+    # write so the cadence still advances when possible, then run regardless.
+    printf '%s\n' "$now" >"$file" 2>/dev/null || true
+    return 0
+  fi
   if printf '%s\n' "$now" >"$tmp" 2>/dev/null; then
     mv -f -- "$tmp" "$file" 2>/dev/null || { rm -f -- "$tmp" 2>/dev/null || true; }
   else
@@ -14619,9 +14656,18 @@ cmd_sync_cycle() {
   # Issue #848: per-process roster memoization means the bare
   # bridge_load_roster call would no-op after the first cycle —
   # invalidate the cache here so each cycle observes fresh disk state.
-  BRIDGE_DAEMON_LAST_STEP="load_roster"
-  bridge_roster_cache_invalidate
-  bridge_load_roster
+  # #2036: cadence-gate the roster invalidate+reload (key l1_roster_reload,
+  # default 60s). On a real roster this is a per-tick disk walk + re-parse;
+  # 60s is safe because the canonical bridge_sync above ALSO invalidates and
+  # reloads on its own ≤30s cadence, so a newly-registered dynamic agent is
+  # still picked up within ≤30s — this gate only suppresses the redundant
+  # SECOND reload on the in-between ticks. The mark-before-due heartbeat stays
+  # so a skipped tick still pulses the PR-2 supervisor progress file.
+  _bridge_daemon_mark_progress "l1_roster_reload"
+  if bridge_daemon_pass_due l1_roster_reload "${BRIDGE_DAEMON_L1_ROSTER_RELOAD_INTERVAL_SECONDS:-60}"; then
+    bridge_roster_cache_invalidate
+    bridge_load_roster
+  fi
 
   # Incident #8807 P0b: periodic MCP-orphan cleanup runs EARLY — before every
   # spawn-heavy surface in this cycle (start_cron_dispatch_workers,
@@ -14632,8 +14678,16 @@ cmd_sync_cycle() {
   # (now also resource-guarded by P0a) headroom. The cleanup's own 300s
   # throttle keeps the cadence identical; subshell-isolated + `|| true` so a
   # cleanup error can never abort the tick.
-  BRIDGE_DAEMON_LAST_STEP="mcp_orphan_cleanup_early"
-  ( process_mcp_orphan_cleanup ) || true
+  # #2036: add an OUTER cadence gate (key mcp_orphan_cleanup_early, default
+  # 300s — matching the helper's own internal throttle) so the per-tick cost
+  # on the latency-sensitive ticks is a cheap stamp check, not a subshell
+  # spawn + process scan. Still runs EARLY (before the spawn-heavy surfaces)
+  # on its due ticks. The mark-before-due heartbeat (mark_progress, not a bare
+  # LAST_STEP=) keeps a skipped tick pulsing the PR-2 supervisor progress.
+  _bridge_daemon_mark_progress "mcp_orphan_cleanup_early"
+  if bridge_daemon_pass_due mcp_orphan_cleanup_early "${BRIDGE_DAEMON_MCP_ORPHAN_CLEANUP_GATE_SECONDS:-300}"; then
+    ( process_mcp_orphan_cleanup ) || true
+  fi
 
   # Discord relay runs FIRST — lowest-latency path for DM wake.
   # Issue #1338 defense-in-depth: subshell-isolate (see note above
@@ -14657,19 +14711,32 @@ cmd_sync_cycle() {
   # #1563 PR-2: refresh the supervisor progress heartbeat right before this
   # long bounded step (30s ceiling) so a healthy bridge-sync keeps liveness
   # FRESH and the supervisor's max-step-budget backstop never fires on it.
+  # #2036: cadence-gate bridge-sync. At a 17-agent fleet bridge-sync.sh costs
+  # ~9s per run (the in-code "<1s, pathological timeout" assumption no longer
+  # holds), and running it EVERY 5s tick was a dominant contributor to the
+  # ~2-minute serial cycle that starved idle re-nudge. bridge-sync is roster /
+  # state RECONCILIATION (idle markers are written in real time by the Stop
+  # hook, hooks/mark-idle.sh — NOT by this sync), so a ≤30s reconcile cadence
+  # does not delay nudge eligibility. This is the SINGLE canonical site; the
+  # former `post_sync` second full bridge-sync is removed (#2036), so the
+  # bridge_sync key advances at most once per BRIDGE_DAEMON_BRIDGE_SYNC_INTERVAL
+  # _SECONDS regardless of `changed`. The mark-before-due heartbeat stays so a
+  # skipped tick still pulses the PR-2 supervisor progress file.
   _bridge_daemon_mark_progress "bridge_sync"
-  # Refs #815 Wave B: wrap with bridge_with_timeout so a stuck child cannot
-  # wedge the daemon main loop. 30s ceiling — bridge-sync.sh reconciles roster
-  # + state under normal conditions in <1s; timeouts here are pathological.
-  bridge_with_timeout 30 bridge_sync "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-sync.sh" >/dev/null 2>&1 || true
-  # #1563 PR-2 (r2): re-baseline progress AFTER the long step so the tail work
-  # below inherits the full deadline, not just the residual grace window.
-  _bridge_daemon_mark_progress "bridge_sync"
-  # Issue #848: bridge-sync.sh ran as a child process and may have
-  # touched the roster files; invalidate so this in-loop reload picks
-  # up any newly-registered dynamic agents.
-  bridge_roster_cache_invalidate
-  bridge_load_roster
+  if bridge_daemon_pass_due bridge_sync "${BRIDGE_DAEMON_BRIDGE_SYNC_INTERVAL_SECONDS:-30}"; then
+    # Refs #815 Wave B: wrap with bridge_with_timeout so a stuck child cannot
+    # wedge the daemon main loop. 30s ceiling — bridge-sync.sh reconciles
+    # roster + state; timeouts here are pathological.
+    bridge_with_timeout 30 bridge_sync "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-sync.sh" >/dev/null 2>&1 || true
+    # #1563 PR-2 (r2): re-baseline progress AFTER the long step so the tail work
+    # below inherits the full deadline, not just the residual grace window.
+    _bridge_daemon_mark_progress "bridge_sync"
+    # Issue #848: bridge-sync.sh ran as a child process and may have
+    # touched the roster files; invalidate so this in-loop reload picks
+    # up any newly-registered dynamic agents.
+    bridge_roster_cache_invalidate
+    bridge_load_roster
+  fi
   BRIDGE_DAEMON_LAST_STEP="queue_gateway"
   if process_queue_gateway_requests; then
     changed=0
@@ -15052,9 +15119,13 @@ cmd_sync_cycle() {
   if bridge_daemon_pass_due nudge_late_success_sweep "${BRIDGE_DAEMON_NUDGE_LATE_SUCCESS_INTERVAL_SECONDS:-30}"; then
     ( bridge_daemon_sweep_nudge_late_success ) && changed=0 || true
   fi
+  # #2036: align the OUTER cadence default with the scanner's own internal
+  # interval (BRIDGE_CONTEXT_PRESSURE_SCAN_INTERVAL_SECONDS, default 60) — the
+  # 30s outer gate was running the per-agent pressure scan twice per internal
+  # window for no benefit. Health telemetry only; ≤60s staleness is fine.
   _bridge_daemon_mark_progress "context_pressure_scan"
   if [[ -n "$summary_output" ]] \
-      && bridge_daemon_pass_due context_pressure_scan "${BRIDGE_DAEMON_CONTEXT_PRESSURE_INTERVAL_SECONDS:-30}" \
+      && bridge_daemon_pass_due context_pressure_scan "${BRIDGE_DAEMON_CONTEXT_PRESSURE_INTERVAL_SECONDS:-60}" \
       && process_context_pressure_reports "$summary_output"; then
     changed=0
   fi
@@ -15084,11 +15155,21 @@ cmd_sync_cycle() {
   # a max-step knob the recovery runbook tells operators to RAISE. Without an
   # AFTER mark a raised recovery timeout would collapse the periodic-sync /
   # usage-monitor tail budget to the residual grace window (false-abort class).
+  # #2036: add an OUTER THROTTLE gate (key claude_token_recovery, default 60s)
+  # so the expensive recovery call cannot run on every 5s tick. The INNER
+  # semantic cadence (process_claude_token_recovery's own
+  # BRIDGE_CLAUDE_TOKEN_RECOVERY_INTERVAL_SECONDS, default 300s) is UNCHANGED —
+  # the outer gate only caps how often the daemon enters the call; an
+  # internally-due recovery is noticed within ≤60s, trivial vs the 300s inner
+  # window. The mark-before-due heartbeat stays so a skipped tick pulses
+  # progress; the AFTER mark on a due tick preserves the tail-budget contract.
   _bridge_daemon_mark_progress "claude_token_recovery"
-  if process_claude_token_recovery; then
-    changed=0
+  if bridge_daemon_pass_due claude_token_recovery "${BRIDGE_DAEMON_CLAUDE_TOKEN_RECOVERY_GATE_SECONDS:-60}"; then
+    if process_claude_token_recovery; then
+      changed=0
+    fi
+    _bridge_daemon_mark_progress "claude_token_recovery"
   fi
-  _bridge_daemon_mark_progress "claude_token_recovery"
   # v0.13.6 hotfix — refs operator report 2026-05-15 patch host.
   # Cron-only static agents never trigger the rotation/recovery branch above
   # and so go stale (mgt_ahn hit 429 after 3 days on a 5/12 token). The
@@ -15113,15 +15194,25 @@ cmd_sync_cycle() {
   # max-step budget; a healthy backup stamps progress here, runs under its
   # own bridge_with_timeout, and stays comfortably inside the (600+grace)
   # backstop deadline — the B1 negative control.
+  # #2036: add an OUTER cadence gate (key daily_backup, default 300s) so the
+  # daemon does not enter process_daily_backup on every 5s tick. The semantic
+  # schedule (bridge_daily_backup_due, default daily, called INSIDE the
+  # function) is UNCHANGED — the outer gate only caps the per-tick entry cost;
+  # worst case a due backup starts ≤5min late, trivial against a daily cadence.
+  # The before/after mark_progress brackets stay (mark-before-due so a skipped
+  # tick still pulses progress; after-mark on a due tick preserves the
+  # tail-budget contract for release_monitor + the rest of the tick).
   _bridge_daemon_mark_progress "daily_backup"
-  if process_daily_backup; then
-    changed=0
+  if bridge_daemon_pass_due daily_backup "${BRIDGE_DAEMON_DAILY_BACKUP_GATE_SECONDS:-300}"; then
+    if process_daily_backup; then
+      changed=0
+    fi
+    # #1563 PR-2 (r2): re-baseline progress AFTER the LONGEST bounded step (600s
+    # ceiling) so a healthy max-duration backup leaves the FULL deadline for the
+    # tail (release_monitor + the rest of the tick) — not just the grace window.
+    # This closes the healthy-daemon false-abort class codex reproduced (rc=99).
+    _bridge_daemon_mark_progress "daily_backup"
   fi
-  # #1563 PR-2 (r2): re-baseline progress AFTER the LONGEST bounded step (600s
-  # ceiling) so a healthy max-duration backup leaves the FULL deadline for the
-  # tail (release_monitor + the rest of the tick) — not just the grace window.
-  # This closes the healthy-daemon false-abort class codex reproduced (rc=99).
-  _bridge_daemon_mark_progress "daily_backup"
   BRIDGE_DAEMON_LAST_STEP="release_monitor"
   if process_release_monitor; then
     changed=0
@@ -15207,10 +15298,20 @@ cmd_sync_cycle() {
   # (start_cron_dispatch_workers, process_on_demand_agents). The internal
   # 300s throttle is unchanged, so the cadence is identical — only the
   # in-cycle ordering moved. The late call here is intentionally removed.
-  if [[ "$changed" == "0" ]]; then
-    BRIDGE_DAEMON_LAST_STEP="post_sync"
-    "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-sync.sh" >/dev/null 2>&1 || true
-  fi
+  #
+  # #2036: the former `post_sync` second FULL bridge-sync (a raw
+  # bridge-sync.sh invocation gated only on `changed == 0`) is REMOVED. At a
+  # 17-agent fleet that second ~9s sync ran most cycles and doubled the
+  # heaviest step's per-cycle cost, starving the idle re-nudge dispatch that
+  # this cycle is supposed to deliver every ~5s. The canonical cadence-gated
+  # bridge_sync near the top of cmd_sync_cycle now owns all reconciliation on
+  # the shared bridge_sync key (≤ BRIDGE_DAEMON_BRIDGE_SYNC_INTERVAL_SECONDS,
+  # default 30s); a downstream mutation this tick is reconciled by that next
+  # gated sync within the interval, which is acceptable for roster/state
+  # housekeeping (idle markers are written in real time by the Stop hook, not
+  # by this sync). FUTURE DIRECTION (#2036 Option 3, v0.17): decouple nudge
+  # dispatch onto its own fast/event-driven path so wake latency stops
+  # depending on the maintenance cadence at all.
 
   # Issue #1359 — process pending cron-staging files from iso v2 agents
   # BEFORE the scheduler tick so a freshly-staged create is visible to
@@ -15226,9 +15327,19 @@ cmd_sync_cycle() {
   # #1563 PR-2 (r2): bracket cron_staging_apply — BRIDGE_CRON_STAGING_APPLY_
   # TIMEOUT_SECONDS (default 25s) is a max-step knob; re-baseline progress
   # before+after so a raised ceiling cannot collapse the tail-wrap budget.
+  # #2036: cadence-gate the apply scan (key cron_staging_apply, default 10s).
+  # The empty-directory scan + per-file apply was ~8s per cycle. 10s keeps the
+  # apply latency comfortably UNDER the iso cron staging's 30s operator-facing
+  # result poll (do NOT raise to ≥30s — that would blow the staging timeout in
+  # the iso UID poller). The actual per-apply ceiling stays
+  # BRIDGE_CRON_STAGING_APPLY_TIMEOUT_SECONDS. Mark-before-due keeps a skipped
+  # tick pulsing progress; the after-mark on a due tick preserves the
+  # tail-wrap budget for the cron_sync step below.
   _bridge_daemon_mark_progress "cron_staging_apply"
-  process_cron_staging_apply || daemon_warn "cron-staging apply step failed"
-  _bridge_daemon_mark_progress "cron_staging_apply"
+  if bridge_daemon_pass_due cron_staging_apply "${BRIDGE_DAEMON_CRON_STAGING_APPLY_INTERVAL_SECONDS:-10}"; then
+    process_cron_staging_apply || daemon_warn "cron-staging apply step failed"
+    _bridge_daemon_mark_progress "cron_staging_apply"
+  fi
 
   # Cron sync runs LAST, in the background with a timeout, so it never blocks
   # relay/auto-start above.  Only one sync runs at a time (PID-file guard).

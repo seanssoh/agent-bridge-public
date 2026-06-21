@@ -221,7 +221,13 @@ if [[ -z "$SYNC_BODY" ]]; then
 fi
 
 # H1 — every PERIODIC-EXPENSIVE pass IS gated.
-GATED_PASSES="channel_health plugin_liveness memory_refresh stall_reports unclaimed_queue_escalation unclaimed_marker_sweep nudge_late_success_sweep context_pressure_scan crash_reports"
+# #2036: the heavy un-gated steps that dominated the ~2-minute serial cycle and
+# starved idle re-nudge are now cadence-gated too — bridge_sync (the canonical
+# ≤30s site, with the post_sync second full sync REMOVED), l1_roster_reload,
+# mcp_orphan_cleanup_early, cron_staging_apply, claude_token_recovery (outer
+# throttle), daily_backup (outer gate), and context_pressure_scan (default
+# raised 30→60). A revert of any of these gates fails H1.
+GATED_PASSES="channel_health plugin_liveness memory_refresh stall_reports unclaimed_queue_escalation unclaimed_marker_sweep nudge_late_success_sweep context_pressure_scan crash_reports bridge_sync l1_roster_reload mcp_orphan_cleanup_early cron_staging_apply claude_token_recovery daily_backup"
 H1_FAIL=0
 for p in $GATED_PASSES; do
   if ! printf '%s\n' "$SYNC_BODY" | grep -qE "bridge_daemon_pass_due ${p}\b"; then
@@ -230,7 +236,7 @@ for p in $GATED_PASSES; do
   fi
 done
 if (( H1_FAIL == 0 )); then
-  _pass "H1 every PERIODIC-EXPENSIVE pass (channel_health/plugin_liveness/memory_refresh/stall_reports/unclaimed_*/nudge_late_success/context_pressure/crash_reports) is cadence-gated"
+  _pass "H1 every PERIODIC-EXPENSIVE pass (channel_health/plugin_liveness/memory_refresh/stall_reports/unclaimed_*/nudge_late_success/context_pressure/crash_reports + #2036 bridge_sync/l1_roster_reload/mcp_orphan_cleanup_early/cron_staging_apply/claude_token_recovery/daily_backup) is cadence-gated"
 else
   _fail "H1 periodic-gated" "see un-gated periodic pass lines above"
 fi
@@ -284,6 +290,130 @@ if printf '%s\n' "$SYNC_BODY" | grep -q 'daemon_tick_slow'; then
   _pass "H4 daemon_tick_slow diagnostic audit row is emitted on a budget-exceeding tick (diagnostic only — PR-2 owns the abort)"
 else
   _skip "H4 tick-slow-diagnostic" "no daemon_tick_slow row in cmd_sync_cycle (optional defense-in-depth)"
+fi
+
+# ===========================================================================
+# G7 — #2036 FAIL-OPEN: the gate runs inside the serial daemon cycle under
+# `set -euo pipefail`. A damaged cadence stamp or an unwritable cadence dir
+# must degrade to "run now" (rc=0) — NEVER abort the daemon, and NEVER
+# skip-forever (latch a step off). We exercise the REAL shipped function
+# (eval'd above) under the same shell options the daemon runs with.
+# ===========================================================================
+# Run the fail-open probes under the daemon's strict shell options so a regression
+# that aborts under set -e (e.g. a non-numeric `(( ))` operand) is caught here.
+( set -euo pipefail
+  # G7a — a CORRUPT / non-numeric stamp behaves as last=0 → due now (rc=0),
+  # never skip-forever on a damaged stamp.
+  mkdir -p "$CADENCE_DIR" 2>/dev/null || true
+  printf 'not-a-number\xff\x00garbage\n' >"$CADENCE_DIR/g7_corrupt.ts" 2>/dev/null || true
+  rc=0; bridge_daemon_pass_due g7_corrupt 30 || rc=$?
+  [[ "$rc" == "0" ]]
+) && _pass "G7a corrupt/non-numeric stamp → gate runs NOW (rc=0) under set -e, never skip-forever, never abort" \
+  || _fail "G7a corrupt-stamp-fail-open" "a corrupt cadence stamp did not fail-open to run-now (or aborted under set -e)"
+
+# G7a2 — DIGITS-THEN-GARBAGE skip-forever guard (codex #2036 review blocker). A
+# naive `tr -dc '0-9'` salvage would turn `999999999999999999garbage` into a
+# valid-looking FAR-FUTURE timestamp, and `(( now - last < interval ))` would
+# then SKIP on EVERY tick forever. The shipped gate must require the WHOLE stamp
+# line to be numeric (not salvage leading digits) AND reject a future stamp, so a
+# digits-then-garbage or planted-future stamp behaves as last=0 → run-now.
+( set -euo pipefail
+  mkdir -p "$CADENCE_DIR" 2>/dev/null || true
+  printf '999999999999999999garbage\n' >"$CADENCE_DIR/g7_digitsgarbage.ts" 2>/dev/null || true
+  rc=0; bridge_daemon_pass_due g7_digitsgarbage 30 || rc=$?
+  [[ "$rc" == "0" ]]
+) && _pass "G7a2 digits-then-garbage stamp (999…garbage) → gate runs NOW (rc=0), NOT skip-forever — no tr-salvage into a far-future timestamp (codex #2036 blocker)" \
+  || _fail "G7a2 digits-garbage-skip-forever" "a digits-then-garbage stamp was salvaged into a future timestamp and skip-forever'd (rc!=0) — the #2036 fail-open hole regressed"
+
+# G7a3 — a plain FAR-FUTURE numeric stamp (clock skew / planted) must also be
+# treated as last=0 → run-now, never skip-forever.
+( set -euo pipefail
+  mkdir -p "$CADENCE_DIR" 2>/dev/null || true
+  printf '%s\n' "$(( $(date +%s) + 999999999 ))" >"$CADENCE_DIR/g7_future.ts" 2>/dev/null || true
+  rc=0; bridge_daemon_pass_due g7_future 30 || rc=$?
+  [[ "$rc" == "0" ]]
+) && _pass "G7a3 far-future numeric stamp → gate runs NOW (rc=0), never skip-forever (clock-skew / planted-future guard)" \
+  || _fail "G7a3 future-stamp-skip-forever" "a far-future stamp skip-forever'd (rc!=0) — future stamps must fall back to due-now"
+
+# G7a4 — CONTROL: a VALID recent stamp must STILL throttle (rc=1) within its
+# interval — proves the corrupt/future hardening did not make the gate run-now
+# unconditionally (which would re-introduce the per-tick heavy-step starvation).
+( set -euo pipefail
+  mkdir -p "$CADENCE_DIR" 2>/dev/null || true
+  printf '%s\n' "$(date +%s)" >"$CADENCE_DIR/g7_validrecent.ts" 2>/dev/null || true
+  rc=0; bridge_daemon_pass_due g7_validrecent 3600 || rc=$?
+  [[ "$rc" == "1" ]]
+) && _pass "G7a4 CONTROL: a valid recent stamp still THROTTLES (rc=1) within interval — the corrupt/future hardening is not over-broad" \
+  || _fail "G7a4 valid-stamp-still-throttles" "a valid recent stamp did not throttle (rc!=1) — the fail-open hardening regressed the gate into always-run"
+
+# G7b — an UNREADABLE stamp (mode 000) must not abort and must run-now. (On a
+# CI runner as root, chmod 000 is still readable; skip rather than false-pass.)
+G7B_FILE="$CADENCE_DIR/g7_unreadable.ts"
+mkdir -p "$CADENCE_DIR" 2>/dev/null || true
+NOW="$(date +%s)"
+printf '%s\n' "$NOW" >"$G7B_FILE" 2>/dev/null || true
+chmod 000 "$G7B_FILE" 2>/dev/null || true
+if [[ "$(id -u)" != "0" ]] && [[ ! -r "$G7B_FILE" ]]; then
+  # The stamp is genuinely unreadable for this UID → exercise the fail-open path.
+  # 2>/dev/null on the subshell: the gate's best-effort stamp write legitimately
+  # fails here (that IS the path under test); we assert on rc, not on the
+  # expected shell redirection-error noise.
+  ( set -euo pipefail
+    rc=0; bridge_daemon_pass_due g7_unreadable 30 || rc=$?
+    [[ "$rc" == "0" ]]
+  ) 2>/dev/null && _pass "G7b unreadable stamp (mode 000) → gate runs NOW (rc=0) under set -e, never skip-forever, never abort" \
+    || _fail "G7b unreadable-stamp-fail-open" "an unreadable cadence stamp did not fail-open to run-now (or aborted under set -e)"
+else
+  _skip "G7b unreadable-stamp" "stamp still readable for this UID (root/permissive fs) — cannot exercise the unreadable path"
+fi
+chmod 644 "$G7B_FILE" 2>/dev/null || true
+
+# G7c — an UNWRITABLE cadence DIR (mkdir/mktemp/write all fail) must STILL
+# fail-open to run-now (rc=0) and never abort under set -e. Point the gate at a
+# cadence dir whose PARENT is a read-only file so mkdir -p and mktemp both fail.
+G7C_ROOT="$SMOKE_DIR/ro-state"
+mkdir -p "$G7C_ROOT" 2>/dev/null || true
+# Make the daemon-pass-cadence parent un-writable: create it as a regular FILE
+# so `mkdir -p .../daemon-pass-cadence` cannot succeed.
+printf 'blocker\n' >"$G7C_ROOT/daemon-pass-cadence" 2>/dev/null || true
+if [[ -f "$G7C_ROOT/daemon-pass-cadence" ]]; then
+  # 2>/dev/null: the gate's mkdir/mktemp/write all fail here by design (the path
+  # under test); we assert on rc, not the expected shell redirection-error noise.
+  ( set -euo pipefail
+    export BRIDGE_STATE_DIR="$G7C_ROOT"
+    rc=0; bridge_daemon_pass_due g7_nowrite 30 || rc=$?
+    [[ "$rc" == "0" ]]
+  ) 2>/dev/null && _pass "G7c unwritable cadence dir (mkdir/mktemp/write all fail) → gate runs NOW (rc=0) under set -e, never skip-forever, never abort" \
+    || _fail "G7c unwritable-dir-fail-open" "an unwritable cadence dir did not fail-open to run-now (or aborted under set -e)"
+else
+  _skip "G7c unwritable-dir" "could not stage a file-as-cadence-dir blocker on this fs"
+fi
+
+# ===========================================================================
+# H5 — STATIC bridge-sync DEDUPE: there must be exactly ONE raw bridge-sync.sh
+# invocation in cmd_sync_cycle (the canonical cadence-gated early site). The
+# #2036 fix REMOVED the second `post_sync` full bridge-sync; a revert that
+# re-adds a second raw `bridge-sync.sh` call (or any second sync NOT sharing
+# the bridge_sync cadence key) is the exact regression that re-bloats the cycle
+# and re-starves idle nudge — fail loudly on it.
+# ===========================================================================
+# Count only EXECUTABLE invocations — exclude comment-only lines (the #2036
+# comments mention bridge-sync.sh by name) so the dedupe assertion counts the
+# real `bridge-sync.sh` call site(s), not the prose that documents the removal.
+RAW_SYNC_COUNT="$(printf '%s\n' "$SYNC_BODY" \
+  | grep -E 'bridge-sync\.sh' \
+  | grep -vE '^[[:space:]]*#' \
+  | grep -c . || true)"
+[[ "$RAW_SYNC_COUNT" =~ ^[0-9]+$ ]] || RAW_SYNC_COUNT=0
+# Count distinct bridge_sync cadence gates (must be exactly the single early site).
+BRIDGE_SYNC_GATE_COUNT="$(printf '%s\n' "$SYNC_BODY" | grep -cE 'bridge_daemon_pass_due bridge_sync\b' || true)"
+[[ "$BRIDGE_SYNC_GATE_COUNT" =~ ^[0-9]+$ ]] || BRIDGE_SYNC_GATE_COUNT=0
+if (( RAW_SYNC_COUNT == 1 )) && (( BRIDGE_SYNC_GATE_COUNT == 1 )); then
+  _pass "H5 bridge-sync DEDUPE: exactly ONE raw bridge-sync.sh invocation, guarded by exactly ONE bridge_sync cadence gate (the post_sync second full sync is removed — no double ≤9s sync per cycle)"
+elif (( RAW_SYNC_COUNT > 1 )); then
+  _fail "H5 bridge-sync-dedupe" "found $RAW_SYNC_COUNT raw bridge-sync.sh invocations in cmd_sync_cycle (expected 1) — the #2036 post_sync removal regressed; a second un-deduped ~9s sync re-bloats the cycle"
+else
+  _fail "H5 bridge-sync-dedupe" "raw bridge-sync.sh count=$RAW_SYNC_COUNT, bridge_sync gate count=$BRIDGE_SYNC_GATE_COUNT (expected 1 each) — bridge-sync is no longer the single cadence-gated site"
 fi
 
 # ===========================================================================

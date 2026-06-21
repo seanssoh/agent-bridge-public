@@ -101,13 +101,18 @@ fi
 # (before the spawn-heavy surfaces), not after them.
 # ---------------------------------------------------------------------------
 smoke_log "E: MCP cleanup runs early in cmd_sync_cycle (before spawn surfaces)"
-grep -q 'BRIDGE_DAEMON_LAST_STEP="mcp_orphan_cleanup_early"' "$DAEMON_SH" || \
+# #2036 marks this step via `_bridge_daemon_mark_progress "mcp_orphan_cleanup_early"`
+# (which sets BRIDGE_DAEMON_LAST_STEP internally, then cadence-gates the actual
+# cleanup) instead of a bare `BRIDGE_DAEMON_LAST_STEP=` assignment — accept either
+# marker form. The step still runs early (before the spawn-heavy surfaces).
+mcp_step_marker='(BRIDGE_DAEMON_LAST_STEP="mcp_orphan_cleanup_early"|_bridge_daemon_mark_progress "mcp_orphan_cleanup_early")'
+grep -qE "$mcp_step_marker" "$DAEMON_SH" || \
   smoke_fail "daemon does not run the MCP cleanup early (mcp_orphan_cleanup_early step missing)"
 # Exactly one in-cycle invocation (the early one) — the late call was removed.
 inv="$(grep -c '( process_mcp_orphan_cleanup ) || true' "$DAEMON_SH")"
 [[ "$inv" -eq 1 ]] || smoke_fail "expected exactly 1 process_mcp_orphan_cleanup invocation, found $inv"
 # The early step must precede the cron-dispatch + on-demand spawn steps.
-early_ln="$(grep -n 'BRIDGE_DAEMON_LAST_STEP="mcp_orphan_cleanup_early"' "$DAEMON_SH" | head -n1 | cut -d: -f1)"
+early_ln="$(grep -nE "$mcp_step_marker" "$DAEMON_SH" | head -n1 | cut -d: -f1)"
 cron_ln="$(grep -n 'BRIDGE_DAEMON_LAST_STEP="cron_dispatch_workers"' "$DAEMON_SH" | head -n1 | cut -d: -f1)"
 ondemand_ln="$(grep -n 'BRIDGE_DAEMON_LAST_STEP="on_demand_agents"' "$DAEMON_SH" | head -n1 | cut -d: -f1)"
 [[ -n "$early_ln" && -n "$cron_ln" && -n "$ondemand_ln" ]] || smoke_fail "could not locate cycle step markers"

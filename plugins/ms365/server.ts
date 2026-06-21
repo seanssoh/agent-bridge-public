@@ -438,6 +438,21 @@ function loadJson<T>(path: string): T | null {
   }
 }
 
+// Issue #2035 (item 1): defensively normalize a legacy millisecond `expires_at`
+// to seconds on read. This plugin writes + compares `expires_at` in SECONDS
+// (write = now + expires_in; read = expires_at - now, refresh when near 0), but
+// a legacy ms-format token file (13-digit ms `expires_at`, from an older plugin
+// version or an external pairing) would read as a permanently huge-positive
+// remaining → the seconds-land freshness check thinks it is valid forever and
+// NEVER refreshes. `1e12` seconds is the year 33658 vs ~1.7e9 now, so any
+// `expires_at` above it is unambiguously milliseconds. Mutates `cur` in place
+// (the freshness check and the reported expiry then both see seconds) and
+// returns it for call-site chaining; a null token is passed through untouched.
+function normalizeTokenExpiry(cur: TokenFile | null): TokenFile | null {
+  if (cur && cur.expires_at > 1e12) cur.expires_at = Math.floor(cur.expires_at / 1000)
+  return cur
+}
+
 // Issue #1825: when no explicit upn is passed AND MS365_DEFAULT_UPN is not
 // configured, resolve the default to the single stored token's keyed UPN.
 // After a shared-bot pairing the token is keyed by the authenticated real
@@ -769,13 +784,28 @@ async function doRefresh(upn: string): Promise<TokenFile> {
   return next
 }
 
-async function getAccessToken(upn: string): Promise<string> {
-  const cur = loadJson<TokenFile>(tokenPath(upn))
+// #2035 item 2: proactive callers (a pre-expiry refresh cron) need a wider
+// freshness margin than the interactive default WITHOUT changing the global
+// 300s constant — raising that globally would pull every interactive Graph
+// call's refresh_token rotation cadence in (rejected by the reporter). Opts:
+// `minRemaining` refreshes when fewer than N seconds remain; `force` always
+// refreshes. Both are absent on the interactive path, which keeps the exact
+// 300s reactive behavior.
+const NEAR_EXPIRY_SECONDS = 300
+type TokenFreshness = { minRemaining?: number; force?: boolean }
+
+async function getAccessToken(upn: string, freshness: TokenFreshness = {}): Promise<string> {
+  const cur = normalizeTokenExpiry(loadJson<TokenFile>(tokenPath(upn)))
   if (!cur) throw new Error(`no token for ${upn}; run pair_start then pair_poll to authenticate`)
   const now = Math.floor(Date.now() / 1000)
-  // Pre-call expiry check: refresh when expired OR within the 5-minute
-  // near-expiry margin (preemptive — avoids a mid-call 401).
-  if (cur.expires_at - now > 300) return cur.access_token
+  // Pre-call expiry check: refresh when expired OR within the near-expiry
+  // margin (preemptive — avoids a mid-call 401). The margin defaults to the
+  // 5-minute interactive constant; a proactive caller may widen it via
+  // `minRemaining`, or `force` an unconditional refresh (#2035 item 2). Clamp
+  // the margin to >= 0 (defense in depth) so a negative value can never let an
+  // already-expired token slip past the check.
+  const margin = Math.max(0, freshness.minRemaining ?? NEAR_EXPIRY_SECONDS)
+  if (!freshness.force && cur.expires_at - now > margin) return cur.access_token
   try {
     const refreshed = await refreshToken(upn)
     return refreshed.access_token
@@ -999,15 +1029,33 @@ const tools: ToolDef[] = [
   {
     name: 'get_valid_token',
     description:
-      'Return a currently-valid Microsoft Graph access_token for the UPN, transparently refreshing via the stored refresh_token if it is expired or within the 5-minute near-expiry margin. For trusted in-fleet callers (e.g. the CRM proxy, issue #1650) that must hold a guaranteed-valid token without reading the token file directly. NEVER returns the refresh_token.',
+      'Return a currently-valid Microsoft Graph access_token for the UPN, transparently refreshing via the stored refresh_token if it is expired or within the 5-minute near-expiry margin. For trusted in-fleet callers (e.g. the CRM proxy, issue #1650) that must hold a guaranteed-valid token without reading the token file directly. A proactive-refresh caller may pass min_remaining_seconds to refresh when fewer than that many seconds remain, or force:true to refresh unconditionally (issue #2035). NEVER returns the refresh_token.',
     schema: {
       type: 'object',
       properties: {
         upn: { type: 'string', description: 'User principal name. Defaults to MS365_DEFAULT_UPN.' },
+        min_remaining_seconds: {
+          type: 'number',
+          description:
+            'Proactive-refresh margin: refresh when fewer than this many seconds remain. Omit for the default 5-minute (300s) reactive behavior.',
+        },
+        force: {
+          type: 'boolean',
+          description: 'Refresh unconditionally, ignoring the current expiry. Defaults to false.',
+        },
       },
     },
     handler: async args => {
       const upn = resolveUpn(args.upn)
+      // #2035 item 2: thread an optional proactive-refresh margin through to the
+      // freshness check; absent params keep the interactive 300s behavior.
+      const freshness: TokenFreshness = {}
+      // A negative margin would let an already-expired token slip past the
+      // freshness check, so only accept a finite, non-negative value.
+      if (typeof args.min_remaining_seconds === 'number' && Number.isFinite(args.min_remaining_seconds) && args.min_remaining_seconds >= 0) {
+        freshness.minRemaining = args.min_remaining_seconds
+      }
+      if (args.force === true) freshness.force = true
       // #1650: reuse getAccessToken — pre-call expiry check + refresh_token
       // grant + SingleFlight coordination (no duplicate concurrent refresh) +
       // the transient/permanent classification and actionable re-auth error.
@@ -1015,10 +1063,11 @@ const tools: ToolDef[] = [
       // the token file directly and so used a stale access_token: they now get a
       // guaranteed-valid token and the refresh happens here, in the ms365 plugin
       // that owns the refresh_token.
-      const access_token = await getAccessToken(upn)
+      const access_token = await getAccessToken(upn, freshness)
       // getAccessToken returns only the token string; the file carries the
-      // authoritative post-refresh expiry.
-      const cur = loadJson<TokenFile>(tokenPath(upn))
+      // authoritative post-refresh expiry. Normalize a legacy ms `expires_at`
+      // here too so the reported expiry is in seconds (#2035 item 1).
+      const cur = normalizeTokenExpiry(loadJson<TokenFile>(tokenPath(upn)))
       const now = Math.floor(Date.now() / 1000)
       const expires_at = cur?.expires_at ?? null
       const expires_in_seconds = expires_at != null ? expires_at - now : null
@@ -1781,6 +1830,9 @@ process.on('uncaughtException', err => {
 // JSON line { upn, access_token, expires_at, expires_in_seconds } to stdout and
 // exits — same contract as the get_valid_token tool: refresh-on-expiry via
 // getAccessToken (refresh_token grant + SingleFlight), NEVER the refresh_token.
+// #2035 item 2: a proactive-refresh cron worker (no MCP) can widen the margin
+// with `--min-remaining <seconds>` or force a refresh with `--force`; absent
+// both, the call keeps the interactive 300s reactive behavior.
 // Handled before mcp.connect so it never starts the server.
 if (process.argv[2] === 'get-valid-token') {
   // #1654 codex r1 BLOCKING: resolveUpn() throws when no upn arg AND no
@@ -1789,9 +1841,24 @@ if (process.argv[2] === 'get-valid-token') {
   // is declared outside so the catch can still name it in the audit.
   let upn = ''
   try {
-    upn = resolveUpn(process.argv[3])
-    const access_token = await getAccessToken(upn)
-    const cur = loadJson<TokenFile>(tokenPath(upn))
+    // #2035 item 2: parse optional proactive-refresh flags from the argv tail,
+    // and resolve the upn from the first NON-flag positional so a flag-only call
+    // (`get-valid-token --force`, default UPN from env) is not mistaken for
+    // `get-valid-token <upn=--force>`.
+    const cliArgs = process.argv.slice(3)
+    const freshness: TokenFreshness = {}
+    if (cliArgs.includes('--force')) freshness.force = true
+    const minIdx = cliArgs.indexOf('--min-remaining')
+    if (minIdx !== -1 && cliArgs[minIdx + 1] !== undefined) {
+      const parsed = Number(cliArgs[minIdx + 1])
+      // Reject non-finite / negative margins — a negative margin would let an
+      // already-expired token slip past the freshness check.
+      if (Number.isFinite(parsed) && parsed >= 0) freshness.minRemaining = parsed
+    }
+    const upnArg = cliArgs.find((a, i) => !a.startsWith('--') && cliArgs[i - 1] !== '--min-remaining')
+    upn = resolveUpn(upnArg)
+    const access_token = await getAccessToken(upn, freshness)
+    const cur = normalizeTokenExpiry(loadJson<TokenFile>(tokenPath(upn)))
     const now = Math.floor(Date.now() / 1000)
     const expires_at = cur?.expires_at ?? null
     const expires_in_seconds = expires_at != null ? expires_at - now : null

@@ -3380,6 +3380,58 @@ def run_codex(request: dict[str, Any], prompt: str, schema_path: Path, timeout: 
     return command, completed
 
 
+# Issue #2029 — disposable cron child containment guard. The child runs
+# `claude -p … --permission-mode bypassPermissions` with cwd = the target
+# agent's workdir (which holds that agent's channel transport creds) and no
+# tool allow/deny restrictions, so a prompt-injected or over-eager child could
+# (1) read the token and POST to the chat transport directly, bypassing the
+# no-direct-send relay (observed live as a double-send to a human), and
+# (2) drop BRIDGE_CRON_RUN_ID from the queue CLI's subprocess env and mutate
+# out-of-run tasks. We inject a PreToolUse `Bash` deny hook ONLY into the cron
+# child, via the per-request `--settings` overlay the runner already controls
+# — never the agent's interactive `.claude/settings.json` and never operator-
+# global `~/.claude` (cf. #1981). A PreToolUse hook fires under bypassPermissions
+# (Claude Code runs it BEFORE the permission-prompt system) and inherits the
+# claude process env (incl. BRIDGE_CRON_RUN_ID), which the model cannot strip
+# from the hook's own environment — see hooks/cron-child-guard.py for the full
+# rationale and the HONEST residual (a string-match hook is evadable; macOS
+# "shared" has no airtight containment without OS-level isolation).
+CRON_CHILD_GUARD_HOOK = ROOT / "hooks" / "cron-child-guard.py"
+
+
+def cron_child_guard_settings_overlay() -> str | None:
+    """Return a `--settings` JSON overlay that injects the #2029 guard hook.
+
+    The overlay registers a PreToolUse `Bash` hook → ``hooks/cron-child-guard.py``
+    and is passed to the cron child's ``claude -p`` as an inline JSON string (the
+    CLI's ``--settings`` accepts a path OR a JSON string). Inline (not a temp
+    file) so there is no per-invocation file to create, chown for an iso UID, or
+    leave behind — and so it can never be mistaken for a persisted settings tree.
+    Returns None when the guard hook script is absent (a stripped/partial deploy)
+    so a missing guard degrades to the pre-#2029 behaviour rather than aborting
+    the cron run with an unloadable --settings reference.
+    """
+    if not CRON_CHILD_GUARD_HOOK.is_file():
+        return None
+    overlay = {
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "matcher": "Bash",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": f"{sys.executable} {CRON_CHILD_GUARD_HOOK}",
+                            "timeout": 5,
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+    return json.dumps(overlay, ensure_ascii=True)
+
+
 def run_claude(request: dict[str, Any], prompt: str, timeout: int, request_file: Path | None = None) -> tuple[list[str], subprocess.CompletedProcess[str]]:
     workdir = request["target_workdir"]
     claude_bin = resolve_binary("claude", "BRIDGE_CLAUDE_BIN")
@@ -3422,6 +3474,13 @@ def run_claude(request: dict[str, Any], prompt: str, timeout: int, request_file:
         # raise would skip the Claude config injection below and break every
         # no-model cron job.
     model_flags: list[str] = ["--model", model] if model else []
+    # Issue #2029 — inject the disposable-child containment guard ONLY into this
+    # cron child via a per-request `--settings` overlay (an inline JSON string).
+    # The overlay is a MERGE layer scoped to this one invocation; it never
+    # touches the agent's interactive `.claude/settings.json` or operator-global
+    # `~/.claude`. Omitted entirely when the guard hook script is absent.
+    guard_overlay = cron_child_guard_settings_overlay()
+    guard_flags: list[str] = ["--settings", guard_overlay] if guard_overlay else []
     # PR1.3 — cron child never loads channel plugins or MCP servers. The
     # `--channels` injection and `apply_channel_runtime_env` paths are gone.
     # `--strict-mcp-config` is unconditional (see disable_mcp_for_request).
@@ -3430,6 +3489,7 @@ def run_claude(request: dict[str, Any], prompt: str, timeout: int, request_file:
         "-p",
         "--no-session-persistence",
         "--strict-mcp-config",
+        *guard_flags,
         "--output-format",
         "json",
         "--json-schema",
