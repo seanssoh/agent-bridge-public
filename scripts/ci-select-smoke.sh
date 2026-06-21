@@ -232,6 +232,17 @@ add_required 1905-upgrade-systemd-quiesce-respawn
 # upgrade-quiesce/restart-phase edit re-runs the launchd-aware guard alongside
 # the systemd one.
 add_required 655-upgrade-launchd-quiesce-respawn
+# Issue #2040: the launchd restore now poll-until-not-loads BEFORE bootstrap
+# (defeats the async-bootout race), retries the transient launchd errors,
+# captures launchctl stderr, and VERIFIES the job loaded — emitting a loud WARN +
+# remediation + a load_state in the upgrade summary on failure (systemd parity
+# verifies is-active for both units). Part B: the INDEPENDENT liveness watcher
+# (scripts/bridge-daemon-liveness.sh) re-bootstraps an enabled-but-unloaded
+# launchd/systemd daemon BEFORE the skip_not_running deferral — cooldown-gated,
+# audited, and ★airtight on the operator-disabled SKIP. In the full static suite
+# so any upgrade-restore or liveness-watcher edit re-runs both halves (incl. the
+# disabled-skip + enabled-but-unloaded-recover + mutation gates).
+add_required 2040-upgrade-restore-verify 2040-daemon-enabled-but-unloaded
 # Issue #1916: bridge_init_register_default_picker_sweep now migrates the legacy
 # text-kind picker-sweep cron to shell-kind FAIL-SAFE (recreate-first /
 # verify-before-delete) — the legacy row is deleted only after a shell row is
