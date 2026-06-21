@@ -1100,6 +1100,17 @@ select_for_path() {
       # adversarial binding smoke on every bridge-agents.sh move so a refactor
       # cannot re-open the early-return GC gap.
       add_required 1738-config-caller-binding
+      # Issue #2021: lib/bridge-agents.sh hosts the plugin-MCP liveness probe
+      # path — the tri-state bridge_plugin_mcp_descendant_ready_for_item
+      # (alive / conclusive-dead / inconclusive), the second-signal
+      # bridge_plugin_mcp_engine_log_ready_for_item (current-session-scoped
+      # engine-log evidence), and the bridge_agent_plugin_mcp_alive_for_item
+      # router that consults the log ONLY on the inconclusive verdict. Pull
+      # mcp-liveness-engine-log on every bridge-agents.sh move so a refactor
+      # cannot (a) let the engine log override a clean-dead process verdict,
+      # (b) break the current-session scoping (stale-log false-alive), or
+      # (c) drop the fail-closed fallback when the session id is unresolvable.
+      add_required mcp-liveness-engine-log
       ;;
   esac
 
@@ -2282,7 +2293,15 @@ select_for_path() {
       # 1955-daemon-rogue-warn (added above) pins both axes + the warn-only /
       # never-fail contract so a refactor cannot silently drop the warn or
       # break the canonical-source-root match.
-      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir 1115-cli-usage-drift 1178-helper-contract-daemon-supp F-daemon-supp-groups-mock F-daemon-supp-groups-real δ-1234-daemon-start-policy A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs Beta-beta5-session-id-detect-sudo beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-epsilon-tmux-inject-busy beta5-2-pi-daemon-crashloop-no-set-e-leak beta5-2-kappa-state-audit-reconcile 1359-cron-create-iso-staging 1380-admin-autostart-recovery 1388-daemon-lock-fd-cloexec 1407-runtime-hardening 1405-handoffd-supervision 1679-1680-a2a-receiver-supervisor-robustness 1408-daemon-alert-nudge-hygiene 1473-agent-list-iso-state-fallback 1461-cron-max-parallel-override 1463-launchd-keepalive-singleton-thrash 1563-pr2-daemon-self-abort 1563-pr4-a2a-receiver-healthz 1563-pr5-fp-control-matrix 1563-pr6-watchdog-scan-timeout 1563-pr7-tick-cadence 1563-pr8-a2a-diag-recovery 1629-healthz-not-semaphore-gated 1685-receiver-staleness-selfheal v0165-l0-reconcile-skeleton v0165-l2-tunnel-health v0165-l1-stable-addr v0165-l3-peer-reachability v0165-l4-token-join v0165-l5-relay-roster v0165-l6-net-status-v2 v0166-la-tunnel-bounce-gate v0166-lb-transient-peers 1652-queue-gateway-crashloop 1803-orphan-dir-gc 1809-agents-md-backfill 1855-keychain-free-backfill 1833-status-gateway-timeout-not-down 1934-hook-file-self-heal 1955-daemon-rogue-warn 1973a-gateway-drain-containment 1973c-liveness-recovery teams-managed-send 2005-managed-send-plugin-state-dir
+      # Issue #2021: bridge-daemon.sh's bridge_report_plugin_liveness_miss
+      # consumes bridge_agent_missing_plugin_mcp_channels_csv, which now routes
+      # the inconclusive process-probe case through the current-session
+      # engine-log second signal. Pull mcp-liveness-engine-log on every
+      # bridge-daemon.sh move so a daemon-side liveness change cannot regress
+      # the probe-primary / log-only-rescues-flaky / stale-log-false-alive
+      # contract (the lib lives in bridge-agents.sh but the dead-channel
+      # restart decision is here).
+      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir 1115-cli-usage-drift 1178-helper-contract-daemon-supp F-daemon-supp-groups-mock F-daemon-supp-groups-real δ-1234-daemon-start-policy A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs Beta-beta5-session-id-detect-sudo beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear mcp-liveness-engine-log beta5-2-epsilon-tmux-inject-busy beta5-2-pi-daemon-crashloop-no-set-e-leak beta5-2-kappa-state-audit-reconcile 1359-cron-create-iso-staging 1380-admin-autostart-recovery 1388-daemon-lock-fd-cloexec 1407-runtime-hardening 1405-handoffd-supervision 1679-1680-a2a-receiver-supervisor-robustness 1408-daemon-alert-nudge-hygiene 1473-agent-list-iso-state-fallback 1461-cron-max-parallel-override 1463-launchd-keepalive-singleton-thrash 1563-pr2-daemon-self-abort 1563-pr4-a2a-receiver-healthz 1563-pr5-fp-control-matrix 1563-pr6-watchdog-scan-timeout 1563-pr7-tick-cadence 1563-pr8-a2a-diag-recovery 1629-healthz-not-semaphore-gated 1685-receiver-staleness-selfheal v0165-l0-reconcile-skeleton v0165-l2-tunnel-health v0165-l1-stable-addr v0165-l3-peer-reachability v0165-l4-token-join v0165-l5-relay-roster v0165-l6-net-status-v2 v0166-la-tunnel-bounce-gate v0166-lb-transient-peers 1652-queue-gateway-crashloop 1803-orphan-dir-gc 1809-agents-md-backfill 1855-keychain-free-backfill 1833-status-gateway-timeout-not-down 1934-hook-file-self-heal 1955-daemon-rogue-warn 1973a-gateway-drain-containment 1973c-liveness-recovery teams-managed-send 2005-managed-send-plugin-state-dir
       # Issue #1899: bridge-sync.sh's refresh_missing_session_ids backfill sweep
       # now skips dynamic vanilla Codex (it must never detect/persist an operator
       # ~/.codex session id). Pull 1899 on bridge-sync.sh moves so the daemon
