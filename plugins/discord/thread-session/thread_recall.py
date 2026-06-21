@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""louis-recall — cross-session conversation search for the one Louis.
+"""thread-recall — cross-session conversation search for the channel-owning agent.
 
-thread-session v2, Pillar 1 (spec: shared/reports/2026-06-20-thread-session-v2-recall-egress-spec.md).
+thread-session v2, Pillar 1.
 
-Both the main Louis session and any thread sub-session are the SAME Louis with
+Both the main session and any thread sub-session are the SAME agent with
 SEPARATE context windows. This helper lets either side search the other's
 conversation history (main session jsonl + every thread session jsonl + thread
 archives) so needed info can be synced on demand.
 
-Read-only. No external transport. Scoped to Louis's OWN config dir corpus only
-(never another agent's tree). Plain code — no LLM, no token cost.
+Read-only. No external transport. Scoped to the agent's OWN config dir corpus
+only (never another agent's tree). Plain code — no LLM, no token cost.
 
 Usage:
-  louis_recall.py search --query "S7 발송 결정" [--scope main|threads|all]
-                         [--limit N] [--since ISO8601]
-                         [--config-dir PATH] [--root PATH] [--json]
+  thread_recall.py search --query "..." [--scope main|threads|all]
+                          [--limit N] [--since ISO8601]
+                          [--config-dir PATH] [--root PATH] [--json]
 
 Defaults: --config-dir from $CLAUDE_CONFIG_DIR, --root from $THREAD_SESSION_ROOT
 (both set in the thread-session child env), else derived from this script's path.
@@ -229,7 +229,7 @@ def search(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Cross-session conversation search for the one Louis (read-only).")
+    p = argparse.ArgumentParser(description="Cross-session conversation search for the channel-owning agent (read-only).")
     p.add_argument("--config-dir", type=Path, default=None)
     p.add_argument("--root", type=Path, default=None)
     sub = p.add_subparsers(dest="command", required=True)

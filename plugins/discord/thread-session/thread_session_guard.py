@@ -15,7 +15,7 @@ This hook denies, for the thread-session child:
   * calling Discord/Telegram chat or webhook APIs (Bash or WebFetch/WebSearch),
   * invoking known direct-send helpers,
   * thread-leg Bash commands except a finite realpath-pinned allowlist:
-    thread_task_create.py create and louis_recall.py search,
+    thread_task_create.py create and thread_recall.py search,
   * thread-leg writes to canonical scripts or .threads control state,
   * thread-leg Task/SlashCommand and unknown future tool names.
 
@@ -23,7 +23,7 @@ The child reports its answer via stdout (the outer Discord plugin posts it); it
 never needs to read transport creds, call chat APIs, invoke agb, or curl
 external hosts, so these denials are conflict-free with its real job.
 
-v3 design note: thread-session v3 (2026-06-20) provides louis_recall.py for
+v3 design note: thread-session v3 (2026-06-20) provides thread_recall.py for
 cross-session read (local) and thread_task_create.py as the sole producer shim
 for parent-main tasks. Thread-leg Bash is default-deny; only those two
 realpath-pinned script shapes are allowed.
@@ -49,9 +49,16 @@ import unicodedata
 from typing import Any
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+# Realpath of the bundled thread-session code dir. EVERY file under it
+# (dispatcher, guard, producer, recall, egress, seed_context, …) is pinned
+# read-only against the thread leg — a write to any of them would let the
+# child rewrite the very scripts the realpath-pinned allowlist and the guard
+# itself depend on. Protecting the whole dir (not an enumerated file list) is
+# the closed form: a new helper added to the bundle is covered automatically.
+SCRIPT_DIR_REAL = os.path.realpath(SCRIPT_DIR)
 WORKDIR = os.path.dirname(SCRIPT_DIR)
 THREAD_TASK_CREATE_REAL = os.path.realpath(os.path.join(SCRIPT_DIR, "thread_task_create.py"))
-LOUIS_RECALL_REAL = os.path.realpath(os.path.join(SCRIPT_DIR, "louis_recall.py"))
+THREAD_RECALL_REAL = os.path.realpath(os.path.join(SCRIPT_DIR, "thread_recall.py"))
 DEFAULT_THREAD_ROOT_REAL = os.path.realpath(os.path.join(WORKDIR, ".threads"))
 PYTHON_NAMES = {"python", "python3"}
 
@@ -205,7 +212,7 @@ def _enforce_thread_allowlist(command: str) -> None:
             "thread producer",
         )
         return
-    if script_real == LOUIS_RECALL_REAL:
+    if script_real == THREAD_RECALL_REAL:
         if len(tokens) < 3 or tokens[2] != "search":
             _deny("thread recall invocation not in allowlist", "missing-search")
         _validate_flag_args(tokens[3:], RECALL_FLAGS_WITH_VALUE, RECALL_VALUELESS_FLAGS, "thread recall")
@@ -284,10 +291,27 @@ def _shell_tokens(command: str) -> list[str]:
         _deny("invalid shell command", type(exc).__name__)
 
 
+def _relative_base() -> str:
+    """The directory a thread-leg RELATIVE path resolves against.
+
+    The dispatcher runs the thread-leg Claude with ``cwd=rt.root`` (the thread
+    runtime root, ``thread_session_dispatcher.command_dispatch`` → ``subprocess
+    .run(cwd=rt.root)``), so a relative tool path like ``scratch/note.md`` is
+    ``<thread-root>/scratch/note.md`` from the child's point of view — NOT
+    relative to the bundled plugin dir. Resolving against the wrong base both
+    mis-denied legitimate ``scratch/...`` writes and could mis-classify other
+    relative targets. For a thread leg, anchor to the resolved thread root; for
+    the non-thread (controller) path keep the historical WORKDIR base.
+    """
+    if _is_thread_leg():
+        return _thread_root_real()
+    return WORKDIR
+
+
 def _path_views(value: str) -> tuple[str, str, str]:
     expanded = os.path.expanduser(value)
     normalized = os.path.normpath(expanded).lower()
-    real_input = expanded if os.path.isabs(expanded) else os.path.join(WORKDIR, expanded)
+    real_input = expanded if os.path.isabs(expanded) else os.path.join(_relative_base(), expanded)
     real = os.path.realpath(real_input)
     return normalized, real.lower(), real
 
@@ -347,30 +371,147 @@ def _thread_scratch_real() -> str:
     return os.path.realpath(os.path.join(_thread_root_real(), "scratch"))
 
 
-def _write_allowed_roots() -> tuple[str, ...]:
-    roots = {os.path.realpath("/tmp"), _thread_scratch_real()}
+# Tmp-like roots a thread leg may write benign scratch files into. The thread
+# scratch dir is handled separately (it is the agent's canonical work area);
+# these are the general tmp carve-outs. NOTE: membership in one of these roots
+# is NOT sufficient to allow a write — _write_protected_marker() is applied
+# first, so a protected-path write (transport creds, identity/SOUL/CLAUDE,
+# .claude settings, .mcp.json, .threads control state, the pinned scripts, the
+# bridge state dir) is denied even when it resolves under /tmp or $TMPDIR. An
+# agent workdir / plugin-cache can itself live under a tmp-like root, so the
+# tmp carve-out must never override a protected-path deny (otherwise the whole
+# fail-closed guard is bypassed by relative paths under a tmp cwd).
+def _tmp_write_roots() -> tuple[str, ...]:
+    roots = {os.path.realpath("/tmp")}
     for candidate in (os.environ.get("TMPDIR"), tempfile.gettempdir()):
         if candidate:
             roots.add(os.path.realpath(os.path.expanduser(candidate)))
     return tuple(sorted(roots))
 
 
+# Write-protected path fragments a thread leg must never WRITE, regardless of
+# which root the target resolves under. Broader than the read markers: a write
+# can also clobber control state / settings / the pinned producer+recall+guard
+# scripts. Matched case-insensitively against both the normalized (cwd-relative)
+# view and the realpath view so neither a tmp-relative cwd nor a symlink can
+# launder the target past the check.
+WRITE_PROTECTED_FILE_MARKERS = (
+    ".discord/.env",
+    ".discord/access.json",
+    ".telegram/.env",
+    "access.json",
+    "launch-secrets",
+    ".credentials.json",
+    ".mcp.json",
+    ".claude/settings.json",
+    ".claude/settings.local.json",
+    "soul.md",
+    "memory.md",
+    "common-instructions.md",
+    "active-roster.md",
+    "claude.md",
+    "tasks.db",
+    # Bundled thread-session scripts — also covered structurally by the
+    # SCRIPT_DIR containment check in _check_write_path (step 1b); listed here
+    # so the normalized (raw-input) view denies a relative-name write whose
+    # realpath base might differ. Keep in sync with the bundle.
+    "thread_task_create.py",
+    "thread_session_guard.py",
+    "thread_session_dispatcher.py",
+    "thread_recall.py",
+    "thread_egress.py",
+    "thread_reply.py",
+    "seed_context.py",
+)
+WRITE_PROTECTED_DIR_MARKERS = (".discord", ".telegram", "launch-secrets")
+
+
+def _write_protected_marker(path_lower: str) -> str | None:
+    normalized = path_lower.replace(os.sep, "/")
+    for marker in WRITE_PROTECTED_FILE_MARKERS:
+        if marker in normalized:
+            return marker
+    padded = "/" + normalized.strip("/") + "/"
+    for marker in WRITE_PROTECTED_DIR_MARKERS:
+        if f"/{marker}/" in padded:
+            return marker
+    # .threads control state is protected EXCEPT the agent scratch subtree
+    # (.threads/scratch/...), which is the thread leg's canonical write area.
+    if "/.threads/" in padded and "/.threads/scratch/" not in padded:
+        return ".threads"
+    return None
+
+
 def _check_write_path(value: str) -> None:
     if not _is_thread_leg():
         return
-    _normalized, _real_lower, target = _path_views(value)
-    for root in _write_allowed_roots():
-        if target == root or _is_within(target, root):
-            try:
-                stat_result = os.lstat(target)
-            except FileNotFoundError:
+    expanded = os.path.expanduser(value)
+    normalized, real_lower, target = _path_views(value)
+
+    # 1) Protected-path / category deny FIRST. The tmp carve-out below must
+    #    never override this — an agent workdir or plugin-cache can itself live
+    #    under a tmp-like root, so a relative path under a tmp cwd (e.g.
+    #    .discord/.env, CLAUDE.md, .threads/registry.json) would otherwise be
+    #    laundered into an "allowed" tmp write. Check both path views.
+    for view in (normalized, real_lower):
+        marker = _write_protected_marker(view)
+        if marker:
+            _deny("thread leg write to protected path", marker)
+
+    # 1b) The ENTIRE bundled thread-session code dir is read-only to the thread
+    #     leg — protecting the whole SCRIPT_DIR closes the gap left by an
+    #     enumerated filename list (which omitted thread_session_dispatcher.py /
+    #     seed_context.py and would silently miss any future helper). A write to
+    #     any bundled script could rewrite the dispatcher, the guard itself, or
+    #     the realpath-pinned producer/recall shims, so it must be denied even
+    #     when the plugin/worktree lives under a tmp-like root.
+    if target == SCRIPT_DIR_REAL or _is_within(target, SCRIPT_DIR_REAL):
+        _deny("thread leg write to bundled thread-session script", target)
+
+    # 2) The agent thread scratch subtree is the canonical write area.
+    scratch_root = _thread_scratch_real()
+    if target == scratch_root or _is_within(target, scratch_root):
+        _deny_if_hardlinked(target)
+        return
+
+    # 2b) The thread RUNTIME ROOT (registry.json / registry.lock / guard
+    #     settings / archive / mcp config) is control state the leg must never
+    #     rewrite — only its scratch subtree (handled above) is writable. Deny
+    #     any write that lands inside the resolved thread root but outside
+    #     scratch, independent of the root's directory name (the .threads name
+    #     marker in step 1 only catches the conventional layout; a custom
+    #     THREAD_SESSION_ROOT must be protected too).
+    thread_root = _thread_root_real()
+    if (target == thread_root or _is_within(target, thread_root)) and not _is_within(target, scratch_root):
+        _deny("thread leg write to thread control state", target)
+
+    # 3) General tmp carve-out for benign scratch files (no protected marker
+    #    matched above). Only an EXPLICITLY-ABSOLUTE tmp path qualifies: a
+    #    relative input is resolved against the agent WORKDIR, and when that
+    #    workdir itself lives under a tmp-like root (CI worktrees, plugin
+    #    caches), a relative write (scratch.md, scripts/x.py, .threads/...)
+    #    would otherwise be laundered into the tmp carve-out and bypass the
+    #    "confined to scratch" rule. Relative writes go only to the scratch
+    #    subtree (step 2).
+    if os.path.isabs(expanded):
+        abs_real = os.path.realpath(expanded)
+        for root in _tmp_write_roots():
+            if abs_real == root or _is_within(abs_real, root):
+                _deny_if_hardlinked(target)
                 return
-            except OSError as exc:
-                _deny("thread leg write target stat failed", type(exc).__name__)
-            if stat_result.st_nlink > 1:
-                _deny("thread leg write to hardlinked target", target)
-            return
+
     _deny("thread leg writes confined to scratch", target)
+
+
+def _deny_if_hardlinked(target: str) -> None:
+    try:
+        stat_result = os.lstat(target)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        _deny("thread leg write target stat failed", type(exc).__name__)
+    if stat_result.st_nlink > 1:
+        _deny("thread leg write to hardlinked target", target)
 
 
 def _handle_payload(payload: dict[str, Any]) -> int:
@@ -454,7 +595,7 @@ def _path_payload(tool: str, path: str) -> dict[str, Any]:
 
 def command_selftest() -> int:
     producer_script = shlex.quote(THREAD_TASK_CREATE_REAL)
-    recall_script = shlex.quote(LOUIS_RECALL_REAL)
+    recall_script = shlex.quote(THREAD_RECALL_REAL)
     producer_base = f"python3 {producer_script} create --thread-id t --message-id m"
     recall_base = f"python3 {recall_script} search"
     producer = f"{producer_base} --body ok"
@@ -506,9 +647,9 @@ def command_selftest() -> int:
         f"{producer_base} --body x*",
         f"{producer_base} --title ~/x --body ok",
         f"{recall_base} --query {{a,b}}",
-        f"{producer_base} --body $LOUIS_X",
+        f"{producer_base} --body $SECRET_X",
         f"{producer_base} --body ${{x}}",
-        f'{producer_base} --body "$LOUIS_X"',
+        f'{producer_base} --body "$SECRET_X"',
         f'{producer_base} --title "${{x}}" --body ok',
         f'{producer_base} --body "v=${{PATH}}"',
         f'{producer_base} --body "$BRIDGE_RUNTIME_CREDENTIALS_DIR"',
@@ -536,7 +677,7 @@ def command_selftest() -> int:
         "python3 -m bridge_queue",
         "python3 /opt/agent-bridge/bridge-queue.py claim 1 --agent example-agent",
         f"python3 {shlex.quote(THREAD_TASK_CREATE_REAL)} delete --thread-id t --message-id m --body ok",
-        f"python3 {shlex.quote(LOUIS_RECALL_REAL)} dump --query test",
+        f"python3 {shlex.quote(THREAD_RECALL_REAL)} dump --query test",
         f"python3 {shlex.quote(THREAD_TASK_CREATE_REAL)} create --thread-id t --message-id m --body 'line\nbreak'",
         *hash_denied,
         *fused_flag_denied,
@@ -585,6 +726,13 @@ def command_selftest() -> int:
             scratch_write_tools = {
                 "write_thread_scratch_existing": _guard_rc(_path_payload("Write", scratch_regular)),
                 "write_thread_scratch_hardlink": _guard_rc(_path_payload("Write", scratch_hardlink)),
+                # The thread leg runs with cwd=<thread-root>, so a RELATIVE
+                # scratch write (the common case) must resolve against the
+                # thread root and be allowed; a relative control-state path
+                # (registry.json) and a relative parent escape must still deny.
+                "write_thread_scratch_relative": _guard_rc(_path_payload("Write", "scratch/note.md")),
+                "write_thread_registry_relative": _guard_rc(_path_payload("Write", "registry.json")),
+                "write_thread_parent_escape_relative": _guard_rc(_path_payload("Write", "../CLAUDE.md")),
             }
         finally:
             if old_root is None:
@@ -620,6 +768,12 @@ def command_selftest() -> int:
                 **scratch_write_tools,
                 "write_workdir_scratch": _guard_rc(_path_payload("Write", "scratch.md")),
                 "write_script": _guard_rc(_path_payload("Write", os.path.join(SCRIPT_DIR, "thread_task_create.py"))),
+                # Every bundled script under SCRIPT_DIR must deny — the
+                # dispatcher and seed_context were missing from the enumerated
+                # list before the SCRIPT_DIR containment check (#2060 codex r1).
+                "write_script_dispatcher": _guard_rc(_path_payload("Write", os.path.join(SCRIPT_DIR, "thread_session_dispatcher.py"))),
+                "write_script_seed_context": _guard_rc(_path_payload("Write", os.path.join(SCRIPT_DIR, "seed_context.py"))),
+                "write_script_guard": _guard_rc(_path_payload("Write", os.path.join(SCRIPT_DIR, "thread_session_guard.py"))),
                 "write_relative_script": _guard_rc(_path_payload("Write", "scripts/thread_session_guard.py")),
                 "edit_threads": _guard_rc(_path_payload("Edit", os.path.join(_thread_root_real(), "registry.json"))),
                 "edit_relative_threads": _guard_rc(_path_payload("Edit", ".threads/registry.json")),
@@ -676,8 +830,14 @@ def command_selftest() -> int:
         "write_thread_scratch": 0,
         "write_thread_scratch_existing": 0,
         "write_thread_scratch_hardlink": 2,
+        "write_thread_scratch_relative": 0,
+        "write_thread_registry_relative": 2,
+        "write_thread_parent_escape_relative": 2,
         "write_workdir_scratch": 2,
         "write_script": 2,
+        "write_script_dispatcher": 2,
+        "write_script_seed_context": 2,
+        "write_script_guard": 2,
         "write_relative_script": 2,
         "edit_threads": 2,
         "edit_relative_threads": 2,

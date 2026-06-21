@@ -158,7 +158,7 @@ def build_seed_context(
         return SeedResult(NO_CONTEXT_TEXT, provenance)
 
     redaction_applied = False
-    lines = ["[Inherited recent main context]", "This is deterministic extractive context from the main Louis session."]
+    lines = ["[Inherited recent main context]", "This is deterministic extractive context from the main session."]
     for msg in messages:
         clean, changed = redact(msg["text"])
         redaction_applied = redaction_applied or changed
