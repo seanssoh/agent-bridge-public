@@ -167,6 +167,46 @@ def consume_fresh_arrival_markers() -> set[int]:
     return ids
 
 
+def post_fresh_arrival_marker(task_id: int | str) -> None:
+    """Best-effort one-shot fresh-arrival marker for a freshly enqueued LOCAL task.
+
+    Issue #2045: the fast-wake fresh-arrival marker (#1630) was posted ONLY by
+    the A2A receiver (bridge-handoffd.py::post_fresh_arrival_marker), so a task
+    enqueued through the LOCAL `task create` path -- in particular a self/
+    loopback task (created_by == assigned_to, e.g. a Discord thread sub-session
+    handing off to its own main session) -- never got the marker and fell back
+    to the daemon's slow periodic nudge (minutes). This mirrors the receiver's
+    writer for the local enqueue boundary so every fresh local task (loopback
+    included) gets the SAME one-tick redelivery-age-gate exemption.
+
+    The daemon nudge_scan step (consume_fresh_arrival_markers) exempts the named
+    task id from ONLY the redelivery-AGE gate for one tick, then deletes the
+    consumed marker (one-shot). It bypasses nothing else -- the normal queued-
+    status, idle, cooldown and activity checks still apply, and a marker for a
+    non-queued/done/unknown task is simply ignored and swept. Posting it from
+    this trusted local enqueue path is therefore security-neutral.
+
+    Best-effort by contract (#1630): a marker failure (read-only fs, the daemon
+    not running, a race on the dir) MUST NEVER fail the enqueue. The task is
+    already durably committed; the worst case without the marker is the pre-fix
+    ~60s age-gate latency, never a lost task or a security relaxation.
+    """
+    text = str(task_id).strip()
+    if not text or not text.isdigit():
+        return
+    try:
+        marker_dir = fresh_arrival_dir()
+        marker_dir.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only -- $BRIDGE_STATE_DIR/queue is controller-owned queue state, never an isolated-agent tree
+        marker_path = marker_dir / text
+        tmp_path = marker_path.with_name(marker_path.name + ".tmp")
+        tmp_path.write_text(f"{now_ts()}\n", encoding="utf-8")
+        os.replace(tmp_path, marker_path)
+    except OSError:
+        # Daemon not running, read-only fs, or a benign dir race -- the task is
+        # already committed; never propagate to the enqueue result.
+        return
+
+
 def get_queue_gateway_root() -> Path:
     bridge_home = operator_home()
     state_dir = Path(os.environ.get("BRIDGE_STATE_DIR", str(bridge_home / "state")))
@@ -1553,6 +1593,16 @@ def cmd_create(args: argparse.Namespace) -> int:
             note_path=body_path,
             to_agent=args.assigned_to,
         )
+
+    # Issue #2045: post the one-shot fresh-arrival marker on the LOCAL enqueue
+    # path too (the A2A receiver already does this for inbound handoffs). This
+    # is OUTSIDE the `with` block so it only runs after the task is durably
+    # committed, and it is best-effort -- it never fails the create. It gives a
+    # self/loopback task (created_by == assigned_to, e.g. a thread->main
+    # handoff) the same one-tick redelivery-age-gate exemption the cross-agent
+    # (receiver) path gets, so the daemon fast-wakes it on the next tick instead
+    # of stranding it under the ~60s age gate until the slow periodic nudge.
+    post_fresh_arrival_marker(task_id)
 
     if args.format == "shell":
         fields = {
