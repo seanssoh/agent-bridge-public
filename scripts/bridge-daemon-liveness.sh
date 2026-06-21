@@ -101,6 +101,13 @@ REPO_ROOT="$(cd -P "$SCRIPT_DIR/.." && pwd -P)"
 : "${BRIDGE_DAEMON_GATEWAY_STALL_WITNESS_TOLERANCE_SECONDS:=10}"
 : "${BRIDGE_DAEMON_RECOVERY_RENUDGE_FILE:=$BRIDGE_STATE_DIR/daemon-recovery-renudge.env}"
 : "${BRIDGE_DAEMON_GATEWAY_STALL_DISABLE:=0}"
+# Issue #2055: the upgrade's durable quiesce-intent marker. bridge-upgrade.sh
+# writes it (recording the upgrade pid + platform/label) when it disables the
+# daemon job for the #1820 reconcile window, and clears it on a successful
+# restore-enable. Its presence — with a DEAD recorded upgrade pid — is how this
+# watcher tells an interrupted-upgrade disable (recoverable) from an operator
+# `agb daemon stop` (stay down). Must match bridge-upgrade.sh's default path.
+: "${BRIDGE_UPGRADE_QUIESCE_MARKER_FILE:=$BRIDGE_STATE_DIR/upgrade/daemon-quiesce.intent}"
 
 # Sanitize numeric envs — fall back to defaults on garbage so a typo in a
 # launchd EnvironmentVariables block can't disable the watcher.
@@ -168,6 +175,65 @@ cooldown_active() {
 record_cooldown() {
   mkdir -p "$(dirname "$BRIDGE_DAEMON_LIVENESS_COOLDOWN_FILE")" 2>/dev/null || true
   printf '%s\n' "$(now_ts)" 2>/dev/null >"$BRIDGE_DAEMON_LIVENESS_COOLDOWN_FILE" || true
+}
+
+# ── Issue #2055: interrupted-upgrade discriminator ────────────────────────────
+#
+# A DISABLED daemon job is normally an operator `agb daemon stop` and the #2040
+# recovery FAIL-CLOSED skips it (★ never fight an operator stop). The one
+# exception: an upgrade that was KILLED (SIGKILL / power-loss) between its
+# quiesce-disable and its restore-enable also leaves the job disabled — and the
+# operator never intended that down-state. bridge-upgrade.sh brackets its quiesce
+# window with a durable marker (BRIDGE_UPGRADE_QUIESCE_MARKER_FILE) recording the
+# upgrade pid; it clears the marker on a successful restore OR a deliberate
+# fail-closed abort. So the marker is present ONLY for an interrupted upgrade.
+#
+# This returns 0 (recover: the disabled job is an interrupted-upgrade disable)
+# ONLY when ALL hold:
+#   - the marker file exists, and
+#   - it records a numeric upgrade pid, and
+#   - that pid is NOT alive (the upgrade is dead — an in-flight upgrade with a
+#     LIVE pid is doing its own restore; we must not race it).
+# Any other case (no marker / unreadable pid / pid still alive) returns 1 →
+# the caller keeps the #2040 fail-closed skip. Sets QUIESCE_MARKER_PID /
+# QUIESCE_MARKER_PLATFORM for the caller's audit detail. Pure read; no mutation.
+QUIESCE_MARKER_PID=""
+QUIESCE_MARKER_PLATFORM=""
+interrupted_upgrade_quiesce() {
+  QUIESCE_MARKER_PID=""
+  QUIESCE_MARKER_PLATFORM=""
+  local marker="$BRIDGE_UPGRADE_QUIESCE_MARKER_FILE"
+  [[ -f "$marker" ]] || return 1
+  local pid platform
+  pid="$(
+    # shellcheck disable=SC1090
+    source "$marker" 2>/dev/null
+    printf '%s' "${BRIDGE_QUIESCE_UPGRADE_PID:-}"
+  )"
+  platform="$(
+    # shellcheck disable=SC1090
+    source "$marker" 2>/dev/null
+    printf '%s' "${BRIDGE_QUIESCE_PLATFORM:-}"
+  )"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  # A LIVE upgrade pid means an upgrade is mid-flight running its OWN restore —
+  # defer to it (do not race), so this is NOT a recoverable interrupted disable.
+  if kill -0 "$pid" 2>/dev/null; then
+    return 1
+  fi
+  QUIESCE_MARKER_PID="$pid"
+  QUIESCE_MARKER_PLATFORM="$platform"
+  return 0
+}
+
+# Clear the quiesce-intent marker after the watcher has acted on an interrupted
+# upgrade (recovered or attempted). Single-latch: once the watcher consumes the
+# marker, a later poll must not re-trigger off the same stale interrupted run —
+# if recovery failed and the job is still disabled, the next poll falls back to
+# the normal fail-closed skip (the marker was a one-shot recovery hint, not a
+# standing override of the operator-stop guarantee). Best-effort.
+clear_quiesce_marker() {
+  rm -f "$BRIDGE_UPGRADE_QUIESCE_MARKER_FILE" 2>/dev/null || true
 }
 
 # ── Issue #2040: standing recovery for an enabled-but-unloaded daemon ──────────
@@ -305,14 +371,45 @@ maybe_rebootstrap_launchd() {
   local disabled_state
   disabled_state="$(rebootstrap_launchd_disabled_state "$uid" "$REBOOTSTRAP_LABEL")"
   if [[ "$disabled_state" != "enabled" ]]; then
-    emit_audit daemon_liveness_rebootstrap_skip_disabled \
-      --detail platform="launchd" \
-      --detail label="$REBOOTSTRAP_LABEL" \
-      --detail disabled_state="$disabled_state" \
-      --detail heartbeat_age_seconds="$age"
-    printf '[liveness] launchd job gui/%s/%s disabled-state=%s — skipping re-bootstrap (operator stop / cannot confirm enabled).\n' \
-      "$uid" "$REBOOTSTRAP_LABEL" "$disabled_state"
-    return 0
+    # Issue #2055: a disabled job is normally an operator stop (skip). The sole
+    # exception is an interrupted upgrade — its durable quiesce marker (dead
+    # upgrade pid) proves the disable was an upgrade's, not the operator's. Only
+    # then do we RE-ENABLE the job and recover it; otherwise keep the #2040
+    # fail-closed skip. We never re-enable on an `unknown` disabled-state either,
+    # because a disabled-state we cannot read could be an operator stop — but an
+    # interrupted-upgrade marker is independent proof, so recover regardless of
+    # whether print-disabled was readable.
+    if interrupted_upgrade_quiesce; then
+      emit_audit daemon_liveness_rebootstrap_interrupted_upgrade \
+        --detail platform="launchd" \
+        --detail label="$REBOOTSTRAP_LABEL" \
+        --detail disabled_state="$disabled_state" \
+        --detail upgrade_pid="$QUIESCE_MARKER_PID" \
+        --detail heartbeat_age_seconds="$age"
+      printf '[liveness] launchd job gui/%s/%s disabled by an INTERRUPTED upgrade (dead upgrade pid=%s) — re-enabling + recovering (not an operator stop).\n' \
+        "$uid" "$REBOOTSTRAP_LABEL" "$QUIESCE_MARKER_PID"
+      # Consume the marker (single-latch) BEFORE acting so a failed recovery does
+      # not re-trigger off the same stale run on the next poll.
+      clear_quiesce_marker
+      if [[ "$BRIDGE_DAEMON_LIVENESS_DRY_RUN" != "1" ]]; then
+        launchctl enable "gui/${uid}/${REBOOTSTRAP_LABEL}" >/dev/null 2>&1 || true
+      fi
+      # Fall through to the enabled-but-unloaded recovery below (loaded-check +
+      # cooldown + bootstrap), which is now reachable because the job is enabled.
+      # Note: we re-enable IMMEDIATELY here (disabled -> enabled), so even in the
+      # rare case the cooldown gate below suppresses THIS poll's bootstrap, the
+      # NEXT poll sees a plain enabled-but-unloaded job and recovers it via the
+      # standard #2040 path — recovery is at worst deferred one poll, never lost.
+    else
+      emit_audit daemon_liveness_rebootstrap_skip_disabled \
+        --detail platform="launchd" \
+        --detail label="$REBOOTSTRAP_LABEL" \
+        --detail disabled_state="$disabled_state" \
+        --detail heartbeat_age_seconds="$age"
+      printf '[liveness] launchd job gui/%s/%s disabled-state=%s — skipping re-bootstrap (operator stop / cannot confirm enabled).\n' \
+        "$uid" "$REBOOTSTRAP_LABEL" "$disabled_state"
+      return 0
+    fi
   fi
   # If the job IS loaded, this is not the enabled-but-unloaded case — let the
   # normal skip path handle it (a loaded-but-no-pid job is launchd's to respawn).
@@ -365,6 +462,15 @@ maybe_rebootstrap_systemd() {
       ;;
     disabled|masked)
       # Operator/intentional stop. SKIP + audit, never re-enable.
+      # Issue #2055 note: unlike launchd (whose upgrade quiesce `disable`s the
+      # job, masquerading as an operator stop), bridge-upgrade.sh's systemd
+      # quiesce only `stop`s the unit — it never `disable`s/`mask`s it. So an
+      # INTERRUPTED systemd upgrade leaves the unit enabled+inactive, which the
+      # `enabled` arm below already recovers (reset-failed + start). A
+      # disabled/masked systemd unit is therefore always a genuine operator
+      # action here, and we keep the fail-closed skip — no quiesce-marker
+      # override on the systemd side is needed or wanted (it would risk fighting
+      # a real `systemctl --user disable`).
       emit_audit daemon_liveness_rebootstrap_skip_disabled \
         --detail platform="systemd" \
         --detail service="$svc" \

@@ -243,6 +243,19 @@ add_required 655-upgrade-launchd-quiesce-respawn
 # so any upgrade-restore or liveness-watcher edit re-runs both halves (incl. the
 # disabled-skip + enabled-but-unloaded-recover + mutation gates).
 add_required 2040-upgrade-restore-verify 2040-daemon-enabled-but-unloaded
+# Issue #2055: the quiesce-side follow-up to #2040. bridge-upgrade.sh now brackets
+# its #1820 quiesce window with a DURABLE intent marker
+# (state/upgrade/daemon-quiesce.intent, recording the upgrade pid) written at the
+# launchd disable / systemd stop and cleared on a successful restore (or a
+# deliberate fail-closed / --no-restart-daemon end-state), and its EXIT handler
+# re-enables the job on a catchable abort. The liveness watcher
+# (scripts/bridge-daemon-liveness.sh) reads that marker to tell an INTERRUPTED
+# upgrade disable (dead upgrade pid → re-enable + recover) from an operator stop
+# (no marker → stay down — the #2040 fail-closed contract) and from an in-flight
+# upgrade (live pid → defer). In the full static suite so any quiesce/restore/
+# EXIT-handler or liveness-discriminator edit re-runs the discriminator +
+# operator-stop-preserved + in-flight-defer + mutation gates.
+add_required 2055-interrupted-upgrade-reenable
 # Issue #1916: bridge_init_register_default_picker_sweep now migrates the legacy
 # text-kind picker-sweep cron to shell-kind FAIL-SAFE (recreate-first /
 # verify-before-delete) — the legacy row is deleted only after a shell row is
@@ -4931,6 +4944,13 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # backfill call cannot silently regress.
       if [[ "$path" == "bridge-upgrade.sh" ]]; then
         add_required 1923-askuserquestion-hard-ban
+        # Issue #2055: the quiesce window now writes/clears a durable
+        # quiesce-intent marker (and the EXIT handler re-enables the daemon on a
+        # catchable abort). Pull the interrupted-upgrade smoke on every
+        # bridge-upgrade.sh move so the marker write/clear lifecycle + the
+        # operator-stop-preserved + in-flight-defer discriminators stay exercised
+        # alongside the existing 655/1905/2040 quiesce/restore guards.
+        add_required 655-upgrade-launchd-quiesce-respawn 1905-upgrade-systemd-quiesce-respawn 2040-upgrade-restore-verify 2055-interrupted-upgrade-reenable
       fi
       add_integration integration-minimal
       ;;
@@ -6042,7 +6062,12 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # writes a recovery marker before restart. Pull the Track C smoke on every
       # liveness-watcher move so the stall-requires-old-requests guard, the
       # cross-poll witness, and the recovery-marker contract cannot regress.
-      add_required 1463-launchd-keepalive-singleton-thrash watchdog-silence-stderr-capture launch queue 1973c-liveness-recovery
+      # Issue #2040 Part B / #2055: the watcher recovers an enabled-but-unloaded
+      # daemon (#2040), and discriminates an INTERRUPTED-upgrade disable (recover)
+      # from an operator stop (stay down) via the upgrade's quiesce-intent marker
+      # (#2055). Pull both so a liveness-watcher move re-runs the operator-stop
+      # fail-closed + interrupted-upgrade-recover gates.
+      add_required 1463-launchd-keepalive-singleton-thrash watchdog-silence-stderr-capture launch queue 1973c-liveness-recovery 2040-daemon-enabled-but-unloaded 2055-interrupted-upgrade-reenable
       add_integration integration-minimal
       ;;
 
