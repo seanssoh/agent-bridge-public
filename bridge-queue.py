@@ -1602,7 +1602,15 @@ def cmd_create(args: argparse.Namespace) -> int:
     # handoff) the same one-tick redelivery-age-gate exemption the cross-agent
     # (receiver) path gets, so the daemon fast-wakes it on the next tick instead
     # of stranding it under the ~60s age gate until the slow periodic nudge.
-    post_fresh_arrival_marker(task_id)
+    # ★Scoped to the self/loopback case ONLY (actor == assigned_to): a normal
+    # cross-agent local task is delivered by the create-time push (#2046) and
+    # MUST stay under the ~60s age gate — posting the marker for *every* local
+    # enqueue would exempt every fresh task from both the age gate
+    # (nudge-task-age-gate) and the redundant-active-agent gate
+    # (nudge-redundant-active-agent). The loopback case is exactly the one whose
+    # create-time push may have spooled against a busy main pane.
+    if actor == args.assigned_to:
+        post_fresh_arrival_marker(task_id)
 
     if args.format == "shell":
         fields = {

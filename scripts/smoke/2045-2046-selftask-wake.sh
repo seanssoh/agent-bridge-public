@@ -35,7 +35,9 @@
 #       daemon-step then fast-wakes the fresh task on this tick.
 #   A2 (#2045 mutation): with the marker absent (writer reverted), the same
 #       fresh self-task is suppressed under the age gate.
-#   A3 (#2045): a cross-agent create ALSO posts the marker (parity).
+#   A3 (#2045): a cross-agent create does NOT post the marker — the marker is
+#       scoped to the loopback (actor==assigned_to) case, so #1014's age gate +
+#       the redundant-active-agent gate stay intact for normal local tasks.
 #   B1 (#2046): cmd_create fires the create-time push for a SELF-task.
 #   B2 (#2046 mutation): re-introducing the from!=to guard makes the SAME
 #       self-task skip the push.
@@ -160,11 +162,12 @@ smoke_run "A2 (#2045 mutation) marker absent -> fresh self-task suppressed (age 
     "A2 without the marker the fresh self-task is held by the ~60s age gate (mutation proof)"
 }
 
-smoke_run "A3 (#2045) cross-agent create also posts the marker (parity)" : ; {
+smoke_run "A3 (#2045) cross-agent create does NOT post the marker (loopback-scoped)" : ; {
   rm -rf "$FRESH_ARRIVAL_DIR"
   TID_A3="$(create_via_queue syrs-calendar other-agent 'cross-agent task')"
-  smoke_assert_file_exists "$FRESH_ARRIVAL_DIR/$TID_A3" \
-    "A3 cross-agent create posts the marker too (unchanged fast-wake parity)"
+  if [[ -e "$FRESH_ARRIVAL_DIR/$TID_A3" ]]; then
+    smoke_fail "A3 cross-agent create must NOT post the fresh-arrival marker — the marker is scoped to the loopback (actor==assigned_to) case; a cross-agent local task is delivered by the create-time push (#2046) and must stay under the ~60s age gate (#1014) + the redundant-active-agent gate (else nudge-task-age-gate / nudge-redundant-active-agent regress)"
+  fi
 }
 
 # ===========================================================================
