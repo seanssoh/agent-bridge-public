@@ -413,7 +413,9 @@ test_t8_ci_select_registration() {
   fi
   local arm_block
   arm_block="$(sed -n "${arm_start},${arm_end}p" "$CI_SELECT")"
-  if ! printf '%s\n' "$arm_block" | grep -q "$SMOKE_NAME"; then
+  # Pure-bash substring test (same SIGPIPE-under-pipefail reason as the req_block
+  # check below) — not `printf ... | grep -q`, not a here-string.
+  if [[ "$arm_block" != *"$SMOKE_NAME"* ]]; then
     smoke_fail "T8: '$SMOKE_NAME' not registered under the plugins/teams/* arm at lines $arm_start-$arm_end"
   fi
   # ALSO assert: the dedicated dedupe.ts arm exists (per the 4-site
