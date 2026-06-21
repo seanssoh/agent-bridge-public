@@ -68,6 +68,13 @@ def trusted_parent_agent() -> str:
 
 
 def default_workdir() -> Path:
+    # Prefer the bridge-injected agent workdir; the __file__-relative fallback
+    # only points at the agent workdir under the legacy in-workdir layout (not
+    # when bundled inside a shared plugin dir). default_root() prefers
+    # THREAD_SESSION_ROOT first, so this is the deep fallback.
+    env_wd = os.environ.get("CLAUDE_PROJECT_DIR")
+    if env_wd:
+        return Path(env_wd)
     return Path(__file__).resolve().parents[1]
 
 

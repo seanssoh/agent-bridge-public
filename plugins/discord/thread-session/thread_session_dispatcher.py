@@ -96,10 +96,24 @@ class Runtime:
 
 
 def default_workdir() -> Path:
+    # Prefer the bridge-injected agent workdir (CLAUDE_PROJECT_DIR). The
+    # __file__-relative fallback only resolves to the agent workdir when the
+    # scripts live inside it (the legacy syrs-calendar layout); once the
+    # dispatcher is bundled inside a shared plugin dir that fallback points at
+    # the plugin, not the agent — so the env var is the generalized source.
+    env_wd = os.environ.get("CLAUDE_PROJECT_DIR")
+    if env_wd:
+        return Path(env_wd)
     return Path(__file__).resolve().parents[1]
 
 
 def default_home(workdir: Path) -> Path:
+    # Prefer the agent home derived from the bridge-injected CLAUDE_CONFIG_DIR
+    # (= <agent home>/.claude), so the spawned claude leg authenticates with the
+    # owning agent's credentials. Fall back to the workdir-relative layout.
+    env_cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    if env_cfg:
+        return Path(env_cfg).parent
     return workdir.parent / "home"
 
 
@@ -1232,7 +1246,12 @@ def runtime_from_args(args: argparse.Namespace) -> Runtime:
     workdir = args.workdir.resolve()
     home = args.home.resolve()
     root = (args.root or (workdir / ".threads")).resolve()
-    config_dir = (args.config_dir or (home / ".claude")).resolve()
+    env_config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    config_dir = (
+        args.config_dir
+        or (Path(env_config_dir) if env_config_dir else None)
+        or (home / ".claude")
+    ).resolve()
     return Runtime(
         workdir=workdir,
         home=home,
