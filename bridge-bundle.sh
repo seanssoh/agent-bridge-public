@@ -237,9 +237,13 @@ PY
     bridge_queue_source_shell create --to "$target" --title "[handoff] $title" --from "$actor" --priority "$priority" --body-file "$task_body_path" --format shell
     run_python attach-task --shared-root "$shared_root" --bundle-id "$bundle_id" --task-id "$TASK_ID" --task-title "$TASK_TITLE" --task-priority "$TASK_PRIORITY" >/dev/null
 
-    if [[ "$target" != "$actor" ]]; then
-      bridge_dispatch_notification "$target" "$TASK_TITLE" "agb inbox ${target}" "$TASK_ID" "$priority" >/dev/null 2>&1 || true
-    fi
+    # Issue #2046: mirror cmd_create -- a self/loopback handoff bundle
+    # (target == actor) gets the create-time push too. The TARGET-session busy
+    # gate in bridge_tmux_send_and_submit (bridge_tmux_session_inject_busy)
+    # spools the nudge when the live caller is the target mid-turn, so removing
+    # the from!=to guard wakes an idle thread->main self-handoff in seconds
+    # without self-interrupting a busy session.
+    bridge_dispatch_notification "$target" "$TASK_TITLE" "agb inbox ${target}" "$TASK_ID" "$priority" >/dev/null 2>&1 || true
 
     if [[ $json_mode -eq 1 ]]; then
       run_python show --shared-root "$shared_root" --bundle-id "$bundle_id"

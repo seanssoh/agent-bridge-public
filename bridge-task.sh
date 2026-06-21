@@ -545,10 +545,37 @@ Bypass with --skip-companion-validate (or BRIDGE_TASK_SKIP_COMPANION_VALIDATE=1)
   bridge_queue_source_shell "${args[@]}" --format shell
   printf 'created task #%s for %s [%s] %s\n' "$TASK_ID" "$TASK_ASSIGNED_TO" "$TASK_PRIORITY" "$TASK_TITLE"
 
-  if [[ "$target" != "$actor" ]]; then
-    notice_message="agb inbox ${target}"
-    bridge_dispatch_notification "$target" "$TASK_TITLE" "$notice_message" "$TASK_ID" "$priority" >/dev/null 2>&1 || true
-  fi
+  # Issue #2046: the create-time push (the only seconds-latency wake path) must
+  # fire for a self/loopback task too, not only the cross-agent case. A Discord
+  # thread sub-session that enqueues a task to its OWN main session (thread->main
+  # handoff) is a loopback create (target == actor) that legitimately needs the
+  # wake -- guarding it off left it to the daemon's periodic nudge (minutes).
+  #
+  # The original `target != actor` guard existed to avoid an agent nudging
+  # ITSELF mid-turn into its own composer. That intent is preserved WITHOUT the
+  # guard: bridge_dispatch_notification -> bridge_tmux_send_and_submit gates on
+  # the TARGET session's live state (bridge_tmux_session_inject_busy -- pending
+  # composer input / Claude mid-turn "Working" banner / recent keypress on an
+  # attached pane). When the live caller IS the target session mid-turn, that
+  # gate reports busy and the nudge is spooled to the pending-attention queue
+  # (#132a) rather than typed into the live composer -- never a self-interrupt.
+  # When the target is idle (thread->main, a cron/subprocess producer, or a
+  # parked main session) the gate is clear and the push wakes it in seconds,
+  # restoring parity with the cross-agent path on the same proven busy/spool
+  # rails. So the safety is target-idle/busy, gated at push time, not a blanket
+  # from!=to suppression at create time.
+  #
+  # Bounded residual (carried over from the cross-agent path, NOT introduced
+  # here): bridge_tmux_session_inject_busy's mid-turn BANNER gate is Claude-only
+  # (lib/bridge-tmux.sh -- Codex handles its banner in its own submit path). So a
+  # Codex self-target that is mid-turn with a stale visible prompt line, no
+  # pending composer input, and no recent attached keypress can still take a live
+  # push. This pre-existing #1409-class gap already applies to every cross-agent
+  # push to a Codex target; making the self-task path reuse the identical rails
+  # neither widens nor narrows it. Closing it needs a Codex mid-turn detector
+  # (separate #1409-equivalent work), out of scope for this wake-latency fix.
+  notice_message="agb inbox ${target}"
+  bridge_dispatch_notification "$target" "$TASK_TITLE" "$notice_message" "$TASK_ID" "$priority" >/dev/null 2>&1 || true
 }
 
 cmd_inbox() {
