@@ -338,6 +338,11 @@ add_required 9780-stop-inbox-drain
 # cron tasks it owns/closes no longer wake the model. In the static suite and
 # pulled per-file below on hooks/* / bridge-queue.py / bridge-hooks.py moves.
 add_required 1596-stop-drain-cron-dispatch
+# Issue #2047: a non-consuming producer-only leg (BRIDGE_AGENT_LEG marker) skips
+# the consumer inbox-auto-drain Stop hook while a real consumer main session is
+# still told to drain. In the static suite and pulled per-file below on hooks/*
+# / bridge-queue.py / bridge-hooks.py moves.
+add_required 2047-producer-leg-drain-skip
 # #10222: A2A receiver backpressure must count currently OPEN tasks
 # (queued/claimed/blocked) by joining inbox_dedupe to tasks.db, not all-time
 # accepted rows. Keep this in the static suite and pull it on receiver changes.
@@ -1622,6 +1627,12 @@ select_for_path() {
       # to the find-open `--all` payload (title / created_by / status / id) or
       # the cron-dispatch SQL exclusions cannot silently break the filter.
       add_required 1596-stop-drain-cron-dispatch
+      # Issue #2047: the producer-leg drain-skip smoke drives the queue CLI to
+      # stage a genuinely-actionable row for both the producer and consumer
+      # legs. Pull 2047-producer-leg-drain-skip on every bridge-queue.py move so
+      # a create/claim/done payload change cannot silently make the producer-vs-
+      # consumer fixture vacuous.
+      add_required 2047-producer-leg-drain-skip
       # Issue #1792: bridge-queue.py's cmd_create now records an `origin`
       # attribution stamp (additive nullable column; cron:<run_id> from
       # BRIDGE_CRON_RUN_ID, else session:<id>) and cmd_show surfaces it. Pull
@@ -4386,6 +4397,16 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # block, never-block-when-empty), the #1199 queued-vs-claimed split, or the
       # Stop-chain ordering.
       add_required 9780-stop-inbox-drain
+      # Issue #2047: hooks/bridge_hook_common.py::compute_drain_decision now
+      # early-returns None for a non-consuming producer-only leg (the
+      # BRIDGE_AGENT_LEG marker via producer_only_leg()) so a producer sub-session
+      # that inherited the main's consumer Stop hooks + BRIDGE_AGENT_ID Stops
+      # quietly instead of looping on a drain it can't perform — while a real
+      # consumer main session is STILL told to drain. Pull
+      # 2047-producer-leg-drain-skip on every hooks/* / bridge-hooks.py move so a
+      # future patch cannot regress the producer-skip (false drain loop) OR the
+      # never-mis-skip-a-consumer invariant (dropped drain).
+      add_required 2047-producer-leg-drain-skip
       # Issue #2003: hooks/bridge_hook_common.py::_enqueue_handoff_pending now
       # shares the ATOMIC upsert-open handoff-task contract with bridge-run.sh's
       # restart wake (lib/bridge-state.sh bridge_run_handoff_task_find_or_create)
