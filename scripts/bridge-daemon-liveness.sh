@@ -226,11 +226,14 @@ rebootstrap_launchd_job_loaded() {
 }
 
 # Report the launchd disabled-state for $label. `launchctl print-disabled
-# gui/$uid` emits lines like `"<label>" => true` (disabled) / `"<label>" =>
-# false` (enabled). Prints one of:
-#   disabled — the label line says `=> true`
-#   enabled  — the label line says `=> false` (or, absent any line, the default
-#              is enabled — launchd only lists labels with an explicit override)
+# gui/$uid` emits a label line whose value is the disabled flag. Modern macOS
+# prints `"<label>" => disabled` / `"<label>" => enabled`; older releases print
+# `=> true` (disabled) / `=> false` (enabled). The grep below matches BOTH the
+# real `disabled` word and the legacy `true` (defensive). Prints one of:
+#   disabled — the label line says `=> disabled` (or legacy `=> true`)
+#   enabled  — the label line says `=> enabled` (or legacy `=> false`; or, absent
+#              any line, the default is enabled — launchd only lists labels with
+#              an explicit override)
 #   unknown  — `print-disabled` itself failed (domain unreachable / unsupported)
 # We FAIL CLOSED on `unknown`: the caller skips recovery, because we cannot prove
 # the job is NOT operator-disabled, and the operator-stop guarantee outranks

@@ -1467,10 +1467,13 @@ _bridge_upgrade_launchd_transient_err() {
     *"Input/output error"*)           return 0 ;;
     *) ;;
   esac
-  # EIO numeric form ("... error 5" / "(os/kern) ... 5"): retry. Match the bare
-  # ` 5` / `=5` shapes launchctl uses for errno/mach return codes.
+  # EIO numeric form: retry. Anchor to the errno/mach-code SHAPES launchctl
+  # actually emits ("error 5" / "errno 5" / "Bootstrap failed: 5:" / "(os/kern)
+  # ... 5" / "=5"), NOT a bare ` 5` substring (which would false-match any
+  # unrelated " 5" in a label/path). The textual EIO is already caught above;
+  # this is a backstop and the verify + loud-WARN is the ultimate backstop.
   case "$err" in
-    *" 5"|*" 5 "*|*"= 5"*|*"=5"*|*": 5"*) return 0 ;;
+    *"error 5"*|*"errno 5"*|*": 5:"*|*"=5"*|*"= 5"*|*"(os/kern)"*" 5"*) return 0 ;;
   esac
   return 1
 }
