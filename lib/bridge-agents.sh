@@ -6931,14 +6931,19 @@ bridge_merge_channels_csv() {
 # Explicit suffixes (e.g. `plugin:teams@cosmax-marketplace`) are never
 # rewritten — `bridge_qualify_channel_item` only consults this table for names
 # that arrive without `@<marketplace>`.
+#
+# Task #12033: `discord` is now vendored as a bridge-official plugin
+# (plugins/discord/, see `.claude-plugin/marketplace.json`) and resolves to
+# the local `agent-bridge` marketplace, exactly like `teams`. `telegram`
+# remains the lone built-in still sourced from `claude-plugins-official`.
 bridge_builtin_plugin_marketplace() {
   local plugin_name="${1-}"
 
   case "$plugin_name" in
-    discord|telegram)
+    telegram)
       printf '%s' "claude-plugins-official"
       ;;
-    teams|ms365|mattermost)
+    discord|teams|ms365|mattermost)
       printf '%s' "agent-bridge"
       ;;
     *)
