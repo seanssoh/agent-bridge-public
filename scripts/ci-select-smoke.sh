@@ -2978,7 +2978,16 @@ select_for_path() {
       # silently refuse after upgrade. Pull 1943-cron-unmodeled-warn-on-upgrade
       # on every runner move so a precedence/gate change can't drift the warning
       # away from the gate it predicts.
-      add_required cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner cron-runner-schema-openai-strict cron-path-augmentation-874 queue beta5-2-eta-cron-iso-uid-preflight 1359-cron-create-iso-staging 1379-iso-cron-staging-group 1383-iso-cron-result-json-group 8807-cron-backfill-coalesce 1459-cron-dispatch-recovery 1659-cron-status-walk-perf 1677-cron-summary-short-derive 1792-cron-scope-fence 1875-cron-prod-mutation-guard 1843-cron-consecutive-failure-escalation 1826-cron-at-naive-tz 1842-cron-tamper-iso-groupwrite 1880-cron-explicit-model 1943-cron-unmodeled-warn-on-upgrade
+      # Issue #2029: bridge-cron-runner.py's run_claude now injects the
+      # disposable-child containment guard (hooks/cron-child-guard.py) as a
+      # PreToolUse Bash deny hook via a per-request `--settings` overlay
+      # (cron_child_guard_settings_overlay). Pull 2029-cron-child-relay-guard on
+      # every runner move so a future PR cannot drop the --settings injection,
+      # widen the overlay beyond the scoped PreToolUse Bash hook (leaking into
+      # interactive/global settings), or regress the deny/allow matrix that keeps
+      # a cron child from reading channel creds, direct-sending to a human, or
+      # mutating out-of-run queue tasks.
+      add_required cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner cron-runner-schema-openai-strict cron-path-augmentation-874 queue beta5-2-eta-cron-iso-uid-preflight 1359-cron-create-iso-staging 1379-iso-cron-staging-group 1383-iso-cron-result-json-group 8807-cron-backfill-coalesce 1459-cron-dispatch-recovery 1659-cron-status-walk-perf 1677-cron-summary-short-derive 1792-cron-scope-fence 1875-cron-prod-mutation-guard 1843-cron-consecutive-failure-escalation 1826-cron-at-naive-tz 1842-cron-tamper-iso-groupwrite 1880-cron-explicit-model 1943-cron-unmodeled-warn-on-upgrade 2029-cron-child-relay-guard
       add_integration integration-minimal
       ;;
 
@@ -4462,7 +4471,13 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # / lib/bridge-hooks.sh move so a future patch cannot regress the guard
       # ordering, the realpath comparison, the operator-global-stays-a-regular-
       # file teeth, or the normal-agent no-regression path.
-      add_required 1981-operator-global-hijack-guard 2007-codex-hook-trust
+      # Issue #2029: hooks/cron-child-guard.py is the disposable-cron-child
+      # PreToolUse containment guard the runner injects via --settings. Pull
+      # 2029-cron-child-relay-guard on every hooks/* move so a future patch cannot
+      # regress the channel-cred-read / direct-send deny matrix or the in-run
+      # queue-scope carve-outs (in-run cron-origin allowed, delegation create
+      # allowed, body-quote not a mutation).
+      add_required 1981-operator-global-hijack-guard 2007-codex-hook-trust 2029-cron-child-relay-guard
       add_integration integration-minimal
       ;;
 
