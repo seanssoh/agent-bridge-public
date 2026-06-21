@@ -115,6 +115,36 @@ On first boot, Claude Code loads the Discord plugin from the local
 handles the managed startup so the channel attaches without manual plugin
 menu steps.
 
+## Migrating an Already-Provisioned Discord Channel
+
+Earlier builds sourced Discord from the upstream `claude-plugins-official`
+marketplace, so an existing agent may carry the explicit token
+`plugin:discord@claude-plugins-official` in its roster. The vendored build
+serves Discord from the local `agent-bridge` marketplace instead.
+
+Agent Bridge migrates this automatically — it does **not** double-register.
+Any channel mutation that touches the agent's channel set (`setup discord`,
+`agent update --channels…`, or a roster normalize at launch) rewrites the
+stale `plugin:discord@claude-plugins-official` token **in place** to
+`plugin:discord@agent-bridge` and de-duplicates, so the agent never ends up
+with both. The rewrite is idempotent and leaves any operator-pinned
+marketplace (e.g. `plugin:discord@your-fork`) untouched.
+
+For an install that is already provisioned, the supported path is:
+
+```bash
+# Re-runs the readiness pass on the migrated agent-bridge token and
+# rewrites the launch command. Safe to re-run; nothing double-registers.
+agb setup discord <agent>
+agb agent restart <agent>
+```
+
+No manual edit of the roster CSV is needed, and there is no separate reseed
+step — the `setup discord` + restart above is the whole migration. If you
+prefer, a bare `agent restart` after any channel-set update also converges
+the token, because the launch-time roster normalize applies the same
+migration.
+
 ## Pairing and Allowlist
 
 The Discord allowlist is **snowflake**-based, not email-based. Enable

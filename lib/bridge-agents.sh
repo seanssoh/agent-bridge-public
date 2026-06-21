@@ -6952,6 +6952,70 @@ bridge_builtin_plugin_marketplace() {
   esac
 }
 
+# Task #12033 (discord vendoring): an EXPLICITLY-suffixed channel token for a
+# built-in plugin that has since been vendored to the `agent-bridge`
+# marketplace must be migrated off its old `claude-plugins-official` pin —
+# otherwise an already-provisioned agent that carries
+# `plugin:discord@claude-plugins-official` keeps the old plugin AND gains
+# `plugin:discord@agent-bridge` on the next `setup discord` (double-registered,
+# two MCP servers for one channel). This rewrites the stale pin in place; it
+# does NOT touch operator-pinned non-default marketplaces (e.g.
+# `plugin:discord@my-private-fork`) — only the specific
+# `@claude-plugins-official` → canonical (`agent-bridge`) transition for the
+# vendored built-in set. Idempotent: a token already on the canonical
+# marketplace, or a non-built-in / unsuffixed token, is returned unchanged.
+bridge_migrate_builtin_channel_marketplace() {
+  local item="${1-}"
+  local plugin_name=""
+  local marketplace=""
+  local canonical=""
+
+  item="$(bridge_trim_whitespace "$item")"
+  [[ "$item" == plugin:*@* ]] || {
+    printf '%s' "$item"
+    return 0
+  }
+
+  plugin_name="${item#plugin:}"
+  marketplace="${plugin_name#*@}"
+  plugin_name="${plugin_name%%@*}"
+  canonical="$(bridge_builtin_plugin_marketplace "$plugin_name")"
+
+  # Only rewrite the legacy official pin for a built-in whose canonical home is
+  # now a non-official marketplace (the vendoring transition). Leave any other
+  # explicit marketplace — including operator forks — untouched.
+  if [[ -n "$canonical" \
+      && "$canonical" != "claude-plugins-official" \
+      && "$marketplace" == "claude-plugins-official" ]]; then
+    printf 'plugin:%s@%s' "$plugin_name" "$canonical"
+    return 0
+  fi
+
+  printf '%s' "$item"
+}
+
+# Walk a channel CSV and migrate any stale-marketplace built-in token to its
+# canonical marketplace, de-duplicating so the rewrite cannot leave both the
+# old and the new token side by side (the double-registration the migration
+# exists to prevent). Used by the CSV merge / normalize paths so every channel
+# mutation converges old installs onto the vendored marketplace.
+bridge_migrate_builtin_marketplaces_csv() {
+  local csv="${1-}"
+  local out=""
+  local item=""
+  local -a items=()
+
+  IFS=',' read -r -a items <<<"$csv"
+  for item in "${items[@]}"; do
+    item="$(bridge_trim_whitespace "$item")"
+    [[ -n "$item" ]] || continue
+    item="$(bridge_migrate_builtin_channel_marketplace "$item")"
+    out="$(bridge_append_csv_unique "$out" "$item")"
+  done
+
+  printf '%s' "$out"
+}
+
 bridge_qualify_channel_item() {
   local item="${1-}"
   local plugin_name=""
@@ -7008,6 +7072,12 @@ bridge_normalize_channels_csv() {
   IFS=',' read -r -a chunks <<<"$raw"
   for chunk in "${chunks[@]}"; do
     item="$(bridge_qualify_channel_item "$chunk")"
+    # Task #12033: converge a stale `@claude-plugins-official` pin of a vendored
+    # built-in onto its canonical marketplace so a roster that still carries the
+    # old discord token resolves to `@agent-bridge` on every normalize — not
+    # only after an explicit `setup discord`. No-op for already-canonical or
+    # operator-pinned tokens. De-dup is handled by the append-unique below.
+    item="$(bridge_migrate_builtin_channel_marketplace "$item")"
     normalized="$(bridge_append_csv_unique "$normalized" "$item")"
   done
 

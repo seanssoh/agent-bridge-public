@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
-"""louis-egress — single-point external egress relay for the one Louis.
+"""thread-egress — single-point external egress relay for the channel-owning agent.
 
-thread-session v2, Pillar 2 (spec: shared/reports/2026-06-20-thread-session-v2-recall-egress-spec.md).
+thread-session v2, Pillar 2.
 
 A thread sub-session must NOT send anything outside its own thread directly
 (no agent-bridge A2A, no send helpers). Instead it `queue`s a structured egress
-*intent*. The main Louis session `drain`s pending intents, performs the real
-external action (risk-routed), and `resolve`s each with a result. The dispatcher
-primes resolved results back into the thread on its next turn (`results --ack`),
-so external-bound content is always synced through the single main voice.
+*intent*. The main (channel-owning) session `drain`s pending intents, performs
+the real external action (risk-routed), and `resolve`s each with a result. The
+dispatcher primes resolved results back into the thread on its next turn
+(`results --ack`), so external-bound content is always synced through the single
+main voice.
 
 This solves the guard false-positive (the child never runs an external-send
 command) AND lets the guard harden to deny all child transport. Plain code.
 
 Invariant: risk=gated intents (sends / money / publish / campaign / delegation)
-still require Sean/Myo approval when the main session drains them — the relay is
+still require operator approval when the main session drains them — the relay is
 a mechanism, never an approval bypass.
 
 Subcommands: queue | drain | resolve | results
@@ -169,7 +170,7 @@ def cmd_results(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="External egress relay for the one Louis (child queues, main sends).")
+    p = argparse.ArgumentParser(description="External egress relay for the channel-owning agent (child queues, main sends).")
     p.add_argument("--root", type=Path, default=None)
     sub = p.add_subparsers(dest="command", required=True)
 

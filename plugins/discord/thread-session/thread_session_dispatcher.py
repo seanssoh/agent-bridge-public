@@ -29,7 +29,7 @@ CURRENT_SCHEMA_VERSION = 2
 # default — if neither is set the dispatcher fails closed rather than guess.
 DEFAULT_TRANSPORT = "discord"
 DEFAULT_ADAPTER_VERSION = "thread-session-v3.1-local"
-DEFAULT_TOKEN_THRESHOLD = 400_000  # Opus 1M context: compact ~400k (generous headroom, infrequent). bytes/4 estimate; CJK real ~1.5x → worst-case ~600k, still <1M. Per Sean 2026-06-19.
+DEFAULT_TOKEN_THRESHOLD = 400_000  # Opus 1M context: compact ~400k (generous headroom, infrequent). bytes/4 estimate; CJK real ~1.5x → worst-case ~600k, still <1M.
 TOKEN_BYTES = 4
 LOCK_STALE_SECONDS = 30 * 60
 DISPATCH_WAIT_SECONDS = 180  # rapid same-thread messages serialize: wait for the in-flight dispatch instead of rejecting
@@ -98,7 +98,7 @@ class Runtime:
 def default_workdir() -> Path:
     # Prefer the bridge-injected agent workdir (CLAUDE_PROJECT_DIR). The
     # __file__-relative fallback only resolves to the agent workdir when the
-    # scripts live inside it (the legacy syrs-calendar layout); once the
+    # scripts live inside it (the legacy per-agent-workdir layout); once the
     # dispatcher is bundled inside a shared plugin dir that fallback points at
     # the plugin, not the agent — so the env var is the generalized source.
     env_wd = os.environ.get("CLAUDE_PROJECT_DIR")
@@ -715,7 +715,7 @@ def identity_prompt(rt: Runtime) -> str:
     # Recall + producer shims are bundled alongside this dispatcher (inside the
     # plugin's thread-session/ dir), not in the per-agent workdir — resolve them
     # relative to this file so any Discord agent can use them.
-    recall = Path(__file__).resolve().parent / "louis_recall.py"
+    recall = Path(__file__).resolve().parent / "thread_recall.py"
     producer = TASK_CREATE_SCRIPT
     agent_id = resolve_parent_agent()
     return (

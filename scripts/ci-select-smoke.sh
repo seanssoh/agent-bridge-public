@@ -1554,6 +1554,28 @@ select_for_path() {
       add_integration integration-minimal
       ;;
 
+    plugins/discord/server.ts|plugins/discord/thread-session/*)
+      # Task #12033 (vendored bridge-official Discord plugin, generalized
+      # thread-session). Two source-coupled contracts the 12033 smoke pins
+      # (it also drives the bundled guard + dispatcher `selftest`
+      # subcommands so the fail-closed guard stays green on every touch):
+      #   * Thread-as-session WORKDIR BINDING: server.ts forwards the
+      #     channel-owning agent's workdir/home/config-dir to
+      #     thread_session_dispatcher.py (--workdir/--home/--config-dir) so
+      #     the spawned thread leg cwd's into <agent-workdir>/.threads and
+      #     --add-dir's the agent workdir — NOT the plugin dir (the
+      #     __file__-relative fallback). The smoke dry-runs the dispatcher
+      #     and asserts the binding both directions (positive + plugin-dir
+      #     regression guard + fail-closed-without-parent-agent).
+      #   * Thread GUARD fail-closed: thread_session_guard.py applies the
+      #     protected-path/category denies BEFORE the /tmp|$TMPDIR write
+      #     carve-out, so a thread leg cannot write transport creds / SOUL /
+      #     CLAUDE / .claude settings / .threads control state even when the
+      #     agent workdir lives under a tmp-like root.
+      add_required 12033-discord-thread-session-workdir-binding
+      add_integration integration-minimal
+      ;;
+
     bridge-queue.py|bridge-task.sh|bridge-audit.py)
       # Issue #1014 A: bridge-queue.py's daemon idle-nudge now gates the
       # ACTION REQUIRED nudge on task-queued age so a freshly-pushed task

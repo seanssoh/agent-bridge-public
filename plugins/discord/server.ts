@@ -75,7 +75,38 @@ const THREAD_SESSION_DISPATCHER =
   join(PLUGIN_DIR, 'thread-session', 'thread_session_dispatcher.py')
 const THREAD_SESSION_TIMEOUT_MS = Number(process.env.DISCORD_THREAD_SESSION_TIMEOUT_MS ?? 10 * 60 * 1000)
 const THREAD_SESSION_MAX_BUFFER = Number(process.env.DISCORD_THREAD_SESSION_MAX_BUFFER ?? 256 * 1024)
-// Louis channel auto-session: threads under this parent channel get auto-registered on first message.
+
+// Bind the thread sub-session to the CHANNEL-OWNING agent's workspace, not the
+// plugin dir. The bridge launch envelope inlines the owning agent's workdir,
+// identity home, and Claude config dir; we forward them explicitly to the
+// dispatcher (--workdir/--home/--config-dir) so the spawned thread leg seeds
+// SOUL/CLAUDE + transcript from the owning agent and writes its .threads runtime
+// under the agent workdir — NOT plugins/discord/.threads (the dispatcher's
+// __file__-relative fallback when no agent workspace is resolvable). Without
+// these the dispatcher would cwd into the plugin dir and --add-dir the plugin,
+// mis-attributing the thread leg's identity and runtime.
+//   BRIDGE_AGENT_WORKDIR_RESOLVED — scalar alias the bridge exports for the
+//     owning agent's workdir (the bare BRIDGE_AGENT_WORKDIR name collides with a
+//     bash assoc-array, see bridge-run.sh #1497); CLAUDE_PROJECT_DIR is Claude
+//     Code's own project-dir signal and is the secondary source.
+//   BRIDGE_AGENT_HOME_RESOLVED — owning agent's identity home (v2-aware).
+//   CLAUDE_CONFIG_DIR — owning agent's <home>/.claude (so the thread leg's
+//     claude binary authenticates as the owning agent).
+function firstNonEmptyEnv(...keys: string[]): string {
+  for (const key of keys) {
+    const val = (process.env[key] ?? '').trim()
+    if (val) return val
+  }
+  return ''
+}
+const THREAD_OWNER_WORKDIR = firstNonEmptyEnv(
+  'BRIDGE_AGENT_WORKDIR_RESOLVED',
+  'BRIDGE_AGENT_WORKDIR',
+  'CLAUDE_PROJECT_DIR',
+)
+const THREAD_OWNER_HOME = firstNonEmptyEnv('BRIDGE_AGENT_HOME_RESOLVED', 'BRIDGE_AGENT_HOME')
+const THREAD_OWNER_CONFIG_DIR = firstNonEmptyEnv('CLAUDE_CONFIG_DIR')
+// Thread auto-session: threads under this parent channel get auto-registered on first message.
 // Set DISCORD_THREAD_AUTO_SESSION_CHANNEL_ID per-agent to the parent channel snowflake to enable.
 const THREAD_AUTO_SESSION_CHANNEL_ID = process.env.DISCORD_THREAD_AUTO_SESSION_CHANNEL_ID ?? ''
 const execFileAsync = promisify(execFile)
@@ -534,7 +565,14 @@ async function maybeHandleThreadSession(msg: Message, content: string, atts: str
   // auto-dispatches, and the dispatcher does get_or_create_thread on first call.
   if (THREAD_AUTO_SESSION_CHANNEL_ID === '' || parentId !== THREAD_AUTO_SESSION_CHANNEL_ID) return false
 
-  const args = [
+  // Top-level binding args MUST precede the `dispatch` subcommand (argparse
+  // attaches --workdir/--home/--config-dir to the main parser). They bind the
+  // spawned thread leg to the channel-owning agent's workspace.
+  const args: string[] = []
+  if (THREAD_OWNER_WORKDIR) args.push('--workdir', THREAD_OWNER_WORKDIR)
+  if (THREAD_OWNER_HOME) args.push('--home', THREAD_OWNER_HOME)
+  if (THREAD_OWNER_CONFIG_DIR) args.push('--config-dir', THREAD_OWNER_CONFIG_DIR)
+  args.push(
     'dispatch',
     '--json',
     '--thread-id', threadId,
@@ -544,7 +582,7 @@ async function maybeHandleThreadSession(msg: Message, content: string, atts: str
     '--message-id', msg.id,
     '--user', msg.author.username,
     '--message', content,
-  ]
+  )
   for (const att of atts) args.push('--attachment-meta', att)
 
   try {

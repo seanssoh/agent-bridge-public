@@ -409,6 +409,12 @@ bridge_setup_add_agent_channel() {
 
   channel="$(bridge_qualify_channel_item "$channel")"
   current="$(bridge_agent_channels_csv "$agent")"
+  # Task #12033: migrate any stale `@claude-plugins-official` pin of a vendored
+  # built-in (e.g. discord) onto its canonical marketplace BEFORE merging the
+  # new token, so `setup discord` REPLACES the old plugin instead of leaving the
+  # agent double-registered (`plugin:discord@claude-plugins-official` AND
+  # `plugin:discord@agent-bridge`). Idempotent across reruns.
+  current="$(bridge_migrate_builtin_marketplaces_csv "$current")"
   merged="$(bridge_merge_channels_csv "$current" "$channel")"
   bridge_setup_write_local_assoc "BRIDGE_AGENT_CHANNELS" "$agent" "$merged" >/dev/null
   BRIDGE_AGENT_CHANNELS["$agent"]="$merged"

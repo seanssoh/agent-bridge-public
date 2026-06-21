@@ -26,8 +26,8 @@ fi
 # downstream `setup ms365` and `agent start` failed the bridge-owned
 # plugin-manifest gate. The fix lifts the per-plugin case into a small
 # canonical table (`bridge_builtin_plugin_marketplace`) consulted by the
-# qualifier, so the full built-in set (discord/telegram →
-# @claude-plugins-official; teams/ms365/mattermost → @agent-bridge) gets the
+# qualifier, so the full built-in set (telegram → @claude-plugins-official;
+# discord/teams/ms365/mattermost → @agent-bridge) gets the
 # same resolution, and every caller of `bridge_qualify_channel_item` (the
 # central normalizer, explicit roster channels, dev-channel filtering, the
 # launch diagnostics in `bridge_agent_launch_cmd*`) sees the canonical form.
@@ -40,7 +40,8 @@ fi
 #   T1.  `bridge_qualify_channel_item plugin:teams`     → plugin:teams@agent-bridge
 #   T2.  `bridge_qualify_channel_item plugin:ms365`     → plugin:ms365@agent-bridge
 #   T3.  `bridge_qualify_channel_item plugin:mattermost`→ plugin:mattermost@agent-bridge
-#   T4.  `bridge_qualify_channel_item plugin:discord`   → plugin:discord@claude-plugins-official
+#   T4.  `bridge_qualify_channel_item plugin:discord`   → plugin:discord@agent-bridge
+#         (Task #12033: discord vendored to the agent-bridge marketplace)
 #   T5.  `bridge_qualify_channel_item plugin:telegram`  → plugin:telegram@claude-plugins-official
 #   T6.  `bridge_qualify_channel_item plugin:teams@cosmax-marketplace`
 #         → plugin:teams@cosmax-marketplace (explicit suffix preserved)
@@ -61,7 +62,7 @@ fi
 #   T11. `bridge_builtin_plugin_marketplace teams`      → agent-bridge
 #   T12. `bridge_builtin_plugin_marketplace ms365`      → agent-bridge
 #   T13. `bridge_builtin_plugin_marketplace mattermost` → agent-bridge
-#   T14. `bridge_builtin_plugin_marketplace discord`    → claude-plugins-official
+#   T14. `bridge_builtin_plugin_marketplace discord`    → agent-bridge
 #   T15. `bridge_builtin_plugin_marketplace telegram`   → claude-plugins-official
 #   T16. `bridge_builtin_plugin_marketplace unknown`    → "" (no mapping)
 #
@@ -121,8 +122,10 @@ test_qualify_mattermost() {
 test_qualify_discord() {
   local out
   out="$(bridge_qualify_channel_item "plugin:discord")"
-  smoke_assert_eq "plugin:discord@claude-plugins-official" "$out" \
-    "T4 plugin:discord resolves to @claude-plugins-official"
+  # Task #12033: discord is now a vendored bridge-official plugin resolving to
+  # the local agent-bridge marketplace (mirrors teams/ms365/mattermost).
+  smoke_assert_eq "plugin:discord@agent-bridge" "$out" \
+    "T4 plugin:discord resolves to @agent-bridge"
 }
 
 test_qualify_telegram() {
@@ -200,8 +203,9 @@ test_table_mattermost() {
 test_table_discord() {
   local out
   out="$(bridge_builtin_plugin_marketplace "discord")"
-  smoke_assert_eq "claude-plugins-official" "$out" \
-    "T14 table discord → claude-plugins-official"
+  # Task #12033: discord vendored to the agent-bridge marketplace.
+  smoke_assert_eq "agent-bridge" "$out" \
+    "T14 table discord → agent-bridge"
 }
 
 test_table_telegram() {
@@ -215,6 +219,31 @@ test_table_unknown() {
   local out
   out="$(bridge_builtin_plugin_marketplace "unknown-builtin")"
   smoke_assert_eq "" "$out" "T16 table unknown → empty (no mapping)"
+}
+
+# Task #12033: stale-marketplace migration for vendored built-ins. An existing
+# install carrying the explicit legacy `plugin:discord@claude-plugins-official`
+# token must be REPLACED with `plugin:discord@agent-bridge` (not appended), so a
+# re-provision cannot leave the agent double-registered.
+test_migrate_discord_official_pin() {
+  local out
+  out="$(bridge_migrate_builtin_channel_marketplace "plugin:discord@claude-plugins-official")"
+  smoke_assert_eq "plugin:discord@agent-bridge" "$out" \
+    "T17 migrate plugin:discord@claude-plugins-official → @agent-bridge"
+}
+
+test_migrate_preserves_operator_fork() {
+  local out
+  out="$(bridge_migrate_builtin_channel_marketplace "plugin:discord@my-private-fork")"
+  smoke_assert_eq "plugin:discord@my-private-fork" "$out" \
+    "T18 migrate leaves operator-pinned marketplace untouched"
+}
+
+test_migrate_csv_collapses_double_register() {
+  local out
+  out="$(bridge_migrate_builtin_marketplaces_csv "plugin:discord@claude-plugins-official,plugin:discord@agent-bridge,plugin:ms365@agent-bridge")"
+  smoke_assert_eq "plugin:discord@agent-bridge,plugin:ms365@agent-bridge" "$out" \
+    "T19 migrate CSV collapses old+new discord to a single @agent-bridge token"
 }
 
 main() {
@@ -234,6 +263,9 @@ main() {
   smoke_run "T14 table discord"            test_table_discord
   smoke_run "T15 table telegram"           test_table_telegram
   smoke_run "T16 table unknown"            test_table_unknown
+  smoke_run "T17 migrate discord official pin → agent-bridge" test_migrate_discord_official_pin
+  smoke_run "T18 migrate preserves operator fork"            test_migrate_preserves_operator_fork
+  smoke_run "T19 migrate CSV collapses double-register"      test_migrate_csv_collapses_double_register
   smoke_log "passed"
 }
 
