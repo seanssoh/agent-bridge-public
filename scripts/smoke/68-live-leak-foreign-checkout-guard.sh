@@ -185,7 +185,12 @@ LOAD_ROSTER_LN="$(grep -nE '^[[:space:]]*bridge_load_roster$' "$DAEMON" | head -
 # -> bridge_init_dirs creates state/logs/runtime/shared. This is the real
 # dispatch (proves wiring) and never touches the operator's live home.
 # ---------------------------------------------------------------------------
-STAGE="$SMOKE_TMP_ROOT/stage"   # under SMOKE_TMP_ROOT (mktemp) => transient source
+# Stage the source under a .claude/worktrees/ path so it classifies transient
+# REGARDLESS of $TMPDIR — GitHub Actions sets TMPDIR=/home/runner/work/_temp
+# (RUNNER_TEMP), not /tmp, so a bare "$SMOKE_TMP_ROOT/stage" would be persistent
+# on CI and the guard would (wrongly) allow it. The */.claude/worktrees/* glob
+# matches anywhere; this also mirrors a real Agent-tool fixer worktree.
+STAGE="$SMOKE_TMP_ROOT/.claude/worktrees/agent-68/stage"
 mkdir -p "$STAGE/scripts"
 cp "$SMOKE_REPO_ROOT/bridge-daemon.sh" "$SMOKE_REPO_ROOT/bridge-lib.sh" "$STAGE/"
 [[ -f "$SMOKE_REPO_ROOT/VERSION" ]] && cp "$SMOKE_REPO_ROOT/VERSION" "$STAGE/"
