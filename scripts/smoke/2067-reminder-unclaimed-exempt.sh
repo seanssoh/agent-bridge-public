@@ -254,14 +254,9 @@ ESCALATION_TITLE_PREFIX="[blocked-escalation] task #"
 # Cross-check the title prefixes against bridge-queue.py's source-of-truth
 # constants so a constant rename can't silently desync this smoke from the
 # emit path.
-src_reminder_prefix="$(python3 - "$QUEUE" <<'PY'
-import re, sys
-with open(sys.argv[1], encoding="utf-8") as f:
-    src = f.read()
-m = re.search(r'BLOCKED_REMINDER_TITLE_PREFIX\s*=\s*"([^"]*)"', src)
-print(m.group(1) if m else "")
-PY
-)"
+# grep/sed (NOT a python-heredoc-in-capture: footgun #11 deadlock class) —
+# extract the BLOCKED_REMINDER_TITLE_PREFIX literal straight from the source.
+src_reminder_prefix="$(grep -oE 'BLOCKED_REMINDER_TITLE_PREFIX[[:space:]]*=[[:space:]]*"[^"]*"' "$QUEUE" | head -n1 | sed -E 's/.*=[[:space:]]*"([^"]*)".*/\1/')"
 [[ "$src_reminder_prefix" == "$REMINDER_TITLE_PREFIX" ]] \
   || smoke_fail "precondition: BLOCKED_REMINDER_TITLE_PREFIX desynced: got '$src_reminder_prefix' want '$REMINDER_TITLE_PREFIX'"
 
@@ -364,23 +359,9 @@ smoke_run "M removing the exemption re-escalates the reminder (non-vacuous)" : ;
   mut_filter="$mut_helper_dir/unclaimed-task-filter.py"
   # Strip the created_by/title skip block (the `continue` that exempts the
   # daemon reminder). Anchor on the distinctive `== "daemon"` guard.
-  if ! python3 - "$real_filter" "$mut_filter" <<'PY'; then
-import re, sys
-src = open(sys.argv[1], encoding="utf-8").read()
-# Remove the multi-line `if (r.get("created_by") ... startswith(...)):\n continue`
-# exemption block.
-pattern = re.compile(
-    r'\n        if \(r\.get\("created_by"\) or ""\) == "daemon" and str\(\n'
-    r'            r\.get\("title"\) or ""\n'
-    r'        \)\.startswith\(BLOCKED_REMINDER_TITLE_PREFIX\):\n'
-    r'            continue\n'
-)
-new, n = pattern.subn("\n", src)
-if n != 1:
-    sys.stderr.write(f"mutation: expected to strip 1 exemption block, stripped {n}\n")
-    sys.exit(3)
-open(sys.argv[2], "w", encoding="utf-8").write(new)
-PY
+  # Standalone fixture (NOT an inline interpreter heredoc — footgun #11):
+  if ! python3 "$REPO_ROOT/scripts/smoke/2067-reminder-unclaimed-exempt-mutate.py" \
+       "$real_filter" "$mut_filter"; then
     smoke_fail "M precondition: failed to strip the helper exemption block"
   fi
   # Confirm the mutated helper still compiles and no longer skips on daemon-origin.
@@ -400,12 +381,15 @@ PY
   # the M reminder we create.
   leftover_json="$(python3 "$QUEUE" find-open --agent "$TARGET" --status-filter queued --all --format json 2>/dev/null | head -n1)"
   [[ -n "$leftover_json" ]] || leftover_json="[]"
-  while IFS= read -r lid; do
+  # var-capture (NOT a `< <(procsub)` — lint-heredoc-ban H3); ids are integers
+  # so plain word-splitting is safe here.
+  leftover_ids="$(python3 -c 'import json,sys
+for r in json.loads(sys.argv[1] or "[]"):
+    print(r["id"])' "$leftover_json")"
+  for lid in $leftover_ids; do
     [[ "$lid" =~ ^[0-9]+$ ]] || continue
     python3 "$QUEUE" cancel "$lid" --actor smoke --note "M isolation" >/dev/null 2>&1 || true
-  done < <(python3 -c 'import json,sys
-for r in json.loads(sys.argv[1] or "[]"):
-    print(r["id"])' "$leftover_json")
+  done
 
   : >"$AUDIT_LOG"
   mut_reminder_id="$(queue_aged_task "$TARGET" daemon "${REMINDER_TITLE_PREFIX}9003 needs status refresh")"
