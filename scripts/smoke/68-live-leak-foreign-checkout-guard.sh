@@ -54,11 +54,12 @@ DAEMON="$SMOKE_REPO_ROOT/bridge-daemon.sh"
 smoke_assert_file_exists "$LIB" "bridge-lib.sh present"
 smoke_assert_file_exists "$DAEMON" "bridge-daemon.sh present"
 
-# Belt-and-suspenders: even the pure-function subshells must never default
-# BRIDGE_HOME to the operator's live runtime. Pin it at a sandbox up front.
-smoke_make_temp_root "68-guard"
-export BRIDGE_HOME="$SMOKE_TMP_ROOT/sandbox-home"
-export BRIDGE_STATE_DIR="$BRIDGE_HOME/state"
+# Use the framework helper: it builds a valid isolation-v2 sandbox home (writes
+# the layout-marker.sh + exports BRIDGE_LAYOUT=v2 / BRIDGE_LAYOUT_MARKER_DIR), so
+# the inner `bash -c` subshells that re-source bridge-lib.sh do NOT hit the Linux
+# isolation-v2 hard-die on a markerless home (macOS skips that check; Linux/CI
+# does not). It also pins BRIDGE_HOME off the operator's live runtime.
+smoke_setup_bridge_home "68-guard"
 
 # ---------------------------------------------------------------------------
 # 1 + 2: pure-function tables — sourced once, emit KEY=value lines.
@@ -199,30 +200,39 @@ cp -R "$SMOKE_REPO_ROOT/scripts/python-helpers" "$STAGE/scripts/python-helpers"
 # Persistent (NOT transient) fake live home, created EMPTY. Under $HOME so the
 # classifier treats it as a real install; removed after the assertions.
 FAKE_LIVE="$HOME/.cache/agb-68-fakelive.$$"
-# run a staged daemon verb against the fake live home; echo "RC=<rc>|ENTRIES=<n>"
-# into the captured output and leave the home empty for the next case.
+# Run a staged daemon verb against a valid-v2 fake live home, reporting
+# "RC=<rc>|NEWENTRIES=<delta>" — entries CREATED by the run beyond the
+# pre-existing marker/state fixture. A real live install is isolation-v2-marked,
+# so we mark FAKE_LIVE too (otherwise Linux bridge-lib.sh hard-dies on a
+# markerless home BEFORE reaching the guard). NEWENTRIES=0 proves the refuse /
+# help paths created no runtime/state/log/shared dirs.
 _staged_run() {  # $@ = daemon args
-  rm -rf "$FAKE_LIVE"; mkdir -p "$FAKE_LIVE"
-  local out rc entries
-  if out="$(BRIDGE_HOME="$FAKE_LIVE" BRIDGE_STATE_DIR="$FAKE_LIVE/state" "$BASH_BIN" "$STAGE/bridge-daemon.sh" "$@" 2>&1)"; then rc=0; else rc=$?; fi
-  entries="$(find "$FAKE_LIVE" -mindepth 1 2>/dev/null | wc -l | tr -d ' ')"
   rm -rf "$FAKE_LIVE"
-  printf '%s\nRC=%s|ENTRIES=%s\n' "$out" "$rc" "$entries"
+  mkdir -p "$FAKE_LIVE/state"
+  printf 'BRIDGE_LAYOUT=v2\nBRIDGE_DATA_ROOT=%s\n' "$FAKE_LIVE/data" >"$FAKE_LIVE/state/layout-marker.sh"
+  local out rc before after
+  before="$(find "$FAKE_LIVE" -mindepth 1 2>/dev/null | wc -l | tr -d ' ')"
+  if out="$(BRIDGE_HOME="$FAKE_LIVE" BRIDGE_STATE_DIR="$FAKE_LIVE/state" \
+            BRIDGE_LAYOUT=v2 BRIDGE_LAYOUT_MARKER_DIR="$FAKE_LIVE/state" \
+            "$BASH_BIN" "$STAGE/bridge-daemon.sh" "$@" 2>&1)"; then rc=0; else rc=$?; fi
+  after="$(find "$FAKE_LIVE" -mindepth 1 2>/dev/null | wc -l | tr -d ' ')"
+  rm -rf "$FAKE_LIVE"
+  printf '%s\nRC=%s|NEWENTRIES=%s\n' "$out" "$rc" "$(( after - before ))"
 }
 
 # (a) a real state-mutating verb refuses (exit 3) and creates NO live dirs.
 STAGE_OUT="$(_staged_run run)"
-smoke_assert_contains "$STAGE_OUT" "RC=3|ENTRIES=0" "staged run verb exits 3 + creates NO live entries (guard precedes bridge_init_dirs)"
+smoke_assert_contains "$STAGE_OUT" "RC=3|NEWENTRIES=0" "staged run verb exits 3 + creates NO live entries (guard precedes bridge_init_dirs)"
 smoke_assert_contains "$STAGE_OUT" "live-leak guard" "staged refuse prints the guard banner"
 
 # (b) #68 codex r2: help forms are read-only and MUST print usage (exit 0) even
 # from a foreign checkout — never refuse, never mkdir.
 HELP_RUN_OUT="$(_staged_run run --help)"
-smoke_assert_contains "$HELP_RUN_OUT" "RC=0|ENTRIES=0" "staged \`run --help\` prints usage (exit 0), no live mkdir, no refuse"
+smoke_assert_contains "$HELP_RUN_OUT" "RC=0|NEWENTRIES=0" "staged \`run --help\` prints usage (exit 0), no live mkdir, no refuse"
 smoke_assert_not_contains "$HELP_RUN_OUT" "live-leak guard" "\`run --help\` is not refused by the guard"
 smoke_assert_contains "$HELP_RUN_OUT" "Usage:" "\`run --help\` actually prints usage"
 HELP_ENSURE_OUT="$(_staged_run ensure --help)"
-smoke_assert_contains "$HELP_ENSURE_OUT" "RC=0|ENTRIES=0" "staged \`ensure --help\` prints usage (exit 0), no live mkdir, no refuse"
+smoke_assert_contains "$HELP_ENSURE_OUT" "RC=0|NEWENTRIES=0" "staged \`ensure --help\` prints usage (exit 0), no live mkdir, no refuse"
 smoke_assert_not_contains "$HELP_ENSURE_OUT" "live-leak guard" "\`ensure --help\` is not refused by the guard"
 
 smoke_cleanup_temp_root || true
