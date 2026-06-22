@@ -154,6 +154,7 @@ deliver() {
     python3 "$HELPER" deliver-to-receiver "$SMOKE_REPO_ROOT" "$CFG_A" \
       "$CAPTURE" "$overrides"
 }
+# shellcheck disable=SC2120  # parameterized to mirror deliver(); current callers pass no override
 deliver_no_gate() {
   local overrides="${1:-}"; [[ -n "$overrides" ]] || overrides='{}'
   env "${TEST_FLAGS[@]}" \
