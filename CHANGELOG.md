@@ -4,6 +4,22 @@ All notable changes to Agent Bridge are documented here. This project adheres
 loosely to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and tracks
 version bumps via the `VERSION` file.
 
+## [0.17.0-beta1] — 2026-06-22 (mainline · beta)
+
+**v0.17.0-beta1 — the first cut of the v0.17 feature line (beta — features still landing).** This forks the mainline from `v0.16.16-rc2` and carries the `v0.16.16-rc3` hardening already on `main`; the **v0.16.x LTS line continues independently** (the `lts` / Latest head is unchanged and is NOT this prerelease). As a beta it is a live-test vehicle, not a promotion — expect further v0.17 features to land on top before a stable v0.17.0. First-batch features (each carried its own internal codex review at park time; this cut is the integration gate — full Linux CI + codex integration review):
+
+### Channels
+
+- **bridge-official Discord plugin — vendored, generalized thread-as-session (#2060).** A first-party Discord channel plugin under `plugins/discord/` (server + thread-session dispatcher/guard/egress, access + configure skills, docs). A Discord thread maps to an agent sub-session with workdir binding; the `thread_session_guard` is a PreToolUse guard that fails-closed on reads of the channel transport credentials (`.discord/.env` / `.telegram/.env`), with a self-test proving the deny survives tmp carve-outs and path-normalization evasion. Generalizes the thread-as-session pattern so the same machinery serves other thread-capable channels.
+
+### Reliability / fallback
+
+- **Provider-health outage oracle — Anthropic-outage detection for Codex fallback (P1a, #2066; master-gated OFF).** A daemon-owned 1-prober/N-readers oracle (`bridge-provider-health.py` + `lib/bridge-provider-health.sh` accessors + a gated `cmd_sync_cycle` tick + the `bridge-usage-probe.py` outage classifier) that detects a real Anthropic outage — scoped-on-first-report, DNS-guarded (never blame Anthropic for a local network failure), N-of-M static-agent fleet quorum, recovery hysteresis, and 429/auth explicitly NOT outage-class. **Steady state = zero probes**: the whole tick is a hard NO-OP unless `BRIDGE_FALLBACK_ENABLED` is on AND the oracle has pending work, so a production install pays nothing. Nothing consumes the DOWN state yet — this is the detection foundation for the Anthropic-outage → Codex fallback that P1b (cron) and P3 (live) will build on. Daemon-state writes are O_EXCL-serialized; the stale-lock break is meta-lock-serialized so it is race-free even on the portable no-fcntl path (no lost report under concurrent eviction).
+
+### A2A
+
+- **agent→node discovery (whois) + `send --peer auto` + a `known_agents` roster column (#2025).** `agb a2a whois <agent>` resolves which node(s) an agent lives on by consulting the rooms registry; ambiguity (the same agent name on >1 node) is never collapsed — every candidate is listed, never guessed. `agb a2a send` with `--peer auto` (or omitted) auto-resolves the node from `--to` via the same whois lookup and fails closed (with the candidate list) on an ambiguous target or an incomplete room roster; an explicit `--peer` is still honored verbatim with no whois. `a2a peers list` (plain + `--json`) gains a `known_agents` node→agents column so an operator can see the node↔agent mapping at a glance. No secret material leaks into `whois` / `peers` output.
+
 ## [0.16.16-rc3] — 2026-06-21 (LTS · release candidate)
 
 **v0.16.16-rc3 — the third release candidate on the v0.16.16 LTS line: it carries everything in rc2 plus the wave of issues the rc2 soak surfaced (10 issues / 8 tracks, #2040-#2048 + #2051).** Like rc1/rc2 this is a soak vehicle, not a promotion — `v0.16.15` stays the `lts` / Latest head and this prerelease is **not** marked Latest. The batch is daemon/launchd reliability (the #2040 enabled-but-unloaded recovery + the #2051 admin self-restart split-brain guard), picker/cron/session correctness, doc-backfill, and a root-cause auth fix (the #2048 ms365 cross-process refresh lock that ends the operator's recurring ~3h M365 re-auth). Each PR carried its own internal codex review; the rc3 cut is the integration gate (full Linux CI + codex integration review).
