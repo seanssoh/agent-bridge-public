@@ -369,10 +369,24 @@ bridge_path_is_transient() {
   local path="${1:-}"
   [[ -n "$path" ]] || return 1
   case "$path" in
-    /tmp/*|/private/tmp/*|/var/tmp/*|/var/folders/*|*/.claude/worktrees/*)
+    # macOS `cd -P`/`pwd -P` canonicalizes /var -> /private/var, so a checkout
+    # or sandbox under $TMPDIR (/var/folders/.../T) resolves to
+    # /private/var/folders/...; match BOTH the raw and the canonicalized forms.
+    /tmp/*|/private/tmp/*|/var/tmp/*|/private/var/tmp/*|/var/folders/*|/private/var/folders/*|*/.claude/worktrees/*|*/.agent-bridge/worktrees/*)
       return 0
       ;;
   esac
+  # Managed-worker checkout roots (`agent-bridge --prefer new`): the canonical
+  # path is ${BRIDGE_WORKTREE_ROOT:-~/.agent-bridge/worktrees}/<project>/<agent>
+  # — a removable FOREIGN checkout, NOT a live install. The default
+  # ~/.agent-bridge/worktrees is caught by the glob above; also honor an
+  # explicit BRIDGE_WORKTREE_ROOT and a custom BRIDGE_HOME's worktrees/ so a
+  # worker under a non-standard home still classifies transient. (#68 codex r1)
+  local _wt
+  for _wt in "${BRIDGE_WORKTREE_ROOT:-}" "${BRIDGE_HOME:+${BRIDGE_HOME%/}/worktrees}"; do
+    [[ -n "$_wt" ]] || continue
+    [[ "$path" == "${_wt%/}/"* ]] && return 0
+  done
   bridge_early_ephemeral_tmp_root "$path" >/dev/null 2>&1 && return 0
   return 1
 }
@@ -392,7 +406,11 @@ bridge_foreign_checkout_verdict() {
     return 0
   fi
   case "$cmd" in
-    start|ensure|run|restart|sync) ;;
+    # State-mutating daemon verbs. run-cron-worker writes worker pid/state/
+    # followup/finalize artifacts into the live runtime, so it is the same
+    # foreign-checkout class as the loop verbs (#68 codex r1). The a2a receiver
+    # is the same class but is a separate entry point — tracked as a follow-up.
+    start|ensure|run|restart|sync|run-cron-worker) ;;
     *) printf 'allow'; return 0 ;;
   esac
   if ! bridge_path_is_transient "$src"; then

@@ -6,6 +6,23 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/bridge-lib.sh"
+# #68: when executed directly, fail-closed BEFORE bridge_load_roster — which
+# calls bridge_init_dirs and mkdir's the live runtime/state/log/shared dirs.
+# Extract the verb read-only from "$@" (skipping leading option flags) and
+# refuse a state-mutating verb driven from a transient (worktree / CI / fixer)
+# checkout against a persistent live home, before ANY live dir is created. The
+# bottom dispatch re-checks with the fully-parsed $CMD (defense in depth). When
+# SOURCED (e.g. the a2a-receiver-supervise smoke seam) this early pass is
+# skipped so the smoke can drive the in-process tick.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  for _bridge_daemon_early_arg in "$@"; do
+    case "$_bridge_daemon_early_arg" in
+      --skip-plugin-liveness) continue ;;
+      *) bridge_guard_foreign_checkout "$_bridge_daemon_early_arg"; break ;;
+    esac
+  done
+  unset _bridge_daemon_early_arg
+fi
 bridge_load_roster
 
 usage() {
