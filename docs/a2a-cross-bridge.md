@@ -672,12 +672,55 @@ backpressure: over quota → `429` with `Retry-After`.
 | Oversized / invalid body | `413` / `422` + dead-letter |
 | Outbox growth | caps + dead-letter + `a2a outbox gc` |
 
+## Agent → node discovery (`agb a2a whois`, `--peer auto-resolve`) (#2025)
+
+A2A is addressed by **node** (`--peer <bridge-id>`), but operators and agents
+think in **agent ids**. Closing that gap is a usability feature, not a new wire
+path — it is **client-side only** (it does not touch the receiver). "I want to
+message agent X on another bridge" is now:
+
+```bash
+agb a2a whois X            # X -> <node>   (then, if you like, --peer <node>)
+agb a2a send --to X …      # --peer omitted -> auto-resolves the node from X
+```
+
+- **`agb a2a whois <agent> [--json]`** answers `<agent> -> <node>` from the
+  **shared room roster** — the leader-authoritative `room_members` membership
+  (each member is recorded as `agent@node`), aggregated across rooms read-only
+  via the same `bridge-rooms.py list/show --json` delegation `net-status` uses.
+  It reuses that **single source of truth** — there is no new registry, no
+  config-derived guess, and it opens no db itself (iso-boundary-safe). Three
+  cases: **unique** (`<agent> -> <node>`, annotated `(self)` when the agent is
+  on this node), **ambiguous** (the same id on >1 node — every candidate is
+  listed, exit nonzero, **nothing is picked**), **not-found** (no shared room
+  places it — clear error, exit nonzero). `--json` emits
+  `{agent, status, node, candidates, self}`.
+
+- **`a2a send --peer auto-resolve`** — when `--peer` is omitted (or `--peer
+  auto`), the node is resolved from `--to` via the same `resolve_agent_node`
+  lookup whois uses, so the two surfaces can never disagree. A **unique** match
+  proceeds (logging `--peer auto-resolved: <agent> -> <node>`); an **ambiguous**
+  match **fails with the candidate list** rather than guessing; **not-found**
+  fails with an actionable error. An **explicit** `--peer <node>` is honored
+  verbatim — no whois lookup, no behavior change.
+
+- **`a2a peers list`** gains a `known_agents` column (plain output and a
+  `known_agents` array in `--json`): the agents known to live on each peer node,
+  derived from the same room roster. A node id in a room roster **is** a peer /
+  `bridge_id`, so the column keys directly on the peer `id`. `-` when no shared
+  room places any agent on that peer.
+
+Because discovery rides the room roster, whois/auto-resolve only see agents you
+**share a room with**. For an agent in no shared room, address it the original
+way with an explicit `--peer <node>` (unchanged).
+
 ## CLI surface
 
-- `agent-bridge a2a send --peer <peer> --to <agent> --title <t> [--body ...|--body-file ...] [--priority ...] [--dry-run]`
+- `agent-bridge a2a send [--peer <peer>|auto] --to <agent> --title <t> [--body ...|--body-file ...] [--priority ...] [--dry-run]` — omit `--peer` (or pass `auto`) to **auto-resolve** the node from `--to` via `a2a whois`; see *Agent → node discovery* above
+- `agent-bridge a2a whois <agent> [--json]` — resolve which node(s) an agent lives on (agent → node discovery; #2025)
 - `agent-bridge a2a outbox list|retry <id>|drop <id>|gc`
 - `agent-bridge a2a inbox-dedupe list|gc`
-- `agent-bridge a2a peers list|test <peer>`
+- `agent-bridge a2a peers list|test <peer>` — `peers list` carries a `known_agents` roster column (#2025): the agents known to live on each peer node, from the shared room roster
 - `agent-bridge a2a deliver` — drain the outbox once
 - `agent-bridge a2a diagnose-stuck [--json] [--dry-run] [--probe-timeout <s>] [--ledger <path>]` — classify backoff-waiting `retry` rows by failing leg + reset backoff for peers whose TCP probe recovered (#1563 PR-8; also run automatically by the daemon stuck-scan)
 - `agent-bridge a2a announce-identity [--peer <id>] [--dry-run] [--timeout <s>]` — push a signed `peer-identity-update` to peers after an IP change
