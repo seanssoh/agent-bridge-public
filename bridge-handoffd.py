@@ -4196,21 +4196,40 @@ class HandoffHandler(BaseHTTPRequestHandler):
             leader_agent = str(room["leader_agent"] or "")
             outcome = _room_join_verify_hash(room, token_hash)
             if outcome != rooms.TOKEN_OK:
-                # NO TOKEN ORACLE (#2024 A.4): an UNKNOWN peer is not yet a
-                # trusted party, so the peer-facing reply must NOT disclose the
-                # token verdict (mismatch / expired / revoked) — that would let
-                # an unpaired prober distinguish "this token was once valid but
-                # expired/revoked" from "this token never matched", i.e. probe
-                # the leader's invite state. The reply collapses to the SAME
-                # opaque `unknown peer` every other unknown-peer reject uses; the
-                # AUDIT keeps the precise `unknown_peer_token_<outcome>` reason
-                # for the operator. (An already-authenticated peer keeps the
-                # detailed `invite token <outcome>` error elsewhere — it has
-                # already proven the node-link, so there is no oracle there.)
+                # #2073 ERROR TAXONOMY (security-safe). A token-bootstrap attempt
+                # whose token does NOT verify is, in practice, almost always a
+                # STALE invite (the leader re-minted, silently invalidating the
+                # link) — NOT an attack. Pre-#2073 this collapsed to an opaque
+                # `unknown peer`, which sent the joiner chasing a phantom
+                # "secret mismatch" / manual-registration. We now return ONE
+                # actionable bucket, `stale_or_unknown_invite`, with a single
+                # remedy string.
+                #
+                # NO ORACLE (the #2024 A.4 constraint still holds): the three
+                # token verdicts (mismatch / expired / revoked) collapse to the
+                # SAME external response + the SAME remedy, so an unpaired prober
+                # still cannot distinguish "once-valid-but-expired/revoked" from
+                # "never-matched" — the subreason lives ONLY in the local audit.
+                # We never echo the token, its hash, or which verdict fired. The
+                # disclosure is bounded to "this room exists, led by us, and your
+                # invite did not verify" — exactly the actionable signal the
+                # joiner needs, and no finer. (Room-unknown / not-leader / no-seed
+                # rejects ABOVE+BELOW stay the opaque `unknown peer`, so room
+                # existence is not leaked for a room this node does not lead.)
+                #
+                # HMAC-stage failures are NOT routed here: a CURRENT-token
+                # candidate that then fails the per-pair HMAC (e.g. the joiner
+                # signed with a stale derived key) is a `bad_signature` on the
+                # established-peer path — it is never relabeled stale.
                 audit("room_join_reject", reason=f"unknown_peer_token_{outcome}",
                       peer=peer_id, client=client_ip, room_id=room_id,
                       security=True)
-                self._reply(403, {"ok": False, "error": "unknown peer"})
+                self._reply(403, {
+                    "ok": False,
+                    "code": "stale_or_unknown_invite",
+                    "error": "invite is stale or invalid — ask the room leader "
+                             "to issue a fresh invite link (`agb room invite`)",
+                })
                 return None
             try:
                 key_seed = room["invite_key_seed"]
