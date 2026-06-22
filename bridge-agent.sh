@@ -75,7 +75,14 @@ Subcommands:
   attach             Attach to <agent>'s tmux session.
   compact            Trigger an admin-driven /compact for <agent>.
   handoff            Capture a handoff note for <agent>.
-  ack-crash          Clear the crash-state marker for <agent>.
+  ack-crash          Acknowledge <agent>'s crash report (suppress the alarm).
+                     When the agent is currently healthy/running, the stale
+                     report is also retired so the daemon's suppressed-notify
+                     churn stops (#2063).
+  clear-crash        Unconditionally retire <agent>'s crash report
+                     (the report env file + state/body/tail). The override
+                     for a known-stale report regardless of the active probe
+                     (#2063).
 
 Examples:
   $(basename "$0") create reviewer --engine claude
@@ -7310,10 +7317,43 @@ run_ack_crash() {
   [[ $# -eq 0 ]] || bridge_die "지원하지 않는 agent ack-crash 옵션입니다: $1"
   bridge_require_agent "$agent"
   if bridge_agent_ack_crash_report "$agent"; then
-    printf 'ack-crash: %s\n' "$agent"
+    # Issue #2063: ACK-suppress alone leaves a VALID report.env on disk, so
+    # the daemon's `crash_notified_origin_suppressed` churn keeps firing every
+    # sweep. When the agent is currently healthy/running, the crash the report
+    # describes is over — retire the report so the churn actually stops. When
+    # the agent is NOT active (a real in-progress crash/relaunch loop), keep
+    # the report as evidence and only ACK-suppress; `clear-crash` is the
+    # explicit override for that case.
+    if bridge_agent_is_active "$agent"; then
+      bridge_agent_clear_crash_report "$agent"
+      printf 'ack-crash: %s (healthy — crash report retired)\n' "$agent"
+    else
+      printf 'ack-crash: %s\n' "$agent"
+    fi
   else
     bridge_die "ack-crash failed: no crash report or state available for '$agent'"
   fi
+}
+
+# Issue #2063: explicit operator path to retire a crash report unconditionally
+# (e.g. a known-stale report on an agent the operator has already inspected,
+# regardless of the active probe). `ack-crash` only retires when the agent is
+# currently healthy; `clear-crash` is the deliberate override that always
+# retires report.env + its companion state/body/tail files.
+run_clear_crash() {
+  local agent="${1:-}"
+
+  shift || true
+  [[ -n "$agent" ]] || bridge_die "Usage: $(basename "$0") clear-crash <agent>"
+  [[ $# -eq 0 ]] || bridge_die "지원하지 않는 agent clear-crash 옵션입니다: $1"
+  bridge_require_agent "$agent"
+  if [[ ! -f "$(bridge_agent_crash_report_file "$agent")" \
+     && ! -f "$(bridge_agent_crash_state_file "$agent")" ]]; then
+    printf 'clear-crash: %s (no crash report to retire)\n' "$agent"
+    return 0
+  fi
+  bridge_agent_clear_crash_report "$agent"
+  printf 'clear-crash: %s (crash report retired)\n' "$agent"
 }
 
 run_attach() {
@@ -8576,6 +8616,9 @@ case "$subcommand" in
   ack-crash)
     run_ack_crash "$@"
     ;;
+  clear-crash)
+    run_clear_crash "$@"
+    ;;
   forget-session)
     run_forget_session "$@"
     ;;
@@ -8597,7 +8640,7 @@ case "$subcommand" in
   *)
     # Issue #163 Phase 2: surface an intent-recovery hint before dying.
     _hint="$(bridge_suggest_subcommand "$subcommand" \
-      "create update delete retire list registry show describe reclassify roster doctor rerender-settings start safe-mode stop restart ack-crash forget-session set-onboarding attach compact handoff")"
+      "create update delete retire list registry show describe reclassify roster doctor rerender-settings start safe-mode stop restart ack-crash clear-crash forget-session set-onboarding attach compact handoff")"
     [[ -n "$_hint" ]] && bridge_warn "$_hint"
     bridge_die "지원하지 않는 agent 명령입니다: $subcommand"
     ;;

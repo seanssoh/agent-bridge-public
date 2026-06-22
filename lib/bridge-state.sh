@@ -3923,12 +3923,24 @@ bridge_agent_write_crash_report() {
   local stderr_file="$5"
   local launch_cmd="$6"
   local launch_cmd_display=""
+  local launch_cmd_raw=""
+  local launch_cmd_raw_display=""
   local report_file=""
   local tail_file=""
   local error_hash=""
   local stderr_tail=""
 
   launch_cmd_display="$(bridge_redact_inline_env_secrets "$launch_cmd")"
+  # Issue #2063: also capture the operator-configured ROSTER BASE launch cmd
+  # (the side-effect-free `_raw` value) so the daemon staleness guard can do an
+  # apples-to-apples raw-base-vs-raw-base compare. The recorded RESOLVED
+  # `CRASH_LAUNCH_CMD` is NOT sufficient on its own: the static builder injects
+  # roster --model/--effort/--name into the resolved cmd, so a resolved-vs-raw
+  # compare cannot distinguish a roster-injected same-launch from a base flag
+  # REMOVAL (both look like "recorded has tokens current lacks"). Recording the
+  # raw base makes the comparison symmetric and exact.
+  launch_cmd_raw="$(bridge_agent_launch_cmd_raw "$agent" 2>/dev/null || true)"
+  launch_cmd_raw_display="$(bridge_redact_inline_env_secrets "$launch_cmd_raw")"
   report_file="$(bridge_agent_crash_report_file "$agent")"
   tail_file="$(bridge_agent_crash_tail_file "$agent")"
   mkdir -p "$(dirname "$report_file")"
@@ -3947,6 +3959,7 @@ CRASH_EXIT_CODE=$(printf '%q' "$exit_code")
 CRASH_STDERR_FILE=$(printf '%q' "$stderr_file")
 CRASH_TAIL_FILE=$(printf '%q' "$tail_file")
 CRASH_LAUNCH_CMD=$(printf '%q' "$launch_cmd_display")
+CRASH_LAUNCH_CMD_RAW=$(printf '%q' "$launch_cmd_raw_display")
 CRASH_ERROR_HASH=$(printf '%q' "$error_hash")
 CRASH_REPORTED_AT=$(printf '%q' "$(bridge_now_iso)")
 EOF
@@ -3959,6 +3972,88 @@ bridge_agent_clear_crash_report() {
     "$(bridge_agent_crash_report_body_file "$agent")" \
     "$(bridge_agent_crash_tail_file "$agent")" \
     "$(bridge_agent_crash_state_file "$agent")" >/dev/null 2>&1 || true
+}
+
+# Issue #2063: decide whether a leftover crash report is STALE relative to the
+# agent's CURRENT launch command. A leftover report.env from a PRIOR launch era
+# (dynamic→static convert, reclassify, `update --set-launch-cmd`, manual launch
+# change) otherwise keeps driving false crash-loop alarms on a healthy agent:
+# the daemon re-reads it every sweep with no awareness that the recorded launch
+# no longer matches the agent's current launch.
+#
+# Signal selection (the important correctness point):
+#   - PREFERRED — the recorded ROSTER BASE (`CRASH_LAUNCH_CMD_RAW`, captured at
+#     write time) compared SYMMETRICALLY against the agent's current roster base
+#     (`bridge_agent_launch_cmd_raw`, side-effect-free). Both sides are the
+#     operator-configured base, so the compare is exact in BOTH directions —
+#     an ADDED, REMOVED, or CHANGED base flag is detected (codex review #2063
+#     r2: a resolved-vs-raw compare cannot tell a roster-injected
+#     --model/--effort from a base flag REMOVAL, because the static builder
+#     injects roster model/effort/--name into the RESOLVED cmd).
+#   - LEGACY FALLBACK — a pre-fix report.env has no `CRASH_LAUNCH_CMD_RAW`. Fall
+#     back to the recorded RESOLVED `CRASH_LAUNCH_CMD` vs the current raw base
+#     with the asymmetric (fail-safe) containment, which never false-retires a
+#     roster-injected same-launch (it just cannot catch a pure base REMOVAL on
+#     a legacy report — acceptable: those age out / are ack-cleared, and the
+#     daemon never silently drops a real crash because of the fail-safe bias).
+#
+# The current launch base is `bridge_agent_launch_cmd_raw` — SIDE-EFFECT-FREE
+# (unlike `bridge_agent_launch_cmd`, which normalizes/persists session state and
+# consumes the trusted-resume marker, so it must NOT be called from the daemon
+# crash loop). The comparison is shell-token / base-signature based (NOT a
+# byte-prefix); see launch-cmd-base-signature.py.
+#
+# $1 — recorded CRASH_LAUNCH_CMD_RAW (roster base at capture; may be empty on a
+#      legacy report or a dynamic agent with no roster base).
+# $2 — recorded CRASH_LAUNCH_CMD (resolved; the legacy fallback signal).
+# $3 — agent id (current launch base resolved here, side-effect-free).
+#
+# Returns 0 (true, STALE → retire) ONLY on positive evidence of a launch-base
+# mismatch. Returns 1 (not stale → keep alarming) when the bases match, or the
+# comparison is incomparable (either side empty/unparseable, a signature that
+# degenerates to the bare engine token, or a cross-engine pair). This fail-safe
+# bias guarantees a real same-launch crash loop is never silently dropped.
+bridge_agent_crash_report_launch_stale() {
+  local recorded_raw="$1"
+  local recorded_resolved="$2"
+  local agent="$3"
+  local current_raw=""
+  local mode=""
+  local recorded=""
+  local rc=0
+
+  [[ -n "$agent" ]] || return 1
+
+  current_raw="$(bridge_agent_launch_cmd_raw "$agent" 2>/dev/null || true)"
+  # Redact every side the same way the writer redacts the recorded values so a
+  # secret-bearing env prefix compares like-for-like (the recorded values are
+  # already redacted at capture; redacting the live raw base matches them).
+  current_raw="$(bridge_redact_inline_env_secrets "$current_raw")"
+
+  if [[ -n "$recorded_raw" ]]; then
+    # PREFERRED: symmetric raw-base-vs-raw-base. Both sides are the operator
+    # base, so `equal` mode detects add/remove/change of any base flag.
+    mode="equal"
+    recorded="$(bridge_redact_inline_env_secrets "$recorded_raw")"
+  elif [[ -n "$recorded_resolved" ]]; then
+    # LEGACY: resolved-vs-raw with the asymmetric fail-safe containment.
+    mode="stale"
+    recorded="$(bridge_redact_inline_env_secrets "$recorded_resolved")"
+  else
+    # No recorded launch signal at all → cannot prove staleness; keep alarming.
+    return 1
+  fi
+
+  bridge_require_python
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
+  python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/launch-cmd-base-signature.py" \
+    "$mode" "$recorded" "$current_raw" >/dev/null 2>&1 || rc=$?
+  # rc 0 = stale (positive mismatch); rc 1 = same launch; rc 2 = incomparable;
+  # rc 3 = usage error. Treat ONLY rc 0 as stale; everything else keeps the
+  # existing alarm path intact.
+  [[ "$rc" -eq 0 ]]
 }
 
 # #256 Gap 2: persist the rapid-fail circuit-breaker trip so the daemon's

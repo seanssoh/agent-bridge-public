@@ -93,6 +93,7 @@ KNOWN_BROKEN_VERBS=(
   "agent safe-mode"       # #1114 bug class — run_safe_mode treats --help as agent id
   "agent restart"         # #1114 bug class — run_restart treats --help as agent id
   "agent ack-crash"       # #1114 bug class — run_ack_crash treats --help as agent id
+  "agent clear-crash"     # #1114 bug class — run_clear_crash treats --help as agent id (#2063 sibling of ack-crash)
   "agent forget-session"  # #1114 bug class — run_forget_session treats --help as agent id
   "agent attach"          # #1114 bug class — run_attach treats --help as agent id
   "agent compact"         # #1114 bug class — run_compact treats --help as agent id
