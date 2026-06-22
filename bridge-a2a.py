@@ -287,12 +287,42 @@ def cmd_send(args: argparse.Namespace) -> int:
                        "use 'agent-bridge room show <room_id>' to preview the "
                        "roster") or 1
         return _delegate_room_fanout(args)
-    # Below here is the 1:1 cross-bridge send — --peer + --to are required.
+    # Below here is the 1:1 cross-bridge send — --to is required; --peer is the
+    # destination node (peer/bridge id). #2025: when --peer is omitted or the
+    # sentinel `auto`, resolve it from --to via the same whois lookup. The
+    # auto-resolver NEVER guesses — an ambiguous agent (the same name on >1
+    # node) fails with the candidate list instead of picking one. An EXPLICIT
+    # --peer is honored verbatim (no whois, no behavior change).
+    if not args.to:
+        return die("--to is required for a 1:1 send") or 1
+    peer_arg = (args.peer or "").strip()
+    if not peer_arg or peer_arg.lower() == "auto":
+        res = resolve_agent_node(args.to.strip())
+        status = res["status"]
+        if status == "registry_error":
+            return die("--peer auto-resolve could not consult the rooms "
+                       f"registry: {res['error']}. Pass an explicit "
+                       "`--peer <node>`.") or 1
+        if status == "not_found":
+            return die(
+                f"--peer auto-resolve found no node for agent {args.to!r}. "
+                "The agent->node map is built from shared A2A rooms — confirm "
+                "you share a room with the target (`agb a2a whois "
+                f"{args.to}`), or pass an explicit `--peer <node>`."
+            ) or 1
+        if status == "ambiguous":
+            err(f"--peer auto-resolve: agent {args.to!r} is on MULTIPLE nodes "
+                "— refusing to guess. Candidates:")
+            for node in res["candidates"]:
+                err(f"  - {node}")
+            err("Re-send with an explicit `--peer <node>` to disambiguate.")
+            return 1
+        # unique
+        args.peer = res["node"]
+        info(f"--peer auto-resolved: {args.to} -> {args.peer}")
     if not args.peer:
         return die("--peer is required for a 1:1 send (or pass --room for a "
                    "whole-room fan-out)") or 1
-    if not args.to:
-        return die("--to is required for a 1:1 send") or 1
     try:
         cfg = a2a.load_config()
         # #1331: fail-closed at send time too — surface the empty-secret
@@ -695,11 +725,19 @@ def cmd_peers(args: argparse.Namespace) -> int:
 
     if args.action == "list":
         peers = cfg.get("peers", [])
+        # #2025 roster column: which AGENTS are known to live on each peer node,
+        # derived read-only from the shared rooms roster (the same agent->node
+        # source `a2a whois` uses). A peer's `id` IS its node/bridge id, so we
+        # key the roster map on the peer id. Fail-soft: an unreadable rooms db /
+        # no shared rooms yields an empty column (never raises, never blocks the
+        # peer listing). Agent NAMES only — no secret crosses this surface.
+        known_agents = _peer_known_agents(_netstat_rooms_v2(_netstat_applied_epochs()[0]))
         if args.json:
             redacted = []
             for p in peers:
                 rp = {k: v for k, v in p.items() if k not in ("secret", "secret_next", "secrets")}
                 rp["secret_configured"] = bool(a2a.peer_secrets(p))
+                rp["known_agents"] = known_agents.get(str(p.get("id", "")), [])
                 redacted.append(rp)
             print(json.dumps(redacted, ensure_ascii=False, indent=2))
         else:
@@ -707,9 +745,12 @@ def cmd_peers(args: argparse.Namespace) -> int:
                 print("(no peers configured)")
             for p in peers:
                 allow = p.get("inbound_allowlist", [])
+                agents = known_agents.get(str(p.get("id", "")), [])
+                agents_col = ",".join(agents) if agents else "-"
                 print(f"{p.get('id', '?'):20}  {p.get('address', '-'):20}  "
                       f"secret={'yes' if a2a.peer_secrets(p) else 'NO'}  "
-                      f"inbound_allowlist={allow}")
+                      f"inbound_allowlist={allow}  "
+                      f"known_agents={agents_col}")
         # #1563 PR-8 item #5: a non-fatal WARN for any peer keyed on a raw
         # `address` with no Tailscale identity. A raw IP is vulnerable to
         # peer-IP staleness (the peer's IP drifts after a re-login); an
@@ -3172,6 +3213,183 @@ def _netstat_applied_epochs() -> "tuple[dict[str, int], str | None]":
     return applied, None
 
 
+# --------------------------------------------------------------------------
+# a2a whois — agent -> node discovery (#2025)
+# --------------------------------------------------------------------------
+#
+# The agent->node mapping is NOT in the peer config (handoff.local.json carries
+# routing identities + an inbound admit-list, never a remote roster). It lives
+# in the leader-authoritative `room_members` table, surfaced READ-ONLY via the
+# canonical `bridge-rooms.py list/show --json` CLI — the SAME iso-boundary-safe
+# delegation net-status uses (_netstat_rooms_cli). whois reuses that single
+# source of truth; it invents NO new registry and opens NO db itself. A node id
+# in a room roster IS a peer/bridge id (the rooms `node` column == the A2A
+# `bridge_id`), so the resolved node is directly usable as `a2a send --peer`.
+
+
+def _local_node_id() -> str:
+    """This node's own id (the A2A config `bridge_id`), or '' in single-node.
+
+    Mirrors `bridge-rooms.py local_node()` — the rooms `node` column for a
+    local member is this value, so whois marks a resolved node that equals it
+    as `(self)`. Fail-soft: a missing/unreadable config yields ''.
+    """
+    try:
+        cfg = a2a.load_config()
+    except a2a.A2AError:
+        return ""
+    bid = cfg.get("bridge_id", "")
+    return bid.strip() if isinstance(bid, str) else ""
+
+
+def _collect_agent_node_map() -> "tuple[dict[str, list[str]], str | None]":
+    """Aggregate the agent->node(s) map from the read-only rooms roster.
+
+    Walks `bridge-rooms.py list --json` then `show <room_id> --json` for each
+    room, unioning every `{agent, node}` member pair into `{agent: [nodes]}`
+    (nodes sorted + de-duplicated). The SAME read-only rooms-CLI delegation
+    net-status's `_netstat_rooms_v2` uses — never opens rooms.db directly, so
+    it is iso-boundary-safe. Returns `(map, error)`: `error` is set (and the
+    map is whatever was collected so far) when the rooms listing itself could
+    not be read, so the caller can distinguish "no rooms / agent absent" from
+    "could not consult the registry".
+    """
+    listing, err = _netstat_rooms_cli("list")
+    if err is not None:
+        return {}, err
+    if not isinstance(listing, list):
+        return {}, None
+    agent_nodes: dict[str, set[str]] = {}
+    for item in listing:
+        if not isinstance(item, dict):
+            continue
+        rid = item.get("room_id")
+        if not isinstance(rid, str) or not rid:
+            continue
+        detail, derr = _netstat_rooms_cli("show", rid)
+        if derr is not None or not isinstance(detail, dict):
+            continue
+        members = detail.get("members")
+        if not isinstance(members, list):
+            continue
+        for m in members:
+            if not isinstance(m, dict):
+                continue
+            agent = m.get("agent")
+            node = m.get("node")
+            if not isinstance(agent, str) or not agent:
+                continue
+            node = node if isinstance(node, str) else ""
+            agent_nodes.setdefault(agent, set()).add(node)
+    resolved = {a: sorted(n for n in nodes if n)
+                for a, nodes in agent_nodes.items()}
+    return resolved, None
+
+
+def resolve_agent_node(agent: str) -> dict[str, Any]:
+    """Resolve which node(s) `agent` lives on, from the rooms roster.
+
+    Returns a structured result the whois command AND the send auto-resolver
+    share, so the two surfaces can NEVER disagree:
+      {
+        "agent": <str>,
+        "status": "unique" | "ambiguous" | "not_found" | "registry_error",
+        "node": <str|None>,        # set only when status == "unique"
+        "candidates": [<str>...],  # the node(s) found (>=2 when ambiguous)
+        "self": <bool>,            # node == this node's bridge_id (status=unique)
+        "error": <str|None>,       # set only when status == "registry_error"
+      }
+    Ambiguity (the SAME agent name on >1 node) is NEVER collapsed — both whois
+    and the send auto-resolver fail closed on it with the candidate list.
+    """
+    result: dict[str, Any] = {
+        "agent": agent, "status": "not_found", "node": None,
+        "candidates": [], "self": False, "error": None,
+    }
+    amap, err = _collect_agent_node_map()
+    if err is not None:
+        result["status"] = "registry_error"
+        result["error"] = err
+        return result
+    nodes = amap.get(agent, [])
+    if not nodes:
+        result["status"] = "not_found"
+        return result
+    result["candidates"] = nodes
+    if len(nodes) == 1:
+        result["status"] = "unique"
+        result["node"] = nodes[0]
+        result["self"] = (nodes[0] == _local_node_id() and bool(nodes[0]))
+        return result
+    result["status"] = "ambiguous"
+    return result
+
+
+def cmd_whois(args: argparse.Namespace) -> int:
+    """`agb a2a whois <agent>` — discover which node(s) an agent lives on.
+
+    Aggregates the read-only rooms roster (the leader-authoritative
+    `room_members` source) into an agent->node answer. Handles the three real
+    cases the issue calls out: not-found (clear error, exit 1), ambiguous (the
+    same agent on >1 node — list every candidate, exit 1, do NOT pick one), and
+    self (the agent is on THIS node — annotated `(self)`). `--json` emits the
+    structured `resolve_agent_node` result.
+    """
+    agent = (args.agent or "").strip()
+    if not agent:
+        return die("whois needs <agent>") or 1
+    res = resolve_agent_node(agent)
+    if args.json:
+        print(json.dumps(res, ensure_ascii=False))
+        # not-found / ambiguous / registry-error are still a nonzero exit so a
+        # script can branch on the rc without parsing the JSON.
+        return 0 if res["status"] == "unique" else 1
+    status = res["status"]
+    if status == "registry_error":
+        return die(f"whois could not consult the rooms registry: {res['error']}"
+                   ) or 1
+    if status == "not_found":
+        return die(
+            f"whois: no node found for agent {agent!r}. The agent->node map is "
+            "built from shared A2A rooms — confirm you share a room with the "
+            "agent (`agb room list` / `agb a2a net-status`), or send with an "
+            "explicit `--peer <node>`."
+        ) or 1
+    if status == "ambiguous":
+        err(f"whois: agent {agent!r} is on MULTIPLE nodes — ambiguous. "
+            "Candidates:")
+        for node in res["candidates"]:
+            err(f"  - {node}")
+        err("Disambiguate with an explicit `agb a2a send --peer <node> "
+            f"--to {agent}`.")
+        return 1
+    # unique
+    suffix = " (self)" if res["self"] else ""
+    print(f"{agent} -> {res['node']}{suffix}")
+    return 0
+
+
+def _peer_known_agents(rooms_v2: dict[str, Any]) -> dict[str, list[str]]:
+    """Map each known node -> the sorted agent names on it (from rooms roster).
+
+    Read-only over the SAME `_netstat_rooms_v2` roster window. Used to give
+    `peers list` a node->agents column so an operator can see node<->agent at a
+    glance instead of having to already know a room_id.
+    """
+    node_agents: dict[str, set[str]] = {}
+    for r in rooms_v2.get("room_roster", []):
+        if not isinstance(r, dict):
+            continue
+        for m in r.get("members", []):
+            if not isinstance(m, dict):
+                continue
+            node = m.get("node")
+            agent = m.get("agent")
+            if isinstance(node, str) and node and isinstance(agent, str) and agent:
+                node_agents.setdefault(node, set()).add(agent)
+    return {n: sorted(a) for n, a in node_agents.items()}
+
+
 def cmd_net_status(args: argparse.Namespace) -> int:
     """Read-only snapshot of this node's A2A network/transport state (#1697 v1
     + #1708 v2 control-loop status window).
@@ -3718,7 +3936,10 @@ def build_parser() -> argparse.ArgumentParser:
     # are therefore NOT argparse-required (validated in cmd_send so a `--room`
     # send is not forced to supply a peer it does not have).
     p_send.add_argument("--peer", default=None, help="configured peer bridge id "
-                        "(1:1 send; mutually exclusive with --room)")
+                        "(1:1 send; mutually exclusive with --room). OMIT it (or "
+                        "pass `auto`) to auto-resolve the node from --to via "
+                        "`a2a whois` — auto-resolve fails with the candidate "
+                        "list on an ambiguous agent (it never guesses)")
     p_send.add_argument("--to", default=None, help="target agent on the peer "
                         "bridge (1:1 send) or a single room member to narrow a "
                         "--room fan-out to (agent or agent@node)")
@@ -3739,6 +3960,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_send.add_argument("--dry-run", action="store_true",
                         help="resolve + validate but do not write the outbox")
     p_send.set_defaults(func=cmd_send)
+
+    p_whois = sub.add_parser(
+        "whois",
+        help="resolve which node(s) an agent lives on (agent->node discovery)",
+        description=(
+            "Discover which peer/node an agent lives on from the shared A2A "
+            "rooms roster (the leader-authoritative room_members source, the "
+            "same read-only `bridge-rooms.py` data net-status uses — no new "
+            "registry, no db write). Answers 'crm-dash-wdh -> doohyun-mac' from "
+            "just the agent id, so you no longer need a room_id to find a "
+            "target's node. The resolved node is exactly what `a2a send --peer` "
+            "wants. Three cases are handled explicitly: NOT-FOUND (clear error, "
+            "nonzero exit), AMBIGUOUS (the same agent on >1 node — every "
+            "candidate is listed and nothing is guessed, nonzero exit), and "
+            "SELF (the agent is on THIS node — annotated `(self)`). --json emits "
+            "the structured {agent,status,node,candidates,self} result."
+        ),
+    )
+    p_whois.add_argument("agent", help="the agent id to resolve to its node(s)")
+    p_whois.add_argument("--json", action="store_true",
+                         help="emit the structured machine-readable result")
+    p_whois.set_defaults(func=cmd_whois)
 
     p_outbox = sub.add_parser(
         "outbox",
