@@ -247,27 +247,92 @@ class _state_lock:
         ``O_EXCL`` create, where ordinary create-exclusivity then picks a single
         holder. A loser (ENOENT) returns False and the caller spins → re-tries
         the create. No path lets two processes hold the lock concurrently.
+
+        Integration BLOCKING (v0.17 beta1 assembly): the bare stat→rename pair
+        has a TOCTOU. Between this process observing a STALE inode at
+        ``lock_file`` (year-old mtime) and its own ``os.rename``, the stale lock
+        can be evicted by a faster racer AND a FRESH live lock recreated at the
+        same path by the new holder mid-critical-section. ``os.rename`` then
+        yanks that *live* lock (same path, new inode) and this process wrongly
+        enters the critical section concurrently with the live holder → a lost
+        report under heavy concurrency (reproduced ~2/20 trials under CPU load,
+        12-way no-fcntl race). An "identity re-check after rename" alone is NOT
+        sufficient: once a live lock has been renamed away, restoring it is
+        itself racy (a third process can O_EXCL-create at the path before the
+        restore), so the live holder is already disrupted.
+
+        Fix: serialize the stale-break with a short-lived O_EXCL META-LOCK
+        (``<lock>.break``). Only one process at a time runs stat→evict, so there
+        is no concurrent-yank window. Staleness is re-evaluated UNDER the
+        meta-lock (the decision is made under exclusion, not before it), so a
+        lock that became fresh since the cheap pre-check is never evicted. A
+        process that cannot get the meta-lock returns False and re-spins the
+        normal O_EXCL create. The meta-lock is itself self-healing: a breaker
+        that crashes holding it is reaped by mtime on the next pass.
         """
+        # Cheap lock-free pre-check: only contend for the break meta-lock when
+        # the lock currently LOOKS stale. A live lock never needs breaking.
         try:
             st = lock_file.stat()
         except OSError:
             return False
         if (time.time() - st.st_mtime) <= LOCK_STALE_SECONDS:
             return False
-        graveyard = lock_file.parent / (STATE_BASENAME + f".lock.dead.{os.getpid()}.{os.urandom(6).hex()}")
-        try:
-            os.rename(str(lock_file), str(graveyard))  # atomic; exactly one racer wins
-        except OSError:
-            # ENOENT (another racer already evicted it) or any other error — we
-            # are not the evictor. Spin and re-try the normal create.
+
+        break_lock = lock_file.parent / (STATE_BASENAME + ".lock.break")
+        bfd = self._try_create(break_lock)
+        if bfd is None:
+            # Reap a crashed breaker's stale meta-lock once, then retry.
+            try:
+                bst = break_lock.stat()
+                if (time.time() - bst.st_mtime) > LOCK_STALE_SECONDS:
+                    grave = break_lock.parent / (
+                        STATE_BASENAME + f".lock.break.dead.{os.getpid()}.{os.urandom(6).hex()}"
+                    )
+                    try:
+                        os.rename(str(break_lock), str(grave))
+                        os.unlink(str(grave))
+                    except OSError:
+                        pass
+                    bfd = self._try_create(break_lock)
+            except OSError:
+                pass
+        if bfd is None:
+            # Another process owns the break — let it evict; we re-spin.
             return False
-        # We evicted the stale lock. Discard the corpse and signal a retry; the
-        # normal O_EXCL create on the next loop iteration selects the holder.
+
         try:
-            os.unlink(str(graveyard))
-        except OSError:
-            pass
-        return True
+            # Re-evaluate staleness UNDER the meta-lock. The original holder may
+            # have exited (lock gone) or a fresh holder may have recreated it;
+            # in both cases the live lock is NOT stale and must not be evicted.
+            try:
+                st2 = lock_file.stat()
+            except OSError:
+                return False
+            if (time.time() - st2.st_mtime) <= LOCK_STALE_SECONDS:
+                return False
+            graveyard = lock_file.parent / (
+                STATE_BASENAME + f".lock.dead.{os.getpid()}.{os.urandom(6).hex()}"
+            )
+            try:
+                os.rename(str(lock_file), str(graveyard))
+            except OSError:
+                # Vanished between the re-stat and the rename — not our eviction.
+                return False
+            try:
+                os.unlink(str(graveyard))
+            except OSError:
+                pass
+            return True
+        finally:
+            try:
+                os.close(bfd)
+            except OSError:
+                pass
+            try:
+                os.unlink(str(break_lock))
+            except OSError:
+                pass
 
     def __enter__(self) -> "_state_lock":
         lock_file = _lock_path()

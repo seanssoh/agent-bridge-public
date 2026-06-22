@@ -26,6 +26,7 @@ bridge-migrate.py:13
 bridge-notify.py:0
 bridge-orphan-gc.py:10
 bridge-profile.py:18
+bridge-provider-health.py:12
 bridge-queue-gateway.py:19
 bridge-queue.py:12
 bridge-relay-cleanup.py:27
