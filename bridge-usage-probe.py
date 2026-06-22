@@ -56,6 +56,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -454,6 +455,24 @@ def map_payload_to_cache(payload: Any, token_digest: str = "") -> dict[str, Any]
 CLASSIFICATION_ACCOUNT_RATE_LIMIT = "account-rate-limit"
 CLASSIFICATION_EDGE_BLOCKED = "edge-blocked"
 CLASSIFICATION_FAILURE = "failure"
+# Issue #2066 (v0.17 fallback oracle, P1a): a provider-side OUTAGE bucket,
+# distinct from account-quota (429) / edge-block / generic failure. An outage
+# is a server-side capacity/availability failure — a 5xx, Anthropic's 529
+# "overloaded", or an `overloaded_error` body — NOT something the client did
+# wrong (auth/quota/prompt). The provider-health oracle (bridge-provider-health.py)
+# consumes this bucket to decide an Anthropic outage may be underway; nothing in
+# the usage-probe rotation path acts on it (an outage classification falls
+# through to the SAME degrade-serve-stale path a 5xx already took before this
+# bucket existed — see run_probe — so adding it cannot regress rotation).
+CLASSIFICATION_OUTAGE = "outage"
+# The HTTP status family that signals a provider-side outage (vs a client error).
+# 529 is Anthropic's documented "overloaded" status; 500/502/503/504 are the
+# generic upstream-failure 5xx family. 429/403 are deliberately EXCLUDED — those
+# are quota/edge and stay owned by the 3-way classify_probe_http_error logic.
+OUTAGE_HTTP_STATUSES = frozenset({500, 502, 503, 504, 520, 521, 522, 523, 524, 529})
+# Substrings in an error body that mark a provider overload even when the
+# numeric status is ambiguous (e.g. a 200-wrapped JSON error envelope).
+OUTAGE_BODY_MARKERS = ("overloaded_error", "overloaded")
 # Probe result status emitted for an edge-blocked response (also the audit
 # status string the wrapper records).
 EDGE_BLOCKED_STATUS = "edge-blocked"
@@ -510,8 +529,73 @@ def _has_anthropic_origin_headers(headers: dict[str, str]) -> bool:
     return False
 
 
+# --------------------------------------------------------------------------- #
+# Outage-class classification (#2066 P1a — shared by the provider-health oracle)
+# --------------------------------------------------------------------------- #
+# Text signatures that mark an OUTAGE-CLASS failure in free-form output — a cron
+# child's stderr/stdout or a live pane's scrollback. Deliberately ALIGNED with
+# bridge-stall.py's `network` group (econnreset / 502 / 503 / upstream connect /
+# context deadline) PLUS the provider-overload markers (529 / overloaded_error).
+# These are the failures that mean "the provider/server is unavailable", as
+# opposed to auth/quota/prompt/local-fs failures which must NEVER be misread as
+# an outage (that would falsely strand the fleet on the Codex fallback).
+_OUTAGE_TEXT_PATTERNS = (
+    r"\boverloaded_error\b",
+    r"\boverloaded\b",
+    r"\bhttp[/ ]?1\.[01]?\s*5\d\d\b",
+    r"\b5\d\d\s+(?:internal server error|bad gateway|service unavailable|gateway time-?out)\b",
+    r"\b502\s+bad gateway\b",
+    r"\b503\s+service unavailable\b",
+    r"\b504\s+gateway time-?out\b",
+    r"\b529\b",
+    r"\beconnreset\b",
+    r"\beconnrefused\b",
+    r"\bconnection\s+refused\b",
+    r"\bconnection\s+reset\s+by\s+peer\b",
+    r"\bconnection\s+aborted\b",
+    r"\bcontext\s+deadline\s+exceeded\b",
+    r"\bupstream\s+connect\s+error\b",
+    r"\bupstream\s+request\s+timeout\b",
+    # A timeout only classifies as outage when an explicit network/provider
+    # subject word is adjacent — mirrors bridge-stall.py #161 narrowing so a
+    # benign "(timeout 5m)" tool-budget hint never trips a false outage.
+    r"\b(?:connection|request|socket|upstream|gateway|api|server|provider)\s+timed?\s*out\b",
+)
+_OUTAGE_TEXT_RE = re.compile("|".join(_OUTAGE_TEXT_PATTERNS), re.IGNORECASE)
+
+
+def _http_status_is_outage(status: int) -> bool:
+    """True for a server-side outage HTTP status (5xx family + 529)."""
+    try:
+        code = int(status)
+    except (TypeError, ValueError):
+        return False
+    return code in OUTAGE_HTTP_STATUSES or (500 <= code <= 599)
+
+
+def _body_marks_outage(body: str | None) -> bool:
+    """True when a response body carries an `overloaded_error` / overload marker."""
+    if not body:
+        return False
+    lowered = body.lower()
+    return any(marker in lowered for marker in OUTAGE_BODY_MARKERS)
+
+
+def classify_outage_class_text(text: str | None) -> bool:
+    """True when free-form text (cron stderr/stdout or a live pane) signals an
+    OUTAGE-class failure: a 5xx / 529 / overloaded / connection-reset/refused.
+
+    Shared by the provider-health oracle's report paths (cron exit+stderr and
+    live pane/stall text). Returns False for auth/quota/prompt/local errors so a
+    bad-prompt or 401 is never misread as an Anthropic outage (#2066 §4).
+    """
+    if not text:
+        return False
+    return bool(_OUTAGE_TEXT_RE.search(text))
+
+
 def classify_probe_http_error(exc: "ProbeHTTPError") -> str:
-    """3-way classify a probe HTTP error: account quota / edge block / failure.
+    """4-way classify a probe HTTP error: outage / account quota / edge / failure.
 
     - ``account-rate-limit``: a 429 whose body is the endpoint's
       ``error.type == rate_limit_error`` AND whose response headers prove the
@@ -531,7 +615,18 @@ def classify_probe_http_error(exc: "ProbeHTTPError") -> str:
     Back-compat: when the exception carries NO header information at all
     (``headers is None`` — a legacy seam), fall back to the pre-headers
     body-only rule: a 429 ``rate_limit_error`` is an account signal.
+
+    Issue #2066 (P1a): a provider-side OUTAGE (5xx / 529 / ``overloaded_error``)
+    classifies as ``CLASSIFICATION_OUTAGE`` BEFORE the 429/403 logic. This is the
+    only behavior change to this function — and it is safe for the usage-probe
+    rotation path: an outage status formerly returned ``CLASSIFICATION_FAILURE``
+    and fell through to the degrade-serve-stale arm in run_probe, which is
+    exactly where ``CLASSIFICATION_OUTAGE`` also falls through (run_probe only
+    special-cases ACCOUNT_RATE_LIMIT and EDGE_BLOCKED). The 429/403 quota/edge
+    discrimination below is untouched.
     """
+    if _http_status_is_outage(exc.status) or _body_marks_outage(exc.body):
+        return CLASSIFICATION_OUTAGE
     if exc.status not in (429, 403):
         return CLASSIFICATION_FAILURE
     headers = _normalized_error_headers(exc)
