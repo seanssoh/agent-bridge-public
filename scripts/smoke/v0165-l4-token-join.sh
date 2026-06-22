@@ -97,7 +97,9 @@ join_as() {
 json_field() { python3 "$SCRIPT_DIR/a2a-rooms-p1a-helper.py" json-field "$1" "$2"; }
 
 # deliver [overrides_json] — replay $CAPTURE through the real node-A receiver
-# WITH the auto-join feature gate ON. The leader cfg starts with no joiner peer.
+# with the auto-join feature gate EXPLICITLY ON. The leader cfg starts with no
+# joiner peer. (Functionally identical to the default now, but kept explicit so
+# the positive cases read intentionally and are robust to the default flipping.)
 deliver() {
   local overrides="${1:-}"
   [[ -n "$overrides" ]] || overrides='{}'
@@ -106,11 +108,24 @@ deliver() {
       "$CAPTURE" "$overrides"
 }
 
-# deliver_no_gate — same but with the feature gate UNSET (default-unchanged).
-deliver_no_gate() {
+# deliver_default [overrides_json] — replay with the gate env UNSET. Since #2024 B
+# the DEFAULT is ON, so this exercises the production default posture (an unset
+# install admits a valid first-contact token to PENDING).
+deliver_default() {
   local overrides="${1:-}"
   [[ -n "$overrides" ]] || overrides='{}'
   env "${TEST_FLAGS[@]}" \
+    python3 "$HELPER" deliver-to-receiver "$SMOKE_REPO_ROOT" "$CFG_A" \
+      "$CAPTURE" "$overrides"
+}
+
+# deliver_opt_out [overrides_json] — replay with the gate EXPLICITLY OFF
+# (BRIDGE_A2A_ROOM_AUTOJOIN=0). This is the operator opt-out: the unknown-peer
+# bootstrap is refused with the posture-only 403 room_autojoin_disabled.
+deliver_opt_out() {
+  local overrides="${1:-}"
+  [[ -n "$overrides" ]] || overrides='{}'
+  env "BRIDGE_A2A_ROOM_AUTOJOIN=0" "${TEST_FLAGS[@]}" \
     python3 "$HELPER" deliver-to-receiver "$SMOKE_REPO_ROOT" "$CFG_A" \
       "$CAPTURE" "$overrides"
 }
@@ -186,28 +201,28 @@ test_valid_token_admits_to_pending() {
 }
 
 # ---------------------------------------------------------------------------
-# default-unchanged + actionable-403 (#2024 A.3): with the env gate UNSET an
-# unknown peer is STILL 403, but the reply now carries the ACTIONABLE posture
-# code `room_autojoin_disabled` (so a first-contact joiner can be told the
-# leader's gate is off and to ask the leader to enable it, rather than rotating
-# the invite — rotation does not change the gate posture). The code is POSTURE
-# ONLY: the gate fires BEFORE any body shape parse / room lookup / token verify,
-# so it says nothing about whether the invite is valid (an expired/revoked token
-# under the disabled gate gets the same code) — never room existence or token
-# validity (no oracle). It must also leave the leader pristine: NO peer, NO
-# pending row, NO disk write.
+# opt-out + actionable-403 (#2024 A.3 / B): with the gate EXPLICITLY OFF
+# (BRIDGE_A2A_ROOM_AUTOJOIN=0 — the operator opt-out) an unknown peer is 403,
+# and the reply carries the ACTIONABLE posture code `room_autojoin_disabled`
+# (so a first-contact joiner can be told the leader opted out and to ask them to
+# re-enable it, rather than rotating the invite — rotation does not change the
+# gate posture). The code is POSTURE ONLY: the gate fires BEFORE any body shape
+# parse / room lookup / token verify, so it says nothing about whether the
+# invite is valid (an expired/revoked token under the opt-out gets the same
+# code) — never room existence or token validity (no oracle). It must also
+# leave the leader pristine: NO peer, NO pending row, NO disk write.
 # ---------------------------------------------------------------------------
-test_gate_disabled_actionable_403() {
+test_opt_out_actionable_403() {
   reset_leader_cfg
-  # Snapshot the leader cfg on disk so we can prove the disabled gate wrote
+  # Snapshot the leader cfg on disk so we can prove the opt-out gate wrote
   # NOTHING (posture-only — it returns before any peer/disk work).
   local cfg_before
   cfg_before="$(python3 "$HELPER" config-text "$CFG_A")"
   join_as bart -- "$LINK" >/dev/null 2>&1 || smoke_fail "capture a request"
   local res
-  res="$(deliver_no_gate)"
+  res="$(deliver_opt_out)"
   smoke_assert_contains "$res" "status=403" \
-    "with BRIDGE_A2A_ROOM_AUTOJOIN unset, an unknown peer is STILL 403 (default unchanged)"
+    "with BRIDGE_A2A_ROOM_AUTOJOIN=0 (opt-out), an unknown peer is 403"
   smoke_assert_contains "$res" "room_autojoin_disabled" \
     "the reject now carries the actionable posture code room_autojoin_disabled"
   smoke_assert_contains "$res" "disabled on the leader" \
@@ -247,6 +262,89 @@ test_gate_disabled_actionable_403() {
 }
 
 # ---------------------------------------------------------------------------
+# #2024 B default-ON (positive): with the gate env UNSET (the production
+# default after #2024 B), a valid first-contact token is admitted to a PENDING
+# (still leader-approved) join — the same outcome as an explicit =1, proving the
+# DEFAULT now resolves ENABLED. The reverse peer is auto-registered exactly as
+# under the explicit gate.
+# ---------------------------------------------------------------------------
+test_default_unset_admits_to_pending() {
+  reset_leader_cfg
+  join_as nat -- "$LINK" >/dev/null 2>&1 \
+    || smoke_fail "joiner side should self-bootstrap + capture the signed request"
+  smoke_assert_file_exists "$CAPTURE" "the signed cross-node request was captured"
+  local res
+  res="$(deliver_default)"
+  smoke_assert_contains "$res" "status=200" \
+    "DEFAULT (env UNSET) admits a valid unknown-peer token → 200 (auto-join is ON by default, #2024 B)"
+  smoke_assert_contains "$res" "\"status\": \"pending\"" \
+    "the wire reply is still pending (leader-approval gate intact under the new default)"
+  smoke_assert_not_contains "$res" "room_autojoin_disabled" \
+    "the default posture does NOT emit the opt-out 403 code"
+  local ids
+  ids="$(python3 "$HELPER" peer-ids "$CFG_A")"
+  smoke_assert_contains "$ids" "$NODE_B" "the joiner node was auto-registered under the default-ON gate"
+  local rows
+  rows="$(python3 "$HELPER" pending-rows "$BRIDGE_A2A_ROOMS_DB" "$ROOM")"
+  smoke_assert_contains "$rows" "\"verified\": 1" "the pending row is verified (full preamble ran under default-ON)"
+}
+
+# ---------------------------------------------------------------------------
+# #2024 B default-ON (FAIL-CLOSED): the flip MUST NOT weaken the security
+# boundary. Under the DEFAULT (env unset → ON), a FORGED-signature token and an
+# EXPIRED token are BOTH still rejected with NO pending row and NO durable peer
+# write — proving the per-pair HMAC + token TTL gates remain the boundary, the
+# env flip only governs WHETHER the bootstrap is reachable.
+# ---------------------------------------------------------------------------
+test_default_on_forged_and_expired_fail_closed() {
+  # --- forged signature under the DEFAULT gate → 401, no pending row, no peer.
+  reset_leader_cfg
+  join_as fae -- "$LINK" >/dev/null 2>&1 || smoke_fail "capture a request"
+  local wrong_key path mid ts body bodyhash canonical badsig
+  wrong_key="$(python3 "$HELPER" token-hash-key "$RAW_TOKEN" "$ROOM" "$NODE_A" "$NODE_B")"
+  path="$(python3 "$HELPER" captured-field "$CAPTURE" path)"
+  mid="$(python3 "$HELPER" captured-field "$CAPTURE" header:X-AGB-Message-Id)"
+  ts="$(python3 "$HELPER" captured-field "$CAPTURE" header:X-AGB-Timestamp)"
+  body="$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['body'])" "$CAPTURE")"
+  bodyhash="$(python3 -c "import hashlib,sys;print(hashlib.sha256(sys.argv[1].encode()).hexdigest())" "$body")"
+  canonical="$(printf 'POST\n%s\n%s\n%s\n%s\n%s' "$path" "$NODE_B" "$mid" "$ts" "$bodyhash")"
+  badsig="$(python3 -c "import hmac,hashlib,sys;print('v1='+hmac.new(bytes.fromhex(sys.argv[1]),sys.argv[2].encode(),hashlib.sha256).hexdigest())" "$wrong_key" "$canonical")"
+  local res
+  res="$(deliver_default '{"headers":{"X-AGB-Signature":"'"$badsig"'"}}')"
+  smoke_assert_contains "$res" "status=401" \
+    "default-ON fail-closed: a FORGED-key signature still fails HMAC (401), the env flip did not bypass it"
+  local rows
+  rows="$(python3 "$HELPER" pending-rows "$BRIDGE_A2A_ROOMS_DB" "$ROOM")"
+  smoke_assert_not_contains "$rows" "fae" "default-ON fail-closed: no pending row for the forged-signature join"
+  local ids
+  ids="$(python3 "$HELPER" peer-ids "$CFG_A")"
+  smoke_assert_not_contains "$ids" "$NODE_B" \
+    "default-ON fail-closed: the forged-signature bootstrap persists NO peer to disk (no poisoning)"
+  # --- expired token under the DEFAULT gate → 403 opaque, no pending row, no peer.
+  reset_leader_cfg
+  local out room link
+  out="$(room_create_as fern 1)"
+  room="$(json_field room_id "$out")"
+  link="$(json_field invite_link "$out")"
+  python3 "$HELPER" set-token-ts "$BRIDGE_A2A_ROOMS_DB" "$room" 1 >/dev/null
+  join_as fern -- "$link" >/dev/null 2>&1 || smoke_fail "capture an expired-token request"
+  res="$(deliver_default)"
+  smoke_assert_contains "$res" "status=403" \
+    "default-ON fail-closed: an EXPIRED token is still 403 (token TTL gate intact)"
+  # #2073 TAXONOMY: a stale/expired/revoked token returns the single actionable
+  # `stale_or_unknown_invite` bucket (it superseded the old opaque `unknown
+  # peer` for the token-invalid case). NO TOKEN ORACLE still holds — every
+  # token-invalid verdict collapses to the SAME external response, so the env
+  # flip to default-ON did not turn the gate into a token-verdict oracle.
+  smoke_assert_contains "$res" "stale_or_unknown_invite" \
+    "default-ON fail-closed: the expired-token reply stays OPAQUE (no token-verdict oracle under the new default)"
+  smoke_assert_not_contains "$res" "expired" \
+    "default-ON fail-closed: the peer-facing reply does NOT disclose the expired verdict"
+  ids="$(python3 "$HELPER" peer-ids "$CFG_A")"
+  smoke_assert_not_contains "$ids" "$NODE_B" "default-ON fail-closed: no peer auto-registered for an expired token"
+}
+
+# ---------------------------------------------------------------------------
 # negative control (#2024 A.3): genuinely MALFORMED/garbage requests stay
 # OPAQUE — the actionable room_autojoin_disabled code is reserved for the gate
 # posture, never handed to noise. A request that fails the receiver's preamble
@@ -257,8 +355,10 @@ test_malformed_stays_opaque_under_gate_off() {
   reset_leader_cfg
   join_as bess -- "$LINK" >/dev/null 2>&1 || smoke_fail "capture a request"
   # Garbage protocol tag → opaque 400 "unsupported protocol", never the gate code.
+  # Run under the EXPLICIT opt-out (=0) so the gate WOULD have fired if it were
+  # reached — proving the preamble rejection precedes the gate posture code.
   local res
-  res="$(deliver_no_gate '{"headers":{"X-AGB-Protocol":"garbage-vNaN"}}')"
+  res="$(deliver_opt_out '{"headers":{"X-AGB-Protocol":"garbage-vNaN"}}')"
   smoke_assert_contains "$res" "status=400" \
     "a malformed (bad-protocol) request is rejected at the preamble, before the gate"
   smoke_assert_contains "$res" "unsupported protocol" \
@@ -559,16 +659,16 @@ test_reattach_known_vs_new() {
   smoke_assert_contains "$ids" "$NODE_B" "reattach: the new peer is now persisted (known)"
   # Now nodeB is KNOWN. A second join from nodeB takes the established-peer path
   # (find_peer succeeds) — it never re-enters the token-bootstrap branch. Prove
-  # the known-peer path still works even WITHOUT the env gate (no token-bootstrap
-  # needed for an already-paired peer).
+  # the known-peer path is INDEPENDENT of the auto-join gate: it still works even
+  # with the gate EXPLICITLY OFF (no token-bootstrap needed for a paired peer).
   join_as ivy -- "$link" >/dev/null 2>&1 || smoke_fail "capture a second request"
   local res
-  res="$(deliver_no_gate)"
+  res="$(deliver_opt_out)"
   smoke_assert_contains "$res" "status=200" \
-    "reattach: a KNOWN peer re-joins via the ordinary node-link (no token-bootstrap, gate off)"
-  # A brand-new DIFFERENT peer with the gate off is still 403 (two-factor for new).
-  # nodeC uses its OWN fresh room/link (a distinct single-use nonce) so it is a
-  # genuine first contact, not a replay of ivy's link.
+    "reattach: a KNOWN peer re-joins via the ordinary node-link (gate opt-out does not affect paired peers)"
+  # A brand-new DIFFERENT peer with the gate EXPLICITLY OFF is 403 (the opt-out
+  # restores the two-factor-for-new posture). nodeC uses its OWN fresh room/link
+  # (a distinct single-use nonce) so it is a genuine first contact, not a replay.
   local outc linkc cfg_c="$SMOKE_TMP_ROOT/handoff-C.json"
   outc="$(room_create_as jade 0)"
   linkc="$(json_field invite_link "$outc")"
@@ -578,9 +678,9 @@ test_reattach_known_vs_new() {
       "BRIDGE_A2A_CONFIG=$cfg_c" "BRIDGE_ROOMS_TEST_POST_HOOK=$POST_HOOK" \
       "CAPTURE_FILE=$CAPTURE" "CLIENT_IP=$ADDR_B" \
     python3 "$ROOMS_CLI" join "$linkc" >/dev/null 2>&1 || smoke_fail "capture nodeC request"
-  res="$(deliver_no_gate '{"headers":{"X-AGB-Peer":"nodeC"}}')"
+  res="$(deliver_opt_out '{"headers":{"X-AGB-Peer":"nodeC"}}')"
   smoke_assert_contains "$res" "status=403" \
-    "reattach: a brand-new peer is still 403 with the gate off (new ≠ known; two-factor)"
+    "reattach: a brand-new peer is 403 under the gate opt-out (new ≠ known; two-factor)"
 }
 
 # ---------------------------------------------------------------------------
@@ -625,7 +725,9 @@ test_remote_addr_socket_only() {
 # ---------------------------------------------------------------------------
 smoke_run "setup: room on node A + v2 SIGNED invite (reach= + s=)" test_setup_signed_invite
 smoke_run "case 4: a valid token admits to PENDING (not 403); peer auto-registered" test_valid_token_admits_to_pending
-smoke_run "gate disabled: env unset → 403 room_autojoin_disabled (posture-only, no write)" test_gate_disabled_actionable_403
+smoke_run "#2024 B default-ON: env UNSET admits a valid token to PENDING (new default)" test_default_unset_admits_to_pending
+smoke_run "#2024 B default-ON fail-closed: forged sig → 401 / expired → 403, no pending row, no peer" test_default_on_forged_and_expired_fail_closed
+smoke_run "opt-out: env=0 → 403 room_autojoin_disabled (posture-only, no write)" test_opt_out_actionable_403
 smoke_run "negative: a malformed request stays OPAQUE under the gate (no posture code)" test_malformed_stays_opaque_under_gate_off
 smoke_run "case 1: token-hash-as-key rejected (domain separation)" test_token_hash_as_key_rejected
 smoke_run "case 1b: bad-sig bootstrap does not poison the shared in-mem cfg (r2 P1)" test_shared_cfg_no_poison_across_requests

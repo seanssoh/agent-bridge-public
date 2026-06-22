@@ -292,13 +292,17 @@ assert_wrapper_denied \
   "$ADMIN_AGENT" "operator-tui" \
   "BRIDGE_A2A_PEER_SUSPECT_THRESHOLD=1"
 
-# 1j (#2024): the room-autojoin flag is allowlisted but STRICT — only the
-# literal "1" is a valid value; any other value (here "0") is denied by the
-# flag_one type screen so a confusing no-op can't be persisted.
+# 1j (#2024 B): the room-autojoin flag is allowlisted and flag_bool — "1" and
+# "0" (and their on/off spellings) are valid, durable values, but a GARBAGE
+# value (here "2") is rejected by the flag_bool type screen so a confusing/
+# ambiguous value can't be persisted. (This caller has no live pane binding, so
+# the wrapper denies at the caller-trust gate regardless; the positive value
+# canonicalization for "0"/"1" is asserted directly against validate_env_value
+# in the value-screen section below.)
 assert_wrapper_denied \
-  "wrapper: room-autojoin non-1 value denied (flag_one)" \
+  "wrapper: room-autojoin garbage value denied" \
   "$ADMIN_AGENT" "operator-tui" \
-  "BRIDGE_A2A_ROOM_AUTOJOIN=0"
+  "BRIDGE_A2A_ROOM_AUTOJOIN=2"
 
 # Confirm NOTHING was written by any denied attempt.
 if [[ -f "$ENV_FILE" ]]; then
@@ -638,5 +642,19 @@ assert_bash_verdict \
   "$ADMIN_AGENT" \
   "cat $ENV_FILE" \
   "ALLOW"
+
+# ===========================================================================
+# SECTION 5 (#2024 B) — VALUE SCREEN: flag_bool canonicalization, asserted
+# directly against bridge-config.validate_env_value (the wrapper's negative
+# tests above deny at the caller-trust gate before value validation runs, so the
+# canonicalization is covered here where the screen is actually reached). The
+# helper is a standalone script (no heredoc-stdin into a subprocess) per the
+# lint-heredoc-ban contract; the bridge-config.py path is argv[1].
+# ===========================================================================
+if "$PYTHON_BIN" "$SCRIPT_DIR/v0166-lc-config-set-env-valuecheck.py" "$WRAPPER"; then
+  smoke_log "ok: flag_bool value screen — 0/1/on/off canonicalize, garbage rejected"
+else
+  smoke_fail "flag_bool value screen failed (see valuecheck helper output)"
+fi
 
 smoke_log "PASS: all config set-env wrapper + hook + #341 cases held"

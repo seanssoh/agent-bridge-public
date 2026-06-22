@@ -94,12 +94,14 @@ verified by hash compare — an invalid token is rejected. The request lands as
 `pending`.
 
 > **Cross-node first-contact** (joining from a node the leader has never paired
-> with) additionally needs the leader to have **room auto-join enabled** — see
-> [Enabling first-contact room auto-join](#enabling-first-contact-room-auto-join-bridge_a2a_room_autojoin--runbook-2024).
-> Without it the join returns `403 code=room_autojoin_disabled`. That response
-> only proves the leader's auto-join gate is off (it is returned *before* any
-> token check) — so do not rotate the invite for it; have the leader enable +
-> restart, then retry.
+> with) goes through the leader's **room auto-join** gate, which is **ON by
+> default since #2024 B** — see
+> [First-contact room auto-join](#enabling-first-contact-room-auto-join-bridge_a2a_room_autojoin--runbook-2024).
+> A leader who has explicitly opted out (`BRIDGE_A2A_ROOM_AUTOJOIN=0`/`off`)
+> returns `403 code=room_autojoin_disabled`. That response only proves the
+> leader's auto-join gate is off (it is returned *before* any token check) — so
+> do not rotate the invite for it; have the leader re-enable + restart, then
+> retry.
 
 ### 3. Leader approves (or denies)
 
@@ -340,61 +342,68 @@ adapters, so the control-loop logic itself stays transport-agnostic:
 
 ### Enabling first-contact room auto-join (`BRIDGE_A2A_ROOM_AUTOJOIN`) — runbook (#2024)
 
-Token-bootstrap join (above) is **gated OFF by default** on the leader's A2A
-receiver. With the gate off, a brand-new node's first `agb room join '<signed
-invite>'` is rejected with **HTTP 403 `code=room_autojoin_disabled`** — the
-leader has not opted in to first-contact auto-join. This code is **posture
-only**: the gate fires *before* any token or room check, so it tells you the
-gate is off but says **nothing** about whether the invite itself is valid (an
-expired/revoked/wrong-room invite gets the same code while the gate is off).
-Opt-in is deliberate: auto-join only ever creates a **pending, leader-approved**
-join (it admits nobody automatically), but it is the only place the receiver
-does any pre-auth work for an *unknown* peer.
+Token-bootstrap join (above) is **ON by default since #2024 B** on the leader's
+A2A receiver: a brand-new node's first `agb room join '<signed invite>'` lands a
+**pending, leader-approved** join without any per-host env tweak. The default-ON
+posture is security-neutral — auto-join only ever creates a pending row (it
+admits nobody automatically), and every gate (per-pair HMAC, `remote_addr` pin,
+token TTL/revocation, dedupe, leader-approval) still runs, so a forged/expired
+token is still rejected with no pending row.
 
-`agb room invite` and `agb a2a setup --show-state` both warn the leader when
-this gate is off. To turn it on:
+`agb room invite` and `agb a2a setup --show-state` both confirm the current
+posture and warn the leader only when it has explicitly opted out.
 
-**Leader** (enable once, then hand out invites):
-
-```bash
-agb config set-env BRIDGE_A2A_ROOM_AUTOJOIN=1   # writes $BRIDGE_HOME/agent-env.local.sh
-agb a2a daemon restart                          # re-sources the override into the receiver
-agb room invite <room_id>                       # mint the signed invite to hand out
-```
-
-> The receiver spawn sources the install-wide `agent-env.local.sh` override
-> directly before launch (#15783), so a restart picks up
-> `BRIDGE_A2A_ROOM_AUTOJOIN` whether you go through `agb a2a daemon restart`
-> or a direct `bash bridge-handoff-daemon.sh start`. To turn the gate back
-> **off**, remove the key from `agent-env.local.sh` and restart.
-
-**Joiner** (single signed link completes onboarding):
+**Joiner** (single signed link completes onboarding, no leader config needed):
 
 ```bash
 agb room join '<signed invite link>'
 ```
 
+**Opt out** (restore the conservative default-OFF posture — e.g. a leader that
+does not want any pre-auth work for unknown peers). A leader that has opted out
+rejects a first-contact join with **HTTP 403 `code=room_autojoin_disabled`**.
+This code is **posture only**: the gate fires *before* any token or room check,
+so it tells you the gate is off but says **nothing** about whether the invite
+itself is valid (an expired/revoked/wrong-room invite gets the same code while
+opted out).
+
+```bash
+agb config set-env BRIDGE_A2A_ROOM_AUTOJOIN=0   # opt out; writes $BRIDGE_HOME/agent-env.local.sh
+agb a2a daemon restart                          # re-sources the override into the receiver
+```
+
+> The receiver spawn sources the install-wide `agent-env.local.sh` override
+> directly before launch (#15783), so a restart picks up the opt-out whether
+> you go through `agb a2a daemon restart` or a direct `bash
+> bridge-handoff-daemon.sh start`. To turn the gate back **on** after opting
+> out, set `BRIDGE_A2A_ROOM_AUTOJOIN=1` (or remove the key entirely — the
+> default is ON) and restart. `agb room invite` and `agb a2a setup
+> --show-state` confirm the current posture and warn when a leader has opted
+> out.
+
 **If the joiner gets `room_autojoin_disabled`**: this response proves *only*
-that the leader's auto-join gate is disabled (it is returned before any token
-check, so it does not confirm the invite is valid). Ask the leader to run the
-two commands above and restart the receiver, then retry. **Do not rotate the
-invite** for this error; rotation does not change the leader's gate posture.
+that the leader has opted OUT of auto-join (it is returned before any token
+check, so it does not confirm the invite is valid). Ask the leader to re-enable
+it (`agb config set-env BRIDGE_A2A_ROOM_AUTOJOIN=1` + `agb a2a daemon restart`),
+then retry. **Do not rotate the invite** for this error; rotation does not
+change the leader's gate posture.
 
-**If the joiner gets `stale_or_unknown_invite`** (gate already on): the invite
-link is stale or no longer matches the leader's current invite — almost always
-because the leader re-minted (`agb room invite` / `rotate-invite` silently
-invalidate every outstanding link). The remedy is exactly what the reject says:
-ask the leader for a **fresh** link and retry. This single bucket covers
-rotated / expired / unknown tokens identically (it never tells the joiner which —
-that would be an oracle); the precise verdict is in the leader's audit log only.
-A joiner that previously bootstrapped from the old link **self-heals** on the
-fresh link (its local node-link key is refreshed automatically), so no manual
-peer cleanup is needed (#2073). A non-leader node or a room this node does not
-lead is still rejected with the opaque `unknown peer` (no room-existence leak).
+**If the joiner gets `stale_or_unknown_invite`** (auto-join on, the default):
+the invite link is stale or no longer matches the leader's current invite —
+almost always because the leader re-minted (`agb room invite` / `rotate-invite`
+silently invalidate every outstanding link). The remedy is exactly what the
+reject says: ask the leader for a **fresh** link and retry. This single bucket
+covers rotated / expired / unknown tokens identically (it never tells the joiner
+which — that would be an oracle); the precise verdict is in the leader's audit
+log only. A joiner that previously bootstrapped from the old link **self-heals**
+on the fresh link (its local node-link key is refreshed automatically), so no
+manual peer cleanup is needed (#2073). A non-leader node or a room this node does
+not lead is still rejected with the opaque `unknown peer` (no room-existence
+leak).
 
-**If the joiner gets `bad_signature`** (gate on, token current): this is a real
-HMAC-stage failure — a tampered body, a wrong key, or local key-cache drift — and
-is NOT the stale-invite case above. Re-running `agb room join` with a fresh
+**If the joiner gets `bad_signature`** (auto-join on, token current): this is a
+real HMAC-stage failure — a tampered body, a wrong key, or local key-cache drift —
+and is NOT the stale-invite case above. Re-running `agb room join` with a fresh
 signed link is the first thing to try; if it persists, the node-link secrets have
 genuinely diverged.
 

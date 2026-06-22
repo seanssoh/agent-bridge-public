@@ -118,6 +118,24 @@ ENV_KEY_TYPE_NON_NEG_INT = "non_neg_int"
 #                  durable value is "1"; to turn the feature back OFF the
 #                  operator removes the key from the managed file and restarts.
 ENV_KEY_TYPE_FLAG_ONE = "flag_one"
+#   "flag_bool"  — a two-state ON/OFF gate that is DURABLY settable to either
+#                  state. Canonicalizes a small fixed set of stripped/lowercase
+#                  spellings to "1" (1/true/on/yes) or "0"
+#                  (0/false/off/no/disable/disabled) and rejects everything
+#                  else. Unlike flag_one, "0" is a meaningful durable value —
+#                  used by a DEFAULT-ON feature whose consuming code resolves an
+#                  unset env to ON, so the operator needs an explicit, durable
+#                  opt-out (e.g. BRIDGE_A2A_ROOM_AUTOJOIN, #2024 B). The runtime
+#                  off-value set is kept in lock-step with
+#                  bridge_a2a_common.ROOM_AUTOJOIN_OFF_VALUES.
+ENV_KEY_TYPE_FLAG_BOOL = "flag_bool"
+# Canonical on/off spellings accepted by ENV_KEY_TYPE_FLAG_BOOL. Exact members
+# only (after strip + lowercase); anything not listed is rejected by
+# validate_env_value so a smuggled/ambiguous value cannot land in the managed
+# file. The OFF set mirrors bridge_a2a_common.ROOM_AUTOJOIN_OFF_VALUES so the
+# durable file value and the runtime resolver agree.
+ENV_FLAG_BOOL_ON_VALUES = frozenset({"1", "true", "on", "yes"})
+ENV_FLAG_BOOL_OFF_VALUES = frozenset({"0", "false", "off", "no", "disable", "disabled"})
 
 # NARROW allowlist. Each entry was confirmed to be read from `os.environ`
 # (not a JSON config field) and to be a non-secret operational timing /
@@ -137,7 +155,7 @@ ENV_KEY_TYPE_FLAG_ONE = "flag_one"
 #   BRIDGE_A2A_RECEIVER_STALENESS_CLAIM_STALE_SECONDS
 #                                            lib/daemon-helpers/a2a-receiver-staleness.py:383 (int seconds)
 #   BRIDGE_DYNAMIC_IDLE_REAP_SECONDS         bridge-daemon.sh:reap_idle_dynamic_agents (int>=0; 0 disables)
-#   BRIDGE_A2A_ROOM_AUTOJOIN                 bridge-handoffd.py:_room_join_bootstrap_unknown_peer (== "1" gate)
+#   BRIDGE_A2A_ROOM_AUTOJOIN                 bridge-handoffd.py:_room_join_bootstrap_unknown_peer (default-ON gate; flag_bool)
 ENV_KEY_ALLOWLIST: dict[str, str] = {
     "BRIDGE_A2A_WARP_HANDSHAKE_STALE_SECONDS": ENV_KEY_TYPE_POS_INT,
     "BRIDGE_A2A_RECONCILE_INTERVAL": ENV_KEY_TYPE_POS_INT,
@@ -154,10 +172,12 @@ ENV_KEY_ALLOWLIST: dict[str, str] = {
     "BRIDGE_DYNAMIC_IDLE_REAP_SECONDS": ENV_KEY_TYPE_NON_NEG_INT,
     # Issue #2024: leader-side A2A room first-contact auto-join feature gate.
     # The receiver admits an unknown peer presenting a valid room invite token
-    # to a PENDING (still leader-approved) join only when this is exactly "1";
-    # default-OFF, discoverable via `agb config set-env` + `agb a2a daemon
-    # restart` so the receiver inherits it. Non-secret feature toggle.
-    "BRIDGE_A2A_ROOM_AUTOJOIN": ENV_KEY_TYPE_FLAG_ONE,
+    # to a PENDING (still leader-approved) join. DEFAULT-ON since #2024 B: an
+    # unset env resolves ENABLED; the operator opts OUT durably with
+    # `agb config set-env BRIDGE_A2A_ROOM_AUTOJOIN=0` + `agb a2a daemon restart`.
+    # flag_bool (not flag_one) precisely because "0" is now a meaningful durable
+    # value. Non-secret feature toggle.
+    "BRIDGE_A2A_ROOM_AUTOJOIN": ENV_KEY_TYPE_FLAG_BOOL,
     # Issue #16309: queue-gateway CLIENT read-wait timeout (seconds). An iso
     # agent's `agb done/claim` proxies through the daemon's once-per-tick
     # queue-gateway serve-once (bridge-queue.py:646 passes this to the gateway
@@ -1305,6 +1325,25 @@ def validate_env_value(key: str, raw: str) -> tuple[str | None, str | None]:
         return None, (
             f"value for {key} must be the literal \"1\" (the feature gate is "
             f"strict; remove the key + restart to disable), got {raw!r}"
+        )
+    if expected == ENV_KEY_TYPE_FLAG_BOOL:
+        # A two-state ON/OFF gate that is durably settable to EITHER state.
+        # Accept a small fixed set of unambiguous spellings (exact, after the
+        # control-char rejection above + strip + lowercase) and CANONICALIZE to
+        # "1" / "0" so only those two forms land in the managed file. Reject
+        # everything else (no loose prefixes, no arbitrary truthy strings) so a
+        # smuggled value cannot survive — the consuming code resolves an unset
+        # key to ON, so the meaningful durable opt-out is the canonical "0".
+        low = text.lower()
+        if low in ENV_FLAG_BOOL_ON_VALUES:
+            return "1", None
+        if low in ENV_FLAG_BOOL_OFF_VALUES:
+            return "0", None
+        on = "/".join(sorted(ENV_FLAG_BOOL_ON_VALUES))
+        off = "/".join(sorted(ENV_FLAG_BOOL_OFF_VALUES))
+        return None, (
+            f"value for {key} must be an on ({on}) or off ({off}) spelling, "
+            f"got {raw!r}"
         )
     if expected == ENV_KEY_TYPE_POS_FLOAT:
         try:
