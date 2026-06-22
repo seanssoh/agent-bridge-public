@@ -359,13 +359,18 @@ test_revoked_and_expired_still_403() {
   local res
   res="$(deliver)"
   smoke_assert_contains "$res" "status=403" "case 4: an EXPIRED token is still 403 (not admitted)"
-  # NO TOKEN ORACLE (#2024 A.4): the UNKNOWN-peer reply is OPAQUE `unknown peer`
-  # — it must NOT leak the token verdict (`expired`) to an unpaired prober. The
-  # precise verdict lives ONLY in the operator-side audit.
-  smoke_assert_contains "$res" "unknown peer" \
-    "case 4 (A.4): an unknown-peer expired token replies OPAQUE (no token-verdict oracle)"
+  # #2073 TAXONOMY (supersedes the old opaque `unknown peer` for the
+  # token-invalid case): a stale/expired/revoked token now returns the single
+  # actionable `stale_or_unknown_invite` bucket. NO TOKEN ORACLE still holds —
+  # ALL three verdicts (mismatch/expired/revoked) collapse to the SAME external
+  # response + remedy, so a prober cannot distinguish "expired/revoked" from
+  # "never-matched"; the precise verdict lives ONLY in the operator-side audit.
+  smoke_assert_contains "$res" "stale_or_unknown_invite" \
+    "case 4 (#2073): an unknown-peer expired token → the actionable stale_or_unknown_invite bucket"
+  smoke_assert_contains "$res" "fresh invite" \
+    "case 4 (#2073): the reply names the remedy (request a fresh invite)"
   smoke_assert_not_contains "$res" "expired" \
-    "case 4 (A.4): the peer-facing reply does NOT disclose the expired verdict"
+    "case 4 (A.4): the peer-facing reply does NOT disclose the expired verdict (no oracle)"
   local audit="$BRIDGE_LOG_DIR/a2a-handoff.jsonl"
   if [[ -f "$audit" ]]; then
     smoke_assert_contains "$(grep room_join_reject "$audit" | tail -1)" \
@@ -375,7 +380,9 @@ test_revoked_and_expired_still_403() {
   local ids
   ids="$(python3 "$HELPER" peer-ids "$CFG_A")"
   smoke_assert_not_contains "$ids" "$NODE_B" "case 4: no peer auto-registered for an expired token"
-  # Revoked: rotate the original room's invite (old token no longer matches).
+  # Revoked: rotate the original room's invite (old token no longer matches). The
+  # revoked verdict shares the SAME external bucket as expired (the no-oracle
+  # collapse), so the peer-facing reply is byte-identical.
   reset_leader_cfg
   join_as fred -- "$LINK" >/dev/null 2>&1 || smoke_fail "capture an old-token request"
   env "${TEST_FLAGS[@]}" "BRIDGE_ROOMS_TEST_ISO_USER=agent-bridge-alice" \
@@ -384,6 +391,10 @@ test_revoked_and_expired_still_403() {
     || smoke_fail "leader rotate-invite should succeed"
   res="$(deliver)"
   smoke_assert_contains "$res" "status=403" "case 4: a REVOKED (rotated-away) token is still 403"
+  smoke_assert_contains "$res" "stale_or_unknown_invite" \
+    "case 4 (#2073): a REVOKED token shares the SAME stale_or_unknown_invite bucket (no oracle vs expired)"
+  smoke_assert_not_contains "$res" "revoked" \
+    "case 4 (A.4): the peer-facing reply does NOT disclose the revoked verdict"
 }
 
 # ---------------------------------------------------------------------------

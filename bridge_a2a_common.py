@@ -2214,9 +2214,13 @@ def verify_invite_canonical(raw_token: str, canonical: str,
 # TOCTOU-locked peer auto-register (A2A Rooms v0.16.5 Lane 4, #1695)
 # --------------------------------------------------------------------------
 
+ROOM_BOOTSTRAP_PROVENANCE_KEY = "room_bootstrap"
+
+
 def auto_register_room_peer_locked(
     cfg_path: Optional[Path], *, peer_id: str, address: str, port: int,
     secret: str, inbound_allowlist: list[str], transport: str,
+    room_bootstrap: bool = False,
 ) -> tuple[bool, str]:
     """Atomically add a reverse node-link peer for a token-bootstrapped room
     join, under an exclusive advisory FILE LOCK (closes the concurrent-join
@@ -2237,6 +2241,13 @@ def auto_register_room_peer_locked(
 
     NEVER trusts a wire-asserted address: the caller passes the SOCKET
     remote_addr (`client_ip`) as `address`, not a body field.
+
+    `room_bootstrap` (#2073): when True the written entry is STAMPED with the
+    `room_bootstrap=true` provenance flag so a later joiner-side self-heal can
+    recognize the peer as one IT auto-created from an invite token (and is thus
+    safe to refresh on a re-mint) vs a hand-provisioned node-link (which the
+    self-heal must never touch). The flag is provenance metadata only — it never
+    relaxes any auth check.
     """
     if not peer_id or not secret:
         return False, "missing_peer_or_secret"
@@ -2283,6 +2294,8 @@ def auto_register_room_peer_locked(
         }
         if port:
             entry["port"] = int(port)
+        if room_bootstrap:
+            entry[ROOM_BOOTSTRAP_PROVENANCE_KEY] = True
         peers.append(entry)
         # 4. re-validate the secret gate before writing.
         try:
@@ -2299,6 +2312,120 @@ def auto_register_room_peer_locked(
         except OSError as exc:
             return False, f"write_failed:{exc}"[:64]
         return True, "registered"
+    finally:
+        if lock_fd >= 0:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+
+
+def refresh_room_peer_secret_locked(
+    cfg_path: Optional[Path], *, peer_id: str, address: str, port: int,
+    new_secret: str, expected_old_secret: str, inbound_allowlist: list[str],
+) -> tuple[bool, str]:
+    """JOINER-side stale-local-peer SELF-HEAL (#2073): replace a previously
+    token-bootstrapped local leader peer's secret with a freshly-derived per-pair
+    key when (and ONLY when) the leader has re-minted the invite, so a re-join
+    signs with the CURRENT key instead of the stale one (which would fail the
+    receiver's HMAC as an opaque `bad_signature`).
+
+    This is the deliberately NARROW counterpart to `auto_register_room_peer_locked`
+    (which REFUSES to clobber a different secret). It is bounded three ways so it
+    can never silently overwrite a legitimate hand-provisioned node-link:
+
+      1. CALLER-BOUND: only invoked from the join path AFTER a NEW signed invite
+         link verified (token-bound canonical signature + TTL + single-use nonce),
+         and only when the freshly token-derived key DIFFERS from the stored one.
+      2. EXPECTED-OLD GUARD: the on-disk secret MUST equal `expected_old_secret`
+         (the value the caller saw under the same lock-free read). If another
+         writer changed it meanwhile, OR it does not match what the caller
+         compared against, we refuse (`unexpected_secret`) rather than clobber.
+      3. NEW != OLD: a no-op refresh (new secret already current) returns `noop`.
+
+    The `expected_old_secret` guard is what keeps this from being a generic
+    "overwrite any peer secret" verb: the caller only ever passes the secret of a
+    peer it itself bootstrapped from a prior token (the stale value), so a
+    legitimately hand-registered peer (whose secret the caller never derived from
+    a token, hence cannot reproduce) is never a refresh target. Returns
+    (changed, code); fail-closed on any error.
+    """
+    if not peer_id or not new_secret:
+        return False, "missing_peer_or_secret"
+    target_path = cfg_path or config_path()
+    lock_path = target_path.with_name(target_path.name + ".lock")  # noqa: raw-pathlib-controller-only
+    lock_fd = -1
+    try:
+        lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as exc:
+        return False, f"lock_open_failed:{exc}"[:64]
+    try:
+        if fcntl is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            except OSError as exc:
+                return False, f"lock_acquire_failed:{exc}"[:64]
+        try:
+            disk_cfg = load_config(target_path)
+        except A2AError as exc:
+            return False, getattr(exc, "code", "config_load_failed")
+        peers = disk_cfg.get("peers")
+        if not isinstance(peers, list):
+            return False, "config_shape"
+        target: Optional[dict[str, Any]] = None
+        for p in peers:
+            if isinstance(p, dict) and p.get("id") == peer_id:
+                target = p
+                break
+        if target is None:
+            # The peer vanished from disk between the caller's read and the lock;
+            # fall through to the caller's register path rather than inventing one.
+            return False, "peer_absent"
+        # PROVENANCE GATE (defense-in-depth, #2073): the on-disk entry MUST carry
+        # the room_bootstrap stamp — i.e. it is a peer the joiner itself created
+        # from a prior invite token. A hand-provisioned node-link (no stamp) is
+        # NEVER refreshed here even if the caller asks, so an operator-installed
+        # secret can never be overwritten by a token-derived one.
+        if not target.get(ROOM_BOOTSTRAP_PROVENANCE_KEY):
+            return False, "not_room_bootstrap"
+        current = target.get("secret")
+        if isinstance(current, str) and current == new_secret:
+            return False, "noop"  # already current — nothing to refresh
+        if not (isinstance(current, str) and current == expected_old_secret):
+            # The on-disk secret is NOT the stale token-derived value the caller
+            # saw — refuse to overwrite (it may be a legit hand-provisioned key,
+            # or a concurrent writer beat us). Fail closed; do NOT clobber.
+            return False, "unexpected_secret"
+        target["secret"] = new_secret
+        target[ROOM_BOOTSTRAP_PROVENANCE_KEY] = True  # preserve provenance
+        if address:
+            target["address"] = address
+        if port:
+            target["port"] = int(port)
+        if inbound_allowlist:
+            target["inbound_allowlist"] = list(inbound_allowlist)
+        # Drop any stale rotation key so the refreshed entry signs ONLY with the
+        # current derived secret (a leftover secret_next from a prior identity
+        # rotation has no meaning for a token-bootstrapped peer).
+        target.pop("secret_next", None)
+        try:
+            validate_config_peer_secrets(disk_cfg, side="receiver")
+        except A2AError as exc:
+            return False, getattr(exc, "code", "secret_gate")
+        try:
+            orig_mode = target_path.stat().st_mode & 0o777  # noqa: raw-pathlib-controller-only
+        except OSError:
+            orig_mode = 0o600
+        try:
+            write_config_atomic(target_path, disk_cfg, orig_mode)
+        except OSError as exc:
+            return False, f"write_failed:{exc}"[:64]
+        return True, "refreshed"
     finally:
         if lock_fd >= 0:
             try:
