@@ -26,6 +26,12 @@ Subcommands (argv[1]):
                              read stdin `peers list --json`, assert <agent> is
                              in the known_agents column of peer <peer>
   no-secrets <csv>           read stdin, assert none of the secret tokens appear
+  partial-roster-fail-closed import bridge-a2a.py, monkeypatch the read-only
+                             rooms-CLI delegation so `list` returns 2 rooms but
+                             one room's `show` FAILS (the race/unreadable case),
+                             then assert _collect_agent_node_map + resolve_agent_node
+                             FAIL CLOSED (registry_error, node=None) instead of
+                             routing on a partial map (codex #2025 BLOCKING)
 
 Exit 0 on pass, 1 on failure (prints the reason for the smoke log).
 """
@@ -136,6 +142,60 @@ def no_secrets(csv: str) -> int:
     return 0
 
 
+def partial_roster_fail_closed() -> int:
+    """Prove the auto-resolver FAILS CLOSED on a partial room roster (codex
+    #2025 BLOCKING focus item (a)).
+
+    The hole: `_collect_agent_node_map` walked `list` then `show <rid>` per
+    room. If it silently SKIPPED a listed room whose `show` failed, an agent on
+    node-b (room r1) + node-c (room r2) could collapse to a spurious "unique
+    node-b" when r2's show raced out — letting `send --peer auto` route on
+    incomplete data. We import the CLI module and monkeypatch the read-only
+    rooms-CLI delegation so `list` returns BOTH rooms but the SECOND room's
+    `show` fails, then assert the map + resolver return registry_error (NOT a
+    unique node).
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "bridge_a2a_cli_undertest", str(REPO_ROOT / "bridge-a2a.py"))
+    if spec is None or spec.loader is None:
+        return _fail("could not load bridge-a2a.py for the fail-closed unit")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    def fake_rooms_cli(verb, *extra):
+        if verb == "list":
+            return ([{"room_id": "r1", "epoch": 0},
+                     {"room_id": "r2", "epoch": 0}], None)
+        if verb == "show" and extra and extra[0] == "r1":
+            return ({"members": [
+                {"agent": "reviewer", "node": "node-b", "role": "member"}]},
+                None)
+        # r2 show FAILS — the race/unreadable case that must poison the map.
+        return (None, "simulated unreadable room")
+
+    mod._netstat_rooms_cli = fake_rooms_cli  # type: ignore[attr-defined]
+
+    amap, err = mod._collect_agent_node_map()
+    if err is None:
+        return _fail(
+            f"partial roster did NOT fail closed: map={amap!r} err=None "
+            "(a listed-room show failure must poison the whole map)")
+    if amap:
+        return _fail(f"fail-closed map must be empty; got {amap!r}")
+    res = mod.resolve_agent_node("reviewer")
+    if res.get("status") != "registry_error":
+        return _fail(
+            f"resolve_agent_node must be registry_error on a partial roster; "
+            f"got status={res.get('status')!r} node={res.get('node')!r} "
+            "(routing on a partial map would violate never-guess)")
+    if res.get("node") is not None:
+        return _fail(f"fail-closed resolve must not pick a node; got {res!r}")
+    print("partial-roster fail-closed OK")
+    return 0
+
+
 def main(argv: list[str]) -> int:
     if not argv:
         return _fail("no subcommand")
@@ -152,6 +212,8 @@ def main(argv: list[str]) -> int:
         return known_agents_for(rest[0], rest[1])
     if cmd == "no-secrets":
         return no_secrets(rest[0])
+    if cmd == "partial-roster-fail-closed":
+        return partial_roster_fail_closed()
     return _fail(f"unknown subcommand: {cmd}")
 
 
