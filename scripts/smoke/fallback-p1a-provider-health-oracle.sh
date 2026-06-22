@@ -437,7 +437,7 @@ smoke_log "(f) PASS — master gate OFF skips the tick entirely (zero production
 reset_state
 BRIDGE_FALLBACK_PROBE_CMD="$PROBE_OUTAGE" BRIDGE_FALLBACK_DNS_CMD="$DNS_OK" BRIDGE_FALLBACK_CLOCK=7000 \
   python3 "$ORACLE" report-outage --agent alpha --source cron --evidence "503" >/dev/null
-MODE="$(stat -f '%Lp' "$STATE_FILE" 2>/dev/null || stat -c '%a' "$STATE_FILE" 2>/dev/null)"
+MODE="$(stat -c '%a' "$STATE_FILE" 2>/dev/null || stat -f '%Lp' "$STATE_FILE" 2>/dev/null)"
 smoke_assert_eq "644" "$MODE" "state file is mode 0644 (non-secret observational, iso-readable)"
 # Plant a symlink at the leaf; the atomic O_NOFOLLOW replace must NOT follow it.
 VICTIM="$SMOKE_TMP_ROOT/victim.txt"
