@@ -51,10 +51,32 @@ def main() -> int:
         rows = json.loads(raw)
     except Exception:
         rows = []
+    # Issue #2067: the daemon's blocked-aging REMINDER task
+    # ("[blocked-aging] task #<id> needs status refresh", created_by=daemon,
+    # assigned to the OWNING agent — bridge-queue.py process_blocked_task_aging
+    # + BLOCKED_REMINDER_TITLE_PREFIX) is informational re-surfacing of the
+    # agent's OWN blocked work, not new work a third party expects it to claim.
+    # When the owning agent is busy those reminders age unclaimed and the
+    # watchdog escalated EACH to admin — N blocked tasks -> N reminders -> N
+    # admin tasks, pure noise. Skip that class here so it never admin-escalates
+    # (it still re-surfaces on its own blocked-aging cadence to the owning
+    # agent and stays claimable). The match is PRECISE — it requires BOTH the
+    # reserved daemon title prefix AND created_by=='daemon' — so a genuine
+    # work task that merely starts with that literal prefix (any other creator)
+    # STILL escalates. NOT skipped: "[blocked-escalation] task #" — that row is
+    # deliberately admin-assigned/admin-actionable, and an admin-assigned
+    # unclaimed row is already audit-only via the daemon's admin-self-target
+    # guard, so it generates no storm.
+    BLOCKED_REMINDER_TITLE_PREFIX = "[blocked-aging] task #"
+
     for r in rows:
         if not isinstance(r, dict):
             continue
         if (r.get("status") or "") != "queued":
+            continue
+        if (r.get("created_by") or "") == "daemon" and str(
+            r.get("title") or ""
+        ).startswith(BLOCKED_REMINDER_TITLE_PREFIX):
             continue
         try:
             created_ts = int(r.get("created_ts", 0) or 0)

@@ -9602,6 +9602,17 @@ process_unclaimed_queue_escalation() {
     # The find-open --all --format json shape provides created_ts +
     # status. Cron-dispatch rows are worker-queue backlog, not human
     # inbox nudges, so keep them out of the generic unclaimed-task alarm.
+    #
+    # Issue #2067: daemon blocked-aging REMINDER rows are ALSO exempted, but
+    # that exemption is NOT done here by title alone — it is keyed on BOTH the
+    # reminder title prefix AND created_by=daemon inside
+    # lib/daemon-helpers/unclaimed-task-filter.py (see that helper). A
+    # title-only --exclude-title-prefix here would over-exempt a genuine work
+    # task that merely happened to start with "[blocked-aging] task #", which
+    # MUST still escalate. created_by is not a find-open filter dimension, so
+    # the precise (title AND daemon-origin) match lives in the python helper
+    # that already receives created_by. [cron-dispatch] stays here because it
+    # is exempt regardless of creator (worker-queue backlog by design).
     # Filter to status='queued' AND age >= threshold in shell.
     rows="$(bridge_queue_cli find-open --agent "$agent" --status-filter queued --exclude-title-prefix '[cron-dispatch]' --all --format json 2>/dev/null || true)"
     [[ -n "$rows" && "$rows" != "[]" ]] || continue
