@@ -16738,6 +16738,10 @@ daemon_args_have_help() {
 # smoke). A real daemon never sources this file, so the override seam is
 # structurally out of reach in production.
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+# #68: refuse to drive a state-mutating verb against the LIVE runtime from a
+# transient (worktree / CI / fixer) source checkout. Fail-closed before any
+# tick. No-op for help/status/stop and for fully-isolated runs.
+bridge_guard_foreign_checkout "$CMD"
 case "$CMD" in
   -h|--help|help)
     usage
