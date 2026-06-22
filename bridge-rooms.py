@@ -64,6 +64,18 @@ def die(msg: str, code: int = 1) -> int:
     return code
 
 
+def _fmt_ts(ts: int) -> str:
+    """Render a unix timestamp as a readable UTC string for operator-facing
+    invite/issue output (#2073). Falls back to the raw epoch on any error so the
+    re-mint/`room show` lines never raise on a malformed value."""
+    try:
+        from datetime import datetime, timezone
+        return (datetime.fromtimestamp(int(ts), tz=timezone.utc)
+                .strftime("%Y-%m-%d %H:%M:%SZ"))
+    except (ValueError, OverflowError, OSError, TypeError):
+        return f"ts={ts}"
+
+
 # --------------------------------------------------------------------------
 # identity resolution (single-node P1a)
 # --------------------------------------------------------------------------
@@ -509,6 +521,22 @@ def cmd_show(args: argparse.Namespace) -> int:
         ]
     finally:
         conn.close()
+    # #2073 re-mint visibility: surface whether an invite is currently set and
+    # WHEN it was issued/rotated, so the leader can tell at a glance that any
+    # link older than this timestamp is now stale (a re-mint silently invalidates
+    # outstanding links). We NEVER expose the token or its hash — only the
+    # presence flag + the issued time.
+    invite_active = False
+    invite_issued_ts = 0
+    try:
+        invite_active = bool(room["invite_token_sha256"])
+    except (KeyError, IndexError, TypeError):
+        invite_active = False
+    if invite_active:
+        try:
+            invite_issued_ts = int(room["invite_token_ts"])
+        except (KeyError, IndexError, TypeError, ValueError):
+            invite_issued_ts = 0
     payload = {
         "room_id": roster["room_id"],
         "name": room["name"],
@@ -517,6 +545,8 @@ def cmd_show(args: argparse.Namespace) -> int:
         "status": room["status"],
         "members": roster["members"],
         "pending_join_requests": pending,
+        "invite_active": invite_active,
+        "invite_issued_ts": invite_issued_ts,
         "role": "leader",
         "source": "rooms",
     }
@@ -525,6 +555,11 @@ def cmd_show(args: argparse.Namespace) -> int:
         return 0
     info(f"room {payload['room_id']} (epoch {payload['epoch']}, "
          f"leader {payload['leader']})")
+    if invite_active:
+        out(f"invite: active, issued/rotated {_fmt_ts(invite_issued_ts)} "
+            "(any link older than this is now invalid)")
+    else:
+        out("invite: none active (issue one with `agb room invite`)")
     out("members:")
     for m in payload["members"]:
         out(f"  - {m['agent']}@{m['node']} ({m['role']})")
@@ -585,13 +620,14 @@ def _receiver_room_autojoin_enabled() -> bool:
     """Best-effort: will the A2A receiver's effective env have
     ``BRIDGE_A2A_ROOM_AUTOJOIN=1`` on its next (re)start?  (#2024 A.1)
 
-    Mirrors what `bridge_load_roster` sources at receiver startup
-    (lib/bridge-state.sh:1388-1405): the live process env first, then the
-    managed install-wide override file `$BRIDGE_HOME/agent-env.local.sh` (what
-    `agb config set-env` writes and `agb a2a daemon restart` re-sources). A
-    direct `bash bridge-handoff-daemon.sh start` does NOT source that file, so
-    this reflects the SUPPORTED lifecycle, not a raw-bash one. Returns False on
-    any read error — the warning is fail-loud (warn when in doubt)."""
+    Mirrors what the receiver inherits at startup: the live process env
+    first, then the managed install-wide override file
+    `$BRIDGE_HOME/agent-env.local.sh` (what `agb config set-env` writes). The
+    receiver spawn path sources that file directly before launch (#15783,
+    lib/bridge-a2a.sh:bridge_a2a_source_env_overrides), so both `agb a2a
+    daemon start|restart` and a direct `bash bridge-handoff-daemon.sh start`
+    pick up the override. Returns False on any read error — the warning is
+    fail-loud (warn when in doubt)."""
     # noqa: iso-helper-boundary - feature env gate, not a .env file
     if os.environ.get("BRIDGE_A2A_ROOM_AUTOJOIN") == "1":
         return True
@@ -621,8 +657,8 @@ def _warn_if_autojoin_disabled(signed: bool) -> None:
          "first-contact joiner will be rejected with HTTP 403 "
          "(code=room_autojoin_disabled) until you enable it:")
     info("  agb config set-env BRIDGE_A2A_ROOM_AUTOJOIN=1")
-    info("  agb a2a daemon restart   # (re-sources the override; do NOT use a "
-         "direct `bash bridge-handoff-daemon.sh start`)")
+    info("  agb a2a daemon restart   # (the restart spawn re-sources the "
+         "override file)")
     info("the leader still approves every join, so enabling auto-join admits "
          "nobody automatically.")
 
@@ -632,9 +668,19 @@ def cmd_invite(args: argparse.Namespace) -> int:
     ttl = max(0, int(getattr(args, "ttl", 0) or 0))
     conn = rooms.open_rooms()
     try:
-        _require_leader_conn(conn, args.room_id, args)
+        room = _require_leader_conn(conn, args.room_id, args)
+        # #2073: detect a RE-MINT — a prior token already existed for this room,
+        # so issuing a new one SILENTLY invalidates every outstanding link. We
+        # warn LOUDLY below so the leader knows to re-send fresh links to anyone
+        # still holding an old one (the holder would otherwise hit an opaque
+        # `bad_signature` / stale-invite reject with no idea why).
+        try:
+            was_remint = bool(room["invite_token_sha256"])
+        except (KeyError, IndexError, TypeError):
+            was_remint = False
         token = rooms.mint_invite_token()
         rooms.set_invite_token(conn, args.room_id, token, once=args.once, ttl=ttl)
+        issued_ts = rooms.now_ts()
     finally:
         conn.close()
     link = _make_invite_link_for(node, token, args.room_id)
@@ -644,12 +690,22 @@ def cmd_invite(args: argparse.Namespace) -> int:
     if args.json:
         out(json.dumps({"room_id": args.room_id, "invite_link": link,
                         "once": bool(args.once),
+                        "remint": was_remint,
+                        "invite_issued_ts": issued_ts,
                         "receiver_room_autojoin": _receiver_room_autojoin_enabled()}))
     else:
         kind = "single-use" if args.once else "reusable"
         info(f"minted {kind} invite for {args.room_id} "
-             "(old token invalidated)")
+             f"(issued {_fmt_ts(issued_ts)})")
         out(link)
+        if was_remint:
+            # LOUD re-mint warning (#2073): the previous token is now dead. Anyone
+            # already holding an old link will fail to join until they get THIS
+            # one — they do NOT get an automatic notice, so the leader must
+            # re-send. We never echo the OLD token (it is not stored raw anyway).
+            info("WARNING: this re-mint INVALIDATED all previously-issued invite "
+                 "links for this room. Holders of an old link will now be "
+                 "rejected (stale invite) until you re-send THIS fresh link.")
         _warn_if_autojoin_disabled(signed_link)
     return 0
 
@@ -672,6 +728,171 @@ def _have_leader_peer(leader_node: str) -> bool:
         return True
     except Exception:  # noqa: BLE001 - missing config / unknown peer → not paired
         return False
+
+
+def _record_invite_nonce_or_die(room_id: str, nonce: str) -> bool:
+    """Record a signed invite's single-use nonce in the joiner's own rooms.db,
+    rejecting a REPLAY. Returns True when the nonce was fresh (or empty/no-op),
+    False after emitting the operator-facing replay rejection via `die`. Shared by
+    the first-contact bootstrap and the #2073 stale-peer self-heal so both paths
+    enforce the SAME single-use guard identically."""
+    if not nonce:
+        return True
+    try:
+        nconn = rooms.open_rooms()
+        try:
+            fresh = rooms.record_invite_nonce(nconn, room_id, nonce)
+        finally:
+            nconn.close()
+    except rooms.RoomsError as exc:
+        die(f"cannot record invite nonce: {exc}", code=1)
+        return False
+    if not fresh:
+        die("this signed invite link was already used on this node (replay "
+            "refused) — ask the leader to issue a fresh invite with "
+            "`agb room invite`", code=1)
+        return False
+    return True
+
+
+def _local_leader_peer(leader_node: str) -> Optional[dict[str, Any]]:
+    """Return the local A2A node-link peer dict for `leader_node`, or None when no
+    peer exists / the config cannot be read. Distinct from `_have_leader_peer`
+    only in that it hands back the peer (so the self-heal path can read its
+    current secret to decide whether a stale token-derived key needs refresh)."""
+    if a2a is None or not leader_node:
+        return None
+    try:
+        cfg = a2a.load_config()
+        return a2a.find_peer(cfg, leader_node)
+    except Exception:  # noqa: BLE001 - missing config / unknown peer → not paired
+        return None
+
+
+def _joiner_stale_peer_needs_refresh(
+    peer: dict[str, Any], *, leader_node: str, room_id: str, token: str,
+    local_bridge_id: str,
+) -> bool:
+    """Pure, READ-ONLY predicate (#2073): is a self-heal refresh of `peer` even
+    WARRANTED? True ONLY when the peer is a token-bootstrapped local leader peer
+    (carries the `room_bootstrap` provenance stamp) AND the key derived from the
+    SUPPLIED token differs from its stored secret. Writes NOTHING.
+
+    The caller uses this only to decide whether to STAGE a candidate refresh key
+    for the acceptance-anchored retry (codex r2): a no-op re-join (key already
+    current) or a non-bootstrap peer returns False, so it stages nothing. The
+    actual anti-downgrade bound is the LEADER's acceptance of the candidate-key
+    probe in `cmd_join` — this predicate is a cheap pre-filter, NOT a trust gate."""
+    if a2a is None:
+        return False
+    if not peer.get(a2a.ROOM_BOOTSTRAP_PROVENANCE_KEY):
+        return False
+    try:
+        current_secret = a2a.peer_send_secret(peer)
+    except Exception:  # noqa: BLE001 - no secret → not a token-bootstrapped peer
+        return False
+    try:
+        new_key = a2a.room_pair_key_from_token(
+            token, room_id=room_id, leader_node=leader_node,
+            joiner_node=local_bridge_id)
+    except Exception:  # noqa: BLE001 - derivation failure → no refresh
+        return False
+    return bool(new_key) and new_key != current_secret
+
+
+def _joiner_refresh_stale_leader_peer(
+    peer: dict[str, Any], *, leader_node: str, room_id: str, token: str,
+    bootstrap_reach: Optional[dict[str, Any]], local_bridge_id: str,
+) -> Optional[str]:
+    """Joiner-side stale-local-peer SELF-HEAL persist step (#2073).
+
+    The bug: a first join that 403'd while the leader's auto-join gate was OFF
+    STILL wrote a local leader peer whose `secret` was derived from THAT (now
+    stale) invite. After the leader re-mints a fresh invite and enables auto-join,
+    the joiner's `find_peer` succeeds → it SKIPS the bootstrap → signs with the
+    STALE secret → the receiver derives the FRESH key from rooms.db → opaque
+    `bad_signature`. The crypto is correct; the joiner is reusing a stale key.
+
+    CRITICAL CONTRACT (codex r2): this is called ONLY from the acceptance-anchored
+    path in `cmd_join`, AFTER the leader has 2xx-ACCEPTED a probe signed with the
+    candidate key — i.e. the leader's current seed provably derives this exact key.
+    It must NOT be called speculatively on a link's say-so: the invite nonce/
+    signature are token-holder-FORGEABLE (SK-1), so only the leader's acceptance
+    proves the new token is the current one. The function still self-guards (it
+    only refreshes the key derived from `token` for a provenance-stamped peer that
+    differs from the stored one), but the acceptance gate is the real anti-downgrade
+    bound — without it, a stale token's key could be persisted.
+
+    Refreshes the local leader peer's secret to the key DERIVED FROM `token`, only
+    when both of the following hold (each a bound):
+      * a `bootstrap_reach` is supplied (used only for the entry's address/port);
+        and
+      * the existing peer's current secret is a token-bootstrapped key that
+        DIFFERS from the key derived from `token` (`new_key != current`).
+
+    The PRIMARY bound is a PROVENANCE GATE: the refresh only ever touches a peer
+    the joiner ITSELF auto-created from a prior invite token (stamped
+    `room_bootstrap=true` by `auto_register_room_peer_locked`). A hand-provisioned
+    node-link (no such stamp) is NEVER a refresh target, even when the joiner also
+    happens to hold a room invite for that leader — so an operator-installed
+    secret can never be silently overwritten by a token-derived one. On top of
+    that: a peer whose secret already matches the new derived key (an up-to-date
+    re-join) is a NO-OP, and the locked refresh's `expected_old_secret` guard
+    refuses if a concurrent writer changed the secret meanwhile. Returns the
+    refreshed secret (so the immediate send signs with it), or None when no
+    refresh was applied (the caller then signs with the existing secret as
+    before). NEVER raises — a refresh failure degrades to the prior behavior
+    (sign-with-existing), so the worst case is the unchanged opaque error, not a
+    join that breaks differently.
+    """
+    if a2a is None:
+        return None
+    # A refresh is only meaningful for a fresh first-contact-style signed link.
+    # Without a verified new invite we have no fresh token to derive from, so we
+    # must NOT touch an existing peer (that would be an unbounded overwrite).
+    if not bootstrap_reach:
+        return None
+    # PROVENANCE GATE (the primary bound): only refresh a peer the joiner itself
+    # auto-created from a prior invite token. A peer WITHOUT the room_bootstrap
+    # stamp is a hand-provisioned / externally-managed node-link and must never be
+    # rewritten by the self-heal, regardless of secret comparison.
+    if not peer.get(a2a.ROOM_BOOTSTRAP_PROVENANCE_KEY):
+        return None
+    try:
+        current_secret = a2a.peer_send_secret(peer)
+    except Exception:  # noqa: BLE001 - no secret → not a token-bootstrapped peer
+        return None
+    try:
+        new_key = a2a.room_pair_key_from_token(
+            token, room_id=room_id, leader_node=leader_node,
+            joiner_node=local_bridge_id)
+    except Exception:  # noqa: BLE001 - derivation failure → leave the peer as-is
+        return None
+    if not new_key or new_key == current_secret:
+        # Either we could not derive a key, or the stored secret already matches
+        # the new invite — nothing stale to heal.
+        return None
+    # The stored secret differs from the key the NEW invite derives → it is a
+    # stale token-bootstrapped key. Refresh it under the TOCTOU lock, guarded by
+    # the exact stale value we observed so we never clobber a legit/raced secret.
+    address = ""
+    port = 0
+    if bootstrap_reach:
+        address = str(bootstrap_reach.get("address", "")).strip()
+        try:
+            port = int(bootstrap_reach.get("port", 0) or 0)
+        except (TypeError, ValueError):
+            port = 0
+    allowlist = peer.get("inbound_allowlist")
+    allowlist = list(allowlist) if isinstance(allowlist, list) else []
+    try:
+        changed, _code = a2a.refresh_room_peer_secret_locked(
+            None, peer_id=leader_node, address=address, port=port,
+            new_secret=new_key, expected_old_secret=current_secret,
+            inbound_allowlist=allowlist)
+    except Exception:  # noqa: BLE001 - refresh is best-effort; never break join
+        return None
+    return new_key if changed else None
 
 
 def _joiner_bootstrap_leader_peer(
@@ -712,7 +933,8 @@ def _joiner_bootstrap_leader_peer(
         transport = ""
     changed, code = a2a.auto_register_room_peer_locked(
         None, peer_id=leader_node, address=address, port=port,
-        secret=pair_key, inbound_allowlist=[], transport=transport)
+        secret=pair_key, inbound_allowlist=[], transport=transport,
+        room_bootstrap=True)
     if code == "peer_conflict":
         raise rooms.RoomsError(
             f"a local peer {leader_node!r} already exists with a different "
@@ -722,9 +944,12 @@ def _joiner_bootstrap_leader_peer(
         raise rooms.RoomsError(
             f"could not bootstrap a local node-link to {leader_node!r}: {code}",
             code="bootstrap_register_failed")
+    # #2073: stamp the in-mem entry with the room_bootstrap provenance flag too
+    # (the disk write above already carries it) so a same-process later read sees
+    # the marker the self-heal gates on.
     peer_entry: dict[str, Any] = {
         "id": leader_node, "address": address, "secret": pair_key,
-        "inbound_allowlist": [],
+        "inbound_allowlist": [], a2a.ROOM_BOOTSTRAP_PROVENANCE_KEY: True,
     }
     if port:
         peer_entry["port"] = port
@@ -744,6 +969,7 @@ def _joiner_bootstrap_leader_peer(
 def _post_room_join_request(*, leader_node: str, room_id: str, token: str,
                             joiner_agent: str, timeout: float = 30.0,
                             bootstrap_reach: Optional[dict[str, Any]] = None,
+                            override_secret: Optional[str] = None,
                             ) -> tuple[int, bytes]:
     """POST a signed cross-node room-join-request to the leader's node (P4.1).
 
@@ -754,6 +980,12 @@ def _post_room_join_request(*, leader_node: str, room_id: str, token: str,
     `joiner_agent` is the OS-actor-anchored agent id (resolved by the CALLER via
     caller_agent / resolve_os_actor) — NEVER a --from/env value. Returns
     (http_status, response_body).
+
+    `override_secret` (#2073, codex r3): sign with this EXPLICIT key instead of
+    the peer's stored secret, WITHOUT persisting anything. The self-heal probe
+    uses it to test a candidate refreshed key against the leader; the caller
+    persists the refresh ONLY after the leader 2xx-accepts the probe — so a stale
+    token's key (which the leader rejects) can never be written to the config.
 
     Lane 4 (#1695): when there is NO local node-link to the leader yet AND a
     VERIFIED `bootstrap_reach` (the token-signed reach= locator) is supplied, the
@@ -785,12 +1017,27 @@ def _post_room_join_request(*, leader_node: str, room_id: str, token: str,
     try:
         peer = a2a.find_peer(cfg, leader_node)
     except a2a.A2AError:
+        # #2073 r3 INVARIANT (codex): an override_secret PROBE must be intrinsically
+        # NON-PERSISTENT — it may never trigger the bootstrap path, which would
+        # persist a peer via auto_register_room_peer_locked. The probe is only ever
+        # a RETRY against an ALREADY-CONFIGURED leader peer (the self-heal candidate
+        # key), so a missing peer here is a programming error, not a first contact.
+        # Fail closed rather than silently bootstrap-persist the probe's key.
+        if override_secret:
+            raise rooms.RoomsError(
+                "internal: an override_secret join probe requires an existing "
+                "leader peer (the probe must never bootstrap/persist a peer)",
+                code="override_probe_no_peer")
         # No local node-link to the leader yet — self-bootstrap one from the
         # token-signed reach= locator (Lane 4 zero-touch first contact).
         peer = _joiner_bootstrap_leader_peer(
             cfg, leader_node=leader_node, room_id=room_id, token=token,
             bootstrap_reach=bootstrap_reach, local_bridge_id=local_bridge_id)
-    secret = a2a.peer_send_secret(peer)
+    # #2073 r3: an override_secret signs the probe with a candidate refreshed key
+    # WITHOUT persisting it (the caller persists only on the leader's 2xx). With
+    # the guard above, an override_secret can only ever reach here against an
+    # EXISTING peer — so the probe path persists nothing.
+    secret = override_secret if override_secret else a2a.peer_send_secret(peer)
     token_hash = rooms.hash_token(token)
     body = a2a.build_room_join_request(
         room_id=room_id, join_token_sha256=token_hash, joiner_agent=joiner_agent,
@@ -1461,43 +1708,75 @@ def cmd_join(args: argparse.Namespace) -> int:
     # verifies + persists the pending row (no local rooms.db write here — this
     # node is not the leader's node and has no authority over the room).
     if leader_node and leader_node != node:
-        # Lane 4 (#1695): the signed-invite reach=/freshness gates apply ONLY to
-        # a FIRST-CONTACT bootstrap (no local node-link to the leader yet). A
-        # re-join by an already-paired peer takes the ordinary node-link and
-        # neither needs the reach= nor is bound by the single-use nonce (it is not
-        # a fresh first contact). Decide bootstrap-vs-known here.
+        # Lane 4 (#1695): the signed-invite reach=/freshness gates apply to a
+        # FIRST-CONTACT bootstrap (no local node-link to the leader yet). #2073
+        # adds a STALE-PEER SELF-HEAL: an already-paired peer presenting a NEW
+        # signed link whose derived key differs from the stored one refreshes that
+        # local peer instead of signing with the stale key. A plain re-join by an
+        # already-paired peer (unsigned/legacy link, or a signed link whose key
+        # already matches) takes the ordinary node-link unchanged.
         bootstrap_reach: Optional[dict[str, Any]] = None
-        if not _have_leader_peer(leader_node):
-            # Verify the v2 signed canonical FIRST and extract the reach= locator.
-            # A tampered-by-blind-tamperer / forged / EXPIRED link raises here
-            # (fail closed). `bootstrap_reach` lets `_post_room_join_request`
-            # self-register a local node-link.
+        existing_peer = _local_leader_peer(leader_node)
+        # #2073 self-heal staging (set only on the known-peer + verified-new-invite
+        # path below; consumed by the acceptance-anchored retry after the POST).
+        heal_candidate_key: Optional[str] = None
+        heal_reach: Optional[dict[str, Any]] = None
+        heal_nonce = ""
+        _local_id = ""
+        if existing_peer is None:
+            # --- FIRST CONTACT: verify the v2 signed canonical FIRST and extract
+            # the reach= locator. A tampered/forged/EXPIRED link raises here (fail
+            # closed). `bootstrap_reach` lets `_post_room_join_request`
+            # self-register a local node-link. The single-use nonce is consumed
+            # here because this signed link is driving a fresh first contact. ---
             try:
                 verified = _verify_and_extract_reach(parsed, token)
             except rooms.RoomsError as exc:
                 return die(str(exc), code=1)
             if verified is not None:
                 bootstrap_reach = verified.get("reach")
-                # SK-1 single-use guard: record the signed invite's per-issue
-                # nonce so a REPLAYED signed link (re-sent later to drive a fresh
-                # first-contact bootstrap) is rejected. Recorded in the joiner's
-                # own rooms.db; orthogonal to the leader's server-side token TTL.
                 nonce = str(verified.get("nonce") or "")
-                if nonce:
+                if nonce and not _record_invite_nonce_or_die(room_id, nonce):
+                    return 1
+        else:
+            # --- KNOWN PEER (#2073 self-heal): a SIGNED link MAY be a re-mint that
+            # superseded the local peer's secret. We do NOT proactively rewrite the
+            # stored secret here (codex r2: the invite nonce/signature are
+            # TOKEN-HOLDER-FORGEABLE under SK-1 — a holder of the OLD token can
+            # re-sign it with a fresh nonce, so neither the nonce gate nor the link
+            # signature can prove the new token is actually NEWER). Instead we stage
+            # a CANDIDATE refresh key (read-only) and let the join's
+            # ACCEPTANCE-ANCHORED retry below decide: the candidate is only
+            # PERSISTED after the leader 2xx-accepts a probe signed with it, so a
+            # stale token's key (which the leader rejects) can never be written.
+            # An unsigned/legacy link, or a key already current, stages nothing and
+            # takes the ordinary node-link unchanged. ---
+            if bool(parsed.get("s")):
+                verified = None
+                try:
+                    verified = _verify_and_extract_reach(parsed, token)
+                except rooms.RoomsError:
+                    # Tampered/forged/expired signed link to an ALREADY-PAIRED
+                    # peer → no heal, take the node-link re-join. Non-fatal.
+                    verified = None
+                if verified is not None:
                     try:
-                        nconn = rooms.open_rooms()
+                        _cfg = a2a.load_config() if a2a is not None else {}
+                        _local_id = str(_cfg.get("bridge_id", "") or "").strip()
+                    except Exception:  # noqa: BLE001 - config read → skip heal
+                        _local_id = ""
+                    if _local_id and _joiner_stale_peer_needs_refresh(
+                            existing_peer, leader_node=leader_node,
+                            room_id=room_id, token=token,
+                            local_bridge_id=_local_id):
                         try:
-                            fresh = rooms.record_invite_nonce(
-                                nconn, room_id, nonce)
-                        finally:
-                            nconn.close()
-                    except rooms.RoomsError as exc:
-                        return die(f"cannot record invite nonce: {exc}", code=1)
-                    if not fresh:
-                        return die(
-                            "this signed invite link was already used on this "
-                            "node (replay refused) — ask the leader to issue a "
-                            "fresh invite with `agb room invite`", code=1)
+                            heal_candidate_key = a2a.room_pair_key_from_token(
+                                token, room_id=room_id, leader_node=leader_node,
+                                joiner_node=_local_id)
+                            heal_reach = verified.get("reach")
+                            heal_nonce = str(verified.get("nonce") or "")
+                        except Exception:  # noqa: BLE001 - derive → skip heal
+                            heal_candidate_key = None
         try:
             status, resp = _post_room_join_request(
                 leader_node=leader_node, room_id=room_id, token=token,
@@ -1507,6 +1786,40 @@ def cmd_join(args: argparse.Namespace) -> int:
             return die(str(exc), code=1)
         except Exception as exc:  # noqa: BLE001 - transport/config failure
             return die(f"cross-node join failed: {exc}", code=1)
+        # #2073 ACCEPTANCE-ANCHORED self-heal retry. The first attempt signed with
+        # the EXISTING (possibly stale) secret. If the leader rejected it AND we
+        # staged a candidate refresh key from a verified new invite, RETRY signing
+        # with the candidate WITHOUT persisting it. Persist (and burn the nonce)
+        # ONLY when that probe 2xx-accepts — proving the leader's current seed
+        # derives this exact key. A stale token's key never accepts, so it is never
+        # written: the downgrade is impossible by construction (no link/nonce
+        # trust). A genuine re-mint's key accepts → we heal + the retry's own join
+        # already landed the pending row, so we are done.
+        if (not (200 <= status < 300)) and heal_candidate_key:
+            try:
+                rstatus, rresp = _post_room_join_request(
+                    leader_node=leader_node, room_id=room_id, token=token,
+                    joiner_agent=agent, bootstrap_reach=bootstrap_reach,
+                    override_secret=heal_candidate_key)
+            except Exception:  # noqa: BLE001 - probe failure → keep original reject
+                rstatus, rresp = status, resp
+            if 200 <= rstatus < 300:
+                # The leader ACCEPTED the candidate key → it is the current key.
+                # Burn the single-use nonce, then persist the refresh. Both are
+                # post-acceptance, so a forged/replayed stale link never reaches
+                # here (its candidate would have been rejected above).
+                if heal_nonce and not _record_invite_nonce_or_die(
+                        room_id, heal_nonce):
+                    return 1
+                healed = _joiner_refresh_stale_leader_peer(
+                    existing_peer, leader_node=leader_node, room_id=room_id,
+                    token=token, bootstrap_reach=heal_reach,
+                    local_bridge_id=_local_id)
+                if healed:
+                    info("note: refreshed the stale local node-link to leader "
+                         f"{leader_node!r} from the new invite (the previous "
+                         "invite had been rotated/superseded)")
+                status, resp = rstatus, rresp
         if not (200 <= status < 300):
             detail = ""
             try:

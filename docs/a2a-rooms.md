@@ -142,6 +142,15 @@ agb room rotate-invite <room_id>       # rotate to a fresh reusable token
 holding the old token stops working. `rotate-invite` is `invite` without
 `--once` (always reusable). Both are leader-only.
 
+A re-mint prints a **loud warning** that outstanding links are now invalid (so
+the leader knows to re-send the fresh link), and `agb room show <room_id>`
+reports the invite's **issued/rotated time** — any link older than that is stale.
+A joiner that presents a stale link now gets an actionable
+`stale_or_unknown_invite` reject ("ask the leader for a fresh invite"), not an
+opaque `bad_signature`. And a joiner that previously bootstrapped from an old
+link **self-heals**: presenting the fresh link refreshes its local node-link key
+automatically, so the re-join succeeds without any manual peer cleanup (#2073).
+
 ---
 
 ## Internal-queue ACL (`rooms_acl`)
@@ -353,11 +362,11 @@ agb a2a daemon restart                          # re-sources the override into t
 agb room invite <room_id>                       # mint the signed invite to hand out
 ```
 
-> Use `agb a2a daemon restart`, **not** a direct `bash bridge-handoff-daemon.sh
-> start`. Only the `agb` lifecycle path sources the install-wide
-> `agent-env.local.sh` override; a direct bash start launches the receiver
-> without `BRIDGE_A2A_ROOM_AUTOJOIN` and the gate stays off. To turn the gate
-> back **off**, remove the key from `agent-env.local.sh` and restart.
+> The receiver spawn sources the install-wide `agent-env.local.sh` override
+> directly before launch (#15783), so a restart picks up
+> `BRIDGE_A2A_ROOM_AUTOJOIN` whether you go through `agb a2a daemon restart`
+> or a direct `bash bridge-handoff-daemon.sh start`. To turn the gate back
+> **off**, remove the key from `agent-env.local.sh` and restart.
 
 **Joiner** (single signed link completes onboarding):
 
@@ -369,12 +378,25 @@ agb room join '<signed invite link>'
 that the leader's auto-join gate is disabled (it is returned before any token
 check, so it does not confirm the invite is valid). Ask the leader to run the
 two commands above and restart the receiver, then retry. **Do not rotate the
-invite** for this error; rotation does not change the leader's gate posture. If
-the retry *still* fails after the leader has enabled + restarted, then
-troubleshoot token validity / leader routing — once the gate is on, a genuinely
-invalid/expired token or a non-leader node is rejected with the opaque
-`unknown peer` (the gate only ever reveals the leader's posture, never room
-existence or token validity).
+invite** for this error; rotation does not change the leader's gate posture.
+
+**If the joiner gets `stale_or_unknown_invite`** (gate already on): the invite
+link is stale or no longer matches the leader's current invite — almost always
+because the leader re-minted (`agb room invite` / `rotate-invite` silently
+invalidate every outstanding link). The remedy is exactly what the reject says:
+ask the leader for a **fresh** link and retry. This single bucket covers
+rotated / expired / unknown tokens identically (it never tells the joiner which —
+that would be an oracle); the precise verdict is in the leader's audit log only.
+A joiner that previously bootstrapped from the old link **self-heals** on the
+fresh link (its local node-link key is refreshed automatically), so no manual
+peer cleanup is needed (#2073). A non-leader node or a room this node does not
+lead is still rejected with the opaque `unknown peer` (no room-existence leak).
+
+**If the joiner gets `bad_signature`** (gate on, token current): this is a real
+HMAC-stage failure — a tampered body, a wrong key, or local key-cache drift — and
+is NOT the stale-invite case above. Re-running `agb room join` with a fresh
+signed link is the first thing to try; if it persists, the node-link secrets have
+genuinely diverged.
 
 ### `agb a2a net-status` — the control-loop status window (v2, #1708)
 

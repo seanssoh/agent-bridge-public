@@ -230,7 +230,16 @@ fi
 GATED_PASSES="channel_health plugin_liveness memory_refresh stall_reports unclaimed_queue_escalation unclaimed_marker_sweep nudge_late_success_sweep context_pressure_scan crash_reports bridge_sync l1_roster_reload mcp_orphan_cleanup_early cron_staging_apply claude_token_recovery daily_backup"
 H1_FAIL=0
 for p in $GATED_PASSES; do
-  if ! printf '%s\n' "$SYNC_BODY" | grep -qE "bridge_daemon_pass_due ${p}\b"; then
+  # Pure-bash block-membership — NOT `printf '%s\n' "$SYNC_BODY" | grep -qE`.
+  # `grep -q` closes the pipe on its FIRST match, so `printf` dies with SIGPIPE
+  # (141); under this file's `set -o pipefail` the pipeline then returns 141
+  # *even though it matched*, racing a false [FAIL]. The large SYNC_BODY loses
+  # that race intermittently on Linux (and the failing-pass set varies per run)
+  # while macOS pipe timing hid it. The trailing [^A-Za-z0-9_] preserves the
+  # `\b` word boundary the grep used. $_gate_re is left UNQUOTED in =~ so it is
+  # treated as a regex (the literal space matches the call-site space).
+  _gate_re="bridge_daemon_pass_due ${p}[^A-Za-z0-9_]"
+  if [[ ! "$SYNC_BODY" =~ $_gate_re ]]; then
     printf '[FAIL] H1: periodic pass "%s" is NOT cadence-gated in cmd_sync_cycle\n' "$p" >&2
     H1_FAIL=1
   fi
@@ -246,7 +255,9 @@ fi
 TIME_CRITICAL_PASSES="queue_gateway attention_flush cron_dispatch_workers a2a_deliver_tick a2a_stuck_scan_tick a2a_receiver_supervise_tick nudge_scan nudge_agents admin_liveness_escalation mcp_liveness_giveup_recovery prompt_ready_reconcile heartbeats discord_relay permission_timeout_fanout queue_summary"
 H2_FAIL=0
 for p in $TIME_CRITICAL_PASSES; do
-  if printf '%s\n' "$SYNC_BODY" | grep -qE "bridge_daemon_pass_due ${p}\b"; then
+  # Pure-bash (see H1): avoid the `printf | grep -q` SIGPIPE-under-pipefail race.
+  _gate_re="bridge_daemon_pass_due ${p}[^A-Za-z0-9_]"
+  if [[ "$SYNC_BODY" =~ $_gate_re ]]; then
     printf '[FAIL] H2: TIME-CRITICAL pass "%s" was cadence-gated — a delivery/escalation latency regression\n' "$p" >&2
     H2_FAIL=1
   fi
@@ -286,7 +297,7 @@ else
 fi
 
 # H4 — the daemon_tick_slow DIAGNOSTIC row exists (and is NOT an abort).
-if printf '%s\n' "$SYNC_BODY" | grep -q 'daemon_tick_slow'; then
+if [[ "$SYNC_BODY" == *daemon_tick_slow* ]]; then
   _pass "H4 daemon_tick_slow diagnostic audit row is emitted on a budget-exceeding tick (diagnostic only — PR-2 owns the abort)"
 else
   _skip "H4 tick-slow-diagnostic" "no daemon_tick_slow row in cmd_sync_cycle (optional defense-in-depth)"

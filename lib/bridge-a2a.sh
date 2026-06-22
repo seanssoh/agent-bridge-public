@@ -47,6 +47,47 @@ bridge_a2a_log_file() {
   printf '%s' "${BRIDGE_LOG_DIR:-${BRIDGE_HOME:-$HOME/.agent-bridge}/logs}/a2a-handoffd.log"
 }
 
+# Path of the managed install-wide env-override file (`agent-env.local.sh`,
+# written only by the audited `agb config set-env` wrapper, #341/#1734). This
+# is the SAME file `bridge_load_roster` sources LAST (lib/bridge-state.sh
+# §1388-1405) so an override is install-wide. Honors an explicit
+# BRIDGE_AGENT_ENV_LOCAL_FILE (set by bridge-lib.sh when that was sourced),
+# else derives it from BRIDGE_HOME exactly as the other path helpers above —
+# so the value is resolvable even when this lib is sourced by the thin
+# `bridge-handoff-daemon.sh` dispatcher, which does NOT source bridge-lib.sh.
+bridge_a2a_env_override_file() {
+  printf '%s' "${BRIDGE_AGENT_ENV_LOCAL_FILE:-${BRIDGE_HOME:-$HOME/.agent-bridge}/agent-env.local.sh}"
+}
+
+# Source the managed install-wide env overrides into THIS shell so the
+# receiver spawned below inherits them in its os.environ regardless of the
+# caller's ambient env (#15783). Without this, `agb a2a daemon start|restart`
+# reaches the receiver spawn via bridge-handoff-daemon.sh — a thin dispatcher
+# that sources only this lib, never bridge-lib.sh / bridge_load_roster — so an
+# `agb config set-env BRIDGE_A2A_*` override (e.g. BRIDGE_A2A_ROOM_AUTOJOIN=1)
+# recorded into agent-env.local.sh never reached the receiver, making the
+# documented enable procedure a no-op. We source the canonical override file
+# DIRECTLY rather than calling bridge_load_roster because (a) the loader is
+# undefined in the dispatcher context (bridge-lib.sh not sourced), and (b) it
+# carries heavy, restart-irrelevant side effects (full token roster source,
+# agent-class validation, iso-UID fail-closed bridge_die paths). The file is
+# the audited `export KEY='value'`-only managed override location, so a plain
+# `source` is sufficient (each line carries its own `export`, mirroring exactly
+# how bridge_load_roster sources this same file — no `set -a` needed and none
+# used, so we never over-export an unrelated assignment). The source is
+# idempotent (re-sourcing an export-only file just re-applies the same values,
+# harmless when bridge-daemon.sh already loaded it) and guarded on
+# file-exists+readable so a missing/unreadable file never breaks the spawn.
+# This propagates ALL agent-env.local.sh overrides, not just autojoin.
+bridge_a2a_source_env_overrides() {
+  local env_file
+  env_file="$(bridge_a2a_env_override_file)"
+  if [[ -f "$env_file" && -r "$env_file" ]]; then
+    # shellcheck source=/dev/null
+    source "$env_file"
+  fi
+}
+
 # True if `pid` is alive AND its command line is the A2A receiver for
 # THIS install — i.e. a `bridge-handoffd.py serve` process launched with
 # `--pidfile <pid_file>`. A bare `kill -0` is not enough: after the real
@@ -123,6 +164,15 @@ bridge_a2a_receiver_start() {
   # Stale pid file from a previous (now-dead) receiver would otherwise let
   # the new launch's success check pass against the old pid.
   rm -f "$pid_file"
+
+  # #15783: source the managed install-wide env overrides BEFORE the spawn
+  # so the receiver's os.environ inherits every `agb config set-env`
+  # override (BRIDGE_A2A_ROOM_AUTOJOIN and all other BRIDGE_A2A_* / arbitrary
+  # keys) regardless of the caller's ambient env. Must precede the spawn so
+  # the exported vars are present in the environment the `nohup ... python3`
+  # child inherits. See bridge_a2a_source_env_overrides for why a direct
+  # source (not bridge_load_roster) is the right call here.
+  bridge_a2a_source_env_overrides
 
   # `serve --detach` double-forks into its own session AFTER the socket
   # bind, so the receiver is reparented out of this shell's process group

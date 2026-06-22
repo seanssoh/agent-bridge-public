@@ -360,6 +360,94 @@ bridge_sanitize_stale_ephemeral_controller_env() {
   done
 }
 
+# #68 (v0.16 safety class): classify a path as transient/ephemeral — a mktemp
+# scratch dir, a system tmp root, or a wave-orchestration fixer worktree. Lets
+# the daemon foreign-checkout guard tell a throwaway source checkout (or an
+# isolated sandbox home) apart from a real persistent install. Pure string
+# matching plus the existing ephemeral-root helper; no extra fs assumptions.
+bridge_path_is_transient() {
+  local path="${1:-}"
+  [[ -n "$path" ]] || return 1
+  case "$path" in
+    # macOS `cd -P`/`pwd -P` canonicalizes /var -> /private/var, so a checkout
+    # or sandbox under $TMPDIR (/var/folders/.../T) resolves to
+    # /private/var/folders/...; match BOTH the raw and the canonicalized forms.
+    /tmp/*|/private/tmp/*|/var/tmp/*|/private/var/tmp/*|/var/folders/*|/private/var/folders/*|*/.claude/worktrees/*|*/.agent-bridge/worktrees/*)
+      return 0
+      ;;
+  esac
+  # Managed-worker checkout roots (`agent-bridge --prefer new`): the canonical
+  # path is ${BRIDGE_WORKTREE_ROOT:-~/.agent-bridge/worktrees}/<project>/<agent>
+  # — a removable FOREIGN checkout, NOT a live install. The default
+  # ~/.agent-bridge/worktrees is caught by the glob above; also honor an
+  # explicit BRIDGE_WORKTREE_ROOT and a custom BRIDGE_HOME's worktrees/ so a
+  # worker under a non-standard home still classifies transient. (#68 codex r1)
+  local _wt
+  for _wt in "${BRIDGE_WORKTREE_ROOT:-}" "${BRIDGE_HOME:+${BRIDGE_HOME%/}/worktrees}"; do
+    [[ -n "$_wt" ]] || continue
+    [[ "$path" == "${_wt%/}/"* ]] && return 0
+  done
+  bridge_early_ephemeral_tmp_root "$path" >/dev/null 2>&1 && return 0
+  return 1
+}
+
+# #68: pure verdict for the foreign-checkout guard. Args: $1=daemon verb,
+# $2=source checkout dir (BRIDGE_SCRIPT_DIR), $3=runtime home (BRIDGE_HOME).
+# Honors BRIDGE_ALLOW_FOREIGN_CHECKOUT=1 as an explicit escape hatch (the rare
+# legit upgrade self-respawn from a staging dir). Echoes "refuse" ONLY for the
+# leak signature: a STATE-MUTATING verb driven from a TRANSIENT source checkout
+# against a PERSISTENT (real) runtime home. Every other shape — non-mutating
+# verb, persistent source (normal dev/prod), or transient home (fully isolated
+# smoke) — echoes "allow". Globals untouched so the smoke can table-test it.
+bridge_foreign_checkout_verdict() {
+  local cmd="${1:-}" src="${2:-}" home="${3:-}"
+  if [[ "${BRIDGE_ALLOW_FOREIGN_CHECKOUT:-0}" == "1" ]]; then
+    printf 'allow'
+    return 0
+  fi
+  case "$cmd" in
+    # State-mutating daemon verbs. run-cron-worker writes worker pid/state/
+    # followup/finalize artifacts into the live runtime, so it is the same
+    # foreign-checkout class as the loop verbs (#68 codex r1). The a2a receiver
+    # is the same class but is a separate entry point — tracked as a follow-up.
+    start|ensure|run|restart|sync|run-cron-worker) ;;
+    *) printf 'allow'; return 0 ;;
+  esac
+  if ! bridge_path_is_transient "$src"; then
+    printf 'allow'
+    return 0
+  fi
+  if bridge_path_is_transient "$home"; then
+    printf 'allow'
+    return 0
+  fi
+  printf 'refuse'
+  return 0
+}
+
+# #68: enforcing wrapper for a daemon state-mutating verb. Reads the live
+# BRIDGE_SCRIPT_DIR / BRIDGE_HOME globals, and on the leak verdict fails closed
+# (exit 3) with a remediation message BEFORE the daemon ticks any live state.
+# Structural cure for the fixer/CI live-leak class: a worktree or CI checkout
+# inherits BRIDGE_HOME=<live> but runs the daemon binary from a /tmp or
+# .claude/worktrees scratch tree, ticking the operator runtime and — on
+# cleanup of that tree — leaving the live daemon's BRIDGE_SCRIPT_DIR dangling
+# (#946 cascade). Called from bridge-daemon.sh verb dispatch.
+bridge_guard_foreign_checkout() {
+  local cmd="${1:-}" verdict
+  verdict="$(bridge_foreign_checkout_verdict "$cmd" "${BRIDGE_SCRIPT_DIR:-}" "${BRIDGE_HOME:-}")"
+  [[ "$verdict" == "refuse" ]] || return 0
+  {
+    printf '[bridge-daemon] [refuse] #68 live-leak guard: refusing to %s the LIVE runtime\n' "$cmd"
+    printf '[bridge-daemon]   BRIDGE_HOME=%s (persistent install)\n' "${BRIDGE_HOME:-}"
+    printf '[bridge-daemon]   from a transient source checkout BRIDGE_SCRIPT_DIR=%s\n' "${BRIDGE_SCRIPT_DIR:-}"
+    printf '[bridge-daemon] A worktree / CI / fixer checkout must NOT tick the operator live daemon.\n'
+    printf '[bridge-daemon] Run daemon smokes against an isolated home: export BRIDGE_HOME="$(mktemp -d)/sandbox"\n'
+    printf '[bridge-daemon] (legit upgrade self-respawn only: BRIDGE_ALLOW_FOREIGN_CHECKOUT=1)\n'
+  } >&2
+  exit 3
+}
+
 bridge_sanitize_stale_ephemeral_controller_env
 
 if [[ -z "${BRIDGE_HOME:-}" ]]; then
