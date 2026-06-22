@@ -13,17 +13,34 @@ source "$SCRIPT_DIR/bridge-lib.sh"
 # checkout against a persistent live home, before ANY live dir is created. The
 # bottom dispatch re-checks with the fully-parsed $CMD (defense in depth). When
 # SOURCED (e.g. the a2a-receiver-supervise smoke seam) this early pass is
-# skipped so the smoke can drive the in-process tick.
+# skipped so the smoke can drive the in-process tick. Help forms (-h/--help/
+# help, incl. `<verb> --help`) are read-only and MUST still print usage from a
+# foreign checkout — never refuse them (daemon_args_have_help is defined far
+# below, so scan inline here).
+_bridge_daemon_wants_help=0
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   for _bridge_daemon_early_arg in "$@"; do
     case "$_bridge_daemon_early_arg" in
-      --skip-plugin-liveness) continue ;;
-      *) bridge_guard_foreign_checkout "$_bridge_daemon_early_arg"; break ;;
+      -h|--help|help) _bridge_daemon_wants_help=1; break ;;
     esac
   done
+  if [[ "$_bridge_daemon_wants_help" != "1" ]]; then
+    for _bridge_daemon_early_arg in "$@"; do
+      case "$_bridge_daemon_early_arg" in
+        --skip-plugin-liveness) continue ;;
+        *) bridge_guard_foreign_checkout "$_bridge_daemon_early_arg"; break ;;
+      esac
+    done
+  fi
   unset _bridge_daemon_early_arg
 fi
-bridge_load_roster
+# Help is read-only: print usage WITHOUT loading the roster or creating live
+# dirs (bridge_load_roster -> bridge_init_dirs mkdir's them). usage() needs no
+# roster. Sourced contexts (BASH_SOURCE != $0) always load. (#68 codex r2)
+if [[ "${BASH_SOURCE[0]}" != "${0}" || "$_bridge_daemon_wants_help" != "1" ]]; then
+  bridge_load_roster
+fi
+unset _bridge_daemon_wants_help
 
 usage() {
   echo "Usage: bash $SCRIPT_DIR/bridge-daemon.sh [--skip-plugin-liveness] <start|ensure|run|status|sync|stop [--force]|restart [--force]>"
@@ -16757,8 +16774,13 @@ daemon_args_have_help() {
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 # #68: refuse to drive a state-mutating verb against the LIVE runtime from a
 # transient (worktree / CI / fixer) source checkout. Fail-closed before any
-# tick. No-op for help/status/stop and for fully-isolated runs.
-bridge_guard_foreign_checkout "$CMD"
+# tick. No-op for help/status/stop and for fully-isolated runs. Help forms
+# (`<verb> --help`) are read-only and print usage even from a foreign checkout,
+# so let them through to the per-arm daemon_args_have_help short-circuit. "$@"
+# here is post-verb (CMD already shifted off), so this catches `<verb> --help`.
+if ! daemon_args_have_help "$@"; then
+  bridge_guard_foreign_checkout "$CMD"
+fi
 case "$CMD" in
   -h|--help|help)
     usage

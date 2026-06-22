@@ -172,7 +172,7 @@ CASE_LN="$(grep -n '^case "\$CMD" in' "$DAEMON" | tail -1 | cut -d: -f1 || true)
 # The EARLY (raw-arg) guard must precede bridge_load_roster, so the refuse path
 # fires before bridge_init_dirs mkdir's the live runtime dirs (#68 codex r1 #2).
 EARLY_GUARD_LN="$(grep -n 'bridge_guard_foreign_checkout "\$_bridge_daemon_early_arg"' "$DAEMON" | head -1 | cut -d: -f1 || true)"
-LOAD_ROSTER_LN="$(grep -n '^bridge_load_roster$' "$DAEMON" | head -1 | cut -d: -f1 || true)"
+LOAD_ROSTER_LN="$(grep -nE '^[[:space:]]*bridge_load_roster$' "$DAEMON" | head -1 | cut -d: -f1 || true)"
 [[ -n "$EARLY_GUARD_LN" ]] || smoke_fail "early (pre-roster) guard not found in $DAEMON"
 [[ -n "$LOAD_ROSTER_LN" ]] || smoke_fail "bridge_load_roster call not found in $DAEMON"
 (( EARLY_GUARD_LN < LOAD_ROSTER_LN )) || smoke_fail "early guard (line $EARLY_GUARD_LN) must precede bridge_load_roster (line $LOAD_ROSTER_LN)"
@@ -194,13 +194,31 @@ cp -R "$SMOKE_REPO_ROOT/scripts/python-helpers" "$STAGE/scripts/python-helpers"
 # Persistent (NOT transient) fake live home, created EMPTY. Under $HOME so the
 # classifier treats it as a real install; removed after the assertions.
 FAKE_LIVE="$HOME/.cache/agb-68-fakelive.$$"
-rm -rf "$FAKE_LIVE"; mkdir -p "$FAKE_LIVE"
-if STAGE_OUT="$(BRIDGE_HOME="$FAKE_LIVE" BRIDGE_STATE_DIR="$FAKE_LIVE/state" "$BASH_BIN" "$STAGE/bridge-daemon.sh" run 2>&1)"; then STAGE_RC=0; else STAGE_RC=$?; fi
-STAGE_ENTRIES="$(find "$FAKE_LIVE" -mindepth 1 2>/dev/null | wc -l | tr -d ' ')"
-rm -rf "$FAKE_LIVE"
-smoke_assert_eq "3" "$STAGE_RC" "real bridge-daemon.sh run from a transient checkout vs persistent home exits 3"
+# run a staged daemon verb against the fake live home; echo "RC=<rc>|ENTRIES=<n>"
+# into the captured output and leave the home empty for the next case.
+_staged_run() {  # $@ = daemon args
+  rm -rf "$FAKE_LIVE"; mkdir -p "$FAKE_LIVE"
+  local out rc entries
+  if out="$(BRIDGE_HOME="$FAKE_LIVE" BRIDGE_STATE_DIR="$FAKE_LIVE/state" "$BASH_BIN" "$STAGE/bridge-daemon.sh" "$@" 2>&1)"; then rc=0; else rc=$?; fi
+  entries="$(find "$FAKE_LIVE" -mindepth 1 2>/dev/null | wc -l | tr -d ' ')"
+  rm -rf "$FAKE_LIVE"
+  printf '%s\nRC=%s|ENTRIES=%s\n' "$out" "$rc" "$entries"
+}
+
+# (a) a real state-mutating verb refuses (exit 3) and creates NO live dirs.
+STAGE_OUT="$(_staged_run run)"
+smoke_assert_contains "$STAGE_OUT" "RC=3|ENTRIES=0" "staged run verb exits 3 + creates NO live entries (guard precedes bridge_init_dirs)"
 smoke_assert_contains "$STAGE_OUT" "live-leak guard" "staged refuse prints the guard banner"
-smoke_assert_eq "0" "$STAGE_ENTRIES" "refuse path created NO entries in the live home (proves guard precedes bridge_init_dirs)"
+
+# (b) #68 codex r2: help forms are read-only and MUST print usage (exit 0) even
+# from a foreign checkout — never refuse, never mkdir.
+HELP_RUN_OUT="$(_staged_run run --help)"
+smoke_assert_contains "$HELP_RUN_OUT" "RC=0|ENTRIES=0" "staged \`run --help\` prints usage (exit 0), no live mkdir, no refuse"
+smoke_assert_not_contains "$HELP_RUN_OUT" "live-leak guard" "\`run --help\` is not refused by the guard"
+smoke_assert_contains "$HELP_RUN_OUT" "Usage:" "\`run --help\` actually prints usage"
+HELP_ENSURE_OUT="$(_staged_run ensure --help)"
+smoke_assert_contains "$HELP_ENSURE_OUT" "RC=0|ENTRIES=0" "staged \`ensure --help\` prints usage (exit 0), no live mkdir, no refuse"
+smoke_assert_not_contains "$HELP_ENSURE_OUT" "live-leak guard" "\`ensure --help\` is not refused by the guard"
 
 smoke_cleanup_temp_root || true
 smoke_log "PASS: #68 live-leak foreign-checkout guard (classifier + verdict + enforce + wiring + pre-mkdir)"
