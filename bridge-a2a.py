@@ -3246,16 +3246,26 @@ def _collect_agent_node_map() -> "tuple[dict[str, list[str]], str | None]":
     room, unioning every `{agent, node}` member pair into `{agent: [nodes]}`
     (nodes sorted + de-duplicated). The SAME read-only rooms-CLI delegation
     net-status's `_netstat_rooms_v2` uses — never opens rooms.db directly, so
-    it is iso-boundary-safe. Returns `(map, error)`: `error` is set (and the
-    map is whatever was collected so far) when the rooms listing itself could
-    not be read, so the caller can distinguish "no rooms / agent absent" from
-    "could not consult the registry".
+    it is iso-boundary-safe.
+
+    Returns `(map, error)`. FAIL-CLOSED contract (codex #2025 review): the map
+    is trustworthy for an ambiguity decision ONLY if EVERY listed room was read
+    in full. If the top-level `list` fails, OR any LISTED room's `show` fails /
+    returns a non-dict / carries a non-list `members`, we return `({}, error)` —
+    NOT a partial map. This is load-bearing: an agent on node-b (room core) +
+    node-c (room ops) must never collapse to a spurious "unique node-b" just
+    because room ops raced out or was momentarily unreadable, which would let
+    `send --peer auto` route on incomplete roster data. A genuinely empty
+    registry (no rooms, or a listed room with an empty member list) is NOT an
+    error — it yields `({}, None)` so the caller reports an honest "not found".
     """
     listing, err = _netstat_rooms_cli("list")
     if err is not None:
         return {}, err
     if not isinstance(listing, list):
-        return {}, None
+        # A non-list listing is a shape we cannot trust — fail closed rather
+        # than silently treat it as "no rooms".
+        return {}, "rooms list returned a non-list document"
     agent_nodes: dict[str, set[str]] = {}
     for item in listing:
         if not isinstance(item, dict):
@@ -3264,11 +3274,16 @@ def _collect_agent_node_map() -> "tuple[dict[str, list[str]], str | None]":
         if not isinstance(rid, str) or not rid:
             continue
         detail, derr = _netstat_rooms_cli("show", rid)
-        if derr is not None or not isinstance(detail, dict):
-            continue
+        # A listed room whose roster we could NOT fully read poisons the
+        # whole-map completeness guarantee — fail closed (return the error),
+        # never drop the room and continue with a partial map.
+        if derr is not None:
+            return {}, f"rooms show {rid} failed: {derr}"
+        if not isinstance(detail, dict):
+            return {}, f"rooms show {rid} returned a non-dict document"
         members = detail.get("members")
         if not isinstance(members, list):
-            continue
+            return {}, f"rooms show {rid} carried a non-list members field"
         for m in members:
             if not isinstance(m, dict):
                 continue

@@ -193,6 +193,19 @@ check_no_secrets() {
     || smoke_fail "(H) a peer secret leaked into whois/peers output"
 }
 
+# === (J) auto-resolve FAILS CLOSED on a partial room roster ==================
+# codex #2025 BLOCKING: a listed room whose `show` fails must poison the whole
+# agent->node map (registry_error), NOT be silently skipped — else an agent on
+# >1 node could collapse to a spurious "unique" and route `send --peer auto` on
+# incomplete data. This drives the real _collect_agent_node_map +
+# resolve_agent_node with the rooms-CLI delegation monkeypatched to fail one
+# listed room's show.
+check_partial_roster_fail_closed() {
+  helper partial-roster-fail-closed >/dev/null \
+    && smoke_log "ok-partial-fail-closed" \
+    || smoke_fail "(J) a partial room roster did NOT fail closed (auto-resolve could route on incomplete data)"
+}
+
 # === (I) static teeth ========================================================
 check_static_teeth() {
   local src; src="$(cat "$A2A_CLI")"
@@ -226,6 +239,7 @@ main() {
   smoke_run "(F) EXPLICIT --peer is honored verbatim (no whois, no regression)" check_explicit_peer_unchanged
   smoke_run "(G) peers list carries a known_agents roster column" check_peers_roster_column
   smoke_run "(H) NO secret leaks into whois / peers output" check_no_secrets
+  smoke_run "(J) auto-resolve FAILS CLOSED on a partial room roster (no route on incomplete data)" check_partial_roster_fail_closed
   smoke_run "(I) static: whois registered + auto-resolve never guesses + reuses rooms CLI" check_static_teeth
 
   smoke_log "passed"
