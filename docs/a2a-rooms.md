@@ -353,11 +353,11 @@ agb a2a daemon restart                          # re-sources the override into t
 agb room invite <room_id>                       # mint the signed invite to hand out
 ```
 
-> Use `agb a2a daemon restart`, **not** a direct `bash bridge-handoff-daemon.sh
-> start`. Only the `agb` lifecycle path sources the install-wide
-> `agent-env.local.sh` override; a direct bash start launches the receiver
-> without `BRIDGE_A2A_ROOM_AUTOJOIN` and the gate stays off. To turn the gate
-> back **off**, remove the key from `agent-env.local.sh` and restart.
+> The receiver spawn sources the install-wide `agent-env.local.sh` override
+> directly before launch (#15783), so a restart picks up
+> `BRIDGE_A2A_ROOM_AUTOJOIN` whether you go through `agb a2a daemon restart`
+> or a direct `bash bridge-handoff-daemon.sh start`. To turn the gate back
+> **off**, remove the key from `agent-env.local.sh` and restart.
 
 **Joiner** (single signed link completes onboarding):
 
