@@ -585,13 +585,14 @@ def _receiver_room_autojoin_enabled() -> bool:
     """Best-effort: will the A2A receiver's effective env have
     ``BRIDGE_A2A_ROOM_AUTOJOIN=1`` on its next (re)start?  (#2024 A.1)
 
-    Mirrors what `bridge_load_roster` sources at receiver startup
-    (lib/bridge-state.sh:1388-1405): the live process env first, then the
-    managed install-wide override file `$BRIDGE_HOME/agent-env.local.sh` (what
-    `agb config set-env` writes and `agb a2a daemon restart` re-sources). A
-    direct `bash bridge-handoff-daemon.sh start` does NOT source that file, so
-    this reflects the SUPPORTED lifecycle, not a raw-bash one. Returns False on
-    any read error — the warning is fail-loud (warn when in doubt)."""
+    Mirrors what the receiver inherits at startup: the live process env
+    first, then the managed install-wide override file
+    `$BRIDGE_HOME/agent-env.local.sh` (what `agb config set-env` writes). The
+    receiver spawn path sources that file directly before launch (#15783,
+    lib/bridge-a2a.sh:bridge_a2a_source_env_overrides), so both `agb a2a
+    daemon start|restart` and a direct `bash bridge-handoff-daemon.sh start`
+    pick up the override. Returns False on any read error — the warning is
+    fail-loud (warn when in doubt)."""
     # noqa: iso-helper-boundary - feature env gate, not a .env file
     if os.environ.get("BRIDGE_A2A_ROOM_AUTOJOIN") == "1":
         return True
@@ -621,8 +622,8 @@ def _warn_if_autojoin_disabled(signed: bool) -> None:
          "first-contact joiner will be rejected with HTTP 403 "
          "(code=room_autojoin_disabled) until you enable it:")
     info("  agb config set-env BRIDGE_A2A_ROOM_AUTOJOIN=1")
-    info("  agb a2a daemon restart   # (re-sources the override; do NOT use a "
-         "direct `bash bridge-handoff-daemon.sh start`)")
+    info("  agb a2a daemon restart   # (the restart spawn re-sources the "
+         "override file)")
     info("the leader still approves every join, so enabling auto-join admits "
          "nobody automatically.")
 
