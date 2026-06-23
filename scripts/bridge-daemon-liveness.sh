@@ -226,14 +226,44 @@ interrupted_upgrade_quiesce() {
   return 0
 }
 
-# Clear the quiesce-intent marker after the watcher has acted on an interrupted
-# upgrade (recovered or attempted). Single-latch: once the watcher consumes the
-# marker, a later poll must not re-trigger off the same stale interrupted run —
-# if recovery failed and the job is still disabled, the next poll falls back to
-# the normal fail-closed skip (the marker was a one-shot recovery hint, not a
-# standing override of the operator-stop guarantee). Best-effort.
+# Clear the quiesce-intent marker after the watcher has CONFIRMED a successful
+# recovery of an interrupted upgrade (#2064 r2 fix). The marker must be consumed
+# ONLY after the disabled→enabled transition is proven (re-enable verified), NOT
+# before/around the best-effort re-enable. If we cleared it eagerly and the
+# `launchctl enable` (or systemd start) then failed, the job would stay
+# disabled/inactive with the marker gone — the next poll would fall back to the
+# fail-closed skip_disabled and the daemon would stay silently down forever
+# (exactly the #2055 hole #2064 closes). So: keep the marker on a FAILED re-enable
+# (the next poll retries the interrupted-upgrade path); consume it only once the
+# job is no longer disabled (the discriminator has served its purpose — any
+# remaining unloaded recovery is the marker-independent #2040 standing path). A
+# lingering marker on an enabled job is itself a hazard (a later operator
+# `agb daemon stop` could be mis-read as an interrupted upgrade), so we DO clear
+# on a confirmed enable even if the subsequent bootstrap is cooldown-deferred —
+# at that point the #2040 enabled-but-unloaded path recovers without the marker.
+# Best-effort.
 clear_quiesce_marker() {
   rm -f "$BRIDGE_UPGRADE_QUIESCE_MARKER_FILE" 2>/dev/null || true
+}
+
+# Issue #2064 r2 (Finding 2): is an upgrade GENUINELY in flight right now? Returns
+# 0 only when the quiesce marker exists, records a numeric upgrade pid, and that
+# pid is STILL ALIVE. This is the "do not race a live upgrade" guard the systemd
+# liveness recovery uses to DEFER while a legitimate upgrade holds the daemon down
+# inside its #1820 reconcile window — mirrors the launchd I3 LIVE-pid defer. A
+# DEAD-pid marker (orphaned by a SIGKILL'd upgrade) or no marker returns 1 so the
+# normal recovery proceeds and reaps the interrupted upgrade. Pure read.
+live_upgrade_quiesce_in_flight() {
+  local marker="$BRIDGE_UPGRADE_QUIESCE_MARKER_FILE"
+  [[ -f "$marker" ]] || return 1
+  local pid
+  pid="$(
+    # shellcheck disable=SC1090
+    source "$marker" 2>/dev/null
+    printf '%s' "${BRIDGE_QUIESCE_UPGRADE_PID:-}"
+  )"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null
 }
 
 # ── Issue #2040: standing recovery for an enabled-but-unloaded daemon ──────────
@@ -355,6 +385,11 @@ rebootstrap_launchd_daemon() {
 # launchd situation and main() should emit the standard skip.
 maybe_rebootstrap_launchd() {
   local age="$1"
+  # Issue #2064 r2 (Finding 1): set to 1 in the interrupted-upgrade branch when the
+  # post-enable print-disabled re-query came back `unknown` (unverifiable). In that
+  # case the marker consume is DEFERRED to a confirmed-load signal below, so a
+  # failed/cooldown-deferred bootstrap keeps the marker for the next poll.
+  local _interrupted_marker_pending=0
   [[ "$(uname -s 2>/dev/null)" == "Darwin" ]] || return 1
   command -v launchctl >/dev/null 2>&1 || return 1
   rebootstrap_launchd_resolve || return 1
@@ -388,18 +423,61 @@ maybe_rebootstrap_launchd() {
         --detail heartbeat_age_seconds="$age"
       printf '[liveness] launchd job gui/%s/%s disabled by an INTERRUPTED upgrade (dead upgrade pid=%s) — re-enabling + recovering (not an operator stop).\n' \
         "$uid" "$REBOOTSTRAP_LABEL" "$QUIESCE_MARKER_PID"
-      # Consume the marker (single-latch) BEFORE acting so a failed recovery does
-      # not re-trigger off the same stale run on the next poll.
-      clear_quiesce_marker
-      if [[ "$BRIDGE_DAEMON_LIVENESS_DRY_RUN" != "1" ]]; then
+      # Issue #2064 r2 (Finding 1): do NOT consume the marker before/around the
+      # best-effort re-enable. `launchctl enable` is `|| true`; if it fails the job
+      # stays down, and an eagerly-cleared marker would leave the next poll with no
+      # discriminator → fall back to the fail-closed skip_disabled and the daemon
+      # stays silently down forever (the #2055 hole). The marker is consumed ONLY on
+      # a CONFIRMED-healthy signal — either print-disabled re-querying as a positive
+      # `enabled`, OR (codex r2) the job actually being LOADED after bootstrap below.
+      # A re-query that comes back `unknown` (print-disabled unreadable) is NOT a
+      # confirmed re-enable: we still PROCEED to recover (the marker was independent
+      # proof — the I4 fail-closed-on-unknown override), but we DEFER consumption to
+      # the load-confirmation so a failed/cooldown-deferred bootstrap KEEPS the
+      # marker for the next poll. `_interrupted_marker_pending` (declared at function
+      # scope above) carries that intent.
+      if [[ "$BRIDGE_DAEMON_LIVENESS_DRY_RUN" == "1" ]]; then
+        clear_quiesce_marker   # no real enable to fail — preserve the latch semantics
+      else
         launchctl enable "gui/${uid}/${REBOOTSTRAP_LABEL}" >/dev/null 2>&1 || true
+        local reenabled_state
+        reenabled_state="$(rebootstrap_launchd_disabled_state "$uid" "$REBOOTSTRAP_LABEL")"
+        case "$reenabled_state" in
+          disabled)
+            # POSITIVE proof the re-enable did NOT take (launchd refused; the job is
+            # still explicitly disabled). The marker is our only proof this was an
+            # interrupted upgrade — KEEP it so the next poll retries. Audit loudly.
+            emit_audit daemon_liveness_rebootstrap_failed \
+              --detail platform="launchd" \
+              --detail label="$REBOOTSTRAP_LABEL" \
+              --detail reason="reenable_did_not_take" \
+              --detail reenabled_state="$reenabled_state" \
+              --detail heartbeat_age_seconds="$age"
+            printf '[liveness] WARN: launchd re-enable of interrupted-upgrade job gui/%s/%s did NOT take (still disabled) — KEEPING the quiesce marker for the next poll to retry.\n' \
+              "$uid" "$REBOOTSTRAP_LABEL" >&2
+            return 0
+            ;;
+          enabled)
+            # CONFIRMED enabled. The disabled-state discriminator has served its
+            # purpose — consume now; the remaining enabled-but-unloaded recovery is
+            # the marker-independent #2040 standing path. Clearing avoids a lingering
+            # marker mis-reading a later operator stop.
+            clear_quiesce_marker
+            ;;
+          *)
+            # unknown — print-disabled unreadable. NOT a confirmed re-enable (codex
+            # r2). Proceed to recover (marker = independent proof), but DEFER the
+            # consume to the post-bootstrap load-confirmation so a failed bootstrap
+            # keeps the marker.
+            _interrupted_marker_pending=1
+            ;;
+        esac
       fi
       # Fall through to the enabled-but-unloaded recovery below (loaded-check +
-      # cooldown + bootstrap), which is now reachable because the job is enabled.
-      # Note: we re-enable IMMEDIATELY here (disabled -> enabled), so even in the
-      # rare case the cooldown gate below suppresses THIS poll's bootstrap, the
-      # NEXT poll sees a plain enabled-but-unloaded job and recovers it via the
-      # standard #2040 path — recovery is at worst deferred one poll, never lost.
+      # cooldown + bootstrap), now reachable because the job is enabled (or we are
+      # proceeding on an unknown re-query with the marker still held). If the job is
+      # already loaded, or a confirmed bootstrap loads it, a pending marker is
+      # consumed there (see the _interrupted_marker_pending clears below).
     else
       emit_audit daemon_liveness_rebootstrap_skip_disabled \
         --detail platform="launchd" \
@@ -414,6 +492,9 @@ maybe_rebootstrap_launchd() {
   # If the job IS loaded, this is not the enabled-but-unloaded case — let the
   # normal skip path handle it (a loaded-but-no-pid job is launchd's to respawn).
   if rebootstrap_launchd_job_loaded "$uid" "$REBOOTSTRAP_LABEL"; then
+    # #2064 r2: a LOADED job is a confirmed-healthy signal — consume a marker whose
+    # consume was deferred on an `unknown` re-query (the recovery succeeded).
+    if [[ "$_interrupted_marker_pending" == "1" ]]; then clear_quiesce_marker; fi
     emit_audit daemon_liveness_rebootstrap_skip_loaded \
       --detail platform="launchd" \
       --detail label="$REBOOTSTRAP_LABEL" \
@@ -422,6 +503,8 @@ maybe_rebootstrap_launchd() {
   fi
   # Enabled-but-unloaded confirmed. Storm control: respect the cooldown.
   if cooldown_active; then
+    # #2064 r2: do NOT consume a deferred-pending marker on a cooldown skip — the
+    # bootstrap did not run, so recovery is not yet confirmed; keep it for retry.
     emit_audit daemon_liveness_rebootstrap_skip_cooldown \
       --detail platform="launchd" \
       --detail label="$REBOOTSTRAP_LABEL" \
@@ -429,7 +512,11 @@ maybe_rebootstrap_launchd() {
       --detail cooldown_seconds="$BRIDGE_DAEMON_LIVENESS_COOLDOWN_SECONDS"
     return 0
   fi
-  rebootstrap_launchd_daemon "$uid" "$REBOOTSTRAP_LABEL" "$REBOOTSTRAP_PLIST" "$age" || true
+  if rebootstrap_launchd_daemon "$uid" "$REBOOTSTRAP_LABEL" "$REBOOTSTRAP_PLIST" "$age"; then
+    # #2064 r2: bootstrap CONFIRMED the job loaded — consume a deferred-pending
+    # marker now. A failed bootstrap leaves the marker for the next poll.
+    if [[ "$_interrupted_marker_pending" == "1" ]]; then clear_quiesce_marker; fi
+  fi
   return 0
 }
 
@@ -462,15 +549,17 @@ maybe_rebootstrap_systemd() {
       ;;
     disabled|masked)
       # Operator/intentional stop. SKIP + audit, never re-enable.
-      # Issue #2055 note: unlike launchd (whose upgrade quiesce `disable`s the
-      # job, masquerading as an operator stop), bridge-upgrade.sh's systemd
-      # quiesce only `stop`s the unit — it never `disable`s/`mask`s it. So an
-      # INTERRUPTED systemd upgrade leaves the unit enabled+inactive, which the
-      # `enabled` arm below already recovers (reset-failed + start). A
-      # disabled/masked systemd unit is therefore always a genuine operator
-      # action here, and we keep the fail-closed skip — no quiesce-marker
-      # override on the systemd side is needed or wanted (it would risk fighting
-      # a real `systemctl --user disable`).
+      # Issue #2055/#2064 note: unlike launchd (whose upgrade quiesce `disable`s
+      # the job, masquerading as an operator stop), bridge-upgrade.sh's systemd
+      # quiesce only `stop`s the SERVICE — it never `disable`s/`mask`s it (and as
+      # of #2064 it no longer stops THIS liveness timer either). So an INTERRUPTED
+      # systemd upgrade leaves the unit enabled+inactive, which the `enabled` arm
+      # below recovers (reset-failed + start) once the live-upgrade defer clears
+      # (the SIGKILL'd upgrade's marker pid is dead → not in-flight → reap). A
+      # disabled/masked systemd unit is therefore always a genuine operator action
+      # here, and we keep the fail-closed skip — no quiesce-marker override on the
+      # systemd side is needed or wanted (it would risk fighting a real
+      # `systemctl --user disable`).
       emit_audit daemon_liveness_rebootstrap_skip_disabled \
         --detail platform="systemd" \
         --detail service="$svc" \
@@ -493,6 +582,27 @@ maybe_rebootstrap_systemd() {
       --detail service="$svc" \
       --detail heartbeat_age_seconds="$age"
     return 1
+  fi
+  # Issue #2064 r2 (Finding 2): the enabled+inactive state is exactly what a
+  # LEGITIMATE in-flight upgrade produces — its #1820 quiesce `stop`s the service
+  # for the reconcile window. #2055 originally stopped THIS liveness timer during
+  # quiesce so the watcher could not race the #1820 fence, but that left a
+  # SIGKILL'd upgrade with no running invoker to observe the marker → daemon stuck
+  # down. The fix keeps the timer RUNNING during quiesce; this guard is the
+  # counterpart that prevents racing the fence: while an upgrade GENUINELY holds
+  # the marker (a LIVE upgrade pid), DEFER + preserve the marker (mirror the
+  # launchd I3 LIVE-pid defer). A SIGKILL'd upgrade leaves a DEAD-pid (orphaned)
+  # marker — live_upgrade_quiesce_in_flight returns 1 then, so we fall through and
+  # reap it via the normal enabled+inactive recovery below. No marker → normal
+  # #2040 recovery (an operator `systemctl --user stop` without disable, already
+  # recovered pre-#2064; the operator-stop guard for systemd remains disable/mask).
+  if live_upgrade_quiesce_in_flight; then
+    emit_audit daemon_liveness_rebootstrap_skip_live_upgrade \
+      --detail platform="systemd" \
+      --detail service="$svc" \
+      --detail heartbeat_age_seconds="$age"
+    printf '[liveness] systemd unit %s is enabled+inactive but a LIVE upgrade holds the quiesce marker — deferring to its own restore (not racing the #1820 fence).\n' "$svc"
+    return 0
   fi
   if cooldown_active; then
     emit_audit daemon_liveness_rebootstrap_skip_cooldown \
@@ -520,6 +630,12 @@ maybe_rebootstrap_systemd() {
       --detail platform="systemd" \
       --detail service="$svc"
     printf '[liveness] re-started enabled-but-inactive systemd daemon %s\n' "$svc"
+    # Issue #2064 r2 (Finding 1 parity): a CONFIRMED reap consumes any orphaned
+    # quiesce marker (a SIGKILL'd upgrade's dead-pid marker) so it does not linger.
+    # No-op (rm -f) when there was no marker — this path also recovers a plain
+    # operator `systemctl stop` (no disable), which carries no marker. KEEP the
+    # marker on the failure path below so the next poll retries.
+    clear_quiesce_marker
     return 0
   fi
   emit_audit daemon_liveness_rebootstrap_failed \

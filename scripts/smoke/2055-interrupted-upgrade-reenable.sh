@@ -33,6 +33,29 @@
 #        unknown is overridden ONLY by a valid interrupted-upgrade marker).
 #   S1 — ★systemd DISABLED + marker → STILL SKIP (the systemd quiesce only stops,
 #        never disables — a disabled systemd unit is always an operator action).
+#   F1 — ★#2064 Finding 1: launchd interrupted-upgrade marker but the re-enable
+#        FAILS → the marker SURVIVES (KEEP) + rebootstrap_failed audited, no
+#        success. The pre-#2064 eager clear-before-enable stranded the daemon.
+#   F1b— control: same marker, re-enable SUCCEEDS → marker consumed (survival is
+#        gated on failure, not always-keep).
+#   F1c— ★codex r2: enable rc0 but print-disabled UNREADABLE on re-query (unknown)
+#        AND bootstrap FAILS → marker SURVIVES (consume is deferred to a confirmed
+#        LOAD, which never comes — an unknown re-query is not a verified re-enable).
+#   F1d— control for F1c: same unknown re-query but bootstrap LOADS → deferred
+#        consume fires (a confirmed load is the healthy signal).
+#   F2 — ★#2064 Finding 2 (static): the systemd quiesce LEAVES the liveness timer
+#        running (only the service is stopped) so a SIGKILL'd upgrade keeps an
+#        invoker to observe the marker.
+#   F2a— systemd enabled+inactive + LIVE-upgrade marker → DEFER (no start, marker
+#        preserved) — the running timer must not race the #1820 fence.
+#   F2b— ★the SIGKILL topology: systemd enabled+inactive + ORPHANED (dead-pid)
+#        marker → the running timer REAPS it (reset-failed + start). The
+#        uncatchable-interruption path the stopped timer could not cover.
+#   F2c— control: systemd enabled+inactive + NO marker → still recovers (#2040
+#        enabled+inactive contract not regressed by the defer guard).
+#   F2d— Finding-1 parity on systemd: orphaned marker + the reap start does NOT
+#        activate → rebootstrap_failed + the orphaned marker SURVIVES (a confirmed
+#        reap is required to consume it).
 #   U1 — UPGRADE-SIDE: write_quiesce_marker creates an attributable marker;
 #        clear_quiesce_marker removes it (a clean lifecycle leaves no residue —
 #        the stale-marker hole that would otherwise re-enable a later operator
@@ -45,6 +68,9 @@
 #   U5 — ★EXIT-HANDLER (REAL): an abort with NO marker (a deliberate reconcile
 #        failure already cleared it, or no quiesce ran) → NO re-enable. The codex
 #        r2 BLOCKER guard — a deliberate stop must never be re-enabled.
+#   U6 — ★EXIT-HANDLER (REAL, codex r2): an abort with a marker outstanding but the
+#        re-enable UNVERIFIED (job not loaded after bootstrap) → marker SURVIVES
+#        (consume gated on a confirmed load, not on a not-disabled print-disabled).
 #   R1 — ★RECONCILE: rc=2 (legacy no-op) PROCEEDS under set -e — proves the
 #        `|| _reconcile_rc=$?` errexit-disarm makes the fail-closed `case`
 #        reachable so a benign no-op is NOT wrongly failed-closed (codex r2 BLOCKER).
@@ -115,6 +141,17 @@ SYSTEMCTL_LOG="$SMOKE_TMP_ROOT/systemctl-calls.log"
 PRINT_RC_FILE="$SMOKE_TMP_ROOT/print-rc"
 DISABLED_RC_FILE="$SMOKE_TMP_ROOT/disabled-rc"
 BOOTSTRAP_LOADS_FILE="$SMOKE_TMP_ROOT/bootstrap-loads"
+# #2064 tooth F1: when this control file is `1`, a `launchctl enable` is REFUSED —
+# it does NOT clear the disabled override, so print-disabled keeps reporting the
+# job disabled. Models a launchd that rejects the re-enable (the Finding-1 failure
+# the marker must survive). Default (absent/0) = enable succeeds (legacy shim).
+ENABLE_FAILS_FILE="$SMOKE_TMP_ROOT/enable-fails"
+# #2064 tooth F1c/F1d (codex r2): when `1`, a SUCCESSFUL `launchctl enable` (rc 0)
+# leaves print-disabled UNREADABLE (drc=2 unknown) instead of flipping to enabled —
+# models an enable that returned 0 but whose disabled-state cannot be verified. The
+# watcher must then DEFER the marker consume to the post-bootstrap load-confirmation
+# (consume only if the job loads; keep the marker if the bootstrap fails).
+ENABLE_SETS_UNKNOWN_FILE="$SMOKE_TMP_ROOT/enable-sets-unknown"
 cat >"$SHIM_DIR/launchctl" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >>"$LAUNCHCTL_LOG"
@@ -133,8 +170,15 @@ case "\${1:-}" in
   enable)
     # A real \`launchctl enable\` clears the disabled override → print-disabled
     # then reports enabled. Reflect that so the fall-through recovery sees an
-    # enabled job.
-    printf '0' >"$DISABLED_RC_FILE"
+    # enabled job — UNLESS the F1 tooth forces a refusal (override unchanged).
+    if [[ "\$(cat "$ENABLE_FAILS_FILE" 2>/dev/null || printf 0)" == "1" ]]; then
+      exit 1
+    fi
+    if [[ "\$(cat "$ENABLE_SETS_UNKNOWN_FILE" 2>/dev/null || printf 0)" == "1" ]]; then
+      printf '2' >"$DISABLED_RC_FILE"   # enable rc 0 but print-disabled now UNREADABLE
+    else
+      printf '0' >"$DISABLED_RC_FILE"
+    fi
     exit 0
     ;;
   bootstrap)
@@ -195,6 +239,8 @@ seed_stale_no_pid() {
   : >"$AUDIT_LOG"
   : >"$LAUNCHCTL_LOG"
   : >"$SYSTEMCTL_LOG"
+  printf '0' >"$ENABLE_FAILS_FILE"          # #2064 F1: default = re-enable succeeds
+  printf '0' >"$ENABLE_SETS_UNKNOWN_FILE"   # #2064 F1c/F1d: default = enable flips to enabled
   rm -f "$COOLDOWN_FILE" "$MARKER_FILE"
   printf 'tick\n' >"$HEARTBEAT_FILE"
   local old=$(( $(date +%s) - 99999 ))
@@ -303,6 +349,141 @@ audit_has daemon_liveness_rebootstrap_skip_disabled || smoke_fail "S1 FAIL: a di
 systemctl_called start && smoke_fail "S1 FAIL: must NOT start a disabled systemd unit even with a marker. calls=$(cat "$SYSTEMCTL_LOG")"
 smoke_log "S1 PASS: systemd disabled + marker → STILL SKIP (systemd quiesce stops not disables; disabled=operator action)"
 
+# ── F1 (#2064 Finding 1): launchd interrupted-upgrade marker but the re-enable
+# FAILS → the marker MUST SURVIVE (KEEP) so the next poll retries; a forced
+# re-enable failure is audited rebootstrap_failed and does NOT reach
+# rebootstrap_success. The pre-#2064 code cleared the marker BEFORE the
+# `launchctl enable || true`, so a failed enable silently stranded the daemon.
+seed_stale_no_pid
+printf '1' >"$PRINT_RC_FILE"          # not loaded
+printf '1' >"$DISABLED_RC_FILE"       # DISABLED
+printf '1' >"$BOOTSTRAP_LOADS_FILE"
+printf '1' >"$ENABLE_FAILS_FILE"      # ★ launchctl enable is REFUSED (override stays disabled)
+write_marker launchd "$TEST_LABEL"    # interrupted-upgrade marker, dead pid
+run_liveness Darwin
+audit_has daemon_liveness_rebootstrap_interrupted_upgrade || smoke_fail "F1 FAIL: the interrupted-upgrade branch must still fire (it just must not succeed). audit=$(cat "$AUDIT_LOG")"
+launchctl_called enable || smoke_fail "F1 FAIL: re-enable must be ATTEMPTED. calls=$(cat "$LAUNCHCTL_LOG")"
+audit_has daemon_liveness_rebootstrap_failed || smoke_fail "F1 FAIL: a re-enable that did not take must audit rebootstrap_failed. audit=$(cat "$AUDIT_LOG")"
+audit_has daemon_liveness_rebootstrap_success && smoke_fail "F1 FAIL: a refused re-enable must NOT report success. audit=$(cat "$AUDIT_LOG")"
+[[ -f "$MARKER_FILE" ]] || smoke_fail "F1 FAIL (BLOCKER): the quiesce marker MUST SURVIVE a failed re-enable (else the daemon is stranded with no discriminator for the next poll). missing=$MARKER_FILE"
+smoke_log "F1 PASS: launchd interrupted-upgrade re-enable FAILS → marker SURVIVES + rebootstrap_failed audited (next poll retries; the #2055 strand-hole is closed)"
+
+# F1b — control: with the SAME interrupted marker but the re-enable SUCCEEDS, the
+# marker is consumed (proves F1's survival is gated on FAILURE, not always-keep).
+seed_stale_no_pid
+printf '1' >"$PRINT_RC_FILE"
+printf '1' >"$DISABLED_RC_FILE"
+printf '1' >"$BOOTSTRAP_LOADS_FILE"
+printf '0' >"$ENABLE_FAILS_FILE"      # enable succeeds
+write_marker launchd "$TEST_LABEL"
+run_liveness Darwin
+audit_has daemon_liveness_rebootstrap_success || smoke_fail "F1b FAIL: a successful re-enable+bootstrap must report success. audit=$(cat "$AUDIT_LOG")"
+[[ -f "$MARKER_FILE" ]] && smoke_fail "F1b FAIL: a CONFIRMED re-enable must consume the marker. still present=$MARKER_FILE"
+smoke_log "F1b PASS: launchd interrupted-upgrade re-enable SUCCEEDS → marker consumed (survival is gated on failure)"
+
+# F1c — ★codex r2: `launchctl enable` returns 0 but print-disabled is UNREADABLE on
+# re-query (unknown), AND the subsequent BOOTSTRAP FAILS to load → the marker must
+# SURVIVE. An unknown re-query is NOT a confirmed re-enable; the consume is deferred
+# to the post-bootstrap load-confirmation, which here never comes. This is the exact
+# hole codex flagged: clearing on an unverifiable print-disabled would strand the job.
+seed_stale_no_pid
+printf '1' >"$PRINT_RC_FILE"               # not loaded
+printf '1' >"$DISABLED_RC_FILE"            # DISABLED initially
+printf '0' >"$BOOTSTRAP_LOADS_FILE"        # ★ bootstrap does NOT load the job
+printf '0' >"$ENABLE_FAILS_FILE"           # enable returns 0...
+printf '1' >"$ENABLE_SETS_UNKNOWN_FILE"    # ★ ...but leaves print-disabled UNREADABLE
+write_marker launchd "$TEST_LABEL"
+run_liveness Darwin
+audit_has daemon_liveness_rebootstrap_interrupted_upgrade || smoke_fail "F1c FAIL: the interrupted branch must still fire (marker = independent proof, proceed on unknown). audit=$(cat "$AUDIT_LOG")"
+launchctl_called bootstrap || smoke_fail "F1c FAIL: must still ATTEMPT bootstrap on an unknown re-query (recover, do not block). calls=$(cat "$LAUNCHCTL_LOG")"
+audit_has daemon_liveness_rebootstrap_success && smoke_fail "F1c FAIL: a bootstrap that did not load must NOT report success. audit=$(cat "$AUDIT_LOG")"
+[[ -f "$MARKER_FILE" ]] || smoke_fail "F1c FAIL (BLOCKER, codex r2): an UNVERIFIED re-enable (unknown re-query) + FAILED bootstrap must KEEP the marker. missing=$MARKER_FILE"
+smoke_log "F1c PASS: enable rc0 but unknown re-query + bootstrap FAILS → marker SURVIVES (consume deferred to confirmed load; codex r2 hole closed)"
+
+# F1d — control for F1c: SAME unknown re-query, but the bootstrap SUCCEEDS (loads
+# the job) → the deferred consume fires (a confirmed LOAD is the healthy signal).
+seed_stale_no_pid
+printf '1' >"$PRINT_RC_FILE"
+printf '1' >"$DISABLED_RC_FILE"
+printf '1' >"$BOOTSTRAP_LOADS_FILE"        # ★ bootstrap loads the job
+printf '0' >"$ENABLE_FAILS_FILE"
+printf '1' >"$ENABLE_SETS_UNKNOWN_FILE"    # unknown re-query
+write_marker launchd "$TEST_LABEL"
+run_liveness Darwin
+audit_has daemon_liveness_rebootstrap_success || smoke_fail "F1d FAIL: a confirmed bootstrap load must report success. audit=$(cat "$AUDIT_LOG")"
+[[ -f "$MARKER_FILE" ]] && smoke_fail "F1d FAIL: a confirmed LOAD (even via unknown re-query) must consume the deferred marker. still present=$MARKER_FILE"
+smoke_log "F1d PASS: enable rc0 + unknown re-query but bootstrap LOADS → deferred marker consumed (consume gated on confirmed load, not on the unknown re-query)"
+
+# ── F2 (#2064 Finding 2): systemd SIGKILL/power-loss recovery via a RUNNING timer.
+# The quiesce no longer stops the liveness timer; the watcher DEFERs while a LIVE
+# upgrade holds the marker (no fence race) and REAPS an orphaned (dead-pid) marker
+# left by a killed upgrade. Static guard first: the upgrade quiesce must NOT stop
+# the liveness timer (that was the topology hole — nothing left to observe the
+# marker after a SIGKILL).
+QUIESCE_FN="$SMOKE_TMP_ROOT/2064-systemd-quiesce.sh"
+awk '/^_bridge_upgrade_systemd_quiesce_daemon\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$UPGRADE_SRC" >"$QUIESCE_FN"
+grep -q 'systemctl --user stop agent-bridge-daemon.service' "$QUIESCE_FN" \
+  || smoke_fail "F2 FAIL: the systemd quiesce must still stop the SERVICE (the #1820 fence needs it down)."
+grep -E 'stop[[:space:]]+agent-bridge-daemon-liveness\.timer' "$QUIESCE_FN" >/dev/null 2>&1 \
+  && smoke_fail "F2 FAIL (BLOCKER): the systemd quiesce STILL stops the liveness timer — a SIGKILL'd upgrade then has no invoker to observe the marker (#2064 regression)."
+smoke_log "F2 PASS (static): systemd quiesce stops the service but LEAVES the liveness timer running (a SIGKILL'd upgrade keeps an invoker)"
+
+# F2a — systemd enabled+inactive + LIVE-upgrade marker → DEFER (no start, marker
+# preserved). This is the running-timer firing DURING a legitimate quiesce window;
+# it must not race the #1820 fence.
+seed_stale_no_pid
+printf 'enabled' >"$SVC_ENABLED_FILE"
+printf '1' >"$SVC_ACTIVE_RC_FILE"          # inactive (quiesce stopped the service)
+printf '1' >"$SVC_START_ACTIVATES_FILE"
+write_marker systemd agent-bridge-daemon.service "$$"   # LIVE upgrade pid (this smoke)
+run_liveness Linux
+audit_has daemon_liveness_rebootstrap_skip_live_upgrade || smoke_fail "F2a FAIL: a live-upgrade marker must DEFER the systemd recovery. audit=$(cat "$AUDIT_LOG")"
+systemctl_called start && smoke_fail "F2a FAIL (BLOCKER): must NOT start the service while a live upgrade holds the marker (would race the #1820 fence). calls=$(cat "$SYSTEMCTL_LOG")"
+audit_has daemon_liveness_rebootstrap_success && smoke_fail "F2a FAIL: a deferred recovery must not report success. audit=$(cat "$AUDIT_LOG")"
+[[ -f "$MARKER_FILE" ]] || smoke_fail "F2a FAIL: the marker must be PRESERVED while the upgrade is in flight. missing=$MARKER_FILE"
+smoke_log "F2a PASS: systemd enabled+inactive + LIVE-upgrade marker → DEFER (no start, marker preserved; no fence race)"
+
+# F2b — ★the SIGKILL topology: systemd enabled+inactive + ORPHANED (dead-pid)
+# marker → the still-running timer REAPS it (reset-failed + start). The upgrade was
+# killed between quiesce and restore; nothing else can recover the daemon.
+seed_stale_no_pid
+printf 'enabled' >"$SVC_ENABLED_FILE"
+printf '1' >"$SVC_ACTIVE_RC_FILE"          # inactive
+printf '1' >"$SVC_START_ACTIVATES_FILE"    # start activates it
+write_marker systemd agent-bridge-daemon.service   # default = guaranteed-dead pid (orphaned)
+run_liveness Linux
+audit_has daemon_liveness_rebootstrap_skip_live_upgrade && smoke_fail "F2b FAIL: a DEAD-pid (orphaned) marker is not in-flight; must NOT defer. audit=$(cat "$AUDIT_LOG")"
+systemctl_called start || smoke_fail "F2b FAIL (BLOCKER): a SIGKILL'd upgrade (orphaned marker, enabled+inactive) must be REAPED by the running timer (start). calls=$(cat "$SYSTEMCTL_LOG")"
+audit_has daemon_liveness_rebootstrap_success || smoke_fail "F2b FAIL: the reap must report success once the unit is active. audit=$(cat "$AUDIT_LOG")"
+[[ -f "$MARKER_FILE" ]] && smoke_fail "F2b FAIL: a CONFIRMED reap must consume the orphaned marker (no lingering residue). still present=$MARKER_FILE"
+smoke_log "F2b PASS: systemd enabled+inactive + ORPHANED marker (SIGKILL'd upgrade) → REAPED by the running timer + marker consumed (uncatchable-interruption path covered)"
+
+# F2c — control: systemd enabled+inactive + NO marker → still recovers (the
+# pre-existing #2040 enabled+inactive recovery is not regressed by the defer guard).
+seed_stale_no_pid
+printf 'enabled' >"$SVC_ENABLED_FILE"
+printf '1' >"$SVC_ACTIVE_RC_FILE"
+printf '1' >"$SVC_START_ACTIVATES_FILE"
+run_liveness Linux       # no marker written
+systemctl_called start || smoke_fail "F2c FAIL: enabled+inactive with no marker must still recover (#2040 contract). calls=$(cat "$SYSTEMCTL_LOG")"
+audit_has daemon_liveness_rebootstrap_skip_live_upgrade && smoke_fail "F2c FAIL: no marker must not be read as a live upgrade. audit=$(cat "$AUDIT_LOG")"
+smoke_log "F2c PASS: systemd enabled+inactive + NO marker → recover (the defer guard does not regress #2040)"
+
+# F2d — Finding-1 parity on systemd: orphaned marker + the reap START does NOT
+# activate the unit → rebootstrap_failed + the orphaned marker SURVIVES (the next
+# poll retries; a confirmed reap is required to consume it, mirroring launchd F1).
+seed_stale_no_pid
+printf 'enabled' >"$SVC_ENABLED_FILE"
+printf '1' >"$SVC_ACTIVE_RC_FILE"          # inactive
+printf '0' >"$SVC_START_ACTIVATES_FILE"    # ★ start does NOT activate it
+write_marker systemd agent-bridge-daemon.service   # orphaned (dead pid)
+run_liveness Linux
+systemctl_called start || smoke_fail "F2d FAIL: the reap must ATTEMPT a start. calls=$(cat "$SYSTEMCTL_LOG")"
+audit_has daemon_liveness_rebootstrap_failed || smoke_fail "F2d FAIL: a start that did not activate must audit rebootstrap_failed. audit=$(cat "$AUDIT_LOG")"
+audit_has daemon_liveness_rebootstrap_success && smoke_fail "F2d FAIL: a failed reap must NOT report success. audit=$(cat "$AUDIT_LOG")"
+[[ -f "$MARKER_FILE" ]] || smoke_fail "F2d FAIL: a FAILED reap must KEEP the orphaned marker for the next poll. missing=$MARKER_FILE"
+smoke_log "F2d PASS: systemd orphaned marker + reap START fails to activate → rebootstrap_failed + marker SURVIVES (consume gated on confirmed reap)"
+
 # ── U-series: upgrade-side marker lifecycle (write / clear / abort re-enable) ──
 # Extract the #2055 marker helper bodies verbatim from the live bridge-upgrade.sh
 # so the unit tests never drift from the implementation. Source them in isolation
@@ -323,9 +504,17 @@ U_MARKER="$U_STATE/upgrade/daemon-quiesce.intent"
 mkdir -p "$U_STATE"
 
 # Run an extracted-helper snippet with the marker harness + launchctl shim.
+# Default shim state: enable succeeds (flips disabled→enabled), bootstrap LOADS the
+# job (print → 0), so the EXIT handler's #2064 load-confirmation passes. Individual
+# tests override the control files before calling to model failure paths.
 run_marker_helper() {
   local snippet="$1"
   : >"$LAUNCHCTL_LOG"
+  printf '1' >"$DISABLED_RC_FILE"            # start disabled (an interrupted quiesce)
+  printf '1' >"$PRINT_RC_FILE"               # start not-loaded
+  printf '1' >"$BOOTSTRAP_LOADS_FILE"        # bootstrap will load the job
+  printf '0' >"$ENABLE_FAILS_FILE"
+  printf '0' >"$ENABLE_SETS_UNKNOWN_FILE"
   PATH="$SHIM_DIR:$PATH" \
   TARGET_ROOT="$U_HOME" \
   BRIDGE_STATE_DIR="$U_STATE" \
@@ -381,7 +570,15 @@ grep -q '_UPGRADE_RECONCILE_FAILCLOSED_PENDING' "$EXIT_HANDLER" \
 
 run_exit_handler() {
   local seed_marker="$1"
+  local load_ok="${2:-1}"   # #2064: when 1 (default), bootstrap LOADS the job so the
+                            # EXIT handler's load-confirmation passes; 0 = bootstrap
+                            # does NOT load (re-enable UNVERIFIED → marker KEPT).
   : >"$LAUNCHCTL_LOG"
+  printf '1' >"$DISABLED_RC_FILE"            # start disabled (interrupted quiesce)
+  printf '1' >"$PRINT_RC_FILE"               # start not-loaded
+  printf '%s' "$load_ok" >"$BOOTSTRAP_LOADS_FILE"
+  printf '0' >"$ENABLE_FAILS_FILE"
+  printf '0' >"$ENABLE_SETS_UNKNOWN_FILE"
   PATH="$SHIM_DIR:$PATH" \
   TARGET_ROOT="$U_HOME" \
   BRIDGE_STATE_DIR="$U_STATE" \
@@ -418,6 +615,17 @@ rm -f "$U_MARKER"
 run_exit_handler 0
 launchctl_called enable && smoke_fail "U5 FAIL (BLOCKER): the EXIT handler re-enabled the daemon with NO outstanding marker (a deliberate stop must stay down). calls=$(cat "$LAUNCHCTL_LOG")"
 smoke_log "U5 PASS: EXIT handler on abort with NO marker → NO re-enable (deliberate stop / non-quiesce abort stays down)"
+
+# U6 — ★codex r2 EXIT-handler parity: marker outstanding, the re-enable is ATTEMPTED
+# but the job does NOT load (bootstrap fails → the #2064 load-confirmation fails) →
+# the marker MUST SURVIVE (the dying upgrade leaves it for the still-running liveness
+# watcher to retry). The pre-r2 handler consumed it whenever print-disabled was
+# merely not-disabled (incl. an unreadable/empty print-disabled).
+rm -f "$U_MARKER"
+run_exit_handler 1 0   # marker outstanding; bootstrap does NOT load the job
+launchctl_called enable || smoke_fail "U6 FAIL: the re-enable must still be ATTEMPTED on an interrupted-upgrade abort. calls=$(cat "$LAUNCHCTL_LOG")"
+[[ -f "$U_MARKER" ]] || smoke_fail "U6 FAIL (BLOCKER, codex r2): an UNVERIFIED re-enable (job not loaded) must KEEP the marker for the liveness watcher. missing=$U_MARKER"
+smoke_log "U6 PASS: EXIT handler re-enable UNVERIFIED (job not loaded) → marker SURVIVES (consume gated on confirmed load; codex r2 hole closed)"
 
 # ── R-series: the reconcile errexit-disarm makes the fail-closed `case` reachable.
 # Extract the LIVE reconcile dispatch lines from bridge-upgrade.sh and confirm the

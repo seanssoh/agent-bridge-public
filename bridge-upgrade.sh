@@ -1310,14 +1310,24 @@ _bridge_upgrade_clear_quiesce_marker() {
 # quiesce marker is still outstanding (the restore-enable did not clear it — i.e.
 # the upgrade is aborting between disable and restore). Re-`enable`s the launchd
 # job (so KeepAlive can re-supervise) / re-`start`s the systemd unit, then clears
-# the marker. This is the CATCHABLE-abort layer; the SIGKILL/power-loss case the
-# dying process can never reach is recovered by the liveness watcher via the same
-# marker. Pure best-effort — every call is `|| true`-guarded and the function
-# always returns 0 so it can never change the upgrade's exit rc. Must not depend
-# on anything sourced late (the EXIT trap can fire during very-early aborts).
+# the marker ONLY on a CONFIRMED re-enable. This is the CATCHABLE-abort layer; the
+# SIGKILL/power-loss case the dying process can never reach is recovered by the
+# liveness watcher via the same marker. Pure best-effort — every call is
+# `|| true`-guarded and the function always returns 0 so it can never change the
+# upgrade's exit rc. Must not depend on anything sourced late (the EXIT trap can
+# fire during very-early aborts).
+#
+# Issue #2064 r2 (Finding 1): the marker is consumed ONLY when the re-enable is
+# VERIFIED (launchd: print-disabled now reports enabled; systemd: the unit is
+# is-active). If the re-enable fails warn-only, KEEP the marker so the standing
+# liveness watcher (still running — #2064 keeps the systemd timer alive) recovers
+# the orphaned-marker job on its next tick. An UNCONDITIONAL clear here would, on a
+# failed re-enable, leave the job down with no discriminator for the watcher — the
+# #2055 hole this PR closes.
 _bridge_upgrade_reenable_on_abort() {
   [[ "${_UPGRADE_DAEMON_QUIESCE_MARKER_WRITTEN:-0}" == "1" ]] || return 0
-  local marker platform target uid
+  local marker platform target uid recovered
+  recovered=0
   marker="$(_bridge_upgrade_quiesce_marker_path)"
   [[ -f "$marker" ]] || { _UPGRADE_DAEMON_QUIESCE_MARKER_WRITTEN=0; return 0; }
   # shellcheck disable=SC1090
@@ -1333,6 +1343,25 @@ _bridge_upgrade_reenable_on_abort() {
           launchctl enable "gui/${uid}/${target}" >/dev/null 2>&1 || true
           launchctl bootstrap "gui/${uid}" "${HOME:-}/Library/LaunchAgents/${target}.plist" >/dev/null 2>&1 || true
           launchctl kickstart -k "gui/${uid}/${target}" >/dev/null 2>&1 || true
+          # Issue #2064 r2 (codex r2): require a POSITIVE confirmation before
+          # consuming the marker — the job must be LOADED (`launchctl print` exits 0)
+          # AND not explicitly disabled. The prior check trusted print-disabled
+          # alone, so a print-disabled that FAILED (empty output → grep miss) wrongly
+          # counted as enabled and cleared the marker on an UNVERIFIED re-enable. The
+          # loaded-check is the strong signal: if the job is loaded after
+          # enable+bootstrap+kickstart, recovery genuinely succeeded. If print-disabled
+          # is readable AND still says disabled, that is positive proof of failure.
+          # Otherwise (not loaded, or unverifiable) KEEP the marker for the still-
+          # running liveness watcher to retry.
+          local pd_out
+          pd_out="$(launchctl print-disabled "gui/${uid}" 2>/dev/null)" || pd_out=""
+          if printf '%s\n' "$pd_out" | grep -E "\"${target}\"[[:space:]]*=>[[:space:]]*(true|disabled)" >/dev/null 2>&1; then
+            echo "[bridge-upgrade] WARN: launchd re-enable of gui/${uid}/${target} did NOT take (still disabled) — KEEPING the quiesce marker so the liveness watcher retries." >&2
+          elif launchctl print "gui/${uid}/${target}" >/dev/null 2>&1; then
+            recovered=1
+          else
+            echo "[bridge-upgrade] WARN: launchd re-enable of gui/${uid}/${target} is UNVERIFIED (job not loaded) — KEEPING the quiesce marker so the liveness watcher retries." >&2
+          fi
         fi
       fi
       ;;
@@ -1341,12 +1370,26 @@ _bridge_upgrade_reenable_on_abort() {
         echo "[bridge-upgrade] WARN: upgrade aborting mid-quiesce — re-starting systemd daemon unit ${target} so it / the liveness watcher can recover it." >&2
         systemctl --user reset-failed "$target" >/dev/null 2>&1 || true
         systemctl --user start "$target" >/dev/null 2>&1 || true
+        # #2064: the liveness timer is now left RUNNING through quiesce, so it does
+        # not need restarting here; start it defensively in case some other path
+        # stopped it (idempotent on an already-active timer).
         systemctl --user start agent-bridge-daemon-liveness.timer >/dev/null 2>&1 || true
+        # Verify the SERVICE actually came back active before consuming the marker.
+        if systemctl --user is-active "$target" >/dev/null 2>&1; then
+          recovered=1
+        else
+          echo "[bridge-upgrade] WARN: systemd re-start of ${target} did NOT make it active — KEEPING the quiesce marker so the liveness watcher retries." >&2
+        fi
       fi
       ;;
-    *) ;;
+    *)
+      # Unknown/empty platform — we cannot verify a re-enable. Leave the marker for
+      # the liveness watcher rather than clearing on an unverifiable best-effort.
+      ;;
   esac
-  _bridge_upgrade_clear_quiesce_marker
+  if (( recovered == 1 )); then
+    _bridge_upgrade_clear_quiesce_marker
+  fi
   return 0
 }
 # END: Issue #2055 durable quiesce-intent marker
@@ -1421,11 +1464,14 @@ _bridge_upgrade_daemon_systemd_active() {
   systemctl --user is-active --quiet agent-bridge-daemon.service 2>/dev/null
 }
 
-# Stop the systemd-user daemon units so systemd cannot respawn the daemon during
-# the #1820 reconcile. Stop the liveness TIMER first (so it can't re-fire the
-# service), then the service. Best-effort (|| true): a systemctl failure must
-# never abort the upgrade. No-op (returns 0, no systemctl calls) on a
-# non-systemd-managed install.
+# Stop the systemd-user daemon SERVICE so systemd cannot respawn the daemon during
+# the #1820 reconcile. Issue #2064 (Finding 2): the liveness TIMER is LEFT RUNNING
+# (it used to be stopped here) so a SIGKILL'd upgrade still has an invoker to
+# observe the quiesce marker; the watcher's live_upgrade_quiesce_in_flight DEFER
+# guard keeps the still-running timer from racing the #1820 fence while this
+# upgrade pid is alive. Best-effort (|| true): a systemctl failure must never abort
+# the upgrade. No-op (returns 0, no systemctl calls) on a non-systemd-managed
+# install.
 _bridge_upgrade_systemd_quiesce_daemon() {
   _bridge_upgrade_daemon_systemd_active || return 0
   # Issue #1905 r2: the STOP path below is the ACTUAL origin of the rc=3 race —
@@ -1436,11 +1482,20 @@ _bridge_upgrade_systemd_quiesce_daemon() {
   # re-assert it explicitly here so the STOP path is self-evidently bus-covered
   # and cannot silently regress if the detector call is ever refactored away.
   _bridge_upgrade_systemd_user_bus_ready || true
-  echo "[bridge-upgrade] systemd-managed daemon detected — stopping agent-bridge-daemon-liveness.timer + agent-bridge-daemon.service for the layout-v2 reconcile window (they would otherwise respawn the daemon and race the #1820 fence)." >&2
+  echo "[bridge-upgrade] systemd-managed daemon detected — stopping agent-bridge-daemon.service for the layout-v2 reconcile window (it would otherwise respawn the daemon and race the #1820 fence). Leaving agent-bridge-daemon-liveness.timer RUNNING (#2064) so a SIGKILL'd upgrade still has an invoker to observe the quiesce marker." >&2
   # Issue #2055: write the durable quiesce-intent marker BEFORE the stop so a
   # crash between here and the restore-enable is attributable to this upgrade.
   _bridge_upgrade_write_quiesce_marker systemd agent-bridge-daemon.service
-  systemctl --user stop agent-bridge-daemon-liveness.timer >/dev/null 2>&1 || true
+  # Issue #2064 (Finding 2): do NOT stop the liveness timer here. Stopping it was
+  # the original #2055/#1905 way to keep the watcher from racing the #1820 fence,
+  # but it also meant a SIGKILL/power-loss between this stop and the restore left
+  # NO running process to observe the quiesce marker — the daemon stayed down
+  # forever (the timer is the ONLY installed systemd liveness scheduler). The
+  # timer now stays running; the watcher's live_upgrade_quiesce_in_flight DEFER
+  # guard (bridge-daemon-liveness.sh, mirrors the launchd I3 LIVE-pid defer) is
+  # what keeps it from racing the fence while THIS upgrade pid is alive. When the
+  # upgrade is killed, its marker pid goes dead → the still-running timer reaps the
+  # enabled+inactive service on the next tick.
   systemctl --user stop agent-bridge-daemon.service >/dev/null 2>&1 || true
   return 0
 }
