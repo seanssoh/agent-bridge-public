@@ -36,6 +36,12 @@ trap cleanup EXIT
 PLACEHOLDER_HEADING="# <Agent Name> — <Role>"
 MANAGED_START="<!-- BEGIN AGENT BRIDGE DOC MIGRATION -->"
 MANAGED_END="<!-- END AGENT BRIDGE DOC MIGRATION -->"
+# Issue #1816: the refreshed BEGIN marker now carries a ` v=<version>` stamp
+# (`<!-- BEGIN AGENT BRIDGE DOC MIGRATION v=0.16.16-rc3 -->`). Post-refresh
+# assertions match the stable PREFIX so they accept the stamped marker the
+# renderer emits while the seed fixtures keep using the legacy unstamped
+# MANAGED_START to prove the splice rewrites a stale block.
+MANAGED_START_PREFIX="<!-- BEGIN AGENT BRIDGE DOC MIGRATION"
 
 setup_bridge_fixture() {
   smoke_cleanup_temp_root
@@ -159,7 +165,8 @@ test_customized_workdir_preserved() {
   smoke_assert_not_contains "$body" "managed canon line v1" \
     "repro: stale managed block survived (should be spliced out)"
   # The managed block lives between the markers; both must be present exactly once.
-  smoke_assert_contains "$body" "$MANAGED_START" \
+  # #1816: the refreshed BEGIN marker is stamped, so assert on the stable prefix.
+  smoke_assert_contains "$body" "$MANAGED_START_PREFIX" \
     "repro: managed block start marker missing after preserve+refresh"
   smoke_assert_contains "$body" "$MANAGED_END" \
     "repro: managed block end marker missing after preserve+refresh"
