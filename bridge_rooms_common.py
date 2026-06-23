@@ -34,6 +34,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 import sqlite3
 import time
@@ -165,6 +166,283 @@ def configured_admin_agent_id() -> str:
     `patch`.
     """
     return os.environ.get("BRIDGE_ADMIN_AGENT_ID", "").strip()
+
+
+class AdminIdResolveError(Exception):
+    """A configured roster file EXISTS but could not be read/decoded.
+
+    #2081 r2 review F1: this is DISTINCT from "the roster has no admin line"
+    (which returns ''). A read/parse failure on an existing roster must NOT be
+    silently downgraded to "no admin configured" — that would re-open the very
+    fail-open this fix closes (a real local admin would classify UNKNOWN and a
+    non-admin@remote -> admin@local delivery would be allowed). The caller MUST
+    fail-closed (refuse to serve) rather than serve with the admin boundary
+    silently disabled.
+    """
+
+
+# A configured admin agent id is the canonical agent NAME — the same restricted
+# charset agent creation enforces (alnum, dot, underscore, hyphen). #2081 r3
+# review F1: we use this to REJECT a malformed/truncated roster value (e.g. an
+# unbalanced-quote `BRIDGE_ADMIN_AGENT_ID="padmin` partial write) rather than
+# export garbage that would misclassify the real admin and fall open.
+_ADMIN_ID_VALID_RE = re.compile(r'^[A-Za-z0-9._-]+$')
+
+
+def _parse_admin_id_from_roster(path: Path) -> tuple[bool, str]:
+    """Extract `BRIDGE_ADMIN_AGENT_ID` from an on-disk roster file.
+
+    Returns a tri-state `(found, value)`:
+      - (False, "") : the file has NO BRIDGE_ADMIN_AGENT_ID assignment — the
+                      caller continues to the next roster (this is NOT this
+                      file's admin).
+      - (True, "")  : the file's effective assignment is EMPTY (`...=` or `=""`)
+                      — #2081 r3 review F2: bash `source` would leave the var
+                      empty here, so the caller must STOP and treat the node as
+                      "no admin configured" rather than fall through to a stale
+                      higher-precedence-but-earlier-sourced roster.
+      - (True, id)  : the effective configured admin NAME.
+
+    Reads the SAME line `bridge-setup.sh` (`bridge_setup_write_local_scalar`)
+    writes — `BRIDGE_ADMIN_AGENT_ID="<value>"` — tolerating an optional leading
+    `export ` and trailing comment. We grep rather than `source` the roster
+    because it references bridge-lib arrays / functions not loaded in the
+    receiver's bare process, so a `source` would error out.
+
+    #2081 r2 review F2: a roster can carry MORE THAN ONE assignment (a stale
+    `export BRIDGE_ADMIN_AGENT_ID="old"` above setup's later canonical line).
+    Bash `source` keeps the LAST assignment, so we take the LAST match.
+
+    #2081 r3 review F1: a malformed quoted value (unbalanced quotes from a
+    truncated/partial write) is a corruption, NOT a valid id — we RAISE
+    ValueError so the caller fail-closes (refuses to serve) instead of exporting
+    a garbage value that misclassifies the real admin and re-opens the fail-open.
+    An EMPTY value is valid (it means no admin); a non-empty value must match the
+    restricted agent-id charset.
+
+    Raises FileNotFoundError if the file is absent (the caller treats absence as
+    "not a candidate"); raises any OTHER OSError / UnicodeDecodeError to the
+    caller (an EXISTING-but-unreadable roster — review F1 fail-closed signal).
+    """
+    # #2081 r5-round5 review: decode the RAW bytes WITHOUT universal-newline
+    # translation. `Path.read_text()` (newline=None) rewrites a lone `\r` (and
+    # `\r\n`) to `\n`, which would SPLIT a `"padmin"\r#evil` line at the `\r` and
+    # make the regex capture just `"padmin"` — diverging from bash, which sees the
+    # literal `\r` as part of the value (CR is not IFS word-whitespace). Reading
+    # the undecoded bytes keeps us byte-faithful to what bash sources. A decode
+    # error raises UnicodeDecodeError to the caller (existing-but-unreadable →
+    # fail-closed), same as before.
+    text = path.read_bytes().decode("utf-8")  # may raise to the caller
+    # Match a plain `=` OR a `+=` append (#2081 r5 review). We do NOT honor `+=`
+    # as a true append against a prior value — a roster admin id is a single
+    # canonical name, and an append into it is a corruption/tamper signal — but
+    # we MUST match the line so it cannot be silently ignored (which would make
+    # us fall through to a stale earlier roster). The `+=` form is handled below.
+    # `(?m)$` matches before `\n` ONLY (not before a bare `\r`), and `.` excludes
+    # `\n` but KEEPS `\r`, so a `\r` stays in the captured RHS as bash sees it.
+    pat = re.compile(
+        r'^[ \t]*(?:export[ \t]+)?BRIDGE_ADMIN_AGENT_ID(\+?=)(.*)$', re.MULTILINE)
+    matches = pat.findall(text)
+    if not matches:
+        return False, ""
+    # LAST assignment wins (bash source semantics). The capture starts RIGHT
+    # after `=` and includes any leading whitespace — and #2081 r3-round4 review
+    # F1: in a bash assignment `KEY= padmin`, whitespace immediately after `=`
+    # makes the VALUE EMPTY (the rest is a separate command/word, not the value).
+    # So we must NOT lstrip the RHS before parsing; a leading-whitespace (or
+    # empty) RHS is an empty value, not `padmin`.
+    op, raw = matches[-1]
+    if op == "+=":
+        # A `+=` on this var is not a shape setup ever writes; refuse rather than
+        # guess the appended value (fail closed → caller refuses to serve).
+        raise ValueError(
+            "BRIDGE_ADMIN_AGENT_ID uses '+=' (append) — unsupported / malformed")
+    value = _unquote_roster_value(raw)  # raises ValueError on malformed quoting
+    if value and not _ADMIN_ID_VALID_RE.match(value):
+        raise ValueError(
+            f"BRIDGE_ADMIN_AGENT_ID has an invalid agent-id value {value!r}")
+    return True, value
+
+
+def _unquote_roster_value(raw: str) -> str:
+    """Decode the RHS of a roster `KEY=<raw>` assignment to its bash value.
+
+    `raw` is the text RIGHT after `=`, with leading whitespace PRESERVED (the
+    caller does not lstrip it). Validates the COMPLETE RHS grammar so a malformed
+    value cannot be silently TRUNCATED to a valid-looking id and exported:
+
+      * #2081 r3-round4 review F1: LEADING whitespace after `=` means the bash
+        VALUE IS EMPTY (`KEY= padmin` assigns `KEY=""` and runs `padmin` as a
+        separate word). So a raw that is empty OR begins with whitespace yields
+        '' (no admin) — NOT the trailing word.
+      * Double/single-quoted: `"value"` / `'value'`, then ONLY optional trailing
+        whitespace + an optional `# comment`. Junk fused to the closing quote
+        (`"padmin"evil`) is malformed (bash would concatenate to `padminevil` —
+        we refuse to honor that and RAISE rather than truncate to `padmin`). An
+        unterminated quote (`"padmin`, a partial write) is malformed.
+      * Bare token: a run of non-whitespace; a `#` is a comment delimiter ONLY
+        when whitespace-separated (`padmin # c`), exactly as bash word-splitting
+        treats it — so `padmin#evil` is the LITERAL token `padmin#evil`, NOT
+        `padmin`. The token then faces the restricted agent-id charset check in
+        the caller, so `padmin#evil` fail-closes (raises) instead of truncating.
+
+    Raises ValueError on any malformed RHS; the caller maps it to
+    AdminIdResolveError so the receiver refuses to serve rather than serve with a
+    wrong/garbage admin id.
+    """
+    # Leading whitespace (or an all-whitespace / empty RHS) → empty value: bash
+    # assigns `KEY=""` and treats the rest as a separate command/word.
+    if raw == "" or raw[:1] in (" ", "\t"):
+        return ""
+    if raw[:1] in ('"', "'"):
+        q = raw[0]
+        end = raw.find(q, 1)
+        if end == -1:
+            raise ValueError(
+                "BRIDGE_ADMIN_AGENT_ID has an unbalanced quote (malformed / "
+                "truncated roster line)")
+        value = raw[1:end]
+        rest = raw[end + 1:]
+        # #2081 r5 review: ONLY whitespace + an optional `# comment` may follow
+        # the closing quote. Anything ELSE fused to the close quote is bash
+        # CONCATENATION (`"padmin"evil` -> padminevil, `"padmin"#evil` ->
+        # padmin#evil — a `#` with no preceding whitespace is NOT a comment). We
+        # refuse to honor concatenation (it never appears in a real admin id) and
+        # RAISE rather than silently truncate to `padmin`. A `# comment` is a
+        # comment ONLY when whitespace-separated from the closing quote.
+        if rest and rest[:1] not in (" ", "\t"):
+            raise ValueError(
+                "BRIDGE_ADMIN_AGENT_ID has junk/concatenation fused to the "
+                f"closing quote ({rest!r}) — malformed")
+        rest_stripped = rest.lstrip(" \t")
+        if rest_stripped and not rest_stripped.startswith("#"):
+            raise ValueError(
+                "BRIDGE_ADMIN_AGENT_ID has trailing junk after the closing "
+                f"quote ({rest_stripped!r}) — malformed")
+        return value
+    # Bare token. A `#` is a comment ONLY when word-whitespace-separated (bash
+    # word splitting), so a `#` fused into the token stays part of it. #2081
+    # r5-round5 review: bash IFS word-whitespace is ONLY space/tab/newline — NOT
+    # vertical-tab/form-feed/carriage-return — so we split on space/tab ONLY
+    # (`[ \t]`), never Python's `str.split()` (which also splits on \v\f\r and
+    # would diverge from bash). A VT/FF/CR therefore stays IN the token and is
+    # rejected by the caller's strict agent-id charset, exactly as a fused `#` /
+    # quote / `$` is — never silently truncated to a valid prefix.
+    no_comment = re.split(r'[ \t]#', raw, maxsplit=1)[0]
+    fields = [f for f in re.split(r'[ \t]+', no_comment) if f]
+    if not fields:
+        return ""
+    if len(fields) > 1:
+        # `padmin extra` — bash would assign only `padmin`, but extra bare words
+        # on an assignment line are a corruption signal here; refuse rather than
+        # silently keep the first field.
+        raise ValueError(
+            "BRIDGE_ADMIN_AGENT_ID has unexpected trailing words "
+            f"({fields[1:]!r}) — malformed")
+    return fields[0]
+
+
+def resolve_admin_agent_id() -> str:
+    """The configured admin id, env-first then resolved from the on-disk roster.
+
+    SECURITY (#2081 fail-open fix). The cross-node admin↔admin authz predicate
+    recomputes a LOCAL endpoint's admin status from `$BRIDGE_ADMIN_AGENT_ID`
+    (`classify_local_admin`). But the receiver LAUNCH paths do NOT all export it:
+    `agent-bridge` skips the parent roster-load for `a2a`, `bridge_a2a_receiver_
+    start` sources only `agent-env.local.sh`, and the systemd handoffd unit runs
+    with only `BRIDGE_HOME` in its environment. With the var absent a LOCAL admin
+    classifies as UNKNOWN, so a `non-admin@remote -> admin@local` cross-node
+    delivery flips from the intended DENY (`sender_not_admin`) to ALLOW
+    (`not_admin_involved`) — a fail-OPEN of the admin boundary.
+
+    The fix is to make the configured admin id AVAILABLE on the launch path, NOT
+    to blanket-fail-closed on a local UNKNOWN: a node that legitimately has no
+    configured admin (or whose two endpoints are both non-admins — the common
+    case) must keep delivering non-admin↔non-admin room traffic. Blanket-unknown-
+    deny would break exactly that traffic. So we resolve the admin NAME the same
+    way setup persists it (the roster file) and let `classify_local_admin` make
+    the correct admin/non-admin call.
+
+    Precedence: an already-exported env value WINS (the normal managed-agent
+    launch via bridge-run.sh, and the controller's own ambient env). Only when
+    env is empty do we read `$BRIDGE_HOME/agent-roster.local.sh` then
+    `agent-roster.sh`.
+
+    Returns '' ONLY for a node with no configured admin in any READABLE roster
+    (correctly leaves every local endpoint UNKNOWN, which keeps non-admin traffic
+    open and fail-closes only an admin-claimed counterpart). #2081 r2 review F1:
+    if a roster file EXISTS but cannot be read/decoded — or carries a malformed
+    (unbalanced-quote / invalid-charset) value (#2081 r3 review F1) — we RAISE
+    AdminIdResolveError rather than return '' or a garbage value. The caller
+    fail-closes (refuses to serve) rather than serve with a wrong/absent admin id.
+
+    #2081 r3 review F2: the LOCAL roster has precedence over the shared roster
+    because bash sources the shared roster FIRST and the local roster LAST, so
+    the local last-assignment is the effective value. A local assignment that is
+    PRESENT-BUT-EMPTY (`BRIDGE_ADMIN_AGENT_ID=`) therefore means "no admin" and
+    must STOP the search — NOT fall through to a stale `="admin"` in the shared
+    roster, which bash would have overwritten.
+    """
+    env_val = os.environ.get("BRIDGE_ADMIN_AGENT_ID", "").strip()
+    if env_val:
+        return env_val
+    # Honor the explicit roster-path overrides (set by bridge-lib.sh and by the
+    # isolated-smoke harness) the same way the shell side does, else derive from
+    # BRIDGE_HOME exactly as setup persists it. Local roster wins over the shared
+    # roster (bash sources shared first, local last → local is effective).
+    home = bridge_home()
+    candidates: list[Path] = []
+    local_override = os.environ.get("BRIDGE_ROSTER_LOCAL_FILE", "").strip()
+    if local_override:
+        candidates.append(Path(local_override))
+    candidates.append(home / "agent-roster.local.sh")
+    shared_override = os.environ.get("BRIDGE_ROSTER_FILE", "").strip()
+    if shared_override:
+        candidates.append(Path(shared_override))
+    candidates.append(home / "agent-roster.sh")
+    seen: set[str] = set()
+    for path in candidates:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            found, value = _parse_admin_id_from_roster(path)
+        except FileNotFoundError:
+            # Not a candidate on this node — not an error; try the next.
+            continue
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            # The file EXISTS but could not be read/decoded (perms, partial
+            # write, binary garbage) OR carries a malformed/invalid value. Do
+            # NOT silently downgrade to "no admin" / export garbage — fail closed
+            # so the caller refuses to serve fail-open (F1).
+            raise AdminIdResolveError(
+                f"roster {path} has an unreadable/invalid admin id: {exc}") from exc
+        if found:
+            # The first roster (in bash-effective precedence) that ASSIGNS the
+            # var is authoritative — even if it assigns EMPTY (F2). Do not fall
+            # through to a stale earlier-sourced roster.
+            return value
+    return ""
+
+
+def ensure_admin_agent_id_in_env() -> str:
+    """Resolve the configured admin id and stamp it into `os.environ` if unset.
+
+    Called at receiver STARTUP (`bridge-handoffd.py serve`) so the admin↔admin
+    authz predicate can classify a LOCAL admin correctly for the lifetime of the
+    serve, regardless of which launch path (systemd unit / `agb a2a daemon
+    start` / direct daemon start) reached us. Idempotent and side-effect-free
+    when the env already carries the value. Returns the resolved id ('' if none).
+
+    Propagates AdminIdResolveError (review F1) when an existing roster is
+    unreadable, so the serve entrypoint can fail closed rather than start with
+    the admin boundary silently disabled.
+    """
+    resolved = resolve_admin_agent_id()
+    if resolved and not os.environ.get("BRIDGE_ADMIN_AGENT_ID", "").strip():
+        os.environ["BRIDGE_ADMIN_AGENT_ID"] = resolved
+    return resolved
 
 
 def classify_local_admin(agent: str) -> Optional[bool]:
