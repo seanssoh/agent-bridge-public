@@ -1272,21 +1272,81 @@ _bridge_upgrade_quiesce_marker_path() {
   printf '%s' "${BRIDGE_UPGRADE_QUIESCE_MARKER_FILE:-${BRIDGE_STATE_DIR:-$TARGET_ROOT/state}/upgrade/daemon-quiesce.intent}"
 }
 
+# Issue #2064 r3 (Finding 4): a bare pid is NOT a stable process identity — after a
+# SIGKILL'd upgrade the kernel can REUSE that pid for an unrelated long-lived
+# process, and the liveness watcher's `kill -0 $pid` defer would then think the
+# (long-dead) upgrade is still in flight and defer FOREVER → the daemon stays
+# silently down. Bind the marker to a per-process START-IDENTITY token that the
+# watcher can recompute and compare: the kernel never reuses a (pid, start-time)
+# pair within a boot. Emits a single opaque token, empty when no source is
+# readable (the watcher then falls back to the conservative bare-pid defer — a
+# missing token must never make a real in-flight upgrade look reused). Pure read.
+#   Linux : /proc/<pid>/stat field 22 (starttime, clock ticks since boot) — the
+#           canonical, monotonic, reuse-proof process birth stamp.
+#   BSD/mac: `ps -o lstart=` (absolute start wall-clock; second-resolution is
+#           ample to discriminate a reused pid hours/days later).
+# The emitted token is ALWAYS a single shell word — ALL whitespace is collapsed to
+# '_' — because the marker is a SOURCEABLE KEY=value file: an unquoted value with
+# spaces (the raw `ps -o lstart=` form "Mon Jun 24 07:24:01 2026") would, when the
+# watcher `source`s the marker, parse as `KEY=ps-lstart:Mon` + a stray `Jun ...`
+# command → the recorded identity reads back EMPTY and the whole PID-reuse defense
+# silently degrades to the bare-pid defer on BSD/mac (codex r3 catch). The watcher's
+# recompute applies the SAME normalization so matching tokens still compare equal.
+_bridge_upgrade_pid_start_identity() {
+  local pid="$1" tok=""
+  [[ "$pid" =~ ^[0-9]+$ ]] || { printf ''; return 0; }
+  if [[ -r "/proc/$pid/stat" ]]; then
+    # Field 22 is starttime. comm (field 2) is parenthesized and MAY itself contain
+    # spaces AND ')' (e.g. a process named "(weird)thing"), so a first-')' anchor is
+    # unsafe — anchor on the LAST ')' in the line, then count whitespace fields after
+    # it: state is the 1st token after the closing paren, so starttime (field 22
+    # overall) is the 20th token after it.
+    tok="$(awk '{ p=0; for (i=length($0); i>=1; i--) if (substr($0,i,1)==")") { p=i; break }
+                 if (p==0) next; s=substr($0,p+1); n=split(s,a," "); if (n>=20) print a[20] }' \
+      "/proc/$pid/stat" 2>/dev/null)" || tok=""
+    if [[ -n "$tok" ]]; then printf 'linux-starttime:%s' "$tok"; return 0; fi
+  fi
+  if command -v ps >/dev/null 2>&1; then
+    # Collapse ALL whitespace runs to a single '_' so the token is one shell word
+    # (the lstart string is space-laden), THEN hard-restrict to a safe allowlist
+    # [A-Za-z0-9:_] via `tr -cd` — this provably strips ANY shell metacharacter
+    # (notably a single-quote, which would otherwise break the single-quoted marker
+    # value and re-open the EMPTY-readback hole on a pathological/locale lstart).
+    # The watcher applies the IDENTICAL pipeline so tokens still compare equal.
+    tok="$(ps -o lstart= -p "$pid" 2>/dev/null | tr -s '[:space:]' ' ' | sed -e 's/^ //' -e 's/ $//' -e 's/ /_/g' | tr -cd 'A-Za-z0-9:_')" || tok=""
+    if [[ -n "$tok" ]]; then printf 'ps-lstart:%s' "$tok"; return 0; fi
+  fi
+  printf ''
+  return 0
+}
+
 # Write the quiesce-intent marker. $1=platform (launchd|systemd), $2=label-or-
 # service. Records the OWNER upgrade pid ($$) so the watcher can tell an in-flight
-# upgrade (pid alive) from an interrupted one (pid dead). Best-effort: a failed
-# write must NEVER abort the upgrade (the quiesce continues; we simply lose the
-# crash-recovery hint for this run). Sets the in-process flag so the EXIT handler
+# upgrade (pid alive) from an interrupted one (pid dead). #2064 r3: ALSO records a
+# process START-IDENTITY token + the writer uid so a REUSED pid (the original
+# upgrade SIGKILL'd, the kernel handing its pid to an unrelated long-lived process)
+# cannot masquerade as an in-flight upgrade and wedge the defer forever. Best-effort:
+# a failed write must NEVER abort the upgrade (the quiesce continues; we simply lose
+# the crash-recovery hint for this run). Sets the in-process flag so the EXIT handler
 # knows a marker is outstanding.
 _bridge_upgrade_write_quiesce_marker() {
   local platform="$1" target="$2"
-  local marker tmp ts
+  local marker tmp ts psid uid
   marker="$(_bridge_upgrade_quiesce_marker_path)"
   mkdir -p "$(dirname "$marker")" 2>/dev/null || { return 0; }
   ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')"
+  psid="$(_bridge_upgrade_pid_start_identity "$$" 2>/dev/null || printf '')"
+  uid="$(id -u 2>/dev/null || printf '%s' "${UID:-}")"
   tmp="${marker}.tmp.$$"
+  # The marker is SOURCED by the watcher, so any value that could carry whitespace or
+  # shell metacharacters is written single-quoted (defense-in-depth — the PSID token
+  # is already normalized space-free, but quoting guarantees a clean source even if a
+  # future identity source emits something exotic). PID/UID are numeric; PLATFORM /
+  # TARGET / TS / VERSION are bridge-controlled tokens, left bare for readability.
   {
     printf 'BRIDGE_QUIESCE_UPGRADE_PID=%s\n' "$$"
+    printf "BRIDGE_QUIESCE_UPGRADE_PSID='%s'\n" "$psid"
+    printf 'BRIDGE_QUIESCE_UPGRADE_UID=%s\n' "$uid"
     printf 'BRIDGE_QUIESCE_PLATFORM=%s\n' "$platform"
     printf 'BRIDGE_QUIESCE_TARGET=%s\n' "$target"
     printf 'BRIDGE_QUIESCE_TS=%s\n' "$ts"
@@ -3891,19 +3951,46 @@ if [[ $RESTART_DAEMON -eq 1 && $DRY_RUN -eq 0 ]]; then
   elif [[ "${_UPGRADE_DAEMON_SYSTEMD_MANAGED:-0}" == "1" ]]; then
     echo "[bridge-upgrade] daemon load-state (systemd): ${_BRIDGE_UPGRADE_SYSTEMD_LOAD_STATE:-unknown}" >&2
   fi
-  # Issue #2055: the restart phase has run to completion (the quiesce window
-  # closed WITHOUT a crash) — so unconditionally clear the quiesce-intent marker,
-  # even if the restore left the job enabled-but-unloaded (LOAD_STATE != loaded).
-  # The catchable-abort window is now closed; any residual not-loaded state is the
-  # #2040 enabled-but-unloaded case, which the liveness watcher recovers via its
-  # marker-INDEPENDENT path (the job is enabled, not disabled). Leaving a stale
-  # marker here would be a LATENT operator-stop regression: a later
-  # `agb daemon stop` would disable the job while this dead-pid marker still sat
-  # on disk, and the watcher would wrongly treat that operator stop as an
-  # interrupted upgrade and re-enable it. The per-success clears above are
-  # belt-and-suspenders; this is the authoritative one.
-  if declare -F _bridge_upgrade_clear_quiesce_marker >/dev/null 2>&1; then
-    _bridge_upgrade_clear_quiesce_marker
+  # Issue #2055 / #2064 r3 (Finding 3): clear the quiesce-intent marker here ONLY
+  # when the restore actually CONFIRMED the daemon job is back (launchd: loaded;
+  # systemd: the service+timer active). The earlier design cleared this marker
+  # UNCONDITIONALLY once the restart phase ran to completion — but the restart phase
+  # "completing" does NOT mean the job recovered: _bridge_upgrade_launchd_restart_daemon
+  # / _bridge_upgrade_systemd_restart_daemon are best-effort and routinely return 0
+  # having left the job ENABLED-BUT-UNLOADED (launchd) or enabled+inactive (systemd)
+  # — and the marker is the ONLY discriminator the standing liveness watcher has for
+  # an enabled-but-DISABLED interrupted-upgrade job (maybe_rebootstrap_launchd treats
+  # a disabled/unknown job with no marker as an operator stop and SKIPS). So an
+  # unconditional clear after an UNVERIFIED restore strands a not-recovered daemon
+  # with no marker → silently down. Now: clear only on the SAME confirmed-recovery
+  # signal the per-success clears inside the restart helpers use (LOAD_STATE), and
+  # otherwise LEAVE the marker for the liveness watcher to recover the orphaned job.
+  # The plain `bridge-daemon.sh ensure` path (neither launchd nor systemd managed)
+  # never wrote a marker, so the clear there is a harmless no-op that preserves the
+  # latent-operator-stop hygiene for any stray residue.
+  # NOTE (errexit): bridge-upgrade.sh runs under `set -euo pipefail`. A trailing
+  # `[[ cond ]] && var=1` as the LAST statement of an if-branch returns 1 when cond
+  # is false and would trip errexit, so use explicit if/then assignments (each
+  # branch's last statement is an unconditional assignment that always returns 0).
+  _bridge_upgrade_restart_recovery_confirmed=0
+  if [[ "${_UPGRADE_DAEMON_LAUNCHD_MANAGED:-0}" == "1" ]]; then
+    if [[ "${_BRIDGE_UPGRADE_LAUNCHD_LOAD_STATE:-unknown}" == "loaded" ]]; then
+      _bridge_upgrade_restart_recovery_confirmed=1
+    fi
+  elif [[ "${_UPGRADE_DAEMON_SYSTEMD_MANAGED:-0}" == "1" ]]; then
+    if [[ "${_BRIDGE_UPGRADE_SYSTEMD_LOAD_STATE:-unknown}" == "active" ]]; then
+      _bridge_upgrade_restart_recovery_confirmed=1
+    fi
+  else
+    # No managed daemon job → no quiesce marker was written; the clear is a no-op.
+    _bridge_upgrade_restart_recovery_confirmed=1
+  fi
+  if (( _bridge_upgrade_restart_recovery_confirmed == 1 )); then
+    if declare -F _bridge_upgrade_clear_quiesce_marker >/dev/null 2>&1; then
+      _bridge_upgrade_clear_quiesce_marker
+    fi
+  else
+    echo "[bridge-upgrade] WARN: restart-phase daemon restore did NOT confirm recovery (load-state: launchd=${_BRIDGE_UPGRADE_LAUNCHD_LOAD_STATE:-n/a} systemd=${_BRIDGE_UPGRADE_SYSTEMD_LOAD_STATE:-n/a}) — KEEPING the quiesce-intent marker so the standing liveness watcher recovers the orphaned daemon job." >&2
   fi
 elif [[ $DRY_RUN -eq 0 ]]; then
   # Issue #2055: --no-restart-daemon (RESTART_DAEMON=0). The #1820 quiesce still

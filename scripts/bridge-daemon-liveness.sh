@@ -108,12 +108,21 @@ REPO_ROOT="$(cd -P "$SCRIPT_DIR/.." && pwd -P)"
 # watcher tells an interrupted-upgrade disable (recoverable) from an operator
 # `agb daemon stop` (stay down). Must match bridge-upgrade.sh's default path.
 : "${BRIDGE_UPGRADE_QUIESCE_MARKER_FILE:=$BRIDGE_STATE_DIR/upgrade/daemon-quiesce.intent}"
+# Issue #2064 r3 (Finding 4): bounded stale-marker AGE ceiling. The marker records
+# its write time (BRIDGE_QUIESCE_TS). A legitimate quiesce window is seconds-to-
+# minutes (the #1820 reconcile), so a marker older than this ceiling is, by
+# construction, an ORPHAN — the upgrade that wrote it is long gone even if its pid
+# now resolves to a live (reused / unrelated) process. Treat such a marker as
+# reapable regardless of pid liveness, as defense-in-depth behind the start-identity
+# check below. Default 3600s (1h) — wildly beyond any real reconcile window.
+: "${BRIDGE_DAEMON_QUIESCE_MAX_AGE_SECONDS:=3600}"
 
 # Sanitize numeric envs — fall back to defaults on garbage so a typo in a
 # launchd EnvironmentVariables block can't disable the watcher.
 [[ "$BRIDGE_DAEMON_LIVENESS_THRESHOLD_SECONDS" =~ ^[0-9]+$ ]] || BRIDGE_DAEMON_LIVENESS_THRESHOLD_SECONDS=600
 [[ "$BRIDGE_DAEMON_LIVENESS_COOLDOWN_SECONDS" =~ ^[0-9]+$ ]]  || BRIDGE_DAEMON_LIVENESS_COOLDOWN_SECONDS=600
 [[ "$BRIDGE_DAEMON_GATEWAY_STALL_SECONDS" =~ ^[0-9]+$ ]]      || BRIDGE_DAEMON_GATEWAY_STALL_SECONDS=300
+[[ "$BRIDGE_DAEMON_QUIESCE_MAX_AGE_SECONDS" =~ ^[0-9]+$ ]]    || BRIDGE_DAEMON_QUIESCE_MAX_AGE_SECONDS=3600
 
 DAEMON_SH="$REPO_ROOT/bridge-daemon.sh"
 DAEMON_PID_FILE="${BRIDGE_DAEMON_PID_FILE:-$BRIDGE_STATE_DIR/daemon.pid}"
@@ -197,6 +206,111 @@ record_cooldown() {
 # Any other case (no marker / unreadable pid / pid still alive) returns 1 →
 # the caller keeps the #2040 fail-closed skip. Sets QUIESCE_MARKER_PID /
 # QUIESCE_MARKER_PLATFORM for the caller's audit detail. Pure read; no mutation.
+
+# Issue #2064 r3 (Finding 4): recompute a live pid's START-IDENTITY token in the
+# SAME shape bridge-upgrade.sh records at marker-write, so the watcher can prove a
+# live pid is (or is NOT) the same process that wrote the marker. The kernel never
+# reuses a (pid, start-time) pair within a boot, so a token MISMATCH is definitive
+# proof the original upgrade is gone and this pid was REUSED. Empty when no source
+# is readable. Mirrors _bridge_upgrade_pid_start_identity in bridge-upgrade.sh.
+quiesce_pid_start_identity() {
+  local pid="$1" tok=""
+  [[ "$pid" =~ ^[0-9]+$ ]] || { printf ''; return 0; }
+  if [[ -r "/proc/$pid/stat" ]]; then
+    # Anchor on the LAST ')' (comm may contain spaces and ')'); starttime (field 22)
+    # is the 20th whitespace token after the closing paren. Mirrors
+    # _bridge_upgrade_pid_start_identity in bridge-upgrade.sh exactly.
+    tok="$(awk '{ p=0; for (i=length($0); i>=1; i--) if (substr($0,i,1)==")") { p=i; break }
+                 if (p==0) next; s=substr($0,p+1); n=split(s,a," "); if (n>=20) print a[20] }' \
+      "/proc/$pid/stat" 2>/dev/null)" || tok=""
+    if [[ -n "$tok" ]]; then printf 'linux-starttime:%s' "$tok"; return 0; fi
+  fi
+  if command -v ps >/dev/null 2>&1; then
+    # Collapse ALL whitespace to '_' then hard-restrict to [A-Za-z0-9:_] via `tr -cd`,
+    # IDENTICALLY to _bridge_upgrade_pid_start_identity at write time — a marker
+    # recorded as `ps-lstart:Mon_Jun_24_...` must recompute to the same string here,
+    # and the allowlist guarantees the token is a clean single shell word (no quote /
+    # metacharacter) so the SOURCEABLE marker reads back intact.
+    tok="$(ps -o lstart= -p "$pid" 2>/dev/null | tr -s '[:space:]' ' ' | sed -e 's/^ //' -e 's/ $//' -e 's/ /_/g' | tr -cd 'A-Za-z0-9:_')" || tok=""
+    if [[ -n "$tok" ]]; then printf 'ps-lstart:%s' "$tok"; return 0; fi
+  fi
+  printf ''
+  return 0
+}
+
+# Issue #2064 r3 (Finding 4): age of the quiesce marker in seconds (now - the
+# marker's recorded BRIDGE_QUIESCE_TS), or empty when the ts is missing/unparseable.
+# Used by the bounded stale-marker fallback: a marker older than the ceiling is an
+# orphan regardless of pid liveness. ISO-8601 UTC ("...Z") is parsed via `date -d`
+# (GNU) / `date -j -f` (BSD/mac); on a host where neither parses it we return empty
+# and the age fallback simply does not trigger (the identity check still guards).
+quiesce_marker_age_seconds() {
+  local marker="$BRIDGE_UPGRADE_QUIESCE_MARKER_FILE"
+  [[ -f "$marker" ]] || { printf ''; return 0; }
+  local ts epoch now
+  ts="$(
+    # shellcheck disable=SC1090
+    source "$marker" 2>/dev/null
+    printf '%s' "${BRIDGE_QUIESCE_TS:-}"
+  )"
+  [[ -n "$ts" ]] || { printf ''; return 0; }
+  epoch="$(date -u -d "$ts" +%s 2>/dev/null)" \
+    || epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$ts" +%s 2>/dev/null)" \
+    || epoch=""
+  [[ "$epoch" =~ ^[0-9]+$ ]] || { printf ''; return 0; }
+  now="$(now_ts)"
+  printf '%s' "$(( now - epoch ))"
+  return 0
+}
+
+# Issue #2064 r3 (Finding 4): is the marker's recorded upgrade pid a GENUINE live
+# in-flight upgrade? Returns 0 (defer — a real upgrade holds the marker) ONLY when
+# ALL hold:
+#   - the marker records a numeric pid, and
+#   - that pid is alive (kill -0), and
+#   - EITHER the marker has no start-identity token (legacy marker → fall back to the
+#     conservative bare-pid defer so a real in-flight upgrade is never reaped), OR
+#     the live pid's recomputed start-identity MATCHES the marker's (same process),
+#     and
+#   - the marker is NOT older than the bounded age ceiling (a marker that has sat
+#     past any sane reconcile window is an orphan even if its pid happens to be live).
+# Returns 1 (reap — orphaned / reused-pid / stale) otherwise. Pure read; no mutation.
+quiesce_live_in_flight() {
+  local marker="$BRIDGE_UPGRADE_QUIESCE_MARKER_FILE"
+  [[ -f "$marker" ]] || return 1
+  local pid psid age live_psid
+  pid="$(
+    # shellcheck disable=SC1090
+    source "$marker" 2>/dev/null
+    printf '%s' "${BRIDGE_QUIESCE_UPGRADE_PID:-}"
+  )"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  # Bounded age fallback (defense-in-depth): a marker older than the ceiling is an
+  # orphan even if the pid resolves to a live (reused / unrelated) process.
+  age="$(quiesce_marker_age_seconds)"
+  if [[ "$age" =~ ^[0-9]+$ ]] && (( age > BRIDGE_DAEMON_QUIESCE_MAX_AGE_SECONDS )); then
+    return 1
+  fi
+  # Start-identity check: a recorded token that does NOT match the live pid's
+  # current identity is definitive proof of pid REUSE → reap, do not defer.
+  psid="$(
+    # shellcheck disable=SC1090
+    source "$marker" 2>/dev/null
+    printf '%s' "${BRIDGE_QUIESCE_UPGRADE_PSID:-}"
+  )"
+  if [[ -n "$psid" ]]; then
+    live_psid="$(quiesce_pid_start_identity "$pid")"
+    # Only a CONFIRMED mismatch reaps. If we cannot recompute the live identity
+    # (empty token on this host), fall back to the bare-pid defer rather than reap a
+    # possibly-real upgrade on an unverifiable identity.
+    if [[ -n "$live_psid" && "$live_psid" != "$psid" ]]; then
+      return 1
+    fi
+  fi
+  return 0
+}
+
 QUIESCE_MARKER_PID=""
 QUIESCE_MARKER_PLATFORM=""
 interrupted_upgrade_quiesce() {
@@ -216,9 +330,12 @@ interrupted_upgrade_quiesce() {
     printf '%s' "${BRIDGE_QUIESCE_PLATFORM:-}"
   )"
   [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-  # A LIVE upgrade pid means an upgrade is mid-flight running its OWN restore —
-  # defer to it (do not race), so this is NOT a recoverable interrupted disable.
-  if kill -0 "$pid" 2>/dev/null; then
+  # A GENUINELY-LIVE in-flight upgrade is mid-flight running its OWN restore — defer
+  # to it (do not race), so this is NOT a recoverable interrupted disable. #2064 r3
+  # (Finding 4): "genuinely live" is identity-verified — a marker whose pid was
+  # REUSED by an unrelated live process (the upgrade was SIGKILL'd) or that has sat
+  # past the bounded age ceiling is an ORPHAN we MUST recover, not defer to forever.
+  if quiesce_live_in_flight; then
     return 1
   fi
   QUIESCE_MARKER_PID="$pid"
@@ -247,23 +364,19 @@ clear_quiesce_marker() {
 }
 
 # Issue #2064 r2 (Finding 2): is an upgrade GENUINELY in flight right now? Returns
-# 0 only when the quiesce marker exists, records a numeric upgrade pid, and that
-# pid is STILL ALIVE. This is the "do not race a live upgrade" guard the systemd
-# liveness recovery uses to DEFER while a legitimate upgrade holds the daemon down
-# inside its #1820 reconcile window — mirrors the launchd I3 LIVE-pid defer. A
-# DEAD-pid marker (orphaned by a SIGKILL'd upgrade) or no marker returns 1 so the
-# normal recovery proceeds and reaps the interrupted upgrade. Pure read.
+# 0 only when the quiesce marker exists, records a numeric upgrade pid, that pid is
+# STILL ALIVE, AND (#2064 r3, Finding 4) the live pid's start-identity MATCHES the
+# marker's recorded identity and the marker is not past the bounded age ceiling.
+# This is the "do not race a live upgrade" guard the systemd liveness recovery uses
+# to DEFER while a legitimate upgrade holds the daemon down inside its #1820
+# reconcile window — mirrors the launchd I3 LIVE-pid defer. A DEAD-pid marker
+# (orphaned by a SIGKILL'd upgrade), a REUSED-pid marker (the SIGKILL'd upgrade's
+# pid now resolves to an unrelated long-lived process — identity mismatch), a stale
+# (over-age) marker, or no marker returns 1 so the normal recovery proceeds and
+# reaps the interrupted upgrade instead of deferring to a non-upgrade forever. The
+# identity/age teeth live in the shared quiesce_live_in_flight helper above. Pure read.
 live_upgrade_quiesce_in_flight() {
-  local marker="$BRIDGE_UPGRADE_QUIESCE_MARKER_FILE"
-  [[ -f "$marker" ]] || return 1
-  local pid
-  pid="$(
-    # shellcheck disable=SC1090
-    source "$marker" 2>/dev/null
-    printf '%s' "${BRIDGE_QUIESCE_UPGRADE_PID:-}"
-  )"
-  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-  kill -0 "$pid" 2>/dev/null
+  quiesce_live_in_flight
 }
 
 # ── Issue #2040: standing recovery for an enabled-but-unloaded daemon ──────────

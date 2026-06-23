@@ -56,6 +56,32 @@
 #   F2d— Finding-1 parity on systemd: orphaned marker + the reap start does NOT
 #        activate → rebootstrap_failed + the orphaned marker SURVIVES (a confirmed
 #        reap is required to consume it).
+#   F3 — ★#2064 r3 Finding 3 (TOOTH): the NORMAL restart-phase common cleanup clears
+#        the quiesce marker ONLY on a CONFIRMED recovery (launchd LOAD_STATE=loaded /
+#        systemd LOAD_STATE=active). A restart-phase restore that left the job
+#        enabled-but-unloaded (LOAD_STATE=not_loaded) → the marker SURVIVES for the
+#        liveness watcher (the unconditional-clear-after-unverified-restore hole).
+#   F3b— control for F3: same path but LOAD_STATE=loaded → the marker is CLEARED
+#        (the gate consumes on confirmed recovery, not always-keep). + a STATIC guard
+#        that the source no longer unconditionally clears after the restart phase.
+#   F4 — ★#2064 r3 Finding 4 (TOOTH): a marker whose recorded pid is a LIVE process
+#        but whose START-IDENTITY does NOT match (the SIGKILL'd upgrade's pid was
+#        REUSED by an unrelated long-lived process) → REAPED, not deferred forever.
+#   F4b— ★#2064 r3 Finding 4 (age fallback): a marker with a LIVE pid + MATCHING-ish
+#        (empty/legacy) identity but a TS older than the bounded ceiling → REAPED
+#        (defense-in-depth: an over-age marker is an orphan even if the pid is live).
+#   U7 — ★#2064 r3 codex catch: the REAL _bridge_upgrade_write_quiesce_marker records a
+#        start-identity token that, even with the space-laden BSD `ps -o lstart=` form,
+#        survives a `source` of the marker INTACT (non-empty + equal to a fresh
+#        recompute). The pre-fix unquoted+spaced PSID parsed as `KEY=ps-lstart:Mon` +
+#        a stray command → identity read back EMPTY → PID-reuse defense silently lost
+#        on macOS/BSD. Proves the marker is round-trip-safe + the identity matches +
+#        the recorded token carries no whitespace and no single-quote.
+#   U8 — ★#2064 r3 codex round-2: a pathological/locale `ps -o lstart=` that emits a
+#        SINGLE-QUOTE must be STRIPPED by the write-side allowlist (else the ' breaks
+#        the single-quoted marker value → empty readback again). Shims `ps` to emit a
+#        quote-bearing value, runs the REAL identity helper, asserts the token is
+#        allowlist-clean AND round-trips through a single-quoted marker.
 #   U1 — UPGRADE-SIDE: write_quiesce_marker creates an attributable marker;
 #        clear_quiesce_marker removes it (a clean lifecycle leaves no residue —
 #        the stale-marker hole that would otherwise re-enable a later operator
@@ -249,15 +275,24 @@ seed_stale_no_pid() {
 }
 
 # Write a quiesce-intent marker for the given platform/target with the given
-# upgrade pid (default: a guaranteed-dead pid). $3=pid override.
+# upgrade pid (default: a guaranteed-dead pid). $3=pid override. #2064 r3:
+# $4=start-identity (BRIDGE_QUIESCE_UPGRADE_PSID) override — empty (default) models a
+# legacy marker with no recorded identity (the watcher then falls back to the
+# bare-pid defer); a non-matching token models a REUSED pid. $5=BRIDGE_QUIESCE_TS
+# override — defaults to NOW (a fresh marker, so the bounded age fallback does NOT
+# trip); pass an old ISO-8601 ts to model an over-age orphan.
 write_marker() {
   local platform="$1" target="$2" pid="${3:-999998}"
+  local psid="${4:-}"
+  local ts="${5:-$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%SZ')}"
   mkdir -p "$(dirname "$MARKER_FILE")"
   cat >"$MARKER_FILE" <<EOF
 BRIDGE_QUIESCE_UPGRADE_PID=$pid
+BRIDGE_QUIESCE_UPGRADE_PSID='$psid'
+BRIDGE_QUIESCE_UPGRADE_UID=$(id -u 2>/dev/null || printf '%s' "${UID:-}")
 BRIDGE_QUIESCE_PLATFORM=$platform
 BRIDGE_QUIESCE_TARGET=$target
-BRIDGE_QUIESCE_TS=2026-01-01T00:00:00Z
+BRIDGE_QUIESCE_TS=$ts
 BRIDGE_QUIESCE_VERSION=test
 EOF
 }
@@ -484,6 +519,71 @@ audit_has daemon_liveness_rebootstrap_success && smoke_fail "F2d FAIL: a failed 
 [[ -f "$MARKER_FILE" ]] || smoke_fail "F2d FAIL: a FAILED reap must KEEP the orphaned marker for the next poll. missing=$MARKER_FILE"
 smoke_log "F2d PASS: systemd orphaned marker + reap START fails to activate → rebootstrap_failed + marker SURVIVES (consume gated on confirmed reap)"
 
+# ── F4 (#2064 r3 Finding 4 TOOTH): PID-REUSE — a marker pointing at a LIVE process
+# whose START-IDENTITY does NOT match must be REAPED, not deferred forever. Models
+# the SIGKILL'd-upgrade-pid-reused-by-an-unrelated-long-lived-process topology: the
+# bare `kill -0 $pid` would (wrongly) see the marker as in-flight and DEFER forever.
+# We write a marker with pid=$$ (this smoke process, guaranteed LIVE) but inject a
+# PSID token that cannot match $$'s real start-identity → the watcher must recompute
+# $$'s identity, see the mismatch, and REAP (start) rather than defer.
+seed_stale_no_pid
+printf 'enabled' >"$SVC_ENABLED_FILE"
+printf '1' >"$SVC_ACTIVE_RC_FILE"          # inactive (enabled+inactive recovery surface)
+printf '1' >"$SVC_START_ACTIVATES_FILE"    # a start activates it
+write_marker systemd agent-bridge-daemon.service "$$" "linux-starttime:1" # LIVE pid, BOGUS identity
+run_liveness Linux
+audit_has daemon_liveness_rebootstrap_skip_live_upgrade && smoke_fail "F4 FAIL (BLOCKER): a REUSED-pid marker (live pid, identity mismatch) must NOT be read as in-flight — it would defer to a non-upgrade forever. audit=$(cat "$AUDIT_LOG")"
+systemctl_called start || smoke_fail "F4 FAIL (BLOCKER): a reused-pid marker must be REAPED (start), not deferred. calls=$(cat "$SYSTEMCTL_LOG")"
+audit_has daemon_liveness_rebootstrap_success || smoke_fail "F4 FAIL: the reap must report success once active. audit=$(cat "$AUDIT_LOG")"
+[[ -f "$MARKER_FILE" ]] && smoke_fail "F4 FAIL: a CONFIRMED reap must consume the reused-pid marker. still present=$MARKER_FILE"
+smoke_log "F4 PASS: PID-REUSE marker (LIVE pid + identity MISMATCH) → REAPED not deferred (the kill -0-only defer hole is closed)"
+
+# F4b — the bounded stale-marker AGE fallback (defense-in-depth): a marker with a
+# LIVE pid and a LEGACY (empty) identity token — which would otherwise DEFER on the
+# bare-pid fallback — but a TS older than the bounded ceiling → REAPED. An over-age
+# marker is an orphan even when its pid resolves to a live process and we cannot prove
+# reuse via identity. Inject a TS ~2h old (default ceiling 3600s).
+seed_stale_no_pid
+printf 'enabled' >"$SVC_ENABLED_FILE"
+printf '1' >"$SVC_ACTIVE_RC_FILE"
+printf '1' >"$SVC_START_ACTIVATES_FILE"
+_old_ts="$(date -u -d '-2 hours' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -v-2H '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || printf '2000-01-01T00:00:00Z')"
+write_marker systemd agent-bridge-daemon.service "$$" "" "$_old_ts"  # LIVE pid, no identity, OVER-AGE
+run_liveness Linux
+audit_has daemon_liveness_rebootstrap_skip_live_upgrade && smoke_fail "F4b FAIL (BLOCKER): an OVER-AGE marker (past the ceiling) must NOT defer even with a live pid — it is an orphan. audit=$(cat "$AUDIT_LOG")"
+systemctl_called start || smoke_fail "F4b FAIL (BLOCKER): an over-age marker (live pid) must be REAPED via the bounded age fallback. calls=$(cat "$SYSTEMCTL_LOG")"
+audit_has daemon_liveness_rebootstrap_success || smoke_fail "F4b FAIL: the over-age reap must report success once active. audit=$(cat "$AUDIT_LOG")"
+smoke_log "F4b PASS: OVER-AGE marker (LIVE pid past the bounded ceiling) → REAPED via the age fallback (defense-in-depth behind the identity check)"
+
+# F4c — control / non-regression: a marker with a LIVE pid, a MATCHING start-identity,
+# and a FRESH ts → STILL DEFERS (a genuine in-flight upgrade must not be reaped). This
+# proves F4/F4b reap on the FAILURE signals (mismatch / over-age), not always-reap.
+seed_stale_no_pid
+printf 'enabled' >"$SVC_ENABLED_FILE"
+printf '1' >"$SVC_ACTIVE_RC_FILE"
+printf '1' >"$SVC_START_ACTIVATES_FILE"
+# Recompute THIS process's real start-identity using the WATCHER'S OWN function so the
+# marker's recorded token is byte-identical to what the watcher will recompute for the
+# live $$ (a real in-flight upgrade). Extracting + sourcing the actual function (not a
+# re-implemented inline copy) is what keeps this control from drifting from the
+# normalization the watcher applies (codex r3: the inline copy missed the space→'_'
+# normalization and the control wrongly reaped).
+PSID_FN="$SMOKE_TMP_ROOT/2064-quiesce-psid.sh"
+awk '/^quiesce_pid_start_identity\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$LIVENESS_SRC" >"$PSID_FN"
+grep -q 'quiesce_pid_start_identity()' "$PSID_FN" \
+  || smoke_fail "F4c FAIL: could not extract quiesce_pid_start_identity from $LIVENESS_SRC"
+# Pass the SMOKE's own pid ($$) explicitly — a bare `$$` inside `bash -c` would be the
+# SUBSHELL's pid, not the smoke's, so the recorded token would describe a dead helper
+# process and never match the watcher's recompute for the marker's pid (the smoke).
+_self_pid=$$
+_self_psid="$("$BRIDGE_BASH" -c "source '$PSID_FN'; quiesce_pid_start_identity \"\$1\"" _ "$_self_pid" 2>/dev/null)"
+write_marker systemd agent-bridge-daemon.service "$_self_pid" "$_self_psid"   # LIVE pid, MATCHING identity, fresh ts
+run_liveness Linux
+audit_has daemon_liveness_rebootstrap_skip_live_upgrade || smoke_fail "F4c FAIL: a genuine in-flight upgrade (live pid, MATCHING identity, fresh ts) must DEFER (not be reaped). audit=$(cat "$AUDIT_LOG")"
+systemctl_called start && smoke_fail "F4c FAIL (BLOCKER): must NOT reap a genuine in-flight upgrade. calls=$(cat "$SYSTEMCTL_LOG")"
+[[ -f "$MARKER_FILE" ]] || smoke_fail "F4c FAIL: a deferred in-flight marker must be PRESERVED. missing=$MARKER_FILE"
+smoke_log "F4c PASS: in-flight marker (LIVE pid + MATCHING identity + fresh ts) → DEFER (identity/age teeth do not regress the genuine-upgrade defer)"
+
 # ── U-series: upgrade-side marker lifecycle (write / clear / abort re-enable) ──
 # Extract the #2055 marker helper bodies verbatim from the live bridge-upgrade.sh
 # so the unit tests never drift from the implementation. Source them in isolation
@@ -626,6 +726,172 @@ run_exit_handler 1 0   # marker outstanding; bootstrap does NOT load the job
 launchctl_called enable || smoke_fail "U6 FAIL: the re-enable must still be ATTEMPTED on an interrupted-upgrade abort. calls=$(cat "$LAUNCHCTL_LOG")"
 [[ -f "$U_MARKER" ]] || smoke_fail "U6 FAIL (BLOCKER, codex r2): an UNVERIFIED re-enable (job not loaded) must KEEP the marker for the liveness watcher. missing=$U_MARKER"
 smoke_log "U6 PASS: EXIT handler re-enable UNVERIFIED (job not loaded) → marker SURVIVES (consume gated on confirmed load; codex r2 hole closed)"
+
+# U7 — ★#2064 r3 codex catch: the REAL marker writer records a start-identity that
+# SOURCES back INTACT. On BSD/mac the raw `ps -o lstart=` form is "Mon Jun 24 ..." —
+# space-laden — and the marker is a SOURCEABLE KEY=value file, so an unquoted/raw
+# value would parse as `BRIDGE_QUIESCE_UPGRADE_PSID=ps-lstart:Mon` + a stray `Jun ...`
+# command → the recorded identity reads back EMPTY and the whole PID-reuse defense
+# degrades to the bare-pid defer. Drive the real writer (pid=$$, so the identity is
+# populated on any host with /proc or ps), then SOURCE the marker and assert the PSID
+# round-trips non-empty AND equals a fresh recompute of the upgrade-side helper.
+rm -f "$U_MARKER"
+run_marker_helper '
+  _bridge_upgrade_write_quiesce_marker launchd ai.agent-bridge.daemon
+  # Fresh recompute of THIS process identity via the SAME helper the writer used.
+  _fresh="$(_bridge_upgrade_pid_start_identity "$$")"
+  # Source the marker the way the watcher does and surface the read-back PSID.
+  # shellcheck disable=SC1090
+  _read="$(source "'"$U_MARKER"'" 2>/dev/null; printf "%s" "${BRIDGE_QUIESCE_UPGRADE_PSID:-}")"
+  printf "FRESH=[%s]\n" "$_fresh"
+  printf "READBACK=[%s]\n" "$_read"
+'
+_u7_fresh="$(grep -E "^FRESH=" "$SMOKE_TMP_ROOT/u-stdout.txt" | sed -e "s/^FRESH=\[//" -e "s/\]$//")"
+_u7_read="$(grep -E "^READBACK=" "$SMOKE_TMP_ROOT/u-stdout.txt" | sed -e "s/^READBACK=\[//" -e "s/\]$//")"
+# If neither /proc nor ps yields a token on this host, the identity is legitimately
+# empty (the documented conservative fallback) — both sides empty is consistent, not a
+# bug. The bug we guard is a NON-EMPTY identity that read back EMPTY/truncated.
+if [[ -n "$_u7_fresh" ]]; then
+  [[ -n "$_u7_read" ]] || smoke_fail "U7 FAIL (BLOCKER, codex r3): the recorded start-identity ('$_u7_fresh') read back EMPTY after sourcing the marker — a spaced/unquoted PSID broke the source (PID-reuse defense lost on BSD/mac). marker=$(cat "$U_MARKER")"
+  [[ "$_u7_read" == "$_u7_fresh" ]] || smoke_fail "U7 FAIL (BLOCKER): the sourced PSID '$_u7_read' != the fresh recompute '$_u7_fresh' (identity round-trip mismatch → a genuine in-flight upgrade would be misclassified)."
+  case "$_u7_read" in
+    *[[:space:]]*) smoke_fail "U7 FAIL: the recorded PSID '$_u7_read' still contains raw whitespace — it must be normalized to a single shell word for the sourceable marker." ;;
+    *\'*)          smoke_fail "U7 FAIL (BLOCKER, codex r3 round-2): the recorded PSID '$_u7_read' contains a single-quote — it would break the single-quoted marker value and re-open the empty-readback hole." ;;
+  esac
+  smoke_log "U7 PASS: real marker writer records a start-identity that SOURCES back intact + matches a fresh recompute (codex r3 spaced-PSID source hole closed)"
+else
+  smoke_log "U7 PASS (degraded host): no /proc or ps identity source available → identity legitimately empty both sides (conservative bare-pid fallback; nothing to round-trip)"
+fi
+
+# U8 — ★#2064 r3 codex round-2: the WRITE-side normalization must STRIP a single-quote
+# even when the underlying `ps` emits one (a pathological/locale lstart) — otherwise a
+# ' in the value breaks the single-quoted marker on source. Stub `ps` to emit a value
+# containing a quote + spaces, run the REAL identity helper, and assert the token is
+# allowlist-clean (no quote, no whitespace) AND that a marker carrying it sources back
+# intact. Forces the ps branch by making /proc unreadable via a fake pid arg path is
+# not possible, so we shim ps directly and drive the helper with a pid the shim echoes.
+PS_SHIM_DIR="$SMOKE_TMP_ROOT/ps-shim"
+mkdir -p "$PS_SHIM_DIR"
+cat >"$PS_SHIM_DIR/ps" <<'PSEOF'
+#!/usr/bin/env bash
+# Emit a lstart-shaped value WITH a single-quote and spaces (worst case).
+printf "Mon Jun 24 07:24:01 O'Clock 2026\n"
+PSEOF
+chmod +x "$PS_SHIM_DIR/ps"
+rm -f "$U_MARKER"
+# Run the real helper with the ps shim FIRST on PATH and /proc reads suppressed by
+# pointing at a pid whose /proc/<pid>/stat we make unreadable (a non-existent pid).
+_u8_out="$(
+  PATH="$PS_SHIM_DIR:$PATH" \
+  TARGET_ROOT="$U_HOME" BRIDGE_STATE_DIR="$U_STATE" SOURCE_VERSION="u-test" \
+  "$BRIDGE_BASH" -c "
+    set -uo pipefail
+    source '$U_HELPERS'
+    # pid 2222222 almost certainly has no /proc entry → forces the ps branch.
+    _t=\"\$(_bridge_upgrade_pid_start_identity 2222222)\"
+    printf 'TOKEN=[%s]\n' \"\$_t\"
+  " 2>/dev/null
+)"
+_u8_tok="$(printf '%s\n' "$_u8_out" | grep -E "^TOKEN=" | sed -e "s/^TOKEN=\[//" -e "s/\]$//")"
+if [[ -n "$_u8_tok" ]]; then
+  case "$_u8_tok" in
+    *\'*)          smoke_fail "U8 FAIL (BLOCKER): the helper passed through a single-quote ('$_u8_tok') from ps lstart — it must be stripped by the allowlist." ;;
+    *[[:space:]]*) smoke_fail "U8 FAIL (BLOCKER): the helper passed through whitespace ('$_u8_tok') from ps lstart." ;;
+  esac
+  # Prove the token survives a real sourceable marker round-trip (single-quote-wrapped).
+  _u8_marker="$SMOKE_TMP_ROOT/u8-marker.env"
+  printf "BRIDGE_QUIESCE_UPGRADE_PSID='%s'\n" "$_u8_tok" >"$_u8_marker"
+  # shellcheck disable=SC1090
+  _u8_read="$("$BRIDGE_BASH" -c "source '$_u8_marker' 2>/dev/null; printf '%s' \"\${BRIDGE_QUIESCE_UPGRADE_PSID:-}\"")"
+  [[ "$_u8_read" == "$_u8_tok" ]] || smoke_fail "U8 FAIL (BLOCKER): the allowlisted token '$_u8_tok' did not round-trip through a single-quoted marker (read back '$_u8_read')."
+  smoke_log "U8 PASS: a quote-bearing ps lstart is STRIPPED to an allowlist-clean token that round-trips a single-quoted marker (codex r3 round-2 quote hole closed)"
+else
+  smoke_fail "U8 FAIL: the ps shim did not produce a token (the ps branch was not exercised). out=$_u8_out"
+fi
+
+# ── F3 (#2064 r3 Finding 3 TOOTH): the NORMAL restart-phase common cleanup must
+# clear the quiesce marker ONLY on a CONFIRMED recovery (launchd LOAD_STATE=loaded /
+# systemd LOAD_STATE=active), and LEAVE it for the liveness watcher otherwise. The
+# pre-r3 cleanup cleared it UNCONDITIONALLY once the restart phase ran to completion,
+# so a restore that left the launchd job enabled-but-unloaded removed the marker
+# anyway → the next liveness poll had no discriminator → daemon silently down.
+#
+# Static guard FIRST (non-vacuous): the source must (a) NO LONGER contain the old
+# unconditional-clear rationale, and (b) gate the restart-phase clear on the
+# LOAD_STATE confirmed-recovery signal.
+grep -q 'unconditionally clear the quiesce-intent marker' "$UPGRADE_SRC" \
+  && smoke_fail "F3 FAIL (BLOCKER): the restart-phase still UNCONDITIONALLY clears the quiesce marker after an unverified restore (#2064 r3 Finding 3 not applied)."
+grep -q '_bridge_upgrade_restart_recovery_confirmed' "$UPGRADE_SRC" \
+  || smoke_fail "F3 FAIL: the restart-phase confirmed-recovery gate (_bridge_upgrade_restart_recovery_confirmed) is absent from $UPGRADE_SRC."
+smoke_log "F3 (static) PASS: restart-phase clear is gated on confirmed recovery (no unconditional clear after an unverified restore)"
+
+# Faithful mini-harness of the restart-phase confirmed-recovery gate (mirrors the
+# bridge-upgrade.sh block). Drives the REAL _bridge_upgrade_clear_quiesce_marker with
+# the managed-flag + LOAD_STATE combos so the assertion is on actual marker survival.
+run_restart_clear_gate() {
+  local managed="$1" load_state="$2"   # managed: launchd|systemd|none
+  rm -f "$U_MARKER"
+  PATH="$SHIM_DIR:$PATH" \
+  TARGET_ROOT="$U_HOME" \
+  BRIDGE_STATE_DIR="$U_STATE" \
+  SOURCE_VERSION="u-test" \
+  GATE_MANAGED="$managed" \
+  GATE_LOAD_STATE="$load_state" \
+  "$BRIDGE_BASH" -c "
+    # ★ Run under the REAL upgrader errexit regime so this harness catches an
+    # errexit-abort in the gate (a trailing '[[ ]] && var=1' false-branch would
+    # trip set -e — the gate must be set-e-safe).
+    set -euo pipefail
+    source '$U_HELPERS'
+    # A quiesce wrote a marker; the restart phase has now run.
+    _bridge_upgrade_write_quiesce_marker '\${GATE_MANAGED/none/launchd}' ai.agent-bridge.daemon
+    _UPGRADE_DAEMON_LAUNCHD_MANAGED=0
+    _UPGRADE_DAEMON_SYSTEMD_MANAGED=0
+    _BRIDGE_UPGRADE_LAUNCHD_LOAD_STATE='unknown'
+    _BRIDGE_UPGRADE_SYSTEMD_LOAD_STATE='unknown'
+    case \"\${GATE_MANAGED}\" in
+      launchd) _UPGRADE_DAEMON_LAUNCHD_MANAGED=1; _BRIDGE_UPGRADE_LAUNCHD_LOAD_STATE=\"\${GATE_LOAD_STATE}\" ;;
+      systemd) _UPGRADE_DAEMON_SYSTEMD_MANAGED=1; _BRIDGE_UPGRADE_SYSTEMD_LOAD_STATE=\"\${GATE_LOAD_STATE}\" ;;
+    esac
+    # ↓ verbatim shape of the bridge-upgrade.sh restart-phase confirmed-recovery gate.
+    _bridge_upgrade_restart_recovery_confirmed=0
+    if [[ \"\${_UPGRADE_DAEMON_LAUNCHD_MANAGED:-0}\" == \"1\" ]]; then
+      if [[ \"\${_BRIDGE_UPGRADE_LAUNCHD_LOAD_STATE:-unknown}\" == \"loaded\" ]]; then
+        _bridge_upgrade_restart_recovery_confirmed=1
+      fi
+    elif [[ \"\${_UPGRADE_DAEMON_SYSTEMD_MANAGED:-0}\" == \"1\" ]]; then
+      if [[ \"\${_BRIDGE_UPGRADE_SYSTEMD_LOAD_STATE:-unknown}\" == \"active\" ]]; then
+        _bridge_upgrade_restart_recovery_confirmed=1
+      fi
+    else
+      _bridge_upgrade_restart_recovery_confirmed=1
+    fi
+    if (( _bridge_upgrade_restart_recovery_confirmed == 1 )); then
+      _bridge_upgrade_clear_quiesce_marker
+    fi
+  " >"$SMOKE_TMP_ROOT/f3-stdout.txt" 2>"$SMOKE_TMP_ROOT/f3-stderr.txt"
+}
+
+# F3 — launchd restart-phase restore left the job NOT loaded → marker SURVIVES.
+run_restart_clear_gate launchd not_loaded
+[[ -f "$U_MARKER" ]] || smoke_fail "F3 FAIL (BLOCKER): a restart-phase launchd restore that left the job not_loaded must KEEP the marker for the liveness watcher. missing=$U_MARKER"
+smoke_log "F3 PASS: restart-phase launchd restore NOT confirmed (not_loaded) → marker SURVIVES (no unconditional clear after an unverified restore)"
+
+# F3b — control: launchd restore CONFIRMED loaded → marker CLEARED (the gate consumes
+# on confirmed recovery, not always-keep).
+run_restart_clear_gate launchd loaded
+[[ -f "$U_MARKER" ]] && smoke_fail "F3b FAIL: a CONFIRMED launchd restore (loaded) must CLEAR the marker. still present=$U_MARKER"
+smoke_log "F3b PASS: restart-phase launchd restore CONFIRMED (loaded) → marker CLEARED (gate consumes on confirmed recovery)"
+
+# F3c — systemd parity: restore left the unit inactive → marker SURVIVES.
+run_restart_clear_gate systemd inactive
+[[ -f "$U_MARKER" ]] || smoke_fail "F3c FAIL (BLOCKER): a restart-phase systemd restore that left the unit inactive must KEEP the marker. missing=$U_MARKER"
+smoke_log "F3c PASS: restart-phase systemd restore NOT confirmed (inactive) → marker SURVIVES (launchd/systemd parity)"
+
+# F3d — systemd control: restore CONFIRMED active → marker CLEARED.
+run_restart_clear_gate systemd active
+[[ -f "$U_MARKER" ]] && smoke_fail "F3d FAIL: a CONFIRMED systemd restore (active) must CLEAR the marker. still present=$U_MARKER"
+smoke_log "F3d PASS: restart-phase systemd restore CONFIRMED (active) → marker CLEARED (gate consumes on confirmed recovery)"
 
 # ── R-series: the reconcile errexit-disarm makes the fail-closed `case` reachable.
 # Extract the LIVE reconcile dispatch lines from bridge-upgrade.sh and confirm the
