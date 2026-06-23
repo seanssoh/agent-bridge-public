@@ -88,6 +88,195 @@ bridge_a2a_source_env_overrides() {
   fi
 }
 
+# Path of the managed roster file that setup persists the admin id into
+# (`agent-roster.local.sh`, written by `bridge_setup_write_local_scalar
+# BRIDGE_ADMIN_AGENT_ID`). Honors an explicit BRIDGE_ROSTER_LOCAL_FILE (set by
+# bridge-lib.sh when that was sourced), else derives it from BRIDGE_HOME exactly
+# as the other path helpers — so it resolves even when this lib is sourced by
+# the thin `bridge-handoff-daemon.sh` dispatcher, which never sources
+# bridge-lib.sh / runs bridge_load_roster.
+bridge_a2a_roster_local_file() {
+  printf '%s' "${BRIDGE_ROSTER_LOCAL_FILE:-${BRIDGE_HOME:-$HOME/.agent-bridge}/agent-roster.local.sh}"
+}
+
+# #2081 (SECURITY, fail-open fix): export this node's configured admin id into
+# THIS shell so the receiver spawned below inherits it in its os.environ. The
+# #2079 cross-node admin↔admin authz predicate recomputes a LOCAL endpoint's
+# admin status from $BRIDGE_ADMIN_AGENT_ID; the receiver launch paths
+# (`agb a2a daemon start|restart`, direct `bridge-handoff-daemon.sh start`)
+# reach the spawn via this lib WITHOUT a roster load, so without this the var is
+# absent, a local admin classifies UNKNOWN, and `non-admin@remote ->
+# admin@local` flips from DENY to ALLOW.
+#
+# Env-FIRST: an already-exported value WINS (the managed-agent launch via
+# bridge-run.sh, or a controller ambient env). Only when it is empty do we grep
+# the on-disk roster — the SAME line setup writes (`BRIDGE_ADMIN_AGENT_ID=
+# "<value>"`), via the hardened grep+sed the upgrade/channel paths use. We grep
+# rather than `source` the roster because it references bridge-lib arrays /
+# functions not loaded in the dispatcher context, so a `source` would error out.
+# We do NOT fail-closed on an empty resolve: a node with no configured admin
+# legitimately keeps non-admin room traffic open and the predicate already
+# fail-closes any admin-claimed counterpart. The Python serve entrypoint
+# (`bridge-handoffd.py serve`) re-resolves the same value at startup as a
+# defense-in-depth backstop — and is the authoritative gate: it FAILS CLOSED
+# (refuses to serve) when an existing roster is unreadable (#2081 r2 review F1),
+# whereas this shell helper just skips an unreadable file and lets that Python
+# gate decide. It is also the only resolver for the systemd unit, which never
+# runs this shell helper.
+#
+# #2081 r2 review F2: a roster can carry more than one BRIDGE_ADMIN_AGENT_ID
+# assignment (a stale `export ...="old"` above setup's later canonical line).
+# Bash `source` keeps the LAST assignment, so we take `tail -n 1`, not
+# `head -n 1`, to match what the managed-agent launch (which sources the roster)
+# would see — otherwise a stale earlier line would misclassify the real admin.
+#
+# #2081 r3 review F2: the LOCAL roster has precedence (bash sources shared first,
+# local last → local is effective). A local assignment that is PRESENT-BUT-EMPTY
+# (`BRIDGE_ADMIN_AGENT_ID=`) means "no admin" and must STOP the search — NOT fall
+# through to a stale `="admin"` in the shared roster. So we distinguish "the file
+# assigns the var" (authoritative, even if empty) from "the file has no
+# assignment" (continue to the next roster).
+#
+# #2081 r3 review F1: a malformed (unbalanced-quote / invalid-charset) value is a
+# corruption — we do NOT export it. We leave the var unset and let the Python
+# serve entrypoint (the authoritative gate) FAIL CLOSED on the same roster.
+
+# Print the LAST BRIDGE_ADMIN_AGENT_ID assignment in a roster as either
+# `found\t<value>` (value may be empty), `malformed` (unbalanced quote / invalid
+# id), or nothing at all (no assignment in this file). Used by
+# bridge_a2a_export_admin_agent_id to honor bash last-assignment + precedence.
+bridge_a2a_roster_admin_assignment() {
+  local roster="$1" line raw val
+  # Match a plain `=` OR a `+=` append (#2081 r5 review). We must MATCH a `+=`
+  # line so it cannot be silently ignored (which would fall through to a stale
+  # earlier roster), but a `+=` into a single-name admin id is a tamper signal,
+  # so it is rejected below.
+  #
+  # #2081 r5-round6 review: the LINE-matching blanks (leading indent + the
+  # `export` separator) must be `[[:blank:]]` (space+tab ONLY), NOT `[[:space:]]`
+  # (which also matches \v\f\r). Bash treats only space/tab as command blanks, so
+  # a line like `<VT>BRIDGE_ADMIN_AGENT_ID=...` or `export<VT>BRIDGE_...=...` is
+  # NOT a valid assignment to bash (nor to Python's space/tab-only regex). Using
+  # `[[:space:]]` here would make the shell parser MATCH+export a line bash/Python
+  # ignore — and via env-first that pre-exported value would bypass Python's
+  # fail-closed roster parse in cmd_serve. `[[:blank:]]` keeps all three in step.
+  line="$(grep -E '^[[:blank:]]*(export[[:blank:]]+)?BRIDGE_ADMIN_AGENT_ID[+]?=' "$roster" 2>/dev/null | tail -n 1 || true)"
+  [[ -n "$line" ]] || return 0  # no assignment in this file
+  # `+=` append form → malformed (do not guess the appended value).
+  if [[ "$line" =~ ^[[:blank:]]*(export[[:blank:]]+)?BRIDGE_ADMIN_AGENT_ID\+= ]]; then
+    printf 'malformed'; return 0
+  fi
+  # Strip the `[export ]KEY=` prefix; keep the raw RHS (leading whitespace
+  # PRESERVED). #2081 r3-round4 review F1: in `KEY= padmin`, whitespace right
+  # after `=` makes the bash VALUE EMPTY (the rest is a separate word) — so a
+  # leading-whitespace (or empty) RHS is an empty value, NOT `padmin`. We must
+  # NOT ltrim before parsing.
+  raw="${line#"${line%%BRIDGE_ADMIN_AGENT_ID=*}"}"
+  raw="${raw#BRIDGE_ADMIN_AGENT_ID=}"
+  # #2081 r5-round5 review: bash word-splitting whitespace (IFS) is ONLY space,
+  # tab, and newline — NOT the full POSIX `[[:space:]]` class (which also matches
+  # vertical-tab \v, form-feed \f, carriage-return \r). A literal VT after a
+  # closing quote (`"padmin"<VT>#evil`) is NOT a word separator in bash, so it is
+  # part of the value, not a comment lead-in. We therefore use an explicit
+  # space-or-tab class everywhere we mean "bash word whitespace" (newline cannot
+  # occur — we parse a single grep'd line). Using `[[:space:]]` here would
+  # wrongly treat VT/FF/CR as separators and DIVERGE from bash (a silent
+  # fail-open the Python parser already rejects).
+  local _ws=$' \t'   # bash IFS whitespace on a single line: space + tab only
+  # Leading whitespace (or empty RHS) → empty value (found, but no admin).
+  if [[ -z "$raw" || "$raw" == ["$_ws"]* ]]; then
+    printf 'found\t'; return 0
+  fi
+  local rest
+  case "$raw" in
+    '"'*)
+      # double-quoted: require a closing quote; ONLY space/tab + an optional
+      # `# comment` may follow it. Anything fused to the close quote is bash
+      # CONCATENATION (`"padmin"evil` -> padminevil, `"padmin"#evil` ->
+      # padmin#evil — a `#` with no preceding word-whitespace is NOT a comment) —
+      # malformed (#2081 r5: do NOT truncate to `padmin`).
+      if [[ "$raw" != '"'*'"'* ]]; then
+        printf 'malformed'; return 0
+      fi
+      val="${raw#\"}"; val="${val%%\"*}"
+      rest="${raw#\"*\"}"            # everything after the closing quote
+      ;;
+    "'"*)
+      if [[ "$raw" != "'"*"'"* ]]; then
+        printf 'malformed'; return 0
+      fi
+      val="${raw#\'}"; val="${val%%\'*}"
+      rest="${raw#\'*\'}"
+      ;;
+    *)
+      # bare token: a `#` is a comment ONLY when space/tab-separated (bash word
+      # splitting). Strip a space/tab-preceded comment, then rtrim space/tab. A
+      # `#` (or VT/FF/CR) fused into the token stays in it and is rejected by the
+      # charset check below (so `padmin#evil` / `padmin<VT>#evil` are NOT
+      # truncated to `padmin`). Any INNER space/tab that survives (extra
+      # non-comment words like `padmin extra`) is a corruption signal — reject.
+      local nocomment
+      nocomment="${raw%%["$_ws"]#*}"             # drop a `<sp|tab>#...` comment
+      nocomment="${nocomment%"${nocomment##*[!"$_ws"]}"}"  # rtrim sp/tab
+      if [[ "$nocomment" == *["$_ws"]* ]]; then
+        printf 'malformed'; return 0             # inner sp/tab == extra word
+      fi
+      val="$nocomment"
+      rest=""
+      ;;
+  esac
+  # After a quoted value: ONLY space/tab + an optional `# comment` may follow.
+  # `rest` empty → ok. `rest` starting with a non-space/tab (incl. VT/FF/CR or a
+  # fused `#`) → concatenation → malformed. Space/tab then a non-`#` → malformed.
+  if [[ -n "$rest" ]]; then
+    if [[ "$rest" != ["$_ws"]* ]]; then
+      printf 'malformed'; return 0               # fused junk / `#` concatenation
+    fi
+    rest="${rest#"${rest%%[!"$_ws"]*}"}"         # ltrim sp/tab
+    if [[ -n "$rest" && "$rest" != '#'* ]]; then
+      printf 'malformed'; return 0
+    fi
+  fi
+  # A non-empty value must be a valid agent id (alnum . _ -); reject garbage.
+  if [[ -n "$val" && ! "$val" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    printf 'malformed'; return 0
+  fi
+  printf 'found\t%s' "$val"
+}
+
+bridge_a2a_export_admin_agent_id() {
+  if [[ -n "${BRIDGE_ADMIN_AGENT_ID:-}" ]]; then
+    export BRIDGE_ADMIN_AGENT_ID
+    return 0
+  fi
+  local roster assignment val
+  # LOCAL roster first (bash-effective precedence: sourced last), then shared.
+  for roster in "$(bridge_a2a_roster_local_file)" \
+                "${BRIDGE_HOME:-$HOME/.agent-bridge}/agent-roster.sh"; do
+    [[ -r "$roster" ]] || continue
+    assignment="$(bridge_a2a_roster_admin_assignment "$roster")"
+    case "$assignment" in
+      "")
+        # no assignment in this file — fall through to the next roster
+        continue
+        ;;
+      malformed)
+        # corrupt value — do NOT export garbage; let the Python serve gate
+        # fail-closed on the same roster. Stop (this file is authoritative).
+        return 0
+        ;;
+      found*)
+        val="${assignment#found$'\t'}"
+        # Authoritative assignment (even if empty → "no admin"): stop. Only
+        # export a non-empty value; an empty assignment leaves the var unset.
+        [[ -n "$val" ]] && export BRIDGE_ADMIN_AGENT_ID="$val"
+        return 0
+        ;;
+    esac
+  done
+  return 0
+}
+
 # True if `pid` is alive AND its command line is the A2A receiver for
 # THIS install — i.e. a `bridge-handoffd.py serve` process launched with
 # `--pidfile <pid_file>`. A bare `kill -0` is not enough: after the real
@@ -173,6 +362,13 @@ bridge_a2a_receiver_start() {
   # child inherits. See bridge_a2a_source_env_overrides for why a direct
   # source (not bridge_load_roster) is the right call here.
   bridge_a2a_source_env_overrides
+
+  # #2081 (SECURITY): make this node's configured admin id available to the
+  # receiver so the #2079 cross-node admin↔admin authz predicate can classify a
+  # LOCAL admin correctly. Without it a local admin is UNKNOWN and a
+  # non-admin@remote -> admin@local delivery fails OPEN. Env-first, else resolved
+  # from the on-disk roster; never fail-closed on an empty resolve.
+  bridge_a2a_export_admin_agent_id
 
   # `serve --detach` double-forks into its own session AFTER the socket
   # bind, so the receiver is reparented out of this shell's process group

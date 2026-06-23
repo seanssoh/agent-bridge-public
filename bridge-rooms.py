@@ -1039,8 +1039,13 @@ def _post_room_join_request(*, leader_node: str, room_id: str, token: str,
     # EXISTING peer — so the probe path persists nothing.
     secret = override_secret if override_secret else a2a.peer_send_secret(peer)
     token_hash = rooms.hash_token(token)
+    # #2079: attest whether the joiner is THIS node's configured admin. The
+    # joiner is local to this sending node, so classify it from this node's
+    # configured admin id (None == cannot classify -> omitted -> unknown).
+    joiner_is_admin = rooms.classify_local_admin(joiner_agent)
     body = a2a.build_room_join_request(
         room_id=room_id, join_token_sha256=token_hash, joiner_agent=joiner_agent,
+        joiner_is_admin=joiner_is_admin,
     )
     body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
     message_id = a2a.new_message_id(local_bridge_id)
@@ -1601,6 +1606,27 @@ def cmd_talk(args: argparse.Namespace) -> int:
 
     only_to = getattr(args, "to", "") or ""
     fanout = bool(getattr(args, "fanout", False))
+    # #2079 SENDER-SIDE UX GUARD (accident prevention, NOT the security boundary
+    # — the receiver/relay gates are the boundary; remote traffic can bypass
+    # this command entirely). A bare `--to <name>` (no @node) that matches
+    # members on MORE THAN ONE distinct node (counting this sender's own node)
+    # is AMBIGUOUS: a blind fanout could include a forbidden admin leg the
+    # sender did not intend. Refuse LOCALLY and require `NAME@NODE` so the
+    # sender names exactly one recipient. `--to NAME@NODE` (node qualified) and
+    # an unambiguous single-node match pass through unchanged.
+    if only_to and "@" not in only_to:
+        want = only_to.strip()
+        match_nodes = {
+            str(m.get("node", "") or "")
+            for m in members
+            if str(m.get("agent", "") or "") == want
+        }
+        if len(match_nodes) > 1:
+            return die(
+                f"ambiguous_room_target: {want!r} is a member on "
+                f"{len(match_nodes)} nodes in room {room_id} — use NAME@NODE "
+                f"(e.g. {want}@{sorted(match_nodes)[0]}) to name one recipient",
+                code=1)
     remote_targets = _talk_target_pairs(members, agent, node, node,
                                         only_to=only_to)
     # The local (same-node) leg is the whole-room fan-out addition (#1594) and

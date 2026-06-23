@@ -127,6 +127,18 @@ CONFIG_PATH="$BRIDGE_HOME_TARGET/handoff.local.json"
 # systemd-managed path — systemd is the lifecycle owner, not nohup.
 # The receiver still writes a pidfile for the bridge-a2a CLI to consult,
 # but the unit's Type=simple keeps systemd in charge of restart/stop.
+#
+# #2081 (SECURITY): the unit deliberately passes ONLY BRIDGE_HOME in
+# Environment= — it does NOT freeze the configured admin id (BRIDGE_ADMIN_AGENT_ID)
+# into the rendered unit. The #2079 cross-node admin↔admin authz predicate needs
+# this node's admin id to classify a LOCAL admin; `bridge-handoffd.py serve`
+# RESOLVES it from the on-disk roster (agent-roster.local.sh) at STARTUP
+# (rooms.ensure_admin_agent_id_in_env). Startup-resolution (vs a baked-in value)
+# means a later `agb setup admin <new>` is picked up on the next service restart
+# instead of being frozen at install time, and avoids re-rendering the unit on
+# an admin rename. The receiver does NOT fail-closed when no admin is configured
+# (non-admin room traffic stays open; only an admin-claimed counterpart fails
+# closed). Do NOT "fix" this by hardcoding the admin id here.
 UNIT_CONTENT="$(cat <<EOF
 [Unit]
 Description=Agent Bridge A2A handoff receiver

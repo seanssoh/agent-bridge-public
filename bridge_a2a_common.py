@@ -2715,6 +2715,7 @@ def build_room_join_request(
     room_id: str,
     join_token_sha256: str,
     joiner_agent: str,
+    joiner_is_admin: Optional[bool] = None,
 ) -> dict[str, Any]:
     """Build the cross-node room-join-request control body.
 
@@ -2722,13 +2723,26 @@ def build_room_join_request(
     token with `bridge_rooms_common.hash_token` before this is built) — the raw
     token must never reach this function or the wire. `joiner_agent` MUST be the
     OS-actor-anchored agent id (see the section header), never a caller flag.
+
+    #2079: `joiner_is_admin` is the joiner node's ATTESTATION of whether the
+    joining agent is THAT node's configured bridge-admin. It is OPTIONAL and
+    TRI-STATE via key presence: True/False attest a known classification;
+    `None` (could-not-classify, or a pre-#2079 sender) OMITS the key so the
+    leader records UNKNOWN and fail-closes admin-involved cross-node delivery
+    for this member until reclassified. NODE-ATTESTED, not independently
+    verifiable — the leader cannot check a remote node's admin config; the
+    node-link HMAC only proves the node SENT it. This protects against a non-
+    admin agent on an HONEST node, not a malicious node lying about itself.
     """
-    return {
+    body: dict[str, Any] = {
         "protocol": ROOM_JOIN_ENVELOPE_PROTOCOL,
         "room_id": room_id,
         "join_token_sha256": join_token_sha256,
         "joiner_agent": joiner_agent,
     }
+    if joiner_is_admin is not None:
+        body["joiner_is_admin"] = bool(joiner_is_admin)
+    return body
 
 
 def parse_room_join_request(raw: bytes) -> dict[str, Any]:
@@ -2768,6 +2782,15 @@ def parse_room_join_request(raw: bytes) -> dict[str, Any]:
     if len(th) != 64 or any(c not in "0123456789abcdef" for c in th):
         raise A2AError(
             "room-join-request join_token_sha256 must be a sha256 hex digest",
+            code="bad_room_join",
+        )
+    # #2079: the OPTIONAL joiner_is_admin attestation, when present, MUST be a
+    # real JSON bool — a garbage value is refused at the boundary, never half-
+    # trusted into a known classification. Its ABSENCE is the legitimate
+    # unknown (a pre-#2079 sender), so absence is NOT an error.
+    if "joiner_is_admin" in body and not isinstance(body["joiner_is_admin"], bool):
+        raise A2AError(
+            "room-join-request joiner_is_admin must be a boolean when present",
             code="bad_room_join",
         )
     return body
@@ -2896,6 +2919,17 @@ def parse_room_roster_broadcast(raw: bytes) -> dict[str, Any]:
         if not isinstance(role, str):
             raise A2AError(
                 "room-roster-broadcast member 'role' must be a string",
+                code="bad_room_roster",
+            )
+        # #2079: the OPTIONAL bridge_admin classification, when present, MUST be
+        # a real JSON bool — a garbage value is refused at the boundary, never
+        # half-trusted into a known admin/non-admin state. Its ABSENCE is the
+        # legitimate "unknown" (a legacy/pre-#2079 leader, or an unattested
+        # member), so absence is NOT an error.
+        if "bridge_admin" in entry and not isinstance(entry["bridge_admin"], bool):
+            raise A2AError(
+                "room-roster-broadcast member 'bridge_admin' must be a boolean "
+                "when present",
                 code="bad_room_roster",
             )
     return body
