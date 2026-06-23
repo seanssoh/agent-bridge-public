@@ -15,9 +15,91 @@ from pathlib import Path
 
 MANAGED_START = "<!-- BEGIN AGENT BRIDGE DOC MIGRATION -->"
 MANAGED_END = "<!-- END AGENT BRIDGE DOC MIGRATION -->"
+# Issue #1816 / #2062: the BEGIN marker is a STABLE LITERAL — the version stamp
+# does NOT ride the marker line. It lives on a separate in-block metadata line
+# (`_managed_version_line()`, an HTML comment so it is invisible in rendered
+# markdown) right after the BEGIN marker. Keeping the marker literal means every
+# consumer (the watchdog drift probe, the upgrader splice, the migrate/preserve
+# helpers, and any future reader) matches it with a plain substring test — there
+# is no stamp-suffix blast radius to chase across the repo. `MANAGED_START_RE`
+# is retained ONLY as a defensive tolerance for any transitional block that an
+# interim build may have stamped on the marker: `MANAGED_START_PREFIX` is the
+# bytes up to (but excluding) the trailing ` -->`, and the regex matches a
+# stamped-or-unstamped BEGIN alike so a strip/audit still recognizes such a
+# block. Renders never emit the stamped form.
+MANAGED_START_PREFIX = MANAGED_START[: -len(" -->")]
+MANAGED_START_RE = re.escape(MANAGED_START_PREFIX) + r"(?: v=[^\n>]*)? -->"
+# In-block version stamp (#1816 audit goal, #2062 placement). Emitted on its own
+# line immediately after the literal BEGIN marker. HTML-comment form so it is
+# inert in any markdown renderer and never shows up as block content. A future
+# audit reads the version mechanically via `MANAGED_VERSION_RE` instead of the
+# operator md5-ing N blocks by hand; the marker itself stays a stable literal.
+MANAGED_VERSION_PREFIX = "<!-- agent-bridge-managed-version:"
+
+
+def _managed_version_line(version: str) -> str:
+    return f"{MANAGED_VERSION_PREFIX} {version} -->"
+
+
+# Capture the version value from the in-block metadata line (group 1). Tolerant
+# of surrounding whitespace; returns None when the line is absent (e.g. a legacy
+# pre-#1816 block or a transitional marker-stamped block).
+MANAGED_VERSION_RE = re.compile(
+    re.escape(MANAGED_VERSION_PREFIX) + r"\s*([^\n>]*?)\s*-->"
+)
+
+
+def parse_managed_block_version(text: str) -> str | None:
+    """Return the in-block managed version stamp, or None if not present.
+
+    Reads the in-block version line emitted just after the BEGIN marker. Kept
+    here so the watchdog/audit can extract the stamp mechanically without
+    re-deriving the line format. Back-compat: a transitional block that stamped
+    the version onto the BEGIN marker (` v=<version>` suffix) is also recognized
+    so audit reporting does not regress for such a block.
+
+    The search is SCOPED to the managed-block span (BEGIN marker → END marker) so
+    a stray `<!-- agent-bridge-managed-version: ... -->` comment in an agent's
+    own custom CLAUDE.md content outside the block can never be mis-read as the
+    managed stamp.
+    """
+    # Scope to the managed block. The BEGIN marker is matched stamp-tolerantly so
+    # the transitional `v=`-on-marker block is still located; the version may then
+    # be on the marker (no in-block line) — handled by the legacy fallback below.
+    block_match = re.search(
+        rf"{MANAGED_START_RE}.*?{re.escape(MANAGED_END)}", text, flags=re.S
+    )
+    scope = block_match.group(0) if block_match else ""
+    match = MANAGED_VERSION_RE.search(scope)
+    if match:
+        return match.group(1).strip() or None
+    # Transitional fallback: version stamped on the BEGIN marker itself.
+    legacy = re.search(
+        re.escape(MANAGED_START_PREFIX) + r" v=([^\n>]*?) -->", scope
+    )
+    if legacy:
+        return legacy.group(1).strip() or None
+    return None
+
+
 HOME_DIR = str(Path.home())
 HOME_DIR_RE = re.escape(HOME_DIR)
 REPO_ROOT = Path(__file__).resolve().parent
+
+
+def _read_repo_version() -> str:
+    """Read the engine VERSION (first line) for the managed-block stamp.
+
+    Mirror of `bridge-upgrade.py::read_source_version` — kept independent so
+    this module has no import dependency on the upgrader. Returns a benign
+    `0.0.0-dev` sentinel when the file is missing so a partial checkout still
+    renders a (clearly non-release) stamp rather than crashing.
+    """
+    try:
+        version = (REPO_ROOT / "VERSION").read_text(encoding="utf-8").splitlines()[0].strip()
+    except (FileNotFoundError, IndexError, OSError):
+        return "0.0.0-dev"
+    return version or "0.0.0-dev"
 
 REMOVABLE_DOCS = ("AGENTS.md", "IDENTITY.md", "BOOTSTRAP.md")
 AGENT_SHARED_LINKS = (
@@ -25,6 +107,16 @@ AGENT_SHARED_LINKS = (
     "CHANGE-POLICY.md",
     "TOOLS.md",
     "ADMIN-PROTOCOL.md",
+    # Issue #1814: MEMORY-SCHEMA.md joins the canon-symlink family. Its body
+    # is now propagated from `docs/agent-runtime/memory-schema.md` into
+    # `<bridge_home>/shared/MEMORY-SCHEMA.md` (see render_shared_memory_schema_md)
+    # and the home file is a symlink that resolves to that single body — the
+    # exact wiring the canon doc's own header already promises and the
+    # migration guide table records. This retires the per-home byte-copy fork
+    # (the old `sync_memory_schema_from_template` template-sync) and, with the
+    # symlink in place, the legacy template-sync's symlink-clobber path can no
+    # longer fire (it now sees a symlink and refuses — see the is_symlink guard).
+    "MEMORY-SCHEMA.md",
 )
 DEPRECATED_SHARED_FILES = (
     "ROSTER.md",
@@ -43,7 +135,16 @@ MANAGED_SHARED_DOC_NAMES = frozenset(AGENT_SHARED_LINKS) | frozenset(DEPRECATED_
 # managed doc — the doc-migration must not rewrite it (even an in-place legacy
 # path rewrite mutates live agent memory). It is intentionally absent here; the
 # `memory/` tree and `users/<id>/MEMORY.md` are likewise never doc-rewritten.
-AGENT_RUNTIME_REWRITE_FILES = ("SOUL.md", "HEARTBEAT.md", "CHECKLIST.md")
+# Issue #1815: `CHECKLIST.md` is a dead entry from a retired generation of the
+# doc set — nothing in the current product creates or references it, so the
+# per-apply rewrite attempt was always a no-op. `HEARTBEAT.md` is a
+# daemon-written runtime artifact that lives in the agent *workdir*
+# (`<workdir>/HEARTBEAT.md`, written by `write_agent_heartbeat` on each daemon
+# tick), NOT an identity-home doc — any in-place doc rewrite the engine made to
+# it would be overwritten on the very next tick, and in agent homes the file
+# does not exist at all. The doc engine has no business rewriting either, so
+# both are dropped; only `SOUL.md` is a real home doc the migration may rewrite.
+AGENT_RUNTIME_REWRITE_FILES = ("SOUL.md",)
 SHARED_CLAUDE_SKILL_NAMES = (
     "agent-bridge-runtime",
     "agent-bridge-operating-manual",
@@ -438,8 +539,11 @@ def audit_agent(agent_dir: Path) -> AgentAudit:
     claude_path = agent_dir / "CLAUDE.md"
     claude_hits: list[str] = []
     if claude_path.exists():
+        # MANAGED_START_RE matches the stamped (` v=<version>`) and unstamped
+        # BEGIN marker alike (#1816), so the managed block is fully stripped
+        # before legacy-pattern detection regardless of stamp presence.
         claude_text = re.sub(
-            rf"{re.escape(MANAGED_START)}.*?{re.escape(MANAGED_END)}\n*",
+            rf"{MANAGED_START_RE}.*?{re.escape(MANAGED_END)}\n*",
             "",
             read_text(claude_path),
             flags=re.S,
@@ -596,47 +700,88 @@ def append_local_override(base: str, local_path: Path) -> str:
     )
 
 
+def _canon_fallback(name: str, source_rel: str) -> str:
+    """A clearly-degraded body emitted when a canon source doc is missing.
+
+    Mirrors `ADMIN_PROTOCOL_FALLBACK` for the other propagated docs (#1814):
+    the shared copy never silently becomes an *alternate* SSOT body — when the
+    source is absent the file says so loudly and points at the recovery action,
+    instead of carrying a hand-maintained summary that diverges from canon.
+    """
+    return (
+        f"# {name} — Agent Bridge Shared Rules\n\n"
+        f"<!-- Managed by agent-bridge. Source: {source_rel} missing at render time. -->\n\n"
+        f"Source document `{source_rel}` was not present in this install at\n"
+        f"render time. Re-run `agent-bridge upgrade` from a complete source\n"
+        f"checkout to repopulate this file. See repository docs for the\n"
+        f"canonical body.\n"
+    )
+
+
+def _render_canon_doc(source_rel: str, fallback: str) -> str:
+    """Propagate a `docs/agent-runtime/<doc>.md` canon body into shared/.
+
+    The single proven propagation primitive behind ADMIN-PROTOCOL (#1814):
+    read the source-of-truth body from REPO_ROOT, prepend the managed-source
+    header so the shared copy is self-describing, and return it verbatim. One
+    body, two locations, lockstep by construction — no second hand-maintained
+    summary that silently drops most of the contract. Returns `fallback` when
+    the source doc is missing.
+    """
+    source = REPO_ROOT / source_rel
+    if not source.exists():
+        return fallback
+    body = read_text(source)
+    header = (
+        "<!-- Managed by agent-bridge. "
+        f"Source: {source_rel}. "
+        "Edits to this file will be overwritten on the next "
+        "`agent-bridge upgrade`. -->\n\n"
+    )
+    return header + body
+
+
 def render_shared_common_instructions_md(bridge_home: Path) -> str:
-    home = pretty_path(bridge_home)
-    base = f"""# COMMON-INSTRUCTIONS.md — Agent Bridge Shared Rules
+    """Propagate docs/agent-runtime/common-instructions.md into shared/.
 
-<!-- Managed by agent-bridge. Regenerated by agent-bridge. -->
-
-## Scope
-- 이 파일은 bridge-managed 에이전트 전체에 적용되는 공통 운영 규칙 SSOT다.
-- 에이전트별 `CLAUDE.md`, `SOUL.md`는 역할별 규칙을 추가할 수 있지만, 이 파일의 공통 계약을 조용히 우회하면 안 된다.
-- 오래된 메모, 레거시 문서, 과거 handoff와 충돌하면 이 파일이 우선한다.
-
-## Session Start Contract
-- 매 세션 시작 시 `SOUL.md`, `CLAUDE.md`, `COMMON-INSTRUCTIONS.md`를 읽는다.
-- 기술 변경이 있거나 기술 변경 보고를 받았으면 `CHANGE-POLICY.md`까지 읽고 분류 기준을 맞춘다.
-
-## Technical Change Reporting
-- 코드, 설정, 템플릿, 훅, 채널 설정, 크론 동작, 데이터 경로, 스키마, 자동화 계약을 바꾸면 관리자 에이전트에게 queue로 보고한다.
-- 보고에는 최소한 아래를 넣는다.
-  - 무엇을 바꿨는가
-  - 왜 바꿨는가
-  - 어느 파일/경로가 바뀌었는가
-  - 사용자나 다른 에이전트에 어떤 영향이 있는가
-- upstream/downstream 분류를 추측으로 끝내지 않는다. `CHANGE-POLICY.md` 기준으로 판단하거나 관리자에게 넘긴다.
-
-## Queue Delivery Contract
-- task는 `claim -> 처리 -> 결과 전달 -> done --note` 순서를 지킨다.
-- 조용한 done, 빈 note done, raw artifact 없이 free-text handoff를 금지한다.
-- artifact가 있으면 `agent-bridge bundle create`를 우선하고, noisy external input은 `agent-bridge intake triage --route`로 넘긴다.
-
-## Autonomy and Escalation
-- 기본값은 안전한 가정으로 진행하고 결과를 보고하는 것이다.
-- 금전, 파괴적 삭제, 외부 공개, 애매한 제품 결정만 사람에게 묻는다.
-- 같은 질문을 두 번째로 반복할 상황이면, 다시 묻기 전에 bridge escalation을 사용한다.
-
-## Shared Knowledge Contract
-- 팀 전체가 공유해야 하는 durable facts는 `{home}/shared/wiki/`에 기록한다.
-- raw source material은 `{home}/shared/raw/`에 남기고, curated knowledge와 섞지 않는다.
-- 구조화된 외부 시스템이 canonical source라면 wiki는 요약/링크만 유지한다.
-"""
+    Issue #1814: this used to emit a hand-maintained ~2 KB f-string summary
+    whose own first bullet claimed SSOT status — a *second*, diverging body
+    that silently dropped most of the 27.8 KB ratified contract (task-processing
+    detail, escalation rules, changelog'd directives). It is now propagated from
+    the canon doc the exact way ADMIN-PROTOCOL already is, so the shared copy and
+    the canon doc can never drift. The machine-local `*.local.md` override
+    appendix is preserved.
+    """
+    base = _render_canon_doc(
+        "docs/agent-runtime/common-instructions.md",
+        _canon_fallback("COMMON-INSTRUCTIONS.md", "docs/agent-runtime/common-instructions.md"),
+    )
     return append_local_override(
         base, bridge_home / "shared" / "COMMON-INSTRUCTIONS.local.md"
+    )
+
+
+def render_shared_memory_schema_md(bridge_home: Path) -> str:
+    """Propagate docs/agent-runtime/memory-schema.md into shared/.
+
+    Issue #1814: MEMORY-SCHEMA had a canon body (`docs/agent-runtime/
+    memory-schema.md`, 13.8 KB) AND a diverged template fork
+    (`agents/_template/MEMORY-SCHEMA.md`, 8.2 KB) that `sync_memory_schema_from_
+    template` force-copied byte-for-byte into every home — with no statement of
+    which body was authoritative. The canon doc's own header already declares it
+    the SSOT and says each home installs the file as a symlink to it; this
+    renderer makes that true by propagating the canon body into
+    `<bridge_home>/shared/MEMORY-SCHEMA.md` (then `ensure_agent_shared_links`
+    wires the home symlink). Same proven pattern as ADMIN-PROTOCOL and
+    COMMON-INSTRUCTIONS — one body, lockstep by construction.
+
+    `bridge_home` is accepted for dispatch-table signature parity even though
+    the content derives from REPO_ROOT alone.
+    """
+    del bridge_home  # signature parity with other renderers
+    return _render_canon_doc(
+        "docs/agent-runtime/memory-schema.md",
+        _canon_fallback("MEMORY-SCHEMA.md", "docs/agent-runtime/memory-schema.md"),
     )
 
 
@@ -718,17 +863,11 @@ def render_shared_admin_protocol_md(bridge_home: Path) -> str:
     though this renderer derives content from REPO_ROOT alone.
     """
     del bridge_home  # signature parity with other renderers
-    source = REPO_ROOT / "docs" / "agent-runtime" / "admin-protocol.md"
-    if not source.exists():
-        return ADMIN_PROTOCOL_FALLBACK
-    body = read_text(source)
-    header = (
-        "<!-- Managed by agent-bridge. "
-        "Source: docs/agent-runtime/admin-protocol.md. "
-        "Edits to this file will be overwritten on the next "
-        "`agent-bridge upgrade`. -->\n\n"
-    )
-    return header + body
+    # Routes through the shared `_render_canon_doc` primitive (#1814) so the
+    # propagation behaviour is single-sourced across ADMIN-PROTOCOL,
+    # COMMON-INSTRUCTIONS, and MEMORY-SCHEMA. ADMIN_PROTOCOL_FALLBACK is kept
+    # as the bespoke fallback body.
+    return _render_canon_doc("docs/agent-runtime/admin-protocol.md", ADMIN_PROTOCOL_FALLBACK)
 
 
 SKILLS_DOC_MODES = ("legacy-catalog", "plugin-routing", "disabled")
@@ -1133,6 +1272,10 @@ def sync_shared_docs(bridge_home: Path, source_shared: Path, dry_run: bool, stam
         "COMMON-INSTRUCTIONS.md": render_shared_common_instructions_md,
         "CHANGE-POLICY.md": render_shared_change_policy_md,
         "ADMIN-PROTOCOL.md": render_shared_admin_protocol_md,
+        # Issue #1814: MEMORY-SCHEMA.md is now a propagated canon body in
+        # shared/ (symlinked from homes via AGENT_SHARED_LINKS), retiring the
+        # per-home template fork.
+        "MEMORY-SCHEMA.md": render_shared_memory_schema_md,
     }
     # BRIDGE_SKILLS_DOC_MODE chooses the catalog rendering strategy.
     # Whichever file is *not* selected gets cleaned up so a mode flip
@@ -1283,14 +1426,28 @@ def render_agent_bridge_block(agent_dir: Path, session_type: str | None = None) 
     # Normalize explicitly-passed session_type so caller case variants
     # ("Admin", "ADMIN") match the role filter.
     session_type = (session_type or "").strip().lower() or "general"
+    # Issue #1816 / #2062: the version stamp makes a stale/foreign block
+    # mechanically detectable (audit reads the version instead of the operator
+    # md5-ing N blocks by hand). The stamp lives on a SEPARATE in-block metadata
+    # line, NOT on the BEGIN marker — the marker stays the stable literal
+    # MANAGED_START so the watchdog drift probe and every other consumer keep
+    # matching it with a plain substring test (no stamp-suffix blast radius).
+    # The version line is an HTML comment (inert in rendered markdown) read back
+    # via parse_managed_block_version / MANAGED_VERSION_RE.
     lines = [
         MANAGED_START,
+        _managed_version_line(_read_repo_version()),
         "## Agent Bridge Runtime Canon",
         "- `SOUL.md`가 성격과 말투의 기준이다. 매 세션 시작 시 가장 먼저 읽는다.",
         "- `CLAUDE.md`는 운영 계약서다. 레거시 문서나 오래된 메모와 충돌하면 이 파일이 우선한다.",
         "- `SESSION-TYPE.md`는 이 세션이 어떤 종류의 역할인지와 첫 세션 온보딩 상태를 정의한다.",
         "- `NEXT-SESSION.md`가 있으면 시작 직후 읽고 먼저 처리한 뒤, 검증이 끝나면 파일을 삭제한다.",
-        "- `MEMORY.md`와 `memory/`는 작업 메모리다. `HEARTBEAT.md`는 필요할 때만 읽는 운영 참고 문서다.",
+        # Issue #1815: HEARTBEAT.md dropped from this bullet — it is a
+        # daemon-written status artifact in the agent *workdir*, never an
+        # identity-home doc (present in 0 homes). The block must not tell every
+        # agent to "read" a file that does not exist where it looks.
+        "- `MEMORY.md`와 `memory/`는 작업 메모리다.",
+        "- `MEMORY-SCHEMA.md`는 memory wiki를 어떻게 유지할지 정의한다.",
         "- `COMMON-INSTRUCTIONS.md`는 전 에이전트 공통 규칙 SSOT다.",
         "- `CHANGE-POLICY.md`는 기술 변경의 upstream/downstream 분류 계약이다.",
         _agent_block_tools_skills_line(),
@@ -1304,35 +1461,20 @@ def render_agent_bridge_block(agent_dir: Path, session_type: str | None = None) 
             else []
         ),
         "",
+        # Issue #1816: pointer-only block (ratified 2026-04-19,
+        # docs/agent-runtime/common-instructions.md §"Managed block 계약").
+        # The full Queue & Delivery / Task Processing Protocol / Legacy
+        # Guardrails bodies that used to be hardcopied here now live ONLY in the
+        # canon doc; this block points at the relevant section. 본문 하드카피 금지.
         "## Runtime Protocol Pointers",
-        "- 공통 운영 본문은 `COMMON-INSTRUCTIONS.md`에 있다. queue, task 처리, autonomy, upstream issue policy, channel setup의 source of truth다.",
+        "- 공통 운영 본문은 `COMMON-INSTRUCTIONS.md`에 있다. queue 전달, task 처리(claim → 처리 → 결과 전달 → done --note, 조용한 done/빈 note done 금지), autonomy, escalation, upstream issue policy, channel setup의 source of truth다.",
+        "- queue/A2A/bundle/intake 사용법과 status lifecycle(`queued`/`claimed`/`blocked`), blocked escalation timing은 `COMMON-INSTRUCTIONS.md`의 \"Queue Delivery Contract\"와 \"Task Processing Protocol\"을 따른다.",
+        "- legacy guardrails(레거시 tasks.db 경로, shared 문서 위치, cron 경로, 폐지된 `AGENTS.md`/`IDENTITY.md`/`BOOTSTRAP.md`)는 `COMMON-INSTRUCTIONS.md`의 \"Legacy Guardrails\"에 있다.",
         "- admin-only 운영 본문은 `ADMIN-PROTOCOL.md`에 있다. first-run onboarding, self-cleanup, static/dynamic boundary, upgrade protocol은 admin 세션에만 적용된다.",
         "- 운영 매뉴얼 인덱스는 `~/.agent-bridge/.claude/skills/agent-bridge-operating-manual/SKILL.md`에서 찾는다.",
         "- `[Agent Bridge] event=...` 외부 push는 `external-push-handling` skill을 읽고 처리한다. 이 블록에는 7-step 루틴을 하드카피하지 않는다.",
-        "- handoff, memory/wiki, user preference promotion은 `docs/agent-runtime/`의 각 canonical 문서를 따른다.",
-        "",
-        "## Queue & Delivery",
-        "- inbox / task 상태 확인은 `~/.agent-bridge/agb inbox|show|claim|done`를 사용한다.",
-        "- durable A2A는 `~/.agent-bridge/agent-bridge task create|urgent|handoff`를 사용한다.",
-        "- artifact가 같이 가야 하는 cross-agent handoff는 free-text task body 대신 `agent-bridge bundle create`를 우선한다.",
-        "- 사람에게 보이는 Discord/Telegram 응답은 연결된 Claude 세션 안에서 처리한다. direct-send CLI는 기본 경로가 아니다.",
-        "- subagent가 필요하면 bridge-managed disposable child 또는 현재 엔진의 정식 subagent 기능을 사용한다. 옛 child-session 헬퍼는 기준이 아니다.",
         "- 멀티스텝/장시간 작업은 main 루프에서 inline 처리하지 말고 background subagent로 위임해 사람 응답성을 유지한다. 상세 패턴은 `COMMON-INSTRUCTIONS.md`의 \"Background Subagent Delegation\"을 따른다 (background subagent 기능이 없는 엔진은 해당 없음).",
-        "",
-        "## Task Processing Protocol",
-        "- task를 수신하면 `claim → 처리 → 결과 전달 → done` 순서로 닫는다. 상세 규칙은 `COMMON-INSTRUCTIONS.md`의 \"Task Processing Protocol\"을 따른다.",
-        "- **조용한 done 금지**: 결과를 아무에게도 전달하지 않은 채 done만 치는 것은 금지",
-        "- **빈 note done 금지**: --note 없이 done 금지",
-        "- queue의 open status는 `queued`, `claimed`, `blocked`만 공식 상태다. 작업 시작 표시는 `claim`을 사용한다.",
-        "- `[cron-followup]`에 `needs_human_followup=true` → 반드시 사용자 채널로 전달 후 done",
-        "- 인프라 장애 → `agent-bridge urgent <configured-admin-agent> \"...\"`, 비즈니스 판단 필요 → 사람 채널로 에스컬레이션",
-        "- 15분 이상 blocked → `agb update <task_id> --status blocked --note \"사유\"`",
-        "",
-        "## Legacy Guardrails",
-        "- repo checkout의 `~/agent-bridge/state/tasks.db`를 보지 않는다. live queue는 `~/.agent-bridge/state/tasks.db`이며, 직접 sqlite 대신 bridge CLI를 우선한다.",
-        "- 공용 운영 문서는 `~/.agent-bridge/shared/*`를 기준으로 읽는다.",
-        "- cron 생성/수정은 `~/.agent-bridge/agent-bridge cron ...`를 사용한다.",
-        "- 예전 `AGENTS.md`, `IDENTITY.md`, `BOOTSTRAP.md`의 규칙은 여기로 흡수되었다. 삭제된 파일을 기준으로 삼지 않는다.",
+        "- handoff, memory/wiki, user preference promotion은 `docs/agent-runtime/`의 각 canonical 문서를 따른다.",
     ]
     if session_type == "admin":
         lines.extend(_admin_block_lines())
@@ -1393,14 +1535,35 @@ def rewrite_claude_legacy_text(agent_dir: Path, text: str) -> str:
     return text
 
 
-def normalize_claude(agent_dir: Path, dry_run: bool, backup_root: Path) -> bool:
+def normalize_claude(agent_dir: Path, dry_run: bool, backup_root: Path) -> str | None:
+    """Rewrite CLAUDE.md's managed block. Returns the change marker, or None.
+
+    Return contract (#1816): None when nothing changed (so no-op apply runs
+    deposit no backup); the CLAUDE.md path string when the block was rewritten;
+    a `skipped-unbalanced:<path>` marker when the file's BEGIN/END markers are
+    imbalanced. The caller records the returned marker in the apply summary.
+    """
     claude_path = agent_dir / "CLAUDE.md"
     if not claude_path.exists():
-        return False
+        return None
     original = read_text(claude_path)
-    backup_file(claude_path, backup_root, dry_run)
+
+    # Issue #1816 — unbalanced-marker guard. `normalize` strips the old block
+    # with the non-greedy `MANAGED_START.*?MANAGED_END` regex; if an END marker
+    # was lost (hand edit / merge accident) the strip silently no-ops and a fresh
+    # block would be prepended anyway → duplicated, contradictory blocks and
+    # everything from the orphaned BEGIN onward treated as custom content
+    # forever. Count the markers up front; on imbalance, refuse to rewrite and
+    # report the file so the operator can fix it by hand rather than have the
+    # engine corrupt it. (Balanced count == valid; 0/0 is a fresh file with no
+    # block yet — allowed, the block is prepended below.)
+    begin_count = len(re.findall(MANAGED_START_RE, original))
+    end_count = original.count(MANAGED_END)
+    if begin_count != end_count:
+        return f"skipped-unbalanced:{claude_path}"
+
     normalized = re.sub(
-        rf"{re.escape(MANAGED_START)}.*?{re.escape(MANAGED_END)}\n*",
+        rf"{MANAGED_START_RE}.*?{re.escape(MANAGED_END)}\n*",
         "",
         original,
         flags=re.S,
@@ -1413,10 +1576,16 @@ def normalize_claude(agent_dir: Path, dry_run: bool, backup_root: Path) -> bool:
         normalized = f"{first}\n\n{block}\n\n{rest.lstrip()}"
     else:
         normalized = f"{block}\n\n{normalized}"
+    # Issue #1816 — changed-only backups. Render first, compare, and only
+    # `backup_file` + write when the content actually changes. The old code
+    # backed up on every apply pass (before computing the diff), so every cron-
+    # driven no-op apply across an N-agent fleet deposited another timestamped
+    # CLAUDE.md snapshot under state/doc-migration/backups/, growing unbounded.
     if normalized != original:
+        backup_file(claude_path, backup_root, dry_run)
         write_text(claude_path, normalized, dry_run)
-        return True
-    return False
+        return str(claude_path)
+    return None
 
 
 def render_agent_skills_md(agent_dir: Path, registry: dict[str, SkillEntry]) -> str:
@@ -1568,19 +1737,36 @@ def sync_memory_schema_from_template(
     dry_run: bool,
     backup_root: Path,
 ) -> list[str]:
-    """Overwrite an agent's MEMORY-SCHEMA.md with the template version
-    when they differ, keeping a timestamped backup of the previous copy.
+    """Legacy template-sync for MEMORY-SCHEMA.md, now symlink-clobber-guarded.
 
-    Rationale: agents drift from the template because nothing else syncs
-    this file during `agb upgrade`. When the team-wide memory schema
-    evolves (e.g. the 2026-04-19 Daily Note Hygiene addition), agent
-    homes silently fall behind and downstream pipelines starve. The
-    template is the source of truth; local edits should be rare and
-    documented — if someone did hand-edit, the backup preserves it.
+    Issue #1814 (DATA-LOSS): MEMORY-SCHEMA.md is now propagated from the canon
+    doc (`docs/agent-runtime/memory-schema.md`) into `<bridge_home>/shared/` and
+    symlinked into each home by `ensure_agent_shared_links` — which runs *before*
+    this function in `sync_agent_docs`. So on a converged install the home file
+    is a symlink that resolves to the shared canon body, and this legacy
+    template-sync becomes a no-op (it refuses to touch a symlink; see below).
+
+    The hard requirement this function now enforces is the **symlink-clobber
+    guard**. `Path.write_bytes` follows symlinks. The canon doc's own header and
+    the migration guide both describe a `MEMORY-SCHEMA.md -> docs/agent-runtime/
+    memory-schema.md` (or `-> ../shared/MEMORY-SCHEMA.md`) symlink wiring. On any
+    install wired that way, the previous `target.write_bytes(template_bytes)`
+    would have followed the link and overwritten the *canonical* doc with the
+    smaller template fork — fleet-wide, in a single `apply` pass. We now refuse
+    to write through a symlink and leave the link (and its canon target)
+    untouched. This guard is correct and worth holding even if the symlink
+    wiring above is ever reverted.
     """
     changed: list[str] = []
-    template = bridge_home / "agents" / "_template" / "MEMORY-SCHEMA.md"
     target = agent_dir / "MEMORY-SCHEMA.md"
+    # DATA-LOSS GUARD (#1814): never write through a symlink. A symlinked
+    # MEMORY-SCHEMA.md is the canon wiring (post-fix the expected state); writing
+    # the template bytes through it would clobber whatever the link resolves to —
+    # potentially the shared canon body or the canon doc itself. Leave it alone;
+    # the canon body is already kept current by render_shared_memory_schema_md.
+    if target.is_symlink():
+        return changed
+    template = bridge_home / "agents" / "_template" / "MEMORY-SCHEMA.md"
     if not template.exists() or not target.exists():
         return changed
     try:
@@ -1595,6 +1781,17 @@ def sync_memory_schema_from_template(
         return changed
     backup_file(target, backup_root, dry_run)
     if not dry_run:
+        # Belt-and-suspenders: even past the is_symlink() gate above, write the
+        # bytes via an explicit truncate-and-write on a freshly *unlinked* path
+        # so a TOCTOU symlink swap between the check and the write cannot be
+        # followed. (A plain `write_bytes` would re-follow a symlink planted in
+        # the window.) Remove any existing plain file first, then create anew.
+        if target.exists() or target.is_symlink():
+            if target.is_symlink():
+                # Re-check inside the write branch: a link appeared after the
+                # guard — refuse rather than clobber its target.
+                return changed
+            target.unlink()
         target.write_bytes(template_bytes)
     changed.append(str(target))
     return changed
@@ -1608,8 +1805,12 @@ def sync_agent_docs(agent_dir: Path, bridge_home: Path, dry_run: bool, stamp: st
     changed.extend(ensure_agent_shared_links(agent_dir, bridge_home, dry_run, backup_root))
     changed.extend(sync_memory_schema_from_template(agent_dir, bridge_home, dry_run, backup_root))
 
-    if normalize_claude(agent_dir, dry_run, backup_root):
-        changed.append(str(agent_dir / "CLAUDE.md"))
+    claude_change = normalize_claude(agent_dir, dry_run, backup_root)
+    if claude_change is not None:
+        # `claude_change` is either the rewritten CLAUDE.md path or a
+        # `skipped-unbalanced:<path>` marker (#1816 unbalanced-marker guard);
+        # both belong in the apply summary so the operator sees what happened.
+        changed.append(claude_change)
 
     # Per-agent SKILLS.md is only emitted in legacy-catalog mode. In
     # plugin-routing/disabled, the per-agent file is removed (with backup)

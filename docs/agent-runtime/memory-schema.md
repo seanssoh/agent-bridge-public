@@ -1,6 +1,6 @@
 # Agent Runtime — Memory Schema
 
-> Canonical SSOT for how every Agent Bridge runtime stores short-term, long-term, and team-shared memory. Each agent home installs this file as `MEMORY-SCHEMA.md` (symlink to `docs/agent-runtime/memory-schema.md`). The old per-agent `MEMORY-SCHEMA.md` drift copies are deprecated.
+> Canonical SSOT for how every Agent Bridge runtime stores short-term, long-term, and team-shared memory. The bridge renders this body into `<bridge_home>/shared/MEMORY-SCHEMA.md`, and each agent home installs `MEMORY-SCHEMA.md` as a symlink that resolves to that shared file (depth-correct on both v1 `agents/<a>/` and v2 `data/agents/<a>/home/` layouts; issue #1813/#1814). The old per-agent `MEMORY-SCHEMA.md` template-fork copies are deprecated and retired — one body, two locations, lockstep by construction, exactly like `common-instructions.md`.
 >
 > Related canonical docs: [`common-instructions.md`](common-instructions.md), [`wiki-graph-rules.md`](wiki-graph-rules.md), [`wiki-entity-lifecycle.md`](wiki-entity-lifecycle.md), [`research-capture-protocol.md`](research-capture-protocol.md).
 
