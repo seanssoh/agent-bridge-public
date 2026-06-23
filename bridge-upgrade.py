@@ -28,6 +28,29 @@ from typing import Any, Iterator
 MANAGED_CLAUDE_START = "<!-- BEGIN AGENT BRIDGE DOC MIGRATION -->"
 MANAGED_CLAUDE_END = "<!-- END AGENT BRIDGE DOC MIGRATION -->"
 
+
+def _managed_start_pattern(start_marker: str) -> str:
+    """Stamp-tolerant regex for a managed-block BEGIN marker (#1816 / #2062).
+
+    Since #2062 the renderer (`bridge-docs.py`) emits the BEGIN marker as a
+    STABLE LITERAL — the version stamp lives on a separate in-block metadata
+    line, not on the marker — so a plain literal match would already suffice for
+    blocks this engine renders. This regex is retained as DEFENSIVE TOLERANCE:
+    it accepts BOTH the literal marker AND a transitional block that an interim
+    build may have stamped on the marker (` v=<version>` before ` -->`), so the
+    migrate-agents home managed-block refresh recognizes such a block instead of
+    silently leaving it un-refreshed. Mirrors `MANAGED_START_RE` in
+    bridge-docs.py: match the stable prefix
+    `<!-- BEGIN AGENT BRIDGE DOC MIGRATION`, an optional ` v=<stamp>`, then
+    ` -->`. Falls back to the literal escape for any marker that does not carry
+    the DOC-MIGRATION shape (e.g. the #517 pair block).
+    """
+    suffix = " -->"
+    if start_marker.endswith(suffix):
+        prefix = start_marker[: -len(suffix)]
+        return re.escape(prefix) + r"(?: v=[^\n>]*)?" + re.escape(suffix)
+    return re.escape(start_marker)
+
 # Issue #517: admin-only pair-programming SOP block. Generalized
 # extract/refresh helpers below take delimiter args so the same logic
 # rerenders both blocks idempotently.
@@ -709,7 +732,7 @@ def render_template(text: str, agent_id: str, display_name: str, role_text: str,
 
 def extract_managed_block(text: str, start_marker: str, end_marker: str) -> str:
     match = re.search(
-        rf"{re.escape(start_marker)}.*?{re.escape(end_marker)}",
+        rf"{_managed_start_pattern(start_marker)}.*?{re.escape(end_marker)}",
         text,
         re.S,
     )
@@ -723,7 +746,7 @@ def refresh_managed_block(
         return original
     block = managed_block.rstrip() + "\n"
     pattern = re.compile(
-        rf"{re.escape(start_marker)}.*?{re.escape(end_marker)}\n*",
+        rf"{_managed_start_pattern(start_marker)}.*?{re.escape(end_marker)}\n*",
         re.S,
     )
     if pattern.search(original):

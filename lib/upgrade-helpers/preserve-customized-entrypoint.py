@@ -59,6 +59,24 @@ from pathlib import Path
 MANAGED_START = "<!-- BEGIN AGENT BRIDGE DOC MIGRATION -->"
 MANAGED_END = "<!-- END AGENT BRIDGE DOC MIGRATION -->"
 
+
+def _managed_start_pattern(start_marker: str) -> str:
+    """Stamp-tolerant regex for the managed-block BEGIN marker (#1816 / #2062).
+
+    Since #2062 the renderer (bridge-docs.py) emits the BEGIN marker as a stable
+    literal — the version stamp lives on a separate in-block metadata line, not
+    on the marker. This regex is retained as DEFENSIVE TOLERANCE: match the
+    stable prefix plus an OPTIONAL ` v=<stamp>`, so both the literal marker and a
+    transitional marker-stamped copy are recognized. Mirrors
+    bridge-upgrade.py::_managed_start_pattern exactly so the workdir
+    managed-block refresh stays byte-identical to the home-side refresh.
+    """
+    suffix = " -->"
+    if start_marker.endswith(suffix):
+        prefix = start_marker[: -len(suffix)]
+        return re.escape(prefix) + r"(?: v=[^\n>]*)?" + re.escape(suffix)
+    return re.escape(start_marker)
+
 # Unrendered template placeholders. The create-time scaffold substitutes every
 # one of these (see bridge-upgrade.py::render_template / bridge-agents.sh
 # bridge_render_template_string). A copy that STILL carries any of them in its
@@ -103,7 +121,7 @@ def is_placeholder_entrypoint(text: str) -> bool:
 
 def extract_managed_block(text: str) -> str:
     match = re.search(
-        rf"{re.escape(MANAGED_START)}.*?{re.escape(MANAGED_END)}",
+        rf"{_managed_start_pattern(MANAGED_START)}.*?{re.escape(MANAGED_END)}",
         text,
         re.S,
     )
@@ -118,7 +136,7 @@ def refresh_managed_block(original: str, managed_block: str) -> str:
         return original
     block = managed_block.rstrip() + "\n"
     pattern = re.compile(
-        rf"{re.escape(MANAGED_START)}.*?{re.escape(MANAGED_END)}\n*",
+        rf"{_managed_start_pattern(MANAGED_START)}.*?{re.escape(MANAGED_END)}\n*",
         re.S,
     )
     if pattern.search(original):
