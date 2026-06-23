@@ -799,7 +799,7 @@ if [[ -n "$_u8_tok" ]]; then
     *[[:space:]]*) smoke_fail "U8 FAIL (BLOCKER): the helper passed through whitespace ('$_u8_tok') from ps lstart." ;;
   esac
   # Prove the token survives a real sourceable marker round-trip (single-quote-wrapped).
-  _u8_marker="$SMOKE_TMP_ROOT/u8-marker.env"
+  _u8_marker="$SMOKE_TMP_ROOT/u8-marker.state"
   printf "BRIDGE_QUIESCE_UPGRADE_PSID='%s'\n" "$_u8_tok" >"$_u8_marker"
   # shellcheck disable=SC1090
   _u8_read="$("$BRIDGE_BASH" -c "source '$_u8_marker' 2>/dev/null; printf '%s' \"\${BRIDGE_QUIESCE_UPGRADE_PSID:-}\"")"
