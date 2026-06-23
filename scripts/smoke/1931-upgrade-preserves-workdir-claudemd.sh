@@ -36,10 +36,10 @@ trap cleanup EXIT
 PLACEHOLDER_HEADING="# <Agent Name> — <Role>"
 MANAGED_START="<!-- BEGIN AGENT BRIDGE DOC MIGRATION -->"
 MANAGED_END="<!-- END AGENT BRIDGE DOC MIGRATION -->"
-# Issue #1816: the refreshed BEGIN marker now carries a ` v=<version>` stamp
-# (`<!-- BEGIN AGENT BRIDGE DOC MIGRATION v=0.16.16-rc3 -->`). Post-refresh
-# assertions match the stable PREFIX so they accept the stamped marker the
-# renderer emits while the seed fixtures keep using the legacy unstamped
+# Issue #1816/#2062: the refreshed block carries the version on a SEPARATE
+# in-block metadata line, NOT on the BEGIN marker — the marker stays the stable
+# literal MANAGED_START. Post-refresh assertions match the stable PREFIX so they
+# accept whatever the renderer emits while the seed fixtures use the unstamped
 # MANAGED_START to prove the splice rewrites a stale block.
 MANAGED_START_PREFIX="<!-- BEGIN AGENT BRIDGE DOC MIGRATION"
 

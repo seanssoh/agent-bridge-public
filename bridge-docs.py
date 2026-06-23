@@ -15,13 +15,73 @@ from pathlib import Path
 
 MANAGED_START = "<!-- BEGIN AGENT BRIDGE DOC MIGRATION -->"
 MANAGED_END = "<!-- END AGENT BRIDGE DOC MIGRATION -->"
-# Issue #1816: the BEGIN marker is matched by a leading-prefix regex everywhere
-# it is parsed (`MANAGED_START` is the stable prefix; an optional ` v=<stamp>`
-# suffix can follow before the closing `-->`). `MANAGED_START_PREFIX` is the
-# bytes up to (but excluding) the trailing ` -->`, so the strip/audit regexes
-# can match a stamped or unstamped BEGIN marker alike.
+# Issue #1816 / #2062: the BEGIN marker is a STABLE LITERAL — the version stamp
+# does NOT ride the marker line. It lives on a separate in-block metadata line
+# (`_managed_version_line()`, an HTML comment so it is invisible in rendered
+# markdown) right after the BEGIN marker. Keeping the marker literal means every
+# consumer (the watchdog drift probe, the upgrader splice, the migrate/preserve
+# helpers, and any future reader) matches it with a plain substring test — there
+# is no stamp-suffix blast radius to chase across the repo. `MANAGED_START_RE`
+# is retained ONLY as a defensive tolerance for any transitional block that an
+# interim build may have stamped on the marker: `MANAGED_START_PREFIX` is the
+# bytes up to (but excluding) the trailing ` -->`, and the regex matches a
+# stamped-or-unstamped BEGIN alike so a strip/audit still recognizes such a
+# block. Renders never emit the stamped form.
 MANAGED_START_PREFIX = MANAGED_START[: -len(" -->")]
 MANAGED_START_RE = re.escape(MANAGED_START_PREFIX) + r"(?: v=[^\n>]*)? -->"
+# In-block version stamp (#1816 audit goal, #2062 placement). Emitted on its own
+# line immediately after the literal BEGIN marker. HTML-comment form so it is
+# inert in any markdown renderer and never shows up as block content. A future
+# audit reads the version mechanically via `MANAGED_VERSION_RE` instead of the
+# operator md5-ing N blocks by hand; the marker itself stays a stable literal.
+MANAGED_VERSION_PREFIX = "<!-- agent-bridge-managed-version:"
+
+
+def _managed_version_line(version: str) -> str:
+    return f"{MANAGED_VERSION_PREFIX} {version} -->"
+
+
+# Capture the version value from the in-block metadata line (group 1). Tolerant
+# of surrounding whitespace; returns None when the line is absent (e.g. a legacy
+# pre-#1816 block or a transitional marker-stamped block).
+MANAGED_VERSION_RE = re.compile(
+    re.escape(MANAGED_VERSION_PREFIX) + r"\s*([^\n>]*?)\s*-->"
+)
+
+
+def parse_managed_block_version(text: str) -> str | None:
+    """Return the in-block managed version stamp, or None if not present.
+
+    Reads the in-block version line emitted just after the BEGIN marker. Kept
+    here so the watchdog/audit can extract the stamp mechanically without
+    re-deriving the line format. Back-compat: a transitional block that stamped
+    the version onto the BEGIN marker (` v=<version>` suffix) is also recognized
+    so audit reporting does not regress for such a block.
+
+    The search is SCOPED to the managed-block span (BEGIN marker → END marker) so
+    a stray `<!-- agent-bridge-managed-version: ... -->` comment in an agent's
+    own custom CLAUDE.md content outside the block can never be mis-read as the
+    managed stamp.
+    """
+    # Scope to the managed block. The BEGIN marker is matched stamp-tolerantly so
+    # the transitional `v=`-on-marker block is still located; the version may then
+    # be on the marker (no in-block line) — handled by the legacy fallback below.
+    block_match = re.search(
+        rf"{MANAGED_START_RE}.*?{re.escape(MANAGED_END)}", text, flags=re.S
+    )
+    scope = block_match.group(0) if block_match else ""
+    match = MANAGED_VERSION_RE.search(scope)
+    if match:
+        return match.group(1).strip() or None
+    # Transitional fallback: version stamped on the BEGIN marker itself.
+    legacy = re.search(
+        re.escape(MANAGED_START_PREFIX) + r" v=([^\n>]*?) -->", scope
+    )
+    if legacy:
+        return legacy.group(1).strip() or None
+    return None
+
+
 HOME_DIR = str(Path.home())
 HOME_DIR_RE = re.escape(HOME_DIR)
 REPO_ROOT = Path(__file__).resolve().parent
@@ -1366,15 +1426,17 @@ def render_agent_bridge_block(agent_dir: Path, session_type: str | None = None) 
     # Normalize explicitly-passed session_type so caller case variants
     # ("Admin", "ADMIN") match the role filter.
     session_type = (session_type or "").strip().lower() or "general"
-    # Issue #1816: version-stamped BEGIN marker so a stale/foreign block is
-    # detectable mechanically (audit can md5-free compare the stamp instead of
-    # the operator md5-ing N blocks by hand). The stamp rides the marker as a
-    # ` v=<version>` suffix; every parser matches it via MANAGED_START_RE, which
-    # accepts a stamped or unstamped BEGIN alike (back-compat with pre-stamp
-    # blocks already on disk).
-    begin_marker = f"{MANAGED_START_PREFIX} v={_read_repo_version()} -->"
+    # Issue #1816 / #2062: the version stamp makes a stale/foreign block
+    # mechanically detectable (audit reads the version instead of the operator
+    # md5-ing N blocks by hand). The stamp lives on a SEPARATE in-block metadata
+    # line, NOT on the BEGIN marker — the marker stays the stable literal
+    # MANAGED_START so the watchdog drift probe and every other consumer keep
+    # matching it with a plain substring test (no stamp-suffix blast radius).
+    # The version line is an HTML comment (inert in rendered markdown) read back
+    # via parse_managed_block_version / MANAGED_VERSION_RE.
     lines = [
-        begin_marker,
+        MANAGED_START,
+        _managed_version_line(_read_repo_version()),
         "## Agent Bridge Runtime Canon",
         "- `SOUL.md`가 성격과 말투의 기준이다. 매 세션 시작 시 가장 먼저 읽는다.",
         "- `CLAUDE.md`는 운영 계약서다. 레거시 문서나 오래된 메모와 충돌하면 이 파일이 우선한다.",

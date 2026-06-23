@@ -61,12 +61,13 @@ MANAGED_END = "<!-- END AGENT BRIDGE DOC MIGRATION -->"
 
 
 def _managed_start_pattern(start_marker: str) -> str:
-    """Stamp-tolerant regex for the managed-block BEGIN marker (#1816).
+    """Stamp-tolerant regex for the managed-block BEGIN marker (#1816 / #2062).
 
-    The renderer (bridge-docs.py) stamps the engine version onto the BEGIN
-    marker as ` v=<version>` before the closing `-->`. Match the stable prefix
-    plus an OPTIONAL ` v=<stamp>`, so both the stamped template source and a
-    legacy unstamped workdir copy are recognized. Mirrors
+    Since #2062 the renderer (bridge-docs.py) emits the BEGIN marker as a stable
+    literal — the version stamp lives on a separate in-block metadata line, not
+    on the marker. This regex is retained as DEFENSIVE TOLERANCE: match the
+    stable prefix plus an OPTIONAL ` v=<stamp>`, so both the literal marker and a
+    transitional marker-stamped copy are recognized. Mirrors
     bridge-upgrade.py::_managed_start_pattern exactly so the workdir
     managed-block refresh stays byte-identical to the home-side refresh.
     """

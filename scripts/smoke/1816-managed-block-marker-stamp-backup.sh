@@ -5,9 +5,12 @@
 #
 # Pins three halves of issue #1816 (completing the ratified pointer-only block):
 #
-#  A. Version stamp — the BEGIN marker carries ` v=<engine version>` so a stale
-#     or foreign block is mechanically detectable. Pre-stamp blocks (unstamped
-#     marker) must still be recognized/stripped (back-compat).
+#  A. Version stamp — the block carries the engine version so a stale or foreign
+#     block is mechanically detectable. Issue #2062: the stamp lives on a
+#     SEPARATE in-block metadata line (`<!-- agent-bridge-managed-version: <v>
+#     -->`), NOT on the BEGIN marker, so the BEGIN marker stays a stable literal
+#     and every consumer (watchdog/upgrader/migrate) keeps matching it. Pre-stamp
+#     blocks (no version line) must still be recognized/stripped (back-compat).
 #  B. Unbalanced-marker guard (MUTATION-PROVEN) — a CLAUDE.md with an orphaned
 #     BEGIN marker (END lost) must be SKIPPED and reported, NOT double-prepended
 #     or corrupted. Non-vacuous: the md5 is unchanged and the BEGIN count stays
@@ -34,7 +37,10 @@ cleanup() {
 trap cleanup EXIT
 
 BEGIN_PREFIX="<!-- BEGIN AGENT BRIDGE DOC MIGRATION"
+BEGIN_MARKER="<!-- BEGIN AGENT BRIDGE DOC MIGRATION -->"
 END_MARKER="<!-- END AGENT BRIDGE DOC MIGRATION -->"
+# Issue #2062: the version stamp moved off the BEGIN marker to this in-block line.
+VERSION_PREFIX="<!-- agent-bridge-managed-version:"
 
 seed_agent_home() {
   local agent_home="$BRIDGE_AGENT_HOME_ROOT/tester"
@@ -67,13 +73,17 @@ count_str() {
 
 assert_version_stamp_emitted() {
   run_apply tester
-  local block engine_version begin_line
+  local block engine_version
   block="$(cat "$BRIDGE_AGENT_HOME_ROOT/tester/CLAUDE.md")"
-  smoke_assert_contains "$block" "$BEGIN_PREFIX v=" \
-    "BEGIN marker must carry a ' v=<version>' stamp (#1816)"
+  # #2062: the BEGIN marker is the stable literal — NO ` v=` stamp on it.
+  smoke_assert_contains "$block" "$BEGIN_MARKER" \
+    "BEGIN marker must be the stable literal (no stamp suffix) (#2062)"
+  smoke_assert_not_contains "$block" "$BEGIN_PREFIX v=" \
+    "BEGIN marker must NOT carry a ' v=' stamp suffix — the stamp moved off the marker (#2062)"
+  # The version lives on a separate in-block metadata line.
   engine_version="$(head -n1 "$SMOKE_REPO_ROOT/VERSION" | tr -d '[:space:]')"
-  smoke_assert_contains "$block" "$BEGIN_PREFIX v=$engine_version -->" \
-    "BEGIN stamp must match the engine VERSION ($engine_version)"
+  smoke_assert_contains "$block" "$VERSION_PREFIX $engine_version -->" \
+    "in-block version line must carry the engine VERSION ($engine_version) (#1816 audit goal, #2062 placement)"
 }
 
 assert_pointer_only_block() {
@@ -91,7 +101,7 @@ assert_pointer_only_block() {
 }
 
 assert_changed_only_backup() {
-  # tester already has a stamped block from the apply above. A no-op rerun must
+  # tester already has a rendered block (in-block stamp) from the apply above. A no-op rerun must
   # NOT deposit another CLAUDE.md backup and must NOT list CLAUDE.md as changed.
   run_apply tester  # converge
   local before_count
@@ -147,7 +157,8 @@ assert_unbalanced_marker_guard() {
 
 assert_unstamped_block_back_compat() {
   # A pre-stamp (unstamped) BEGIN marker on disk must still be recognized and
-  # re-rendered to the stamped form — back-compat for blocks already deployed.
+  # re-rendered to the new shape (literal marker + in-block version line) —
+  # back-compat for blocks already deployed.
   local agent_home="$BRIDGE_AGENT_HOME_ROOT/legacy"
   mkdir -p "$agent_home"
   printf '# legacy soul\n' >"$agent_home/SOUL.md"
@@ -163,8 +174,11 @@ assert_unstamped_block_back_compat() {
   run_apply legacy
   local block
   block="$(cat "$agent_home/CLAUDE.md")"
-  smoke_assert_contains "$block" "$BEGIN_PREFIX v=" \
-    "unstamped block must be re-rendered to the stamped form (back-compat)"
+  # #2062: re-render yields the literal marker + the in-block version line.
+  smoke_assert_contains "$block" "$BEGIN_MARKER" \
+    "unstamped block must be re-rendered to the literal-marker form (back-compat, #2062)"
+  smoke_assert_contains "$block" "$VERSION_PREFIX " \
+    "unstamped block must be re-rendered with the in-block version line (#1816/#2062)"
   smoke_assert_contains "$block" "preserved custom section" \
     "custom content outside markers must survive the re-render"
   local begin_count
@@ -177,7 +191,7 @@ main() {
   smoke_require_cmd python3
   smoke_setup_bridge_home "1816-marker-stamp"
   seed_agent_home
-  smoke_run "BEGIN marker carries the engine version stamp" \
+  smoke_run "version stamp lives on the in-block line; marker stays literal (#2062)" \
     assert_version_stamp_emitted
   smoke_run "block is pointer-only (no re-inlined protocol bodies)" \
     assert_pointer_only_block
@@ -185,7 +199,7 @@ main() {
     assert_changed_only_backup
   smoke_run "unbalanced-marker guard refuses to corrupt an orphaned-BEGIN file" \
     assert_unbalanced_marker_guard
-  smoke_run "unstamped pre-existing block is re-rendered to stamped (back-compat)" \
+  smoke_run "unstamped pre-existing block is re-rendered to the in-block-stamp form (back-compat)" \
     assert_unstamped_block_back_compat
   smoke_log "passed"
 }

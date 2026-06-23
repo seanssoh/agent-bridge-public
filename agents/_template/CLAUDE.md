@@ -8,9 +8,12 @@
   To refresh after a renderer change, regenerate it from the engine rather than
   editing by hand. It is pointer-only (ratified 2026-04-19): protocol bodies
   live in COMMON-INSTRUCTIONS.md / ADMIN-PROTOCOL.md, not hardcopied here.
-  The ` v=<version>` stamp is overwritten on apply with the live engine version.
+  Issue #2062: the BEGIN marker is a STABLE LITERAL; the version stamp lives on
+  the in-block `<!-- agent-bridge-managed-version: ... -->` line, which apply
+  overwrites with the live engine version.
 -->
-<!-- BEGIN AGENT BRIDGE DOC MIGRATION v=0.16.16-rc3 -->
+<!-- BEGIN AGENT BRIDGE DOC MIGRATION -->
+<!-- agent-bridge-managed-version: 0.16.16-rc3 -->
 ## Agent Bridge Runtime Canon
 - `SOUL.md`가 성격과 말투의 기준이다. 매 세션 시작 시 가장 먼저 읽는다.
 - `CLAUDE.md`는 운영 계약서다. 레거시 문서나 오래된 메모와 충돌하면 이 파일이 우선한다.

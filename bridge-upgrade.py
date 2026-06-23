@@ -30,17 +30,20 @@ MANAGED_CLAUDE_END = "<!-- END AGENT BRIDGE DOC MIGRATION -->"
 
 
 def _managed_start_pattern(start_marker: str) -> str:
-    """Stamp-tolerant regex for a managed-block BEGIN marker (#1816).
+    """Stamp-tolerant regex for a managed-block BEGIN marker (#1816 / #2062).
 
-    The renderer (`bridge-docs.py`) stamps the engine version onto the BEGIN
-    marker as ` v=<version>` before the closing `-->`. The marker matcher here
-    must accept BOTH the stamped (` v=0.16.16` …) and the legacy unstamped
-    form, or the migrate-agents home managed-block refresh silently stops
-    re-rendering a stamped agent (the byte-identical CLAUDE.md never lands in
-    updated_files). Mirrors `MANAGED_START_RE` in bridge-docs.py: match the
-    stable prefix `<!-- BEGIN AGENT BRIDGE DOC MIGRATION`, an optional
-    ` v=<stamp>`, then ` -->`. Falls back to the literal escape for any marker
-    that does not carry the DOC-MIGRATION shape (e.g. the #517 pair block).
+    Since #2062 the renderer (`bridge-docs.py`) emits the BEGIN marker as a
+    STABLE LITERAL — the version stamp lives on a separate in-block metadata
+    line, not on the marker — so a plain literal match would already suffice for
+    blocks this engine renders. This regex is retained as DEFENSIVE TOLERANCE:
+    it accepts BOTH the literal marker AND a transitional block that an interim
+    build may have stamped on the marker (` v=<version>` before ` -->`), so the
+    migrate-agents home managed-block refresh recognizes such a block instead of
+    silently leaving it un-refreshed. Mirrors `MANAGED_START_RE` in
+    bridge-docs.py: match the stable prefix
+    `<!-- BEGIN AGENT BRIDGE DOC MIGRATION`, an optional ` v=<stamp>`, then
+    ` -->`. Falls back to the literal escape for any marker that does not carry
+    the DOC-MIGRATION shape (e.g. the #517 pair block).
     """
     suffix = " -->"
     if start_marker.endswith(suffix):
