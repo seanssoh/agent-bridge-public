@@ -1,0 +1,72 @@
+# scripts/smoke/2081-roster-parse-cases.tsv — #2081 r5-round5 review finding 2.
+#
+# Shared parity table for the BRIDGE_ADMIN_AGENT_ID roster-value parser. BOTH
+# resolvers consume this single file:
+#   - the Python parser bridge_rooms_common._parse_admin_id_from_roster (driven
+#     by scripts/smoke/2081-launch-admin-id-helper.py, parity_table mode)
+#   - the shell parser lib/bridge-a2a.sh:bridge_a2a_roster_admin_assignment
+#     (driven by scripts/smoke/2081-launch-admin-id.sh, Part 3)
+# and each must produce the EXPECTED outcome for every row. The expected column
+# is the SECURE-POLICY result, which by design equals what bash sourcing would
+# produce for every LEGITIMATE shape (verified: every FOUND:<value> row resolves
+# to byte-exactly the value `env -i bash` assigns — so we never accept a WRONG
+# value, no fail-open), and deliberately fail-closes (MALFORMED) the corrupt /
+# concatenation / command-substitution shapes that bash would otherwise honor
+# (`"x"evil` -> xevil, `pa"d"min` -> padmin, `"$(...)"` -> executes). This table
+# pins shell<->Python agreement on that policy and prevents a future divergence
+# where one parser silently accepts a value the other (or bash) reads differently.
+#
+# Format: 3 TAB-separated columns. Lines starting with '#' and blank lines are
+# comments. The roster-line and expected fields use Python/bash escapes decoded
+# by the drivers: \t \v \f \r \n  \\ for a literal backslash. The roster file
+# written for each row is exactly: "#!/usr/bin/env bash\n" + <decoded line> + "\n".
+#
+#   <id>  <roster_line_with_escapes>  <expected>
+# expected is one of: FOUND:<value>  (value may be empty -> "FOUND:")
+#                     MALFORMED
+#                     NONE
+#
+id	roster_line	expected
+normal_quoted	BRIDGE_ADMIN_AGENT_ID="padmin"	FOUND:padmin
+export_quoted	export BRIDGE_ADMIN_AGENT_ID="padmin"	FOUND:padmin
+bare	BRIDGE_ADMIN_AGENT_ID=padmin	FOUND:padmin
+single_quoted	BRIDGE_ADMIN_AGENT_ID='ops.admin'	FOUND:ops.admin
+dotted	BRIDGE_ADMIN_AGENT_ID="ops.admin-2_x"	FOUND:ops.admin-2_x
+empty_bare	BRIDGE_ADMIN_AGENT_ID=	FOUND:
+empty_quoted	BRIDGE_ADMIN_AGENT_ID=""	FOUND:
+quoted_ws_comment	BRIDGE_ADMIN_AGENT_ID="padmin"  # c	FOUND:padmin
+quoted_tab_comment	BRIDGE_ADMIN_AGENT_ID="padmin"\t# c	FOUND:padmin
+bare_ws_comment	BRIDGE_ADMIN_AGENT_ID=padmin # c	FOUND:padmin
+indented	  BRIDGE_ADMIN_AGENT_ID="padmin"	FOUND:padmin
+no_assignment	# nothing here	NONE
+unrelated_var	BRIDGE_OTHER_AGENT_ID="x"	NONE
+unbalanced_quote	BRIDGE_ADMIN_AGENT_ID="padmin	MALFORMED
+invalid_charset	BRIDGE_ADMIN_AGENT_ID="bad name!"	MALFORMED
+junk_after_quote	BRIDGE_ADMIN_AGENT_ID="padmin"evil	MALFORMED
+hash_fused_after_quote	BRIDGE_ADMIN_AGENT_ID="padmin"#evil	MALFORMED
+bare_hash	BRIDGE_ADMIN_AGENT_ID=padmin#evil	MALFORMED
+extra_words	BRIDGE_ADMIN_AGENT_ID=padmin evil	MALFORMED
+mixed_concat	BRIDGE_ADMIN_AGENT_ID=pa"d"min	MALFORMED
+plus_equals	BRIDGE_ADMIN_AGENT_ID+=padmin	MALFORMED
+cmd_subst	BRIDGE_ADMIN_AGENT_ID="$(echo PWN)"	MALFORMED
+backtick_subst	BRIDGE_ADMIN_AGENT_ID="`echo PWN`"	MALFORMED
+leading_space	BRIDGE_ADMIN_AGENT_ID= padmin	FOUND:
+leading_tab	BRIDGE_ADMIN_AGENT_ID=\tpadmin	FOUND:
+leading_space_quote	BRIDGE_ADMIN_AGENT_ID= "padmin"	FOUND:
+vt_then_hash	BRIDGE_ADMIN_AGENT_ID="padmin"\v#evil	MALFORMED
+ff_then_hash	BRIDGE_ADMIN_AGENT_ID="padmin"\f#evil	MALFORMED
+cr_then_hash	BRIDGE_ADMIN_AGENT_ID="padmin"\r#evil	MALFORMED
+bare_vt_inner	BRIDGE_ADMIN_AGENT_ID=padmin\v_x	MALFORMED
+leading_vt	BRIDGE_ADMIN_AGENT_ID=\vpadmin	MALFORMED
+# r5-round6 review: VT/FF/CR in the LINE indent or after `export` is NOT a bash
+# command-blank, so the line is not an assignment to bash/Python — the shell
+# matcher must use [[:blank:]] (space+tab) not [[:space:]] so it agrees (NONE).
+vt_indent	\vBRIDGE_ADMIN_AGENT_ID="padmin"	NONE
+ff_indent	\fBRIDGE_ADMIN_AGENT_ID="padmin"	NONE
+cr_indent	\rBRIDGE_ADMIN_AGENT_ID="padmin"	NONE
+export_vt_sep	export\vBRIDGE_ADMIN_AGENT_ID="padmin"	NONE
+export_cr_sep	export\rBRIDGE_ADMIN_AGENT_ID="padmin"	NONE
+# legit space/tab indent + export separator still MATCH (regression guard)
+space_indent	  BRIDGE_ADMIN_AGENT_ID="padmin"	FOUND:padmin
+tab_indent	\tBRIDGE_ADMIN_AGENT_ID="padmin"	FOUND:padmin
+export_tab_sep	export\tBRIDGE_ADMIN_AGENT_ID="padmin"	FOUND:padmin

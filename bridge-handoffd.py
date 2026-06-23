@@ -5333,6 +5333,43 @@ def cmd_serve(args: argparse.Namespace) -> int:
     # + BRIDGE_A2A_ALLOW_TEST_BIND escape hatch is the only way to
     # silence the gate; we audit that bypass so it cannot be quiet.
     #
+    # #2081 (SECURITY, fail-open fix): resolve this node's configured admin id
+    # from the on-disk roster/config and stamp it into os.environ BEFORE we
+    # serve, so the #2079 cross-node admin↔admin authz predicate
+    # (rooms.classify_local_admin) can classify a LOCAL admin correctly for the
+    # lifetime of the serve. The systemd handoffd unit runs with only
+    # BRIDGE_HOME in its Environment=, and `agb a2a daemon start` reaches the
+    # spawn through a dispatcher that never sources the roster — so without this
+    # startup resolution a LOCAL admin classifies UNKNOWN and a
+    # `non-admin@remote -> admin@local` delivery flips from the intended DENY to
+    # ALLOW. STARTUP resolution (not a value frozen into the rendered unit) means
+    # a later `agb setup admin <new>` is picked up on the next restart. We do NOT
+    # fail-closed when the resolve comes up empty: a node with no configured
+    # admin legitimately keeps non-admin↔non-admin room traffic open, and the
+    # predicate already fail-closes any admin-CLAIMED counterpart (the env value
+    # is a classification input, never a positive trust signal — see #1738).
+    #
+    # #2081 r2 review F1: a roster file that EXISTS but cannot be read/decoded is
+    # NOT "no admin configured" — silently continuing would re-open the fail-open
+    # (a real local admin would classify UNKNOWN). On that resolver error we FAIL
+    # CLOSED: refuse to serve (phase=config — a NON-transient operator error the
+    # supervisor must not crash-loop). A readable roster with no admin line, or no
+    # roster at all, resolves to '' and serving continues (non-admin traffic stays
+    # open). Any UNEXPECTED resolver fault is also treated as config-fail-closed
+    # rather than served fail-open.
+    if rooms is not None:
+        try:
+            rooms.ensure_admin_agent_id_in_env()
+        except rooms.AdminIdResolveError as exc:
+            log(f"FATAL: {exc} (admin_id_unreadable)")
+            audit("startup_fail", code="admin_id_unreadable",
+                  detail=str(exc)[:300], phase="config", security=True)
+            return 1
+        except Exception as exc:
+            log(f"FATAL: admin id resolution failed: {exc} (admin_id_resolve_error)")
+            audit("startup_fail", code="admin_id_resolve_error",
+                  detail=str(exc)[:300], phase="config", security=True)
+            return 1
     # #1563 PR-4: config-load + secret validation failures are tagged
     # phase=config (NON-transient operator error) and the bind resolution
     # failure is tagged phase=bind (potentially-transient availability error),
