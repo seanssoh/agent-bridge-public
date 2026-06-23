@@ -59,6 +59,131 @@ JOIN_PENDING = "pending"
 JOIN_APPROVED = "approved"
 JOIN_DENIED = "denied"
 
+# --------------------------------------------------------------------------
+# #2079 admin-signal (cross-server routing authz). TRI-STATE, never a bool.
+# --------------------------------------------------------------------------
+#
+# A roster member carries a `bridge_admin` classification: is this member the
+# CONFIGURED bridge-admin of ITS OWN node? The receiver/relay authz predicate
+# (admin_cross_node_authz) uses it to enforce the operator rule "an admin-
+# involved cross-node room delivery is allowed ONLY when BOTH endpoints are
+# configured admins".
+#
+# It is deliberately TRI-STATE — `admin` / `non_admin` / `unknown` — NOT a
+# bool with a false default. Codex r1 (design review): a bool that defaults to
+# false on absent/legacy metadata is a SILENT DOWNGRADE — a real admin whose
+# node has not yet broadcast a v2 roster would read as non-admin and a hostile
+# `admin@B -> nonadmin@A` would slip through as "non-admin to non-admin". So an
+# absent/malformed bit MUST stay `unknown` and fail-closed for any admin-
+# involved cross-node delivery; only a KNOWN-non-admin pair (or unknown traffic
+# during rollout, see ADMIN_AUTHZ_COMPAT_OPEN) is allowed.
+#
+# Wire/cache encoding (keeps the signed roster bytes backward compatible):
+#   - known admin     -> member dict has "bridge_admin": true
+#   - known non-admin -> member dict has "bridge_admin": false
+#   - unknown         -> the "bridge_admin" key is ABSENT (a legacy/pre-#2079
+#                        roster, or a node that could not classify the member)
+# Encoding the unknown state as KEY-ABSENT (rather than null) means a roster
+# from a node that predates #2079 deserializes to unknown automatically, and an
+# all-known roster's bytes only grow by the explicit true/false members.
+ADMIN_TRI_ADMIN = "admin"
+ADMIN_TRI_NON_ADMIN = "non_admin"
+ADMIN_TRI_UNKNOWN = "unknown"
+
+# room_members.admin column encoding (tri-state in one INTEGER column):
+#   1  -> known admin
+#   0  -> known non-admin
+#  -1  -> unknown (legacy row, or a cross-node member whose node did not attest)
+# A column added by migration to an existing table defaults to -1 (unknown), so
+# a pre-#2079 member row reads as unknown and fail-closes admin-involved cross-
+# node traffic until a fresh roster reclassifies it.
+ADMIN_COL_ADMIN = 1
+ADMIN_COL_NON_ADMIN = 0
+ADMIN_COL_UNKNOWN = -1
+
+
+def admin_tri_from_col(val: Any) -> str:
+    """Map a stored room_members.admin INTEGER to the tri-state string."""
+    try:
+        n = int(val)
+    except (TypeError, ValueError):
+        return ADMIN_TRI_UNKNOWN
+    if n == ADMIN_COL_ADMIN:
+        return ADMIN_TRI_ADMIN
+    if n == ADMIN_COL_NON_ADMIN:
+        return ADMIN_TRI_NON_ADMIN
+    return ADMIN_TRI_UNKNOWN
+
+
+def admin_col_from_bool(is_admin: Optional[bool]) -> int:
+    """Map a known/unknown admin classification to the stored INTEGER.
+
+    `None` (could-not-classify) stores as UNKNOWN, not non-admin — never let an
+    indeterminate classification masquerade as a known-non-admin (the downgrade
+    Codex r1 flagged).
+    """
+    if is_admin is None:
+        return ADMIN_COL_UNKNOWN
+    return ADMIN_COL_ADMIN if is_admin else ADMIN_COL_NON_ADMIN
+
+
+def admin_col_from_tri(tri: str) -> int:
+    """Map a tri-state string back to the stored INTEGER (round-trips _from_col)."""
+    if tri == ADMIN_TRI_ADMIN:
+        return ADMIN_COL_ADMIN
+    if tri == ADMIN_TRI_NON_ADMIN:
+        return ADMIN_COL_NON_ADMIN
+    return ADMIN_COL_UNKNOWN
+
+
+def admin_tri_from_member(m: dict) -> str:
+    """The tri-state classification of a roster MEMBER DICT (wire/cache form).
+
+    KEY-ABSENT -> unknown (legacy/pre-#2079 roster, or an unattested member).
+    A present "bridge_admin" must be a real bool; anything else is unknown
+    (never half-trusted into a known state).
+    """
+    if "bridge_admin" not in m:
+        return ADMIN_TRI_UNKNOWN
+    val = m.get("bridge_admin")
+    if val is True:
+        return ADMIN_TRI_ADMIN
+    if val is False:
+        return ADMIN_TRI_NON_ADMIN
+    return ADMIN_TRI_UNKNOWN
+
+
+def configured_admin_agent_id() -> str:
+    """This node's CONFIGURED admin agent id (canonical NAME), or '' if unset.
+
+    Source is `$BRIDGE_ADMIN_AGENT_ID` — the controller exports it into the
+    launch env (see bridge-config.py admin_agent_id / bridge-run.sh). It is the
+    canonical admin NAME for THIS node, NOT a trust signal on its own: it only
+    classifies an agent on THIS node as admin/non-admin so the cross-node authz
+    predicate can apply the symmetric admin↔admin rule. A renamed admin works
+    because the comparison is against the configured id, never the literal
+    `patch`.
+    """
+    return os.environ.get("BRIDGE_ADMIN_AGENT_ID", "").strip()
+
+
+def classify_local_admin(agent: str) -> Optional[bool]:
+    """KNOWN admin/non-admin classification of a LOCAL agent, or None if unknown.
+
+    Returns:
+      - True  : `agent` is this node's configured admin.
+      - False : this node HAS a configured admin and `agent` is not it.
+      - None  : this node has NO configured admin id (cannot classify) -> the
+                caller stores/treats this as UNKNOWN, never as non-admin (the
+                downgrade Codex r1 flagged). A node that never configured an
+                admin id has no admins to protect, but we refuse to silently
+                assert non-admin for an endpoint we cannot actually classify.
+    """
+    admin_id = configured_admin_agent_id()
+    if not admin_id:
+        return None
+    return str(agent) == admin_id
+
 # Room status. `active` is the only status P1a sets; the column is frozen so a
 # future `archived`/`disbanded` lifecycle (Phase-2 backlog) needs no rewrite.
 ROOM_ACTIVE = "active"
@@ -624,6 +749,11 @@ CREATE TABLE IF NOT EXISTS room_members (
   node       TEXT NOT NULL DEFAULT '',
   role       TEXT NOT NULL DEFAULT 'member',
   joined_ts  INTEGER NOT NULL,
+  -- #2079 admin-signal TRI-STATE: 1 known admin / 0 known non-admin /
+  -- -1 unknown. A migrated pre-#2079 row defaults to -1 (unknown), so it
+  -- fail-closes admin-involved cross-node delivery until a fresh roster
+  -- reclassifies it. See ADMIN_COL_* + admin_tri_from_col.
+  admin      INTEGER NOT NULL DEFAULT -1,
   PRIMARY KEY (room_id, agent, node)
 );
 CREATE INDEX IF NOT EXISTS idx_room_members_agent ON room_members(agent, node);
@@ -653,6 +783,15 @@ CREATE TABLE IF NOT EXISTS room_join_requests (
   verified     INTEGER NOT NULL DEFAULT 0,
   via_node     TEXT NOT NULL DEFAULT '',
   ttl_expiry   INTEGER NOT NULL DEFAULT 0,
+  -- #2079 admin-signal: the joiner node's ATTESTATION of whether the joining
+  -- agent is that node's configured bridge-admin (1 admin / 0 non-admin /
+  -- -1 unknown). NODE-ATTESTED, not independently verifiable — it protects
+  -- against non-admin agents on an HONEST paired node, not against a malicious
+  -- node lying about its own endpoint (that node already controls every agent
+  -- it runs). Persisted on the pending row because cross-node approval is
+  -- DEFERRED (the leader approves later), so the bit must survive from the join
+  -- request to the membership add. Legacy/local rows default to -1 (unknown).
+  joiner_admin INTEGER NOT NULL DEFAULT -1,
   PRIMARY KEY (room_id, agent, node)
 );
 
@@ -768,6 +907,12 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         # Lane 4 (#1695): token-bootstrap key seed. Nullable (no NOT NULL) so a
         # migrated P1/P4.1 row reads NULL == "no seed" rather than a fake value.
         "ALTER TABLE rooms ADD COLUMN invite_key_seed TEXT",
+        # #2079 admin-signal: existing member rows predate the classification, so
+        # default to -1 (unknown) — they fail-close admin-involved cross-node
+        # delivery until the leader rebroadcasts a v2 roster that reclassifies
+        # them. Existing join-request rows likewise carry no attested admin bit.
+        "ALTER TABLE room_members ADD COLUMN admin INTEGER NOT NULL DEFAULT -1",
+        "ALTER TABLE room_join_requests ADD COLUMN joiner_admin INTEGER NOT NULL DEFAULT -1",
     )
     for stmt in migrations:
         try:
@@ -1062,10 +1207,13 @@ def create_room(conn: sqlite3.Connection, *, name: str, leader_agent: str,
         (room_id, name, leader_agent, leader_node, hash_token(token), ts,
          max(0, int(ttl)), key_seed, 1 if once else 0, ROOM_ACTIVE, ts, ts),
     )
+    # #2079: the leader is local to THIS (creating) node — classify it from
+    # this node's configured admin id (the authoritative local source).
+    leader_admin = admin_col_from_bool(classify_local_admin(leader_agent))
     conn.execute(
-        "INSERT INTO room_members (room_id, agent, node, role, joined_ts) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (room_id, leader_agent, leader_node, ROLE_LEADER, ts),
+        "INSERT INTO room_members (room_id, agent, node, role, joined_ts, admin) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (room_id, leader_agent, leader_node, ROLE_LEADER, ts, leader_admin),
     )
     # Seed the epoch-0 roster cache in the SAME transaction as the room +
     # leader rows so a reader never sees a room with no cache row.
@@ -1336,11 +1484,20 @@ def member_nodes_for_agent(conn: sqlite3.Connection, room_id: str,
 
 
 def add_member(conn: sqlite3.Connection, room_id: str, agent: str,
-               node: str = "", role: str = ROLE_MEMBER) -> None:
+               node: str = "", role: str = ROLE_MEMBER,
+               admin: int = ADMIN_COL_UNKNOWN) -> None:
+    """Admit a member with a tri-state #2079 admin classification.
+
+    `admin` is the stored INTEGER tri-state (ADMIN_COL_ADMIN / _NON_ADMIN /
+    _UNKNOWN). Default UNKNOWN: a caller that omits it (e.g. a pre-#2079 path)
+    records an unattested member that fail-closes admin-involved cross-node
+    delivery until reclassified. Local admits set it from this node's configured
+    admin id; cross-node admits set it from the joiner node's attestation.
+    """
     conn.execute(
         "INSERT OR REPLACE INTO room_members (room_id, agent, node, role, "
-        "joined_ts) VALUES (?, ?, ?, ?, ?)",
-        (room_id, agent, node, role, now_ts()),
+        "joined_ts, admin) VALUES (?, ?, ?, ?, ?, ?)",
+        (room_id, agent, node, role, now_ts(), int(admin)),
     )
     conn.commit()
 
@@ -1415,6 +1572,7 @@ def post_join_request(conn: sqlite3.Connection, room_id: str, agent: str,
 def record_verified_cross_node_join_request(
     conn: sqlite3.Connection, room_id: str, agent: str, node: str,
     *, via_node: str, ttl_expiry: int = 0,
+    joiner_admin: int = ADMIN_COL_UNKNOWN,
 ) -> None:
     """Persist a VERIFIED cross-node (P4.1) pending join request.
 
@@ -1438,10 +1596,10 @@ def record_verified_cross_node_join_request(
     """
     conn.execute(
         "INSERT OR REPLACE INTO room_join_requests (room_id, agent, node, "
-        "requested_ts, status, verified, via_node, ttl_expiry) "
-        "VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
+        "requested_ts, status, verified, via_node, ttl_expiry, joiner_admin) "
+        "VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)",
         (room_id, agent, node, now_ts(), JOIN_PENDING, via_node,
-         max(0, int(ttl_expiry))),
+         max(0, int(ttl_expiry)), int(joiner_admin)),
     )
     conn.commit()
 
@@ -1486,6 +1644,7 @@ def room_join_dedupe_lookup(conn: sqlite3.Connection, peer: str,
 def record_verified_cross_node_join_request_atomic(
     conn: sqlite3.Connection, *, message_id: str, body_sha256: str, peer: str,
     room_id: str, agent: str, node: str, via_node: str, ttl_expiry: int = 0,
+    joiner_admin: int = ADMIN_COL_UNKNOWN,
 ) -> str:
     """ATOMICALLY reserve the dedupe row AND persist the verified pending row.
 
@@ -1527,10 +1686,10 @@ def record_verified_cross_node_join_request_atomic(
         )
         conn.execute(
             "INSERT OR REPLACE INTO room_join_requests (room_id, agent, node, "
-            "requested_ts, status, verified, via_node, ttl_expiry) "
-            "VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
+            "requested_ts, status, verified, via_node, ttl_expiry, joiner_admin) "
+            "VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)",
             (room_id, agent, node, ts, JOIN_PENDING, via_node,
-             max(0, int(ttl_expiry))),
+             max(0, int(ttl_expiry)), int(joiner_admin)),
         )
         conn.commit()
     except sqlite3.IntegrityError:
@@ -1592,21 +1751,39 @@ def set_join_request_status(conn: sqlite3.Connection, room_id: str, agent: str,
 # --------------------------------------------------------------------------
 
 def _sorted_members(conn: sqlite3.Connection,
-                    room_id: str) -> list[dict[str, str]]:
+                    room_id: str) -> list[dict[str, Any]]:
     """Members of a room, deterministically sorted by (agent, node).
 
     The sort is the CANONICAL ordering — P4 signs over exactly this byte
     sequence so any verifier recomputes the same MAC. Never reorder.
+
+    #2079: each member also carries an OPTIONAL "bridge_admin" bool — present
+    only when this node KNOWS the member's admin classification (true/false);
+    omitted (== unknown) for legacy/unattested members. Adding the key changes
+    the SIGNED roster bytes only for members with a known classification, so a
+    cross-node mesh where every node has materialized admin metadata produces a
+    larger but still deterministic signed roster; a legacy node's roster is
+    byte-identical to pre-#2079.
     """
     rows = conn.execute(
-        "SELECT agent, node, role FROM room_members WHERE room_id=? "
+        "SELECT agent, node, role, admin FROM room_members WHERE room_id=? "
         "ORDER BY agent, node",
         (room_id,),
     ).fetchall()
-    return [
-        {"agent": r["agent"], "node": r["node"] or "", "role": r["role"]}
-        for r in rows
-    ]
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        member: dict[str, Any] = {
+            "agent": r["agent"], "node": r["node"] or "", "role": r["role"]}
+        # #2079: materialize the admin bit ONLY when KNOWN (true/false). An
+        # unknown classification omits the key, so a legacy/unattested member
+        # serializes to "unknown" at every verifier (key-absent == unknown).
+        tri = admin_tri_from_col(r["admin"])
+        if tri == ADMIN_TRI_ADMIN:
+            member["bridge_admin"] = True
+        elif tri == ADMIN_TRI_NON_ADMIN:
+            member["bridge_admin"] = False
+        out.append(member)
+    return out
 
 
 def roster_for(conn: sqlite3.Connection, room_id: str) -> dict[str, Any]:
@@ -1673,7 +1850,11 @@ def approve_join(conn: sqlite3.Connection, room_id: str, agent: str,
     authorized.
     """
     require_room(conn, room_id)
-    add_member(conn, room_id, agent, node, role=ROLE_MEMBER)
+    # #2079: the LOCAL admit path admits an agent on the leader's OWN node, so
+    # classify it from THIS node's configured admin id (the authoritative
+    # source for a local endpoint). None (no configured admin) -> UNKNOWN.
+    admin_col = admin_col_from_bool(classify_local_admin(agent))
+    add_member(conn, room_id, agent, node, role=ROLE_MEMBER, admin=admin_col)
     set_join_request_status(conn, room_id, agent, node, JOIN_APPROVED)
     # bump_epoch re-persists room_roster_cache atomically (centralized in F2),
     # so no explicit _recompute_roster_cache call is needed here.
@@ -1731,7 +1912,24 @@ def approve_cross_node(conn: sqlite3.Connection, room_id: str, agent: str,
             "complete the node-link-authenticated, token-verified join first",
             code="no_verified_request",
         )
-    add_member(conn, room_id, agent, node, role=ROLE_MEMBER)
+    # #2079: a REMOTE member's admin classification is the joiner NODE's
+    # attestation, carried on the verified pending row (joiner_admin). The
+    # leader cannot independently verify a remote node's admin config, so it
+    # trusts the node-attested bit (node-attested, not independently
+    # verifiable — see the join-request schema comment). A pre-#2079 pending
+    # row (or one with no attestation) reads -1 (unknown) and fail-closes
+    # admin-involved cross-node delivery for this member until reclassified.
+    prow = conn.execute(
+        "SELECT joiner_admin FROM room_join_requests "
+        "WHERE room_id=? AND agent=? AND node=?",
+        (room_id, agent, node),
+    ).fetchone()
+    # The stored joiner_admin is ALREADY the tri-state INTEGER (1/0/-1); carry
+    # it onto the member row verbatim (unknown stays unknown).
+    admin_col = ADMIN_COL_UNKNOWN
+    if prow is not None:
+        admin_col = admin_col_from_tri(admin_tri_from_col(prow["joiner_admin"]))
+    add_member(conn, room_id, agent, node, role=ROLE_MEMBER, admin=admin_col)
     set_join_request_status(conn, room_id, agent, node, JOIN_APPROVED)
     return bump_epoch(conn, room_id)
 
@@ -2208,15 +2406,23 @@ def cached_roster_members(row: sqlite3.Row) -> Optional[list[dict[str, str]]]:
         return None
     if not isinstance(parsed, list):
         return None
-    out: list[dict[str, str]] = []
+    out: list[dict[str, Any]] = []
     for m in parsed:
         if not isinstance(m, dict):
             return None
-        out.append({
+        entry: dict[str, Any] = {
             "agent": str(m.get("agent", "")),
             "node": str(m.get("node", "")),
             "role": str(m.get("role", "member")) or "member",
-        })
+        }
+        # #2079: preserve the OPTIONAL known admin bit for `room show`/`room
+        # list` rendering (key-absent == unknown).
+        tri = admin_tri_from_member(m)
+        if tri == ADMIN_TRI_ADMIN:
+            entry["bridge_admin"] = True
+        elif tri == ADMIN_TRI_NON_ADMIN:
+            entry["bridge_admin"] = False
+        out.append(entry)
     return out
 
 
@@ -2263,12 +2469,19 @@ ROOM_TALK_SENDER_NOT_MEMBER = "sender_not_member"
 ROOM_TALK_TARGET_NOT_MEMBER = "target_not_member"
 
 
-def _cached_members(row: sqlite3.Row) -> Optional[list[dict[str, str]]]:
-    """Parse the cached `members_json` into a list of {agent,node} dicts.
+def _cached_members(row: sqlite3.Row) -> Optional[list[dict[str, Any]]]:
+    """Parse the cached `members_json` into a list of {agent,node[,bridge_admin]}.
 
     Returns None if the stored JSON is not a list of objects (corrupt cache —
     the caller fails closed). Each entry is normalized to plain strings so the
     membership comparison never trips on a non-string node/agent.
+
+    #2079: the OPTIONAL "bridge_admin" bool is preserved (present only when the
+    cached roster carried a real bool == known; omitted == unknown) so the
+    cross-node admin-authz predicate can classify the sender/target from the
+    SAME verified leader-MAC cache the membership check reads. Membership
+    comparison still keys ONLY on (agent, node) — the admin bit is metadata the
+    authz predicate consumes, not part of the identity tuple.
     """
     try:
         parsed = json.loads(str(row["members_json"] or "[]"))
@@ -2276,14 +2489,20 @@ def _cached_members(row: sqlite3.Row) -> Optional[list[dict[str, str]]]:
         return None
     if not isinstance(parsed, list):
         return None
-    out: list[dict[str, str]] = []
+    out: list[dict[str, Any]] = []
     for m in parsed:
         if not isinstance(m, dict):
             return None
-        out.append({
+        entry: dict[str, Any] = {
             "agent": str(m.get("agent", "")),
             "node": str(m.get("node", "")),
-        })
+        }
+        tri = admin_tri_from_member(m)
+        if tri == ADMIN_TRI_ADMIN:
+            entry["bridge_admin"] = True
+        elif tri == ADMIN_TRI_NON_ADMIN:
+            entry["bridge_admin"] = False
+        out.append(entry)
     return out
 
 
@@ -2337,6 +2556,189 @@ def roster_cache_membership_check(
     if target_pair not in member_pairs:
         return ROOM_TALK_TARGET_NOT_MEMBER
     return ROOM_TALK_OK
+
+
+# --------------------------------------------------------------------------
+# #2079 cross-server routing authz — the admin↔admin predicate
+# --------------------------------------------------------------------------
+#
+# Stable audit reason codes (no secret/identity-oracle ever appears on the
+# wire — these are AUDIT-ONLY; the receiver/relay collapse every reject to a
+# single generic 403). They name WHICH leg of the symmetric rule failed so an
+# operator can debug from the audit log without a reason-bearing wire response.
+ADMIN_AUTHZ_OK = "admin_authz_ok"
+ADMIN_AUTHZ_NOT_ADMIN_INVOLVED = "not_admin_involved"  # ok, no admin endpoint
+ADMIN_AUTHZ_PAIR_REQUIRED = "admin_pair_required"      # one admin, other not
+ADMIN_AUTHZ_SENDER_NOT_ADMIN = "sender_not_admin"      # target admin, sender not
+ADMIN_AUTHZ_TARGET_NOT_ADMIN = "target_not_admin"      # sender admin, target not
+ADMIN_AUTHZ_METADATA_MISSING = "admin_metadata_missing"  # unknown + admin side
+
+# Rollout compatibility: when NEITHER endpoint is a KNOWN admin but at least
+# one is UNKNOWN, the delivery is non-admin traffic as far as we can tell, so it
+# stays open (the brief: "missing/old admin metadata fail-closes admin-involved
+# cross-node, NOT non-admin"). This is an explicit COMPAT FAIL-OPEN for legacy
+# rosters, NOT fail-closed — documented honestly per Codex r1. The teeth are:
+# the moment EITHER side is a KNOWN admin, an unknown counterpart fail-CLOSES.
+
+
+def _member_admin_tri(members: list[dict[str, Any]],
+                      pair: tuple[str, str]) -> str:
+    """Tri-state admin classification of (agent,node) from a cached roster list.
+
+    Absent member, or member without a known bit -> UNKNOWN (never non_admin).
+    """
+    for m in members:
+        if (str(m.get("agent", "")), str(m.get("node", ""))) == pair:
+            return admin_tri_from_member(m)
+    return ADMIN_TRI_UNKNOWN
+
+
+def admin_cross_node_authz(
+    *, sender_tri: str, target_tri: str,
+) -> tuple[bool, str]:
+    """The symmetric admin↔admin cross-node delivery rule (#2079).
+
+    Inputs are the TRI-STATE classifications of the two endpoints, already
+    resolved by the caller (with the LOCAL endpoint RECOMPUTED from this node's
+    configured admin id, never trusted from the cache/wire — see the receiver/
+    relay call sites). Returns (allowed, reason):
+
+      - Neither endpoint KNOWN-admin: allow (ADMIN_AUTHZ_NOT_ADMIN_INVOLVED).
+        Covers known-non-admin↔known-non-admin AND the rollout compat case
+        (unknown↔unknown / unknown↔known-non-admin) — non-admin traffic stays
+        open.
+      - Both endpoints KNOWN-admin: allow (ADMIN_AUTHZ_OK). The only admin-
+        involved delivery permitted.
+      - Exactly one endpoint KNOWN-admin, the other KNOWN-non-admin: DENY
+        (sender_not_admin / target_not_admin) — a non-admin must not reach an
+        admin, nor an admin a non-admin, across nodes.
+      - One endpoint KNOWN-admin, the other UNKNOWN: DENY
+        (admin_metadata_missing) — FAIL CLOSED. We refuse to deliver an admin-
+        involved leg against an endpoint whose admin status we cannot confirm
+        (the downgrade Codex r1 flagged: an unknown counterpart MUST NOT be
+        treated as non-admin and let through).
+
+    Purely functional (no db, no env) so both the receiver and the leader relay
+    apply the IDENTICAL decision, and the test harness can mutation-prove every
+    branch.
+    """
+    s_admin = sender_tri == ADMIN_TRI_ADMIN
+    t_admin = target_tri == ADMIN_TRI_ADMIN
+    if not s_admin and not t_admin:
+        # No KNOWN admin endpoint — non-admin traffic (or rollout-unknown),
+        # stays open. The symmetric rule only engages once a side is admin.
+        return True, ADMIN_AUTHZ_NOT_ADMIN_INVOLVED
+    if s_admin and t_admin:
+        return True, ADMIN_AUTHZ_OK
+    # Exactly one side is a KNOWN admin → require the OTHER side to be a KNOWN
+    # admin too. An unknown other side fail-closes (metadata_missing); a known-
+    # non-admin other side is the precise pair violation.
+    other_tri = target_tri if s_admin else sender_tri
+    if other_tri == ADMIN_TRI_UNKNOWN:
+        return False, ADMIN_AUTHZ_METADATA_MISSING
+    # other side is KNOWN non-admin
+    return False, (ADMIN_AUTHZ_TARGET_NOT_ADMIN if s_admin
+                   else ADMIN_AUTHZ_SENDER_NOT_ADMIN)
+
+
+def _resolve_admin_tri(members: list[dict[str, Any]], *, agent: str, node: str,
+                       this_node: str) -> str:
+    """Resolve an endpoint's admin tri-state for the authz predicate.
+
+    LOCAL OVERLAY (Codex r1 §E): if the endpoint's node IS this node, RECOMPUTE
+    its classification from this node's CONFIGURED admin id (`classify_local_
+    admin`) instead of trusting the cached/wire bit — the local node is the
+    authority on its own admin, and a cache can be stale or a remote-signed
+    roster could carry a wrong bit for a local member. For a REMOTE endpoint we
+    must trust the verified leader-MAC roster (we have no other source). A local
+    node with NO configured admin id yields None -> UNKNOWN (never non_admin).
+    """
+    if node and node == this_node:
+        local = classify_local_admin(agent)
+        if local is None:
+            return ADMIN_TRI_UNKNOWN
+        return ADMIN_TRI_ADMIN if local else ADMIN_TRI_NON_ADMIN
+    return _member_admin_tri(members, (str(agent), str(node)))
+
+
+def room_admin_authz_check(
+    conn: sqlite3.Connection, *, room_id: str, room_epoch: int,
+    sender_agent: str, sender_node: str, target_agent: str, target_node: str,
+    this_node: str,
+) -> tuple[bool, str]:
+    """Receiver-side #2079 admin-authz over the VERIFIED leader-MAC roster cache.
+
+    Runs AFTER `roster_cache_membership_check` has already confirmed both
+    endpoints are cached members at the cached epoch (so the cache row exists,
+    parses, and the epoch matches). Resolves each endpoint's admin tri-state
+    (recomputing the LOCAL endpoint from this node's configured admin id) and
+    applies `admin_cross_node_authz`. Returns (allowed, audit_reason). The
+    caller collapses any deny to the single generic 403; the reason is AUDIT-
+    ONLY (no reason-bearing wire response).
+
+    Defensive: if the cache is unexpectedly missing/corrupt at this point, fail
+    OPEN-to-membership is wrong — return (False, metadata_missing) so an admin-
+    involved delivery cannot slip through on a torn cache. A non-room / non-
+    admin path never reaches here.
+    """
+    row = get_roster_cache(conn, room_id)
+    if row is None or int(room_epoch) != int(row["epoch"]):
+        return False, ADMIN_AUTHZ_METADATA_MISSING
+    members = _cached_members(row)
+    if members is None:
+        return False, ADMIN_AUTHZ_METADATA_MISSING
+    sender_tri = _resolve_admin_tri(
+        members, agent=sender_agent, node=sender_node, this_node=this_node)
+    target_tri = _resolve_admin_tri(
+        members, agent=target_agent, node=target_node, this_node=this_node)
+    return admin_cross_node_authz(sender_tri=sender_tri, target_tri=target_tri)
+
+
+def _authoritative_member_admin_tri(
+    conn: sqlite3.Connection, *, room_id: str, agent: str, node: str,
+    this_node: str,
+) -> str:
+    """Endpoint admin tri-state from the leader's AUTHORITATIVE room_members.
+
+    Used by the leader relay (`_relay_resolve`): the leader holds the canonical
+    membership, so it reads `room_members.admin` directly rather than a cache.
+    LOCAL OVERLAY (Codex r1 §E): a member on the LEADER's OWN node is
+    reclassified from this node's configured admin id, never the stored bit.
+    A member absent from the room -> UNKNOWN.
+    """
+    if node and node == this_node:
+        local = classify_local_admin(agent)
+        if local is None:
+            return ADMIN_TRI_UNKNOWN
+        return ADMIN_TRI_ADMIN if local else ADMIN_TRI_NON_ADMIN
+    row = conn.execute(
+        "SELECT admin FROM room_members WHERE room_id=? AND agent=? AND node=?",
+        (room_id, agent, node),
+    ).fetchone()
+    if row is None:
+        return ADMIN_TRI_UNKNOWN
+    return admin_tri_from_col(row["admin"])
+
+
+def relay_admin_authz_check(
+    conn: sqlite3.Connection, *, room_id: str,
+    sender_agent: str, sender_node: str, target_agent: str, target_node: str,
+    this_node: str,
+) -> tuple[bool, str]:
+    """Leader-relay #2079 admin-authz over the AUTHORITATIVE room_members.
+
+    The leader applies the SAME `admin_cross_node_authz` rule BEFORE forwarding
+    a relayed room message, reading the canonical `room_members.admin` (with the
+    leader's own node recomputed locally). A deny collapses to the same generic
+    403 the receiver returns. Returns (allowed, audit_reason).
+    """
+    sender_tri = _authoritative_member_admin_tri(
+        conn, room_id=room_id, agent=sender_agent, node=sender_node,
+        this_node=this_node)
+    target_tri = _authoritative_member_admin_tri(
+        conn, room_id=room_id, agent=target_agent, node=target_node,
+        this_node=this_node)
+    return admin_cross_node_authz(sender_tri=sender_tri, target_tri=target_tri)
 
 
 def accept_roster_broadcast(
@@ -2584,19 +2986,32 @@ def _reserve_roster_dedupe_only(
     return ROSTER_DUPLICATE
 
 
-def _canonical_member_list(members: list[dict[str, Any]]) -> list[dict[str, str]]:
+def _canonical_member_list(members: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Re-sort + normalize a roster member list to the canonical (agent,node)
     ordering, so the stored cache bytes are reproducible regardless of the
     wire order (defensive — the leader already sorts, but a verifier must not
-    depend on the sender's ordering for its stored canonical form)."""
-    norm = [
-        {
+    depend on the sender's ordering for its stored canonical form).
+
+    #2079: the OPTIONAL "bridge_admin" bool is preserved EXACTLY — present only
+    when the inbound member carried a real bool (known), omitted otherwise
+    (unknown). We must NOT default it to false here: that would forge a known-
+    non-admin classification for a legacy/unattested member (the downgrade
+    Codex r1 flagged). Key-absent stays key-absent through canonicalization, so
+    the re-canonicalized bytes a verifier stores match the leader-signed bytes.
+    """
+    norm: list[dict[str, Any]] = []
+    for m in members:
+        entry: dict[str, Any] = {
             "agent": str(m.get("agent", "")),
             "node": str(m.get("node", "")),
             "role": str(m.get("role", "")),
         }
-        for m in members
-    ]
+        tri = admin_tri_from_member(m)
+        if tri == ADMIN_TRI_ADMIN:
+            entry["bridge_admin"] = True
+        elif tri == ADMIN_TRI_NON_ADMIN:
+            entry["bridge_admin"] = False
+        norm.append(entry)
     norm.sort(key=lambda m: (m["agent"], m["node"]))
     return norm
 
