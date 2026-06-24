@@ -128,13 +128,47 @@ def main() -> int:
     ok("ipv4_mapped_norm", recv_accepts("trusted-routed", "10.0.0.9",
                                         {"hostname": "mapped.example"}))
 
-    # 5. malformed hostname rejects (no address fallback).
+    # 5. malformed hostname (non-string) rejects (no address fallback).
     _reset()
     try:
         a2a.resolve_peer_address({"hostname": 123, "address": "10.0.0.1"})
         ok("malformed_hostname", False, "expected reject")
     except a2a.A2AError as e:
         ok("malformed_hostname", e.code == "resolve_shape", f"code={e.code}")
+
+    # 5b. ★dot-only hostname is a MALFORMED selected key — it must FAIL CLOSED,
+    #     NOT silently fall back to the literal `address` (#16247 patch-dev
+    #     review finding). Sender AND receiver.
+    _reset()
+    for dotonly in (".", "..", " . "):
+        try:
+            a2a.resolve_peer_address({"hostname": dotonly, "address": "10.0.0.1"})
+            ok("dotonly_sender_failclosed", False, f"{dotonly!r} fell back")
+            break
+        except a2a.A2AError as e:
+            if e.code != "resolve_hostname_blank":
+                ok("dotonly_sender_failclosed", False, f"{dotonly!r} code={e.code}")
+                break
+    else:
+        ok("dotonly_sender_failclosed", True)
+    _reset()
+    try:
+        a2a.peer_source_addresses("trusted-routed",
+                                  {"hostname": ".", "address": "10.0.0.1"})
+        ok("dotonly_recv_failclosed", False, "receiver produced a set")
+    except a2a.A2AError as e:
+        ok("dotonly_recv_failclosed", e.code == "resolve_hostname_blank", e.code)
+
+    # 5c. a truly BLANK/absent hostname key stays absent (back-compat) — the
+    #     legacy literal `address` still applies (patch-dev preserved boundary).
+    _reset()
+    ok("blank_hostname_uses_address",
+       a2a.resolve_peer_address({"hostname": "", "address": "10.0.0.1"})
+       == "10.0.0.1")
+    _reset()
+    ok("whitespace_hostname_uses_address",
+       a2a.resolve_peer_address({"hostname": "   ", "address": "10.0.0.2"})
+       == "10.0.0.2")
 
     # 6. routed transport rejects a tailscale key even alongside hostname.
     _reset({"h.example": ["10.0.0.9"]})

@@ -811,12 +811,30 @@ def normalize_hostname(value: Any) -> str:
     A non-string `hostname` is a hard A2AError (no `address` fallback). An
     FQDN compare is case-insensitive and a trailing dot is insignificant, so
     both are folded away for a stable cache key.
+
+    Absent (None) or a blank/whitespace-only string is treated as **absent**
+    (returns '') — an optional key the entry simply does not set, so the
+    legacy literal `address` may still apply. But a NON-blank value that
+    normalizes to empty — a dot-only name like ``"."`` / ``".."`` / ``" . "``
+    (the DNS root, never a peer) — is a **malformed SELECTED hostname**, not an
+    absent key: it fails CLOSED (A2AError), never silently re-enabling the
+    literal-`address` fallback the no-fallback contract removes (#16247 review).
     """
     if value is None:
         return ""
     if not isinstance(value, str):
         raise A2AError("'hostname' must be a string", code="resolve_shape")
-    return value.strip().rstrip(".").lower()
+    stripped = value.strip()
+    if not stripped:
+        return ""
+    host = stripped.rstrip(".").lower()
+    if not host:
+        raise A2AError(
+            f"'hostname' {value!r} is not a usable DNS name — refusing to "
+            "fall back to a literal address.",
+            code="resolve_hostname_blank",
+        )
+    return host
 
 
 def _getaddrinfo_bounded(host: str, timeout: float) -> frozenset[str]:

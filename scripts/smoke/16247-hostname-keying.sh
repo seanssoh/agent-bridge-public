@@ -46,7 +46,10 @@ main() {
   local expect=(
     precedence_node_id_shadows sender_first_ip
     recv_multi_a_first recv_multi_a_nonfirst recv_off_set_rejected
-    ipv4_mapped_norm malformed_hostname routed_rejects_tskey
+    ipv4_mapped_norm malformed_hostname
+    dotonly_sender_failclosed dotonly_recv_failclosed
+    blank_hostname_uses_address whitespace_hostname_uses_address
+    routed_rejects_tskey
     failclosed_first neg_cache_second cache_serves_on_blip
     failclosed_after_expiry bounded_timeout
     backcompat_raw_single backcompat_raw_set hostname_norm_cache_key
