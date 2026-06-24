@@ -26,6 +26,7 @@ import shutil
 import socket
 import sqlite3
 import subprocess
+import threading
 import time
 import urllib.request
 import uuid
@@ -748,20 +749,202 @@ def _name_matches(node: dict[str, Any], name: str) -> bool:
     return False
 
 
+# --------------------------------------------------------------------------
+# Hostname (DNS A/AAAA) peer keying (#16247)
+# --------------------------------------------------------------------------
+#
+# A 4th peer-identity leg: a peer may key on a fixed DNS `hostname` (e.g. a
+# Cloudflare-managed `<handle>.cosmaxcf.com`) that resolves — via the host
+# resolver / split-horizon DNS — to that peer's CURRENT IP. Like the
+# Tailscale identity legs, the stored value is an IDENTITY, never a trusted
+# address: every use live-resolves it (getaddrinfo) and fails CLOSED on an
+# unresolvable name — we never fall back to a literal `address`. `hostname`
+# is transport-AGNOSTIC (getaddrinfo works on any substrate), so unlike the
+# Tailscale keys it is valid for the routed transports too.
+#
+# Resolution is BOUNDED (a daemon thread + join-timeout) because the receiver
+# resolves the sender's hostname BEFORE reading the body (the source-address
+# check), so a hung resolver on untrusted traffic must not block the receiver
+# thread. Results are cached for HOSTNAME_CACHE_TTL so repeated inbound POSTs
+# don't hammer DNS; a still-valid cache entry is served even if a concurrent
+# re-resolve would fail (a transient DNS blip must not 403 a peer inside its
+# freshness window). Lookup FAILURES are negatively cached for a short window
+# (fail-closed) so repeated spoofed requests for a known peer don't force
+# resolver work before every 403.
+
+HOSTNAME_CACHE_TTL = 45.0          # seconds a positive hostname->IPs set is fresh
+HOSTNAME_NEG_CACHE_TTL = 5.0       # seconds a lookup FAILURE is remembered (fail-closed)
+HOSTNAME_LOOKUP_TIMEOUT = 5.0      # seconds before a getaddrinfo is abandoned
+
+# hostname -> (frozenset[str] of normalized IPs, expiry_monotonic). An EMPTY
+# frozenset is a NEGATIVE entry (a recent lookup failed) and means "reject"
+# until it expires.
+_HOSTNAME_CACHE: dict[str, tuple[frozenset[str], float]] = {}
+_HOSTNAME_CACHE_LOCK = threading.Lock()
+
+
+def normalize_ip(value: str) -> str:
+    """Canonicalize an IP string for an apples-to-apples compare.
+
+    Collapses an IPv4-mapped IPv6 address (``::ffff:10.0.0.1``) to its IPv4
+    form so a getaddrinfo AAAA result and an IPv4 ``remote_addr`` compare
+    equal, and normalizes textual form (zero-compression etc). Returns the
+    stripped input unchanged on any parse failure (callers then compare it as
+    an opaque string — never silently equal to a real IP).
+    """
+    text = (value or "").strip()
+    if not text:
+        return ""
+    try:
+        ip = ipaddress.ip_address(text)
+    except ValueError:
+        return text
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    return str(ip)
+
+
+def normalize_hostname(value: Any) -> str:
+    """Validate + canonicalize a `hostname` key. Returns '' when absent/blank.
+
+    A non-string `hostname` is a hard A2AError (no `address` fallback). An
+    FQDN compare is case-insensitive and a trailing dot is insignificant, so
+    both are folded away for a stable cache key.
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise A2AError("'hostname' must be a string", code="resolve_shape")
+    return value.strip().rstrip(".").lower()
+
+
+def _getaddrinfo_bounded(host: str, timeout: float) -> frozenset[str]:
+    """Run getaddrinfo(AF_UNSPEC) under a hard timeout; return normalized IPs.
+
+    getaddrinfo is a blocking C call with no native timeout, so it runs in a
+    daemon thread joined with ``timeout``. A timeout raises A2AError (the
+    orphaned daemon thread is harmless); a resolver error raises A2AError; an
+    empty result raises A2AError — all fail CLOSED (never accept an
+    unresolvable name).
+    """
+    result: dict[str, Any] = {}
+
+    def _worker() -> None:
+        try:
+            infos = socket.getaddrinfo(
+                host, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
+            ips = {normalize_ip(str(info[4][0])) for info in infos}
+            result["ips"] = frozenset(ip for ip in ips if ip)
+        except Exception as exc:  # noqa: BLE001 — fail closed on ANY resolver error
+            result["error"] = exc
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        raise A2AError(
+            f"DNS lookup for hostname {host!r} exceeded {timeout:.0f}s — "
+            "refusing to block the receiver on an unresolvable name.",
+            code="resolve_hostname_timeout",
+        )
+    if "error" in result:
+        raise A2AError(
+            f"DNS lookup for hostname {host!r} failed: {result['error']}",
+            code="resolve_hostname_failed",
+        )
+    ips = result.get("ips") or frozenset()
+    if not ips:
+        raise A2AError(
+            f"hostname {host!r} resolved to no usable IP — refusing to fall "
+            "back to a stored address.",
+            code="resolve_hostname_empty",
+        )
+    return ips
+
+
+def resolve_hostname_ips(hostname: str) -> frozenset[str]:
+    """Resolve a `hostname` key to its CURRENT IP set, cached + fail-closed.
+
+    Serves a still-valid cached set WITHOUT touching DNS. On a cache
+    miss/expiry it re-resolves; a resolver failure is negatively cached for a
+    short window and re-raised as A2AError (the caller rejects). A still-valid
+    positive entry is served even if a fresh lookup would currently fail, so a
+    transient DNS blip inside the freshness window does not 403 the peer.
+    """
+    host = normalize_hostname(hostname)
+    if not host:
+        raise A2AError("empty hostname key", code="resolve_hostname_blank")
+    now = time.monotonic()
+    with _HOSTNAME_CACHE_LOCK:
+        cached = _HOSTNAME_CACHE.get(host)
+        if cached is not None and cached[1] > now:
+            ips, _exp = cached
+            if ips:
+                return ips
+            raise A2AError(
+                f"hostname {host!r} is in a fail-closed negative-cache window "
+                "after a recent lookup failure.",
+                code="resolve_hostname_neg_cache",
+            )
+    # Miss or expired → resolve live (outside the lock so a slow lookup does
+    # not serialize every receiver thread).
+    try:
+        ips = _getaddrinfo_bounded(host, HOSTNAME_LOOKUP_TIMEOUT)
+    except A2AError:
+        with _HOSTNAME_CACHE_LOCK:
+            _HOSTNAME_CACHE[host] = (frozenset(), now + HOSTNAME_NEG_CACHE_TTL)
+        raise
+    with _HOSTNAME_CACHE_LOCK:
+        _HOSTNAME_CACHE[host] = (ips, now + HOSTNAME_CACHE_TTL)
+    return ips
+
+
+def _first_resolved_ip(ips: frozenset[str]) -> str:
+    """A deterministic single IP from a resolved set (for a SENDER target).
+
+    The receiver source-check uses the FULL set (multi-homed safe); the
+    sender just needs one stable, reachable target, so pick the lowest by
+    sorted order (stable across calls for the same set).
+    """
+    return sorted(ips)[0]
+
+
+def _hostname_is_selected(entry: dict[str, Any]) -> bool:
+    """True when `hostname` is the EFFECTIVE identity leg for this entry.
+
+    Precedence: a Tailscale identity (`node_id`/`tailscale_name`) SHADOWS
+    `hostname`, so a shadowed hostname is never consulted (and never
+    validated). When no Tailscale identity is present, a non-blank `hostname`
+    is selected over the literal `address` (a non-string hostname is a hard
+    error via `normalize_hostname`).
+    """
+    node_id = entry.get("node_id")
+    ts_name = entry.get("tailscale_name")
+    has_ts_identity = (isinstance(node_id, str) and node_id.strip()) or (
+        isinstance(ts_name, str) and ts_name.strip())
+    if has_ts_identity:
+        return False
+    return bool(normalize_hostname(entry.get("hostname")))
+
+
 def resolve_peer_address(entry: dict[str, Any]) -> str:
     """Resolve a peer or `listen` dict to a current Tailscale IP (or literal).
 
-    Precedence (matches the design §8):
+    Precedence (matches the design §8 + #16247):
       1. `node_id`  (Tailscale StableID) → match on a node's `ID`.
       2. `tailscale_name` (MagicDNS/HostName) → match on HostName / DNSName.
-      3. legacy `address` → returned verbatim (full back-compat).
+      3. `hostname` (DNS A/AAAA) → live getaddrinfo (fail-closed + cached).
+      4. legacy `address` → returned verbatim (full back-compat).
 
-    When an identity (`node_id` / `tailscale_name`) is present it is resolved
-    live via `tailscale status --json`; a failure to resolve is a HARD error
-    (TailscaleUnavailable if Tailscale cannot be queried at all, otherwise
-    A2AError) — we deliberately do NOT silently fall back to a possibly-stale
-    `address`, because the whole point of keying on an identity is to avoid
-    trusting a stored IP.
+    When an identity (`node_id` / `tailscale_name` / `hostname`) is present it
+    is resolved live (`tailscale status --json` resp. getaddrinfo); a failure
+    to resolve is a HARD error (TailscaleUnavailable if Tailscale cannot be
+    queried at all, otherwise A2AError) — we deliberately do NOT silently fall
+    back to a possibly-stale `address`, because the whole point of keying on
+    an identity is to avoid trusting a stored IP. This returns ONE address (a
+    sender target); the receiver source-check uses `peer_source_addresses`
+    for the full multi-homed set.
     """
     if not isinstance(entry, dict):
         raise A2AError("address entry must be an object", code="resolve_shape")
@@ -772,6 +955,12 @@ def resolve_peer_address(entry: dict[str, Any]) -> str:
     has_ts_name = isinstance(ts_name, str) and ts_name.strip()
 
     if not has_node_id and not has_ts_name:
+        # No Tailscale identity. A `hostname` key (DNS A/AAAA) takes
+        # precedence over a literal `address` and live-resolves fail-closed,
+        # exactly like the Tailscale legs.
+        hostname = normalize_hostname(entry.get("hostname"))
+        if hostname:
+            return _first_resolved_ip(resolve_hostname_ips(hostname))
         # Legacy raw-IP path — no identity to resolve, return the literal.
         address = entry.get("address", "")
         if not isinstance(address, str):
@@ -1730,10 +1919,17 @@ def resolve_peer_address_for_transport(
                 isinstance(ts_name, str) and ts_name.strip()):
             raise A2AError(
                 f"a {kind} peer/listen entry must key on a raw private "
-                "'address', not a Tailscale node_id/tailscale_name. Remove "
-                "the Tailscale identity keys.",
+                "'address' or a DNS 'hostname', not a Tailscale "
+                "node_id/tailscale_name. Remove the Tailscale identity keys.",
                 code="warp_identity_misconfig",
             )
+        # A `hostname` key (DNS A/AAAA) is transport-AGNOSTIC — getaddrinfo
+        # works on the routed substrate the same as anywhere — and takes
+        # precedence over the raw literal `address`, so a routed peer can
+        # track its current private IP by DNS (#16247). Fail-closed + cached.
+        hostname = normalize_hostname(entry.get("hostname"))
+        if hostname:
+            return _first_resolved_ip(resolve_hostname_ips(hostname))
         address = entry.get("address", "")
         if not isinstance(address, str):
             raise A2AError("'address' must be a string", code="resolve_shape")
@@ -1749,6 +1945,35 @@ def resolve_peer_address_for_transport(
         return address
     # Default: the unchanged Tailscale resolver (raw-IP back-compat included).
     return resolve_peer_address(entry)
+
+
+def peer_source_addresses(kind: str, entry: dict[str, Any]) -> set[str]:
+    """Receiver-side source-address MEMBERSHIP set for a peer/`listen` entry.
+
+    The receiver accepts an inbound POST only if its `remote_addr` is the
+    peer's CURRENT address. A `hostname`-keyed peer can have MULTIPLE current
+    A/AAAA records (multi-homed / round-robin), so it resolves to the FULL set
+    and the receiver accepts membership; every other key (Tailscale identity,
+    raw literal) yields the single resolved IP as a 1-element set — byte-
+    identical to the prior single-string check. Every address is normalized
+    (IPv4-mapped collapsed) so the caller can compare a normalized
+    `remote_addr`.
+
+    Fail CLOSED: a resolver error propagates (A2AError → the caller rejects)
+    and an empty set means reject. This is the multi-IP companion to the
+    single-IP `resolve_peer_address_for_transport`; both share the hostname
+    cache so the sender target is always within the receiver's accepted set.
+    """
+    if not isinstance(entry, dict):
+        raise A2AError("address entry must be an object", code="resolve_shape")
+    if _hostname_is_selected(entry):
+        # The only key that can map to multiple current IPs.
+        hostname = normalize_hostname(entry.get("hostname"))
+        return {normalize_ip(ip) for ip in resolve_hostname_ips(hostname)}
+    # Every other key resolves to a single current IP. Delegating keeps the
+    # Tailscale-key rejection + literal-IP validation in exactly one place.
+    single = normalize_ip(resolve_peer_address_for_transport(kind, entry))
+    return {single} if single else set()
 
 
 # --------------------------------------------------------------------------
