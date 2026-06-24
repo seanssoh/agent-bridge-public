@@ -1460,7 +1460,7 @@ bridge_claude_token_recovery_state_file() {
 }
 
 bridge_claude_pool_exhausted_state_file() {
-  printf '%s/usage/claude-pool-exhausted.env' "$BRIDGE_STATE_DIR"
+  printf '%s/usage/claude-pool-exhausted.env' "$BRIDGE_STATE_DIR"  # noqa: iso-helper-boundary (daemon state-stamp under BRIDGE_STATE_DIR, like claude-token-recovery.env — not an iso agent-env file)
 }
 
 # #1789 (D2 pool-level cooldown): convert an ISO-8601 timestamp to an epoch
