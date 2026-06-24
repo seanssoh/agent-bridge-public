@@ -257,6 +257,52 @@ describe('validateCardIntent', () => {
     bad.sections = []
     expect(validateCardIntent(bad).ok).toBe(false)
   })
+
+  // --- fail-closed type-confusion (Phase-4 review findings) ---------------
+  // A non-string actionId/valueState would stringify past a `String(...)`
+  // -based enum check. These MUST be rejected by type, not coerced.
+  test('rejects an array-wrapped actionId (type-confusion bypass)', () => {
+    const bad: any = validListIntent()
+    bad.actions[0].actionId = ['openQuoteResultDetail']
+    expect(validateCardIntent(bad).ok).toBe(false)
+  })
+
+  test('rejects an array-wrapped valueState (would fall through to raw value leak)', () => {
+    const bad: any = validListIntent()
+    bad.sections[0].rows[0].valueState = ['calculating']
+    expect(validateCardIntent(bad).ok).toBe(false)
+  })
+
+  test('rejects a payload that carries an actionId (override attempt)', () => {
+    const bad: any = validListIntent()
+    bad.actions[0].payload = { actionId: 'deleteEverything', quoteId: 'q1' }
+    expect(validateCardIntent(bad).ok).toBe(false)
+  })
+})
+
+describe('renderer is authoritative / non-leaking (defense-in-depth)', () => {
+  test('toSubmitAction: validated actionId wins over a payload.actionId', () => {
+    // Even if a payload.actionId slipped past validation, the rendered card's
+    // data.actionId must be the validated, enum-checked id.
+    const card: any = buildAdaptiveCard({
+      kind: 'quoteResult',
+      title: 't',
+      fallbackMarkdown: 's',
+      sections: [
+        { label: '금액강조', rows: [{ label: 'a', value: '1', valueState: 'value' }] },
+      ],
+      actions: [
+        { actionId: 'openQuoteResultDetail', label: 'go', payload: { actionId: 'deleteEverything' } as any },
+      ],
+    })
+    expect(card.actions[0].data.actionId).toBe('openQuoteResultDetail')
+  })
+
+  test('renderValueState: unexpected state renders masked, never the raw value', () => {
+    const r: any = renderValueState({ label: 'x', value: 'SECRET-9999', valueState: 'mystery' as any })
+    expect(r.text).not.toBe('SECRET-9999')
+    expect(r.text).toBe('●●●')
+  })
 })
 
 // ---------------------------------------------------------------------------

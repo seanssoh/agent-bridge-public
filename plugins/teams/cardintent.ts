@@ -190,14 +190,23 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
 
 function validateAction(a: unknown, where: string): string | null {
   if (!isPlainObject(a)) return `${where}: action must be an object`
-  if (!(ACTION_IDS as readonly string[]).includes(String(a.actionId))) {
-    return `${where}: actionId "${String(a.actionId)}" not in the allowed enum`
+  // Fail-closed: actionId must be a STRING in the closed enum. A non-string
+  // (e.g. the array `["openQuoteResultDetail"]`) would stringify to an allowed
+  // id and slip past a `String(...)`-based check — reject it by type first.
+  if (typeof a.actionId !== 'string' || !(ACTION_IDS as readonly string[]).includes(a.actionId)) {
+    return `${where}: actionId "${String(a.actionId)}" not a string in the allowed enum`
   }
   if (typeof a.label !== 'string' || a.label.length === 0) {
     return `${where}: action.label must be a non-empty string`
   }
   if (a.payload !== undefined && !isPlainObject(a.payload)) {
     return `${where}: action.payload must be an object when present`
+  }
+  // payload is an identifier allowlist only — it must NOT carry an `actionId`
+  // (that would let a malicious payload override the validated, enum-checked id
+  // in the rendered card).
+  if (isPlainObject(a.payload) && 'actionId' in a.payload) {
+    return `${where}: action.payload must not contain an actionId key`
   }
   return null
 }
@@ -209,8 +218,12 @@ function validateRow(r: unknown, where: string): string | null {
   if (typeof r.value !== 'string') {
     return `${where}: row.value must be a string (got ${typeof r.value})`
   }
-  if (!(VALUE_STATES as readonly string[]).includes(String(r.valueState))) {
-    return `${where}: row.valueState "${String(r.valueState)}" not in the allowed enum`
+  // Fail-closed: valueState must be a STRING in the closed enum. A non-string
+  // (e.g. `["calculating"]`) would stringify past a `String(...)` check, then
+  // miss every `switch` case in renderValueState and fall through to the raw
+  // `row.value` — leaking a value that should have been masked/withheld.
+  if (typeof r.valueState !== 'string' || !(VALUE_STATES as readonly string[]).includes(r.valueState)) {
+    return `${where}: row.valueState "${String(r.valueState)}" not a string in the allowed enum`
   }
   return null
 }
@@ -278,8 +291,11 @@ export function renderValueState(row: Row): RenderedValue {
     case 'masked':
       return { text: '●●●', color: 'Accent' }
     default:
-      // Unreachable after validation, but keep the renderer total.
-      return { text: row.value, color: 'Default' }
+      // Unreachable after validation (valueState is enum-checked to a string).
+      // Defense-in-depth: NEVER fall through to the raw `row.value` — an
+      // unexpected state must not leak a value that a masked/withheld state
+      // would have hidden. Render the masked placeholder instead.
+      return { text: '●●●', color: 'Accent' }
   }
 }
 
@@ -340,7 +356,10 @@ function toSubmitAction(a: Action): AcElement {
   return {
     type: 'Action.Submit',
     title: a.label,
-    data: { actionId: a.actionId, ...a.payload },
+    // actionId LAST so the validated, enum-checked id is authoritative and a
+    // payload key can never override it (defense-in-depth; validateAction also
+    // rejects a payload carrying actionId).
+    data: { ...a.payload, actionId: a.actionId },
   }
 }
 
