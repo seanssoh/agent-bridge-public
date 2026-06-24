@@ -1646,7 +1646,22 @@ select_for_path() {
       # no token material. Pull on every ms365/server.ts move so a refactor
       # cannot silently drop the cross-process serialization back to the
       # in-process-only SingleFlight that double-consumes across processes.
-      add_required 1209-ms365-redirect-resolver 1210-ms365-scope-normalize 1215-ms365-dir-mode 1343-ms365-token-refresh 1650-ms365-get-valid-token 1825-ms365-token-key-by-claim 2035-ms365-token-freshness 2048-ms365-xproc-refresh-lock beta5-2-zeta-teams-mcp-dedup beta5-2-xi-misc-fixes
+      # Issue #1650 (refresh-scope continuity): doRefresh now sends the
+      # refresh_token grant scope through withOfflineAccess(...) so every
+      # refresh keeps `offline_access` — the scope that authorizes
+      # refresh_token issuance + rotation. Microsoft's token-endpoint response
+      # echoes only the narrowed RESOURCE scopes (drops offline_access/openid/
+      # profile); the plugin persisted that narrowed scope and sent it verbatim
+      # on the next refresh, so the second refresh onward dropped offline_access
+      # and Entra silently stopped renewing the refresh_token → the token "sat
+      # expired" and the next Graph/CRM call surfaced `Authentication required`.
+      # The 1650-ms365-refresh-scope-continuity smoke drives the REAL server.ts
+      # get-valid-token CLI with a narrowed-scope fetch-mock across successive
+      # expiry cycles and asserts every grant carries offline_access; a revert
+      # of the fix drops it on the 2nd+ grant, so the pass is mutation-proven.
+      # Pull on every ms365/server.ts move so a refactor cannot silently
+      # re-introduce the scope drift.
+      add_required 1209-ms365-redirect-resolver 1210-ms365-scope-normalize 1215-ms365-dir-mode 1343-ms365-token-refresh 1650-ms365-get-valid-token 1650-ms365-refresh-scope-continuity 1825-ms365-token-key-by-claim 2035-ms365-token-freshness 2048-ms365-xproc-refresh-lock beta5-2-zeta-teams-mcp-dedup beta5-2-xi-misc-fixes
       add_integration integration-minimal
       ;;
 
