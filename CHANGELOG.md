@@ -4,6 +4,14 @@ All notable changes to Agent Bridge are documented here. This project adheres
 loosely to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and tracks
 version bumps via the `VERSION` file.
 
+## [0.17.0-beta2.1] — 2026-06-25 (mainline · beta · restart-safety hotfix)
+
+**v0.17.0-beta2.1 — a fleet restart-safety hotfix on top of beta2.** beta2's Teams Adaptive Card renderer added `bun-types` as a type-only `devDependency` for its typecheck. The plugin-cache seed treats every nested `package.json` — including `node_modules/bun-types/package.json` — as a **channel-required** contract file, but the node_modules copy skipped `bun-types`, so the `teams` plugin **failed to link into the cache** (`linked-failed`, criticality=channel-required). The practical blast radius (confirmed in cm-prod soak) is broader than a blocked re-seed: a **channel-required `linked-failed` teams plugin bricks any bot (re)start** — the bot exits immediately after launch. `always_on` bots survive only while never restarted (`--no-restart`); a daemon crash / upgrade / kill would brick them. This release removes the hazard.
+
+### Channels / packaging
+
+- **teams: drop the `bun-types` type-only devDependency + bump 0.1.1 → 0.1.2 (#2097).** `bun-types` is removed from `devDependencies` (bun provides `bun:test` natively at runtime; it was only needed for `tsc`), so `node_modules` no longer carries it and the seed contract has nothing to miss — the channel-required `teams` plugin links clean (`linked-verified`) and bots start normally. A minimal `bun:test` ambient shim keeps `bun run typecheck` passing without the package. The plugin version bump makes a fleet reseed **version-triggered** (clean refresh) rather than force-only — the same-version staleness that masked the regression. **No runtime/renderer change**: the Adaptive Card renderer is byte-unchanged and remains **dark-launched / dormant** (`AC_QUOTE_RESULT_CARD` defaults OFF). The deeper plugin-cache seed contract bug — which can recur for any plugin declaring a type-only or symlinked dependency — is tracked separately ([#2098](https://github.com/seanssoh/agent-bridge-public/issues/2098)).
+
 ## [0.17.0-beta2] — 2026-06-24 (mainline · beta)
 
 **v0.17.0-beta2 — a Teams Adaptive Card renderer (dark-launched / dormant) on top of beta1, plus the v0.16.16 stabilization fixes that landed on `main` after beta1, folded into the v0.17 line.** Like beta1 this is a live-test vehicle, not a promotion — the `v0.16.x` LTS line continues independently and is **not** this prerelease. The Adaptive Card feature ships **dormant**: the CRM core defaults its `AC_QUOTE_RESULT_CARD` flag OFF, so the renderer is inert until a later opt-in light-up — a beta2 install sees **zero behavior change** until then. Each PR carried its own internal codex review; this cut adds a full orchestrator Phase-4 pair-review on the new feature (which caught and fixed three fail-closed/spoofing bugs before merge) on top of green Linux CI.
