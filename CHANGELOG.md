@@ -4,6 +4,26 @@ All notable changes to Agent Bridge are documented here. This project adheres
 loosely to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and tracks
 version bumps via the `VERSION` file.
 
+## [0.17.0-beta2] — 2026-06-24 (mainline · beta)
+
+**v0.17.0-beta2 — a Teams Adaptive Card renderer (dark-launched / dormant) on top of beta1, plus the v0.16.16 stabilization fixes that landed on `main` after beta1, folded into the v0.17 line.** Like beta1 this is a live-test vehicle, not a promotion — the `v0.16.x` LTS line continues independently and is **not** this prerelease. The Adaptive Card feature ships **dormant**: the CRM core defaults its `AC_QUOTE_RESULT_CARD` flag OFF, so the renderer is inert until a later opt-in light-up — a beta2 install sees **zero behavior change** until then. Each PR carried its own internal codex review; this cut adds a full orchestrator Phase-4 pair-review on the new feature (which caught and fixed three fail-closed/spoofing bugs before merge) on top of green Linux CI.
+
+### Channels
+
+- **Teams Adaptive Card `quoteResult` renderer — `cardintent` fenced pass-through, Model B (#2096).** The `@agent-bridge/teams` plugin now extracts a `cardintent` fenced block from the agent's outbound reply text and renders it as a Microsoft Adaptive Card v1.2 attachment (FactSet / ColumnSet ≤3 columns, no `Table`/`targetWidth`, `valueState`→문구·색 mapping) alongside the text. **Additive + fail-closed**: with no fence the existing reply is byte-for-byte unchanged; any parse / validation / §10 / render failure degrades to graceful text-only (never throws into the send); and the raw fenced JSON is always stripped from what the user sees. CardIntent validation is fully fail-closed — string-typed closed enums for `actionId` / `valueState`, and a payload may not override the validated `actionId` — and a §10 forbidden-cost-key golden scans the rendered card bytes. Ships **dark-launched / dormant**. (The forbidden-key list is a contract-derived placeholder pending the vendored `forbidden_cost_keys.gen.json` hash-pin.)
+
+### Folded v0.16.16 stabilization (from `main`, post-beta1)
+
+The seven v0.16.16-line fixes that landed on `main` after the beta1 cut, folded into the v0.17 line (each merged to `main` with its own green CI + codex / patch review; the `ci-select` required-set was union-merged exactly, with zero dangling smoke tokens):
+
+- **#2091 (#1990)** — hooks: per-writer unique temp for the concurrent settings-render race (ends the `plugin_mcp_liveness_restart_failed` flap).
+- **#2089 (#1653)** — upgrade: clear a spurious conflict sidecar that holds no recovery.
+- **#2088 (#1789)** — daemon: pool-level cooldown for saturated claude-token rotation.
+- **#2086 (#1650)** — ms365: always send `offline_access` on the refresh-token grant.
+- **#2083 (#16309)** — config: allowlist `BRIDGE_QUEUE_GATEWAY_TIMEOUT_SECONDS` as a tunable env knob.
+- **#2092** — ci: restore green after #2089 (raw-pathlib noqa + heredoc baseline row).
+- **#2094** — docs: the LTS branch is protected; force-pushes are CI-gated.
+
 ## [0.17.0-beta1] — 2026-06-22 (mainline · beta)
 
 **v0.17.0-beta1 — the first cut of the v0.17 feature line (beta — features still landing).** This forks the mainline from `v0.16.16-rc2` and carries the `v0.16.16-rc3` hardening already on `main`; the **v0.16.x LTS line continues independently** (the `lts` / Latest head is unchanged and is NOT this prerelease). As a beta it is a live-test vehicle, not a promotion — expect further v0.17 features to land on top before a stable v0.17.0. First-batch features (each carried its own internal codex review at park time; this cut is the integration gate — full Linux CI + codex integration review):
