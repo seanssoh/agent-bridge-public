@@ -21,13 +21,16 @@
 # XDG_RUNTIME_DIR fails "connect to bus" and is NOT logged — closing the CI blind
 # spot that masked the r2 regression), and asserts (with the test env
 # XDG_RUNTIME_DIR UNSET so the helpers MUST establish it):
-#   T1 — systemd-active quiesce stops the liveness TIMER, then the SERVICE
-#        (timer first so it can't re-fire the service).
-#   T2 — systemd restart starts the SERVICE, then re-arms the liveness TIMER.
+#   T1 — systemd-active quiesce stops ONLY the SERVICE (#2064: the liveness TIMER
+#        is LEFT RUNNING so a SIGKILL'd upgrade still has an invoker for the
+#        quiesce marker; the watcher's live-upgrade DEFER guard avoids the fence
+#        race that stopping the timer used to prevent).
+#   T2 — systemd restart starts the SERVICE, then re-arms the liveness TIMER
+#        (idempotent on an already-running timer).
 #   T3 — NON-systemd path (detector → false) makes ZERO systemctl calls
 #        (byte-for-byte unchanged behavior) even with systemctl on PATH.
 #   T4/T5 — inline-fallback detector: inactive → is-active probe only; active →
-#        timer-then-service stop.
+#        stop the SERVICE only (#2064: no timer stop).
 #   T6 — _bridge_upgrade_systemd_user_bus_ready exports XDG_RUNTIME_DIR from
 #        /run/user/<uid> when unset, respects an already-set value, and fails
 #        (rc!=0) when no user runtime dir exists.
@@ -162,20 +165,23 @@ run_helper_inline_fallback() {
   " 2>/dev/null
 }
 
-# --- T1: systemd-active quiesce stops timer THEN service ---------------------
+# --- T1: systemd-active quiesce stops ONLY the SERVICE (#2064: leaves timer up) -
+# Issue #2064 (Finding 2): the quiesce no longer stops agent-bridge-daemon-liveness
+# .timer. Stopping it was the old way to keep the watcher from racing the #1820
+# fence, but it left a SIGKILL'd upgrade with no running invoker to observe the
+# quiesce marker → daemon stuck down. The timer now stays running; the watcher's
+# live_upgrade_quiesce_in_flight DEFER guard keeps it from racing the fence while
+# the upgrade pid is alive. So the quiesce makes exactly ONE mutating call —
+# stop the SERVICE — and MUST NOT stop the timer.
 : >"$SYSTEMCTL_LOG"
 run_helper 0 _bridge_upgrade_systemd_quiesce_daemon
 Q_CALLS="$(cat "$SYSTEMCTL_LOG")"
-Q_FIRST="$(sed -n '1p' "$SYSTEMCTL_LOG")"
-Q_SECOND="$(sed -n '2p' "$SYSTEMCTL_LOG")"
-Q_COUNT="$(count_calls "$SYSTEMCTL_LOG")"
-smoke_assert_eq "2" "$Q_COUNT" "T1 quiesce makes exactly 2 systemctl calls (got: $Q_CALLS)"
-smoke_assert_contains "$Q_FIRST" "stop agent-bridge-daemon-liveness.timer" "T1 first call stops the liveness TIMER"
-smoke_assert_contains "$Q_SECOND" "stop agent-bridge-daemon.service" "T1 second call stops the SERVICE"
-# Order: the timer must be stopped before the service (so it can't re-fire it).
-[[ "$Q_FIRST" == *"liveness.timer"* && "$Q_SECOND" == *"daemon.service"* ]] \
-  || smoke_fail "T1 FAIL: timer must be stopped BEFORE service. calls=$Q_CALLS"
-smoke_log "T1 PASS: systemd quiesce stops liveness.timer THEN daemon.service"
+Q_MUT="$(count_mutating_calls "$SYSTEMCTL_LOG")"
+smoke_assert_eq "1" "$Q_MUT" "T1 quiesce makes exactly 1 mutating systemctl call (stop service only) (got: $Q_CALLS)"
+smoke_assert_contains "$Q_CALLS" "stop agent-bridge-daemon.service" "T1 stops the SERVICE"
+grep -E 'stop[[:space:]]+agent-bridge-daemon-liveness\.timer' "$SYSTEMCTL_LOG" >/dev/null 2>&1 \
+  && smoke_fail "T1 FAIL (#2064 regression): quiesce must NOT stop the liveness TIMER (a SIGKILL'd upgrade then has no invoker). calls=$Q_CALLS"
+smoke_log "T1 PASS: systemd quiesce stops daemon.service ONLY, leaves liveness.timer running (#2064)"
 
 # --- T2: systemd restart starts service THEN re-arms timer -------------------
 # The restart helper is systemctl-presence-gated (not is-active), so the
@@ -227,21 +233,21 @@ grep -q 'is-active' "$SYSTEMCTL_LOG" \
   || smoke_fail "T4 FAIL: inline fallback did not probe is-active (got: $(cat "$SYSTEMCTL_LOG"))"
 smoke_log "T4 PASS: inline-fallback inactive path probes is-active only, zero mutating calls"
 
-# --- T5: INLINE-fallback path, service ACTIVE → timer-then-service stop -------
-# Same inline fallback, but is-active → active: the quiesce helper must now
-# stop the liveness TIMER then the SERVICE (proving the inline fallback gate
-# also drives the fix, not just the canonical-detector path).
+# --- T5: INLINE-fallback path, service ACTIVE → stop SERVICE only (#2064) ------
+# Same inline fallback, but is-active → active: the quiesce helper must stop the
+# SERVICE (proving the inline fallback gate also drives the fix, not just the
+# canonical-detector path). Issue #2064: it must NOT stop the liveness timer (the
+# timer stays running so a SIGKILL'd upgrade still has an invoker).
 : >"$SYSTEMCTL_LOG"
 printf '0' >"$IS_ACTIVE_RC_FILE"   # is-active → active
 run_helper_inline_fallback _bridge_upgrade_systemd_quiesce_daemon
 T5_MUT="$(count_mutating_calls "$SYSTEMCTL_LOG")"
-smoke_assert_eq "2" "$T5_MUT" "T5 inline-fallback active quiesce makes 2 mutating systemctl calls (got: $(cat "$SYSTEMCTL_LOG"))"
+smoke_assert_eq "1" "$T5_MUT" "T5 inline-fallback active quiesce makes 1 mutating systemctl call (stop service only) (got: $(cat "$SYSTEMCTL_LOG"))"
 T5_STOPS="$(grep -E '(^| )stop ' "$SYSTEMCTL_LOG")"
-T5_FIRST_STOP="$(printf '%s\n' "$T5_STOPS" | sed -n '1p')"
-T5_SECOND_STOP="$(printf '%s\n' "$T5_STOPS" | sed -n '2p')"
-[[ "$T5_FIRST_STOP" == *"liveness.timer"* && "$T5_SECOND_STOP" == *"daemon.service"* ]] \
-  || smoke_fail "T5 FAIL: inline-fallback must stop timer BEFORE service. stops=$T5_STOPS"
-smoke_log "T5 PASS: inline-fallback active path stops liveness.timer THEN daemon.service"
+smoke_assert_contains "$T5_STOPS" "stop agent-bridge-daemon.service" "T5 inline-fallback stops the SERVICE"
+grep -E 'stop[[:space:]]+agent-bridge-daemon-liveness\.timer' "$SYSTEMCTL_LOG" >/dev/null 2>&1 \
+  && smoke_fail "T5 FAIL (#2064 regression): inline-fallback quiesce must NOT stop the liveness TIMER. stops=$T5_STOPS"
+smoke_log "T5 PASS: inline-fallback active path stops daemon.service ONLY, leaves liveness.timer running (#2064)"
 
 # --- T6: user-bus establishment (_bridge_upgrade_systemd_user_bus_ready) -------
 # (a) XDG unset + a present /run/user/<uid> (GOOD base) → exports XDG_RUNTIME_DIR.

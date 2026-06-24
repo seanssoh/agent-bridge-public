@@ -113,8 +113,14 @@ def _list_agents(bridge_home: Path) -> list[str]:
 
 
 def _managed_block_text(text: str, bd) -> str:
+    # Issue #1816: the BEGIN marker may carry a ` v=<version>` stamp. Use the
+    # renderer's stamp-tolerant `MANAGED_START_RE` (prefix + optional stamp +
+    # ` -->`) rather than a literal escape of the unstamped marker, or a stamped
+    # CLAUDE.md measures as having NO managed block and the legacy-inline
+    # detector below mis-classifies the managed content.
+    start_re = getattr(bd, "MANAGED_START_RE", None) or re.escape(bd.MANAGED_START)
     match = re.search(
-        rf"{re.escape(bd.MANAGED_START)}.*?{re.escape(bd.MANAGED_END)}",
+        rf"{start_re}.*?{re.escape(bd.MANAGED_END)}",
         text,
         flags=re.S,
     )

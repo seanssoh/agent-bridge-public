@@ -7006,6 +7006,7 @@ process_crash_reports() {
   local stderr_file=""
   local tail_file=""
   local launch_cmd=""
+  local launch_cmd_raw=""
   local error_hash=""
   local reported_at=""
   local state_file=""
@@ -7036,9 +7037,25 @@ process_crash_reports() {
     stderr_file=""
     tail_file=""
     launch_cmd=""
+    launch_cmd_raw=""
     error_hash=""
     reported_at=""
-    daemon_source_state_file "$report_file" "crash-report/$agent" 1 "CRASH_AGENT" || continue
+    # Issue #2063 (codex r3): SANITIZE the FULL report.env CRASH_* field set
+    # (5th positional) before sourcing. `daemon_source_state_file` only unsets
+    # the vars listed here, and the local resets above are re-overwritten by
+    # `${CRASH_*:-}` reads AFTER the source — so a TRUNCATED report.env (e.g. a
+    # partially flushed write from an iso UID: the writer emits CRASH_AGENT
+    # FIRST, so an interrupted write can leave a sourceable file with only
+    # CRASH_AGENT set) would otherwise inherit a PRIOR loop iteration's
+    # CRASH_LAUNCH_CMD / CRASH_LAUNCH_CMD_RAW and feed that stale value into the
+    # DESTRUCTIVE stale-retire guard — falsely retiring a healthy agent's
+    # report (a different agent's launch cmd) and violating the "missing launch
+    # signal → keep alarming" fail-safe. Unsetting the whole family makes a
+    # missing field read empty (which the guard treats as incomparable →
+    # keep alarming) instead of leaking.
+    daemon_source_state_file "$report_file" "crash-report/$agent" 1 "CRASH_AGENT" \
+      "CRASH_AGENT CRASH_ENGINE CRASH_FAIL_COUNT CRASH_EXIT_CODE CRASH_STDERR_FILE CRASH_TAIL_FILE CRASH_LAUNCH_CMD CRASH_LAUNCH_CMD_RAW CRASH_ERROR_HASH CRASH_REPORTED_AT" \
+      || continue
     agent="${CRASH_AGENT:-$agent}"
     [[ -n "$agent" ]] || continue
     if ! bridge_agent_exists "$agent"; then
@@ -7078,8 +7095,34 @@ process_crash_reports() {
     stderr_file="${CRASH_STDERR_FILE:-}"
     tail_file="${CRASH_TAIL_FILE:-}"
     launch_cmd="${CRASH_LAUNCH_CMD:-}"
+    launch_cmd_raw="${CRASH_LAUNCH_CMD_RAW:-}"
     error_hash="${CRASH_ERROR_HASH:-}"
     reported=0
+
+    # Issue #2063: a leftover report.env from a PRIOR launch era keeps
+    # driving false crash-loop alarms on a HEALTHY agent after the agent's
+    # launch command changes (dynamic→static convert, reclassify,
+    # `update --set-launch-cmd`, manual launch change). The recorded launch no
+    # longer matches the agent's current launch — the crash predates the
+    # current launch and is stale. Detect that by comparing the recorded ROSTER
+    # BASE (`CRASH_LAUNCH_CMD_RAW`, preferred symmetric signal; legacy reports
+    # fall back to the resolved `CRASH_LAUNCH_CMD`) against the agent's current
+    # side-effect-free roster base. A GENUINE ongoing crash rewrites report.env
+    # with the CURRENT launch base, so a matching base still alarms; only a
+    # launch-era mismatch is auto-retired, replacing the alarm/notify/
+    # `crash_notified_origin_suppressed` churn (~200×/12h observed). The audit
+    # fires ONCE here because the very next statement clears report.env, so the
+    # next sweep finds nothing to process.
+    if bridge_agent_crash_report_launch_stale "$launch_cmd_raw" "$launch_cmd" "$agent"; then
+      bridge_agent_clear_crash_report "$agent"
+      bridge_audit_log daemon crash_report_retired_stale_launch_cmd "$agent" \
+        --detail engine="$engine" \
+        --detail fail_count="$fail_count" \
+        --detail exit_code="$exit_code" \
+        --detail error_hash="$error_hash"
+      changed=0
+      continue
+    fi
 
     if [[ "$agent" == "$admin_agent" ]]; then
       if [[ "$error_hash" != "$last_hash" || $(( now_ts - last_report_ts )) -ge "$cooldown" ]]; then

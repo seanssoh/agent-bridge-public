@@ -13,7 +13,7 @@ bridge-daemon-helpers.py:0
 bridge-dashboard.py:3
 bridge-dev-plugin-cache.py:62
 bridge-discord-relay.py:9
-bridge-docs.py:67
+bridge-docs.py:71
 bridge-doctor.py:19
 bridge-guard.py:0
 bridge-handoffd.py:9

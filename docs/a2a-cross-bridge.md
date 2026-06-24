@@ -387,6 +387,50 @@ Fail-closed and conservative — it never guesses:
 > recommendations live in docs + the runtime WARN, never baked into tracked
 > source.
 
+### Keying a peer on a fixed DNS `hostname` (#16247)
+
+For a fleet whose nodes sit behind **fixed DNS names** (e.g. a Cloudflare-managed
+`<handle>.cosmaxcf.com` that resolves — via split-horizon DNS — to that node's
+current private routed IP), a peer/`listen` entry may key on a `hostname` instead
+of (or in addition to) a raw `address`:
+
+```jsonc
+{ "hostname": "bridge-b.cosmaxcf.com" }   // resolves live via getaddrinfo
+```
+
+`hostname` is a **4th identity leg**, transport-agnostic (it works on the
+`tailscale`, `cloudflare-warp-mesh`, and `trusted-routed` transports alike —
+`getaddrinfo` is substrate-independent). The full resolver precedence is:
+
+> **`node_id` > `tailscale_name` > `hostname` > literal `address`.**
+
+Semantics mirror the Tailscale identity legs — the stored value is an
+**identity, never a trusted address**:
+
+- **Live-resolved every use** (sender target + receiver source-check) via
+  `getaddrinfo` (A + AAAA), so an IP change behind the name self-heals with no
+  config edit. The lookup is **bounded** (a hard timeout, fail-closed) so an
+  untrusted inbound request can't block the receiver on a hung resolver.
+- **Fail-closed, no stale fallback**: an unresolvable / empty / malformed
+  `hostname` is a hard error (the sender retries; the receiver rejects) — it
+  **never** falls back to a literal `address`. A short result cache (~45s) means
+  a *transient* DNS blip inside the freshness window is absorbed (the last good
+  set is served); once the entry expires and DNS still cannot refresh, it fails
+  closed.
+- **Multi-homed safe**: the receiver source-address check accepts the request if
+  `remote_addr` is **any** of the name's current A/AAAA records (membership, not
+  a single string); IPv4-mapped IPv6 is normalized so an AAAA `::ffff:v4` result
+  matches an IPv4 client. The sender picks one deterministic target from the same
+  (shared-cache) set, so the sender's choice is always within the receiver's
+  accepted set.
+- On the routed transports (`cloudflare-warp-mesh` / `trusted-routed`) a
+  `hostname` is accepted (precedence over the raw `address`), while the Tailscale
+  identity keys (`node_id`/`tailscale_name`) remain a rejected misconfiguration.
+
+`hostname` keying needs no migrate step — set it on the peer (and you may keep the
+raw `address`, which is ignored while `hostname` is present, for a tag-both /
+auto-switch rollout).
+
 ## Signed `peer-identity-update` control message (`agb a2a announce-identity`)
 
 Even with identity-keyed configs + per-request resolution, the

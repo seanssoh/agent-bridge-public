@@ -43,6 +43,28 @@ _bridge_upgrade_exit_handler() {
     bridge_scoped_lock_release "${_BRIDGE_UPGRADE_LOCK_TOKEN:-}" || true
     _BRIDGE_UPGRADE_LOCK_TOKEN=""
   fi
+  # Issue #2055: if the upgrade is aborting (rc != 0) with a quiesce-intent marker
+  # still outstanding, the daemon job was disabled FOR THIS UPGRADE but the
+  # restore-enable never cleared it — so re-enable the job now (the catchable-abort
+  # self-heal layer; the SIGKILL/power-loss case is recovered by the liveness
+  # watcher via the same marker). On a clean exit (rc == 0) the restore already
+  # cleared the marker, so this is a no-op. Integrated here rather than via a
+  # second EXIT trap, which would clobber this handler. Pure best-effort: the
+  # helper is fully `|| true`-guarded and always returns 0, so it can never
+  # change rc. declare -F guards keep it safe on a very-early abort before the
+  # helper is defined.
+  #
+  # A DELIBERATE #1820 reconcile failure does NOT reach this re-enable: the
+  # reconcile rc is captured (not set -e-aborted, see the `|| _reconcile_rc=$?`
+  # at the reconcile call), so a refusal/error flows through the fail-closed
+  # `case *)` arm — which CLEARS the marker before its own `exit 1` — and the
+  # marker is gone by the time we land here. So the only marker-outstanding aborts
+  # that re-enable are genuine crashes/signals between quiesce and restore, i.e.
+  # the interrupted upgrade #2055 must self-heal.
+  if [[ $rc -ne 0 ]] \
+      && declare -F _bridge_upgrade_reenable_on_abort >/dev/null 2>&1; then
+    _bridge_upgrade_reenable_on_abort || true
+  fi
   unset BRIDGE_LAYOUT_RESOLVER_BYPASS BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID
   if [[ $rc -ne 0 \
         && "${JSON:-0}" == "1" \
@@ -103,6 +125,14 @@ _UPGRADE_DAEMON_SYSTEMD_MANAGED=0
 # init rationale as the systemd flag above. A host is systemd OR launchd, never
 # both, so at most one of these two flags is ever set to 1.
 _UPGRADE_DAEMON_LAUNCHD_MANAGED=0
+# Issue #2055: set to 1 once the #1820 quiesce step has written the durable
+# quiesce-intent marker (state/upgrade/daemon-quiesce.intent) — i.e. the daemon
+# job has been disabled/booted-out FOR THIS UPGRADE. The EXIT handler reads this
+# (along with the marker on disk) to decide whether to re-enable the job if the
+# upgrade aborts before the restore-enable clears it. Declared up here so the
+# EXIT trap (installed at the very top) is always nounset-safe even when the
+# reconcile/quiesce block never runs (dry-run / analyze / early bridge_die).
+_UPGRADE_DAEMON_QUIESCE_MARKER_WRITTEN=0
 JSON=0
 ALLOW_DIRTY=0
 ALLOW_DIRTY_SOURCE=0
@@ -1210,6 +1240,220 @@ _bridge_upgrade_write_complete_marker() {
 }
 # END: Issue #1662 upgrade-complete marker helpers
 
+# BEGIN: Issue #2055 durable quiesce-intent marker (crash-safe daemon re-enable)
+# #2040 hardened the RESTORE side (verify the launchd/systemd job came back) and
+# added a standing liveness watcher that re-bootstraps an enabled-but-unloaded
+# daemon. But the watcher deliberately FAIL-CLOSED skips a *disabled* job — it
+# cannot tell an interrupted-upgrade-disable from an operator `agb daemon stop`.
+# So if an upgrade is KILLED (SIGKILL / power-loss) between the quiesce-disable
+# and the restore-enable, the job is left disabled+unloaded and stays silently
+# down (#2055).
+#
+# Fix: bracket the quiesce window with a DURABLE intent marker. The quiesce step
+# (launchd OR systemd) writes state/upgrade/daemon-quiesce.intent recording THIS
+# upgrade's pid + the platform/label so the disable is attributable to an upgrade.
+# The restore-enable clears it on success. The marker is the DISCRIMINATOR the
+# #2040 watcher lacked:
+#   - marker present + the recorded upgrade pid is DEAD  -> interrupted upgrade,
+#     the disable is RECOVERABLE (re-enable + reload).
+#   - marker present + the recorded upgrade pid is ALIVE -> an upgrade is in
+#     flight; the watcher defers to the upgrade's own restore (do not fight it).
+#   - marker ABSENT + the job is disabled                -> operator stop; stay
+#     down (the #2040 Part-B fail-closed-on-disabled contract is preserved).
+# Two layers of self-heal: (1) the upgrade's EXIT handler re-enables on a
+# CATCHABLE abort (set -e / SIGINT/SIGTERM), and (2) the marker lets the
+# independent liveness watcher recover the UNCATCHABLE crash (SIGKILL/power-loss)
+# the dying upgrade process can never handle itself.
+#
+# Marker FORMAT (sourceable KEY=value, mirrors launchagent.config): a single
+# small file the watcher reads without sourcing bridge-lib. Written atomically
+# (tmp + mv) so a crash mid-write never leaves a half-marker.
+_bridge_upgrade_quiesce_marker_path() {
+  printf '%s' "${BRIDGE_UPGRADE_QUIESCE_MARKER_FILE:-${BRIDGE_STATE_DIR:-$TARGET_ROOT/state}/upgrade/daemon-quiesce.intent}"
+}
+
+# Issue #2064 r3 (Finding 4): a bare pid is NOT a stable process identity — after a
+# SIGKILL'd upgrade the kernel can REUSE that pid for an unrelated long-lived
+# process, and the liveness watcher's `kill -0 $pid` defer would then think the
+# (long-dead) upgrade is still in flight and defer FOREVER → the daemon stays
+# silently down. Bind the marker to a per-process START-IDENTITY token that the
+# watcher can recompute and compare: the kernel never reuses a (pid, start-time)
+# pair within a boot. Emits a single opaque token, empty when no source is
+# readable (the watcher then falls back to the conservative bare-pid defer — a
+# missing token must never make a real in-flight upgrade look reused). Pure read.
+#   Linux : /proc/<pid>/stat field 22 (starttime, clock ticks since boot) — the
+#           canonical, monotonic, reuse-proof process birth stamp.
+#   BSD/mac: `ps -o lstart=` (absolute start wall-clock; second-resolution is
+#           ample to discriminate a reused pid hours/days later).
+# The emitted token is ALWAYS a single shell word — ALL whitespace is collapsed to
+# '_' — because the marker is a SOURCEABLE KEY=value file: an unquoted value with
+# spaces (the raw `ps -o lstart=` form "Mon Jun 24 07:24:01 2026") would, when the
+# watcher `source`s the marker, parse as `KEY=ps-lstart:Mon` + a stray `Jun ...`
+# command → the recorded identity reads back EMPTY and the whole PID-reuse defense
+# silently degrades to the bare-pid defer on BSD/mac (codex r3 catch). The watcher's
+# recompute applies the SAME normalization so matching tokens still compare equal.
+_bridge_upgrade_pid_start_identity() {
+  local pid="$1" tok=""
+  [[ "$pid" =~ ^[0-9]+$ ]] || { printf ''; return 0; }
+  if [[ -r "/proc/$pid/stat" ]]; then
+    # Field 22 is starttime. comm (field 2) is parenthesized and MAY itself contain
+    # spaces AND ')' (e.g. a process named "(weird)thing"), so a first-')' anchor is
+    # unsafe — anchor on the LAST ')' in the line, then count whitespace fields after
+    # it: state is the 1st token after the closing paren, so starttime (field 22
+    # overall) is the 20th token after it.
+    tok="$(awk '{ p=0; for (i=length($0); i>=1; i--) if (substr($0,i,1)==")") { p=i; break }
+                 if (p==0) next; s=substr($0,p+1); n=split(s,a," "); if (n>=20) print a[20] }' \
+      "/proc/$pid/stat" 2>/dev/null)" || tok=""
+    if [[ -n "$tok" ]]; then printf 'linux-starttime:%s' "$tok"; return 0; fi
+  fi
+  if command -v ps >/dev/null 2>&1; then
+    # Collapse ALL whitespace runs to a single '_' so the token is one shell word
+    # (the lstart string is space-laden), THEN hard-restrict to a safe allowlist
+    # [A-Za-z0-9:_] via `tr -cd` — this provably strips ANY shell metacharacter
+    # (notably a single-quote, which would otherwise break the single-quoted marker
+    # value and re-open the EMPTY-readback hole on a pathological/locale lstart).
+    # The watcher applies the IDENTICAL pipeline so tokens still compare equal.
+    tok="$(ps -o lstart= -p "$pid" 2>/dev/null | tr -s '[:space:]' ' ' | sed -e 's/^ //' -e 's/ $//' -e 's/ /_/g' | tr -cd 'A-Za-z0-9:_')" || tok=""
+    if [[ -n "$tok" ]]; then printf 'ps-lstart:%s' "$tok"; return 0; fi
+  fi
+  printf ''
+  return 0
+}
+
+# Write the quiesce-intent marker. $1=platform (launchd|systemd), $2=label-or-
+# service. Records the OWNER upgrade pid ($$) so the watcher can tell an in-flight
+# upgrade (pid alive) from an interrupted one (pid dead). #2064 r3: ALSO records a
+# process START-IDENTITY token + the writer uid so a REUSED pid (the original
+# upgrade SIGKILL'd, the kernel handing its pid to an unrelated long-lived process)
+# cannot masquerade as an in-flight upgrade and wedge the defer forever. Best-effort:
+# a failed write must NEVER abort the upgrade (the quiesce continues; we simply lose
+# the crash-recovery hint for this run). Sets the in-process flag so the EXIT handler
+# knows a marker is outstanding.
+_bridge_upgrade_write_quiesce_marker() {
+  local platform="$1" target="$2"
+  local marker tmp ts psid uid
+  marker="$(_bridge_upgrade_quiesce_marker_path)"
+  mkdir -p "$(dirname "$marker")" 2>/dev/null || { return 0; }
+  ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')"
+  psid="$(_bridge_upgrade_pid_start_identity "$$" 2>/dev/null || printf '')"
+  uid="$(id -u 2>/dev/null || printf '%s' "${UID:-}")"
+  tmp="${marker}.tmp.$$"
+  # The marker is SOURCED by the watcher, so any value that could carry whitespace or
+  # shell metacharacters is written single-quoted (defense-in-depth — the PSID token
+  # is already normalized space-free, but quoting guarantees a clean source even if a
+  # future identity source emits something exotic). PID/UID are numeric; PLATFORM /
+  # TARGET / TS / VERSION are bridge-controlled tokens, left bare for readability.
+  {
+    printf 'BRIDGE_QUIESCE_UPGRADE_PID=%s\n' "$$"
+    printf "BRIDGE_QUIESCE_UPGRADE_PSID='%s'\n" "$psid"
+    printf 'BRIDGE_QUIESCE_UPGRADE_UID=%s\n' "$uid"
+    printf 'BRIDGE_QUIESCE_PLATFORM=%s\n' "$platform"
+    printf 'BRIDGE_QUIESCE_TARGET=%s\n' "$target"
+    printf 'BRIDGE_QUIESCE_TS=%s\n' "$ts"
+    printf 'BRIDGE_QUIESCE_VERSION=%s\n' "${SOURCE_VERSION:-unknown}"
+  } >"$tmp" 2>/dev/null && mv -f "$tmp" "$marker" 2>/dev/null \
+    && _UPGRADE_DAEMON_QUIESCE_MARKER_WRITTEN=1
+  rm -f "$tmp" 2>/dev/null || true
+  return 0
+}
+
+# Clear the quiesce-intent marker after a successful restore-enable. Idempotent
+# (rm -f on an absent file is a no-op). Clears the in-process flag so the EXIT
+# handler does not double-act. Best-effort.
+_bridge_upgrade_clear_quiesce_marker() {
+  rm -f "$(_bridge_upgrade_quiesce_marker_path)" 2>/dev/null || true
+  _UPGRADE_DAEMON_QUIESCE_MARKER_WRITTEN=0
+  return 0
+}
+
+# EXIT-handler-invoked best-effort re-enable of the daemon job. Runs ONLY when a
+# quiesce marker is still outstanding (the restore-enable did not clear it — i.e.
+# the upgrade is aborting between disable and restore). Re-`enable`s the launchd
+# job (so KeepAlive can re-supervise) / re-`start`s the systemd unit, then clears
+# the marker ONLY on a CONFIRMED re-enable. This is the CATCHABLE-abort layer; the
+# SIGKILL/power-loss case the dying process can never reach is recovered by the
+# liveness watcher via the same marker. Pure best-effort — every call is
+# `|| true`-guarded and the function always returns 0 so it can never change the
+# upgrade's exit rc. Must not depend on anything sourced late (the EXIT trap can
+# fire during very-early aborts).
+#
+# Issue #2064 r2 (Finding 1): the marker is consumed ONLY when the re-enable is
+# VERIFIED (launchd: print-disabled now reports enabled; systemd: the unit is
+# is-active). If the re-enable fails warn-only, KEEP the marker so the standing
+# liveness watcher (still running — #2064 keeps the systemd timer alive) recovers
+# the orphaned-marker job on its next tick. An UNCONDITIONAL clear here would, on a
+# failed re-enable, leave the job down with no discriminator for the watcher — the
+# #2055 hole this PR closes.
+_bridge_upgrade_reenable_on_abort() {
+  [[ "${_UPGRADE_DAEMON_QUIESCE_MARKER_WRITTEN:-0}" == "1" ]] || return 0
+  local marker platform target uid recovered
+  recovered=0
+  marker="$(_bridge_upgrade_quiesce_marker_path)"
+  [[ -f "$marker" ]] || { _UPGRADE_DAEMON_QUIESCE_MARKER_WRITTEN=0; return 0; }
+  # shellcheck disable=SC1090
+  platform="$(source "$marker" 2>/dev/null; printf '%s' "${BRIDGE_QUIESCE_PLATFORM:-}")"
+  # shellcheck disable=SC1090
+  target="$(source "$marker" 2>/dev/null; printf '%s' "${BRIDGE_QUIESCE_TARGET:-}")"
+  case "$platform" in
+    launchd)
+      if command -v launchctl >/dev/null 2>&1 && [[ -n "$target" ]]; then
+        uid="$(id -u 2>/dev/null || printf '%s' "${UID:-}")"
+        if [[ -n "$uid" ]]; then
+          echo "[bridge-upgrade] WARN: upgrade aborting mid-quiesce — re-enabling launchd daemon job gui/${uid}/${target} so KeepAlive / the liveness watcher can recover it." >&2
+          launchctl enable "gui/${uid}/${target}" >/dev/null 2>&1 || true
+          launchctl bootstrap "gui/${uid}" "${HOME:-}/Library/LaunchAgents/${target}.plist" >/dev/null 2>&1 || true
+          launchctl kickstart -k "gui/${uid}/${target}" >/dev/null 2>&1 || true
+          # Issue #2064 r2 (codex r2): require a POSITIVE confirmation before
+          # consuming the marker — the job must be LOADED (`launchctl print` exits 0)
+          # AND not explicitly disabled. The prior check trusted print-disabled
+          # alone, so a print-disabled that FAILED (empty output → grep miss) wrongly
+          # counted as enabled and cleared the marker on an UNVERIFIED re-enable. The
+          # loaded-check is the strong signal: if the job is loaded after
+          # enable+bootstrap+kickstart, recovery genuinely succeeded. If print-disabled
+          # is readable AND still says disabled, that is positive proof of failure.
+          # Otherwise (not loaded, or unverifiable) KEEP the marker for the still-
+          # running liveness watcher to retry.
+          local pd_out
+          pd_out="$(launchctl print-disabled "gui/${uid}" 2>/dev/null)" || pd_out=""
+          if printf '%s\n' "$pd_out" | grep -E "\"${target}\"[[:space:]]*=>[[:space:]]*(true|disabled)" >/dev/null 2>&1; then
+            echo "[bridge-upgrade] WARN: launchd re-enable of gui/${uid}/${target} did NOT take (still disabled) — KEEPING the quiesce marker so the liveness watcher retries." >&2
+          elif launchctl print "gui/${uid}/${target}" >/dev/null 2>&1; then
+            recovered=1
+          else
+            echo "[bridge-upgrade] WARN: launchd re-enable of gui/${uid}/${target} is UNVERIFIED (job not loaded) — KEEPING the quiesce marker so the liveness watcher retries." >&2
+          fi
+        fi
+      fi
+      ;;
+    systemd)
+      if command -v systemctl >/dev/null 2>&1 && [[ -n "$target" ]]; then
+        echo "[bridge-upgrade] WARN: upgrade aborting mid-quiesce — re-starting systemd daemon unit ${target} so it / the liveness watcher can recover it." >&2
+        systemctl --user reset-failed "$target" >/dev/null 2>&1 || true
+        systemctl --user start "$target" >/dev/null 2>&1 || true
+        # #2064: the liveness timer is now left RUNNING through quiesce, so it does
+        # not need restarting here; start it defensively in case some other path
+        # stopped it (idempotent on an already-active timer).
+        systemctl --user start agent-bridge-daemon-liveness.timer >/dev/null 2>&1 || true
+        # Verify the SERVICE actually came back active before consuming the marker.
+        if systemctl --user is-active "$target" >/dev/null 2>&1; then
+          recovered=1
+        else
+          echo "[bridge-upgrade] WARN: systemd re-start of ${target} did NOT make it active — KEEPING the quiesce marker so the liveness watcher retries." >&2
+        fi
+      fi
+      ;;
+    *)
+      # Unknown/empty platform — we cannot verify a re-enable. Leave the marker for
+      # the liveness watcher rather than clearing on an unverifiable best-effort.
+      ;;
+  esac
+  if (( recovered == 1 )); then
+    _bridge_upgrade_clear_quiesce_marker
+  fi
+  return 0
+}
+# END: Issue #2055 durable quiesce-intent marker
+
 # BEGIN: Issue #1905 systemd-aware quiesce/restart around the #1820 reconcile
 # On a sudo-self systemd install the daemon lifecycle is owned by
 # `agent-bridge-daemon.service` (Restart=) + `agent-bridge-daemon-liveness.timer`.
@@ -1280,11 +1524,14 @@ _bridge_upgrade_daemon_systemd_active() {
   systemctl --user is-active --quiet agent-bridge-daemon.service 2>/dev/null
 }
 
-# Stop the systemd-user daemon units so systemd cannot respawn the daemon during
-# the #1820 reconcile. Stop the liveness TIMER first (so it can't re-fire the
-# service), then the service. Best-effort (|| true): a systemctl failure must
-# never abort the upgrade. No-op (returns 0, no systemctl calls) on a
-# non-systemd-managed install.
+# Stop the systemd-user daemon SERVICE so systemd cannot respawn the daemon during
+# the #1820 reconcile. Issue #2064 (Finding 2): the liveness TIMER is LEFT RUNNING
+# (it used to be stopped here) so a SIGKILL'd upgrade still has an invoker to
+# observe the quiesce marker; the watcher's live_upgrade_quiesce_in_flight DEFER
+# guard keeps the still-running timer from racing the #1820 fence while this
+# upgrade pid is alive. Best-effort (|| true): a systemctl failure must never abort
+# the upgrade. No-op (returns 0, no systemctl calls) on a non-systemd-managed
+# install.
 _bridge_upgrade_systemd_quiesce_daemon() {
   _bridge_upgrade_daemon_systemd_active || return 0
   # Issue #1905 r2: the STOP path below is the ACTUAL origin of the rc=3 race —
@@ -1295,8 +1542,20 @@ _bridge_upgrade_systemd_quiesce_daemon() {
   # re-assert it explicitly here so the STOP path is self-evidently bus-covered
   # and cannot silently regress if the detector call is ever refactored away.
   _bridge_upgrade_systemd_user_bus_ready || true
-  echo "[bridge-upgrade] systemd-managed daemon detected — stopping agent-bridge-daemon-liveness.timer + agent-bridge-daemon.service for the layout-v2 reconcile window (they would otherwise respawn the daemon and race the #1820 fence)." >&2
-  systemctl --user stop agent-bridge-daemon-liveness.timer >/dev/null 2>&1 || true
+  echo "[bridge-upgrade] systemd-managed daemon detected — stopping agent-bridge-daemon.service for the layout-v2 reconcile window (it would otherwise respawn the daemon and race the #1820 fence). Leaving agent-bridge-daemon-liveness.timer RUNNING (#2064) so a SIGKILL'd upgrade still has an invoker to observe the quiesce marker." >&2
+  # Issue #2055: write the durable quiesce-intent marker BEFORE the stop so a
+  # crash between here and the restore-enable is attributable to this upgrade.
+  _bridge_upgrade_write_quiesce_marker systemd agent-bridge-daemon.service
+  # Issue #2064 (Finding 2): do NOT stop the liveness timer here. Stopping it was
+  # the original #2055/#1905 way to keep the watcher from racing the #1820 fence,
+  # but it also meant a SIGKILL/power-loss between this stop and the restore left
+  # NO running process to observe the quiesce marker — the daemon stayed down
+  # forever (the timer is the ONLY installed systemd liveness scheduler). The
+  # timer now stays running; the watcher's live_upgrade_quiesce_in_flight DEFER
+  # guard (bridge-daemon-liveness.sh, mirrors the launchd I3 LIVE-pid defer) is
+  # what keeps it from racing the fence while THIS upgrade pid is alive. When the
+  # upgrade is killed, its marker pid goes dead → the still-running timer reaps the
+  # enabled+inactive service on the next tick.
   systemctl --user stop agent-bridge-daemon.service >/dev/null 2>&1 || true
   return 0
 }
@@ -1339,6 +1598,10 @@ _bridge_upgrade_systemd_restart_daemon() {
   systemctl --user is-active agent-bridge-daemon-liveness.timer >/dev/null 2>&1 || timer_active=0
   if (( svc_active == 1 && timer_active == 1 )); then
     _BRIDGE_UPGRADE_SYSTEMD_LOAD_STATE="active"
+    # Issue #2055: the restore-enable succeeded — clear the quiesce-intent marker
+    # so the liveness watcher does NOT later treat this (now healthy) unit as an
+    # interrupted-upgrade disable to recover.
+    _bridge_upgrade_clear_quiesce_marker
     echo "[bridge-upgrade] systemd daemon restored — agent-bridge-daemon.service + agent-bridge-daemon-liveness.timer are active." >&2
   else
     _BRIDGE_UPGRADE_SYSTEMD_LOAD_STATE="inactive"
@@ -1405,6 +1668,11 @@ _bridge_upgrade_launchd_quiesce_daemon() {
     return 0
   fi
   echo "[bridge-upgrade] launchd-managed daemon detected — booting out gui/${uid}/${label} for the layout-v2 reconcile window (KeepAlive would otherwise respawn the daemon and race the #1820 fence)." >&2
+  # Issue #2055: write the durable quiesce-intent marker BEFORE the disable so a
+  # crash between here and the restore-enable is attributable to this upgrade —
+  # the marker is what lets the liveness watcher tell an interrupted-upgrade
+  # disable (recover) from an operator `agb daemon stop` (stay down).
+  _bridge_upgrade_write_quiesce_marker launchd "$label"
   # disable first so a bootout cannot be immediately re-loaded by KeepAlive,
   # then bootout to unload the running job. Both best-effort.
   launchctl disable "gui/${uid}/${label}" >/dev/null 2>&1 || true
@@ -1592,6 +1860,10 @@ _bridge_upgrade_launchd_restart_daemon() {
   # load-state so the upgrade summary surfaces it.
   if _bridge_upgrade_launchd_job_loaded "$uid" "$label"; then
     _BRIDGE_UPGRADE_LAUNCHD_LOAD_STATE="loaded"
+    # Issue #2055: the restore re-enabled + re-loaded the job successfully — clear
+    # the quiesce-intent marker so the liveness watcher does NOT later treat this
+    # (now healthy) job as an interrupted-upgrade disable to recover.
+    _bridge_upgrade_clear_quiesce_marker
     echo "[bridge-upgrade] launchd daemon restored — gui/${uid}/${label} is loaded." >&2
   else
     _BRIDGE_UPGRADE_LAUNCHD_LOAD_STATE="not_loaded"
@@ -3532,11 +3804,27 @@ if [[ $DRY_RUN -eq 0 ]]; then
     _reconcile_result_rel="state/migration/layout-v2-reconcile/last-apply.json"
     _reconcile_result_path="$TARGET_ROOT/$_reconcile_result_rel"
     mkdir -p "$TARGET_ROOT/state/migration/layout-v2-reconcile" "$TARGET_ROOT/logs" 2>/dev/null || true
+    # Issue #2055: CAPTURE the reconcile rc WITHOUT letting `set -e` abort first.
+    # The driver propagates the reconcile rc as its final command, and under the
+    # script-level `set -euo pipefail` a bare non-zero command exits IMMEDIATELY —
+    # so without the `|| _reconcile_rc=$?` idiom the rc capture + the fail-closed
+    # `case` below are UNREACHABLE for EVERY non-zero rc, including the benign
+    # rc=2 ("legacy / nothing to do", which MUST proceed + restart the daemon).
+    # The disarm-via-`||` idiom (the same one used elsewhere in this file, see the
+    # `|| _bucv_rc=$?` chmod wrapper) captures the real rc so the `case` runs as
+    # designed: rc 0/2 proceed, rc 1/3 hit the deliberate fail-closed `exit 1`.
+    # This is what makes the #2055 marker discrimination correct end-to-end: a
+    # reconcile FAILURE now reaches the `case *)` arm (which clears the marker so
+    # the daemon stays stopped — deliberate), and a reconcile SUCCESS/no-op flows
+    # to the restore (which re-enables + clears the marker). The ONLY aborts that
+    # now reach the EXIT-handler re-enable are genuine crashes/signals elsewhere
+    # in the window — exactly the interrupted-upgrade case #2055 must self-heal.
+    _reconcile_rc=0
     # shellcheck source=lib/bridge-layout-v2-reconcile.sh
     BRIDGE_HOME="$TARGET_ROOT" BRIDGE_SCRIPT_DIR="$TARGET_ROOT" \
       bash "$TARGET_ROOT"/lib/bridge-layout-v2-reconcile-driver.sh apply \
-      >"$_reconcile_result_path" 2>>"$TARGET_ROOT/logs/upgrade.log"
-    _reconcile_rc=$?
+      >"$_reconcile_result_path" 2>>"$TARGET_ROOT/logs/upgrade.log" \
+      || _reconcile_rc=$?
     case "$_reconcile_rc" in
       0)
         echo "[bridge-upgrade] layout-v2 reconcile: applied (see $_reconcile_result_rel)" >&2
@@ -3580,6 +3868,14 @@ if [[ $DRY_RUN -eq 0 ]]; then
             printf '}\n'
           } >"$_rf_path" 2>/dev/null || true
         fi
+        # Issue #2055: this is a DELIBERATE fail-closed abort — the daemon is left
+        # STOPPED on purpose (never resume over a stranded v1->v2 fork). Clear the
+        # quiesce-intent marker so neither the EXIT-handler re-enable NOR the
+        # liveness watcher mistakes this intentional stop for an interrupted-
+        # upgrade disable to recover. (An interrupted upgrade is a CRASH that
+        # never reaches this line, so its marker survives — exactly the
+        # discrimination #2055 needs.)
+        _bridge_upgrade_clear_quiesce_marker
         exit 1
         ;;
     esac
@@ -3654,6 +3950,56 @@ if [[ $RESTART_DAEMON -eq 1 && $DRY_RUN -eq 0 ]]; then
     echo "[bridge-upgrade] daemon load-state (launchd): ${_BRIDGE_UPGRADE_LAUNCHD_LOAD_STATE:-unknown}" >&2
   elif [[ "${_UPGRADE_DAEMON_SYSTEMD_MANAGED:-0}" == "1" ]]; then
     echo "[bridge-upgrade] daemon load-state (systemd): ${_BRIDGE_UPGRADE_SYSTEMD_LOAD_STATE:-unknown}" >&2
+  fi
+  # Issue #2055 / #2064 r3 (Finding 3): clear the quiesce-intent marker here ONLY
+  # when the restore actually CONFIRMED the daemon job is back (launchd: loaded;
+  # systemd: the service+timer active). The earlier design cleared this marker
+  # UNCONDITIONALLY once the restart phase ran to completion — but the restart phase
+  # "completing" does NOT mean the job recovered: _bridge_upgrade_launchd_restart_daemon
+  # / _bridge_upgrade_systemd_restart_daemon are best-effort and routinely return 0
+  # having left the job ENABLED-BUT-UNLOADED (launchd) or enabled+inactive (systemd)
+  # — and the marker is the ONLY discriminator the standing liveness watcher has for
+  # an enabled-but-DISABLED interrupted-upgrade job (maybe_rebootstrap_launchd treats
+  # a disabled/unknown job with no marker as an operator stop and SKIPS). So an
+  # unconditional clear after an UNVERIFIED restore strands a not-recovered daemon
+  # with no marker → silently down. Now: clear only on the SAME confirmed-recovery
+  # signal the per-success clears inside the restart helpers use (LOAD_STATE), and
+  # otherwise LEAVE the marker for the liveness watcher to recover the orphaned job.
+  # The plain `bridge-daemon.sh ensure` path (neither launchd nor systemd managed)
+  # never wrote a marker, so the clear there is a harmless no-op that preserves the
+  # latent-operator-stop hygiene for any stray residue.
+  # NOTE (errexit): bridge-upgrade.sh runs under `set -euo pipefail`. A trailing
+  # `[[ cond ]] && var=1` as the LAST statement of an if-branch returns 1 when cond
+  # is false and would trip errexit, so use explicit if/then assignments (each
+  # branch's last statement is an unconditional assignment that always returns 0).
+  _bridge_upgrade_restart_recovery_confirmed=0
+  if [[ "${_UPGRADE_DAEMON_LAUNCHD_MANAGED:-0}" == "1" ]]; then
+    if [[ "${_BRIDGE_UPGRADE_LAUNCHD_LOAD_STATE:-unknown}" == "loaded" ]]; then
+      _bridge_upgrade_restart_recovery_confirmed=1
+    fi
+  elif [[ "${_UPGRADE_DAEMON_SYSTEMD_MANAGED:-0}" == "1" ]]; then
+    if [[ "${_BRIDGE_UPGRADE_SYSTEMD_LOAD_STATE:-unknown}" == "active" ]]; then
+      _bridge_upgrade_restart_recovery_confirmed=1
+    fi
+  else
+    # No managed daemon job → no quiesce marker was written; the clear is a no-op.
+    _bridge_upgrade_restart_recovery_confirmed=1
+  fi
+  if (( _bridge_upgrade_restart_recovery_confirmed == 1 )); then
+    if declare -F _bridge_upgrade_clear_quiesce_marker >/dev/null 2>&1; then
+      _bridge_upgrade_clear_quiesce_marker
+    fi
+  else
+    echo "[bridge-upgrade] WARN: restart-phase daemon restore did NOT confirm recovery (load-state: launchd=${_BRIDGE_UPGRADE_LAUNCHD_LOAD_STATE:-n/a} systemd=${_BRIDGE_UPGRADE_SYSTEMD_LOAD_STATE:-n/a}) — KEEPING the quiesce-intent marker so the standing liveness watcher recovers the orphaned daemon job." >&2
+  fi
+elif [[ $DRY_RUN -eq 0 ]]; then
+  # Issue #2055: --no-restart-daemon (RESTART_DAEMON=0). The #1820 quiesce still
+  # disabled the daemon for the reconcile window, but the operator asked NOT to
+  # bring it back up — this is a DELIBERATE daemon-down end-state, not an
+  # interrupted upgrade. Clear the quiesce-intent marker so the liveness watcher
+  # leaves the (intentionally) disabled job down instead of recovering it.
+  if declare -F _bridge_upgrade_clear_quiesce_marker >/dev/null 2>&1; then
+    _bridge_upgrade_clear_quiesce_marker
   fi
 fi
 

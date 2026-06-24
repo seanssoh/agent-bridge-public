@@ -1493,21 +1493,38 @@ def room_scoped_check(env: dict[str, Any],
             # authenticated peer, pinned to the cached leader) signed this leg; the
             # roster membership check still fails closed if that author is not a
             # cached member at this epoch.
-            reason = rooms.roster_cache_membership_check(
-                conn, room_id=room_id, room_epoch=room_epoch,
-                sender_agent=relayed_author_agent,
-                sender_node=relayed_author_node,
-                target_agent=target_agent, target_node=this_node,
-            )
+            authz_sender_agent = relayed_author_agent
+            authz_sender_node = relayed_author_node
         else:
-            reason = rooms.roster_cache_membership_check(
-                conn, room_id=room_id, room_epoch=room_epoch,
-                sender_agent=sender_agent, sender_node=sender_node,
-                target_agent=target_agent, target_node=this_node,
-            )
+            authz_sender_agent = sender_agent
+            authz_sender_node = sender_node
+        reason = rooms.roster_cache_membership_check(
+            conn, room_id=room_id, room_epoch=room_epoch,
+            sender_agent=authz_sender_agent,
+            sender_node=authz_sender_node,
+            target_agent=target_agent, target_node=this_node,
+        )
+        if reason != rooms.ROOM_TALK_OK:
+            return False, reason
+        # #2079 ADMIN-AUTHZ (the cross-server routing boundary): membership has
+        # passed, so both endpoints are cached members at this epoch. Now apply
+        # the symmetric admin↔admin rule over the VERIFIED leader-MAC roster,
+        # RECOMPUTING the LOCAL target from this node's configured admin id
+        # (never trusting the cache for an endpoint we own). For a RELAYED leg
+        # the original author (leader-vouched) is the sender. A deny is returned
+        # as a distinct `admin_authz:<reason>` code the caller collapses to the
+        # SINGLE generic 403 — the reason is AUDIT-ONLY, never a wire oracle.
+        admin_ok, admin_reason = rooms.room_admin_authz_check(
+            conn, room_id=room_id, room_epoch=room_epoch,
+            sender_agent=authz_sender_agent, sender_node=authz_sender_node,
+            target_agent=target_agent, target_node=this_node,
+            this_node=this_node,
+        )
+        if not admin_ok:
+            return False, "admin_authz:" + admin_reason
+        return True, reason
     finally:
         conn.close()
-    return (reason == rooms.ROOM_TALK_OK), reason
 
 
 # --------------------------------------------------------------------------
@@ -1640,7 +1657,23 @@ def _relay_resolve(env: dict[str, Any], cfg: dict[str, Any],
             return "", "relay_target_not_member"
         if len(remote_targets) > 1:
             return "", "relay_target_ambiguous"
-        return remote_targets[0], "ok"
+        target_node = remote_targets[0]
+        # #2079 ADMIN-AUTHZ at the LEADER (the authoritative relay point): apply
+        # the SAME symmetric admin↔admin rule over the leader's AUTHORITATIVE
+        # room_members (recomputing the leader's own node members locally) BEFORE
+        # forwarding. A deny refuses the relay; the caller collapses it to the
+        # same generic 403 the receiver returns. The audit reason is carried in
+        # the refusal code (`relay_admin_authz:<reason>`) but never leaks to the
+        # wire (the leader replies the generic forbidden status).
+        admin_ok, admin_reason = rooms.relay_admin_authz_check(
+            conn, room_id=room_id,
+            sender_agent=sender_agent, sender_node=sender_node,
+            target_agent=target_agent, target_node=target_node,
+            this_node=this_node,
+        )
+        if not admin_ok:
+            return "", "relay_admin_authz:" + admin_reason
+        return target_node, "ok"
     finally:
         conn.close()
 
@@ -1657,9 +1690,20 @@ def _relay_precheck(env: dict[str, Any], cfg: dict[str, Any],
     allowlist 403 stands — a refused relay must NOT be let through to leak a
     distinct error / room structure. The authoritative relay re-runs
     `_relay_resolve` AFTER dedupe.
+
+    #2079 (codex r1 BLOCKING): an `relay_admin_authz:<reason>` refusal MUST reach
+    `maybe_relay_room_message` so it collapses to the MANDATED single generic 403
+    (`room delivery forbidden`) + the `reject_room_admin_authz` audit — NOT be
+    silently absorbed by the earlier static-allowlist gate (a relay target is
+    typically NOT in the leader's inbound allowlist, so without this it would be
+    answered with the distinct `target ... not in allowlist` body and audited as
+    allowlist, not admin-authz). Letting it through is safe: the post-dedupe path
+    reserves then refuses then RELEASES the reservation (no task, no forward), and
+    the generic body still leaks no admin topology.
     """
     _target_node, reason = _relay_resolve(env, cfg, peer_id)
-    return reason in ("ok", "relay_stale_epoch")
+    return (reason in ("ok", "relay_stale_epoch")
+            or reason.startswith("relay_admin_authz:"))
 
 
 def maybe_relay_room_message(env: dict[str, Any], cfg: dict[str, Any],
@@ -1679,6 +1723,15 @@ def maybe_relay_room_message(env: dict[str, Any], cfg: dict[str, Any],
     if reason == "not_applicable":
         return RelayOutcome("not_applicable")
     if reason != "ok":
+        # #2079: a leader-side ADMIN-AUTHZ refusal collapses to the SAME generic
+        # 403 the receiver returns — the precise reason goes to the AUDIT log
+        # only, never to the wire (no reason-bearing relay oracle that would let
+        # a sender probe the room's admin topology from the leader).
+        if reason.startswith("relay_admin_authz:"):
+            audit("reject_room_admin_authz", peer=peer_id,
+                  room_id=env.get("room_id"), target=env.get("target_agent"),
+                  reason=reason.split(":", 1)[1], relay=True, security=True)
+            return RelayOutcome("refused", 403, "room delivery forbidden")
         # A fail-closed refusal (loop / non-member sender / bad target / stale
         # epoch / db). A stale epoch or an ambiguous target is a 409 (the joiner
         # can refresh its roster and retry at the current epoch); everything else
@@ -2577,29 +2630,34 @@ class HandoffHandler(BaseHTTPRequestHandler):
             self._reply(403, {"ok": False, "error": "unknown peer"})
             return
 
-        # --- remote_addr == authenticated peer's CURRENT address (before body) ---
+        # --- remote_addr ∈ authenticated peer's CURRENT address set (before body) ---
         # Resolve the configured SENDER peer (the authenticated X-AGB-Peer we
-        # just looked up) to its CURRENT address rather than trusting a
+        # just looked up) to its CURRENT address(es) rather than trusting a
         # literal/stale stored value. Transport-aware (#1595): for Tailscale a
         # peer keyed on `node_id`/`tailscale_name` live-resolves to its
         # current TailscaleIP; for cloudflare-warp-mesh the peer is keyed on
         # its raw Mesh device IP (Tailscale identity keys are rejected). A
-        # stale stored `address` would otherwise remain the inbound auth
-        # anchor (the very class P0 exists to close). FAIL CLOSED: any
-        # resolver / Tailscale/WARP error rejects the request (we never fall
-        # through to accept) and the check stays BEFORE the body is read off
-        # the socket.
+        # `hostname`-keyed peer (#16247) live-resolves (getaddrinfo) to its
+        # full current A/AAAA set, so a multi-homed peer is accepted on ANY of
+        # its current IPs (membership, not a single string). A stale stored
+        # `address` would otherwise remain the inbound auth anchor (the very
+        # class P0 exists to close). FAIL CLOSED: any resolver / Tailscale /
+        # WARP / DNS error (incl. a bounded-lookup timeout) rejects the request
+        # (we never fall through to accept) and the check stays BEFORE the body
+        # is read off the socket. Both sides are IP-normalized (IPv4-mapped
+        # collapsed) so a textual/AAAA form mismatch can't false-reject/accept.
         try:
-            peer_addr = a2a.resolve_peer_address_for_transport(
+            peer_addrs = a2a.peer_source_addresses(
                 a2a.transport_kind(cfg), peer)
         except a2a.A2AError as exc:
             audit("reject_addr_unresolved", peer=peer_id, client=client_ip,
                   reason=getattr(exc, "code", "resolve_error"), security=True)
             self._reply(403, {"ok": False, "error": "source address mismatch"})
             return
-        if not peer_addr or client_ip != peer_addr:
+        client_norm = a2a.normalize_ip(client_ip)
+        if not peer_addrs or client_norm not in peer_addrs:
             audit("reject_addr_mismatch", peer=peer_id, client=client_ip,
-                  expected=peer_addr, security=True)
+                  expected=",".join(sorted(peer_addrs)), security=True)
             self._reply(403, {"ok": False, "error": "source address mismatch"})
             return
 
@@ -2882,6 +2940,25 @@ class HandoffHandler(BaseHTTPRequestHandler):
                 room_ok, room_reason = room_scoped_check(env, cfg)
                 if not room_ok:
                     conn.rollback()
+                    # #2079: an admin-authz reject (the cross-server routing
+                    # boundary) collapses to a SINGLE generic 403 with NO precise
+                    # reason on the wire — the reason is AUDIT-ONLY so there is no
+                    # reason-bearing receiver oracle (an attacker cannot probe
+                    # admin topology by reading distinct error strings). Existing
+                    # membership rejects keep their reason-bearing response
+                    # (pre-#2079 behavior; they leak only membership, not admin
+                    # topology, and existing smokes assert them).
+                    if room_reason.startswith("admin_authz:"):
+                        audit("reject_room_admin_authz", peer=peer_id,
+                              client=client_ip, target=env.get("target_agent"),
+                              room_id=env.get("room_id"),
+                              reason=room_reason.split(":", 1)[1],
+                              message_id=message_id, security=True)
+                        self._reply(
+                            403,
+                            {"ok": False, "error": "room delivery forbidden"},
+                        )
+                        return False
                     audit("reject_room_membership", peer=peer_id, client=client_ip,
                           target=env.get("target_agent"), room_id=env.get("room_id"),
                           reason=room_reason, message_id=message_id, security=True)
@@ -3404,7 +3481,7 @@ class HandoffHandler(BaseHTTPRequestHandler):
         # any resolver / Tailscale/WARP error rejects BEFORE the body is read.
         # (Identical anchor to do_POST.)
         try:
-            peer_addr = a2a.resolve_peer_address_for_transport(
+            peer_addrs = a2a.peer_source_addresses(
                 a2a.transport_kind(cfg), peer)
         except a2a.A2AError as exc:
             audit("identity_update_reject", reason=getattr(exc, "code",
@@ -3412,10 +3489,11 @@ class HandoffHandler(BaseHTTPRequestHandler):
                   security=True)
             self._reply(403, {"ok": False, "error": "source address mismatch"})
             return
-        if not peer_addr or client_ip != peer_addr:
+        client_norm = a2a.normalize_ip(client_ip)
+        if not peer_addrs or client_norm not in peer_addrs:
             audit("identity_update_reject", reason="addr_mismatch",
-                  peer=peer_id, client=client_ip, expected=peer_addr,
-                  security=True)
+                  peer=peer_id, client=client_ip,
+                  expected=",".join(sorted(peer_addrs)), security=True)
             self._reply(403, {"ok": False, "error": "source address mismatch"})
             return
 
@@ -3770,7 +3848,7 @@ class HandoffHandler(BaseHTTPRequestHandler):
         # client_ip (never a body-asserted address), so this check still
         # enforces socket==registered-addr — it is the SAME gate, not a bypass.
         try:
-            peer_addr = a2a.resolve_peer_address_for_transport(
+            peer_addrs = a2a.peer_source_addresses(
                 a2a.transport_kind(cfg), peer)
         except a2a.A2AError as exc:
             audit("room_join_reject", reason=getattr(exc, "code",
@@ -3778,9 +3856,11 @@ class HandoffHandler(BaseHTTPRequestHandler):
                   security=True, bootstrapped=bootstrapped)
             self._reply(403, {"ok": False, "error": "source address mismatch"})
             return
-        if not peer_addr or client_ip != peer_addr:
+        client_norm = a2a.normalize_ip(client_ip)
+        if not peer_addrs or client_norm not in peer_addrs:
             audit("room_join_reject", reason="addr_mismatch",
-                  peer=peer_id, client=client_ip, expected=peer_addr,
+                  peer=peer_id, client=client_ip,
+                  expected=",".join(sorted(peer_addrs)),
                   security=True, bootstrapped=bootstrapped)
             self._reply(403, {"ok": False, "error": "source address mismatch"})
             return
@@ -3902,6 +3982,14 @@ class HandoffHandler(BaseHTTPRequestHandler):
         room_id = str(claim["room_id"])
         token_hash = str(claim["join_token_sha256"])
         joiner_agent = str(claim["joiner_agent"])
+        # #2079: the joiner node's ATTESTATION of its admin status (tri-state via
+        # presence). parse_room_join_request already validated it is a real bool
+        # when present; absence == unknown (a pre-#2079 sender). NODE-ATTESTED —
+        # the leader records it as metadata, never independently re-verified.
+        if "joiner_is_admin" in claim:
+            joiner_admin_col = rooms.admin_col_from_bool(bool(claim["joiner_is_admin"]))
+        else:
+            joiner_admin_col = rooms.ADMIN_COL_UNKNOWN
         # The joiner's NODE is the HMAC-authenticated sender bridge — NEVER a
         # wire-asserted field (contract 2). `peer_id` is the signed X-AGB-Peer
         # the auth preamble already bound to this connection.
@@ -3992,7 +4080,7 @@ class HandoffHandler(BaseHTTPRequestHandler):
                     conn, message_id=message_id, body_sha256=computed_hash,
                     peer=peer_id, room_id=room_id, agent=joiner_agent,
                     node=joiner_node, via_node=joiner_node,
-                    ttl_expiry=ttl_expiry,
+                    ttl_expiry=ttl_expiry, joiner_admin=joiner_admin_col,
                 )
             except Exception as exc:  # noqa: BLE001 - last-resort guard
                 # The atomic helper rolled BOTH writes back on failure, so no
@@ -4369,7 +4457,7 @@ class HandoffHandler(BaseHTTPRequestHandler):
         # Transport-aware resolution (#1595): Tailscale identity live-resolve
         # or WARP-Mesh raw device IP; fail closed on any resolver error.
         try:
-            peer_addr = a2a.resolve_peer_address_for_transport(
+            peer_addrs = a2a.peer_source_addresses(
                 a2a.transport_kind(cfg), peer)
         except a2a.A2AError as exc:
             audit("room_roster_reject", reason=getattr(exc, "code",
@@ -4377,10 +4465,11 @@ class HandoffHandler(BaseHTTPRequestHandler):
                   security=True)
             self._reply(403, {"ok": False, "error": "source address mismatch"})
             return
-        if not peer_addr or client_ip != peer_addr:
+        client_norm = a2a.normalize_ip(client_ip)
+        if not peer_addrs or client_norm not in peer_addrs:
             audit("room_roster_reject", reason="addr_mismatch",
-                  peer=peer_id, client=client_ip, expected=peer_addr,
-                  security=True)
+                  peer=peer_id, client=client_ip,
+                  expected=",".join(sorted(peer_addrs)), security=True)
             self._reply(403, {"ok": False, "error": "source address mismatch"})
             return
 
@@ -5253,6 +5342,43 @@ def cmd_serve(args: argparse.Namespace) -> int:
     # + BRIDGE_A2A_ALLOW_TEST_BIND escape hatch is the only way to
     # silence the gate; we audit that bypass so it cannot be quiet.
     #
+    # #2081 (SECURITY, fail-open fix): resolve this node's configured admin id
+    # from the on-disk roster/config and stamp it into os.environ BEFORE we
+    # serve, so the #2079 cross-node admin↔admin authz predicate
+    # (rooms.classify_local_admin) can classify a LOCAL admin correctly for the
+    # lifetime of the serve. The systemd handoffd unit runs with only
+    # BRIDGE_HOME in its Environment=, and `agb a2a daemon start` reaches the
+    # spawn through a dispatcher that never sources the roster — so without this
+    # startup resolution a LOCAL admin classifies UNKNOWN and a
+    # `non-admin@remote -> admin@local` delivery flips from the intended DENY to
+    # ALLOW. STARTUP resolution (not a value frozen into the rendered unit) means
+    # a later `agb setup admin <new>` is picked up on the next restart. We do NOT
+    # fail-closed when the resolve comes up empty: a node with no configured
+    # admin legitimately keeps non-admin↔non-admin room traffic open, and the
+    # predicate already fail-closes any admin-CLAIMED counterpart (the env value
+    # is a classification input, never a positive trust signal — see #1738).
+    #
+    # #2081 r2 review F1: a roster file that EXISTS but cannot be read/decoded is
+    # NOT "no admin configured" — silently continuing would re-open the fail-open
+    # (a real local admin would classify UNKNOWN). On that resolver error we FAIL
+    # CLOSED: refuse to serve (phase=config — a NON-transient operator error the
+    # supervisor must not crash-loop). A readable roster with no admin line, or no
+    # roster at all, resolves to '' and serving continues (non-admin traffic stays
+    # open). Any UNEXPECTED resolver fault is also treated as config-fail-closed
+    # rather than served fail-open.
+    if rooms is not None:
+        try:
+            rooms.ensure_admin_agent_id_in_env()
+        except rooms.AdminIdResolveError as exc:
+            log(f"FATAL: {exc} (admin_id_unreadable)")
+            audit("startup_fail", code="admin_id_unreadable",
+                  detail=str(exc)[:300], phase="config", security=True)
+            return 1
+        except Exception as exc:
+            log(f"FATAL: admin id resolution failed: {exc} (admin_id_resolve_error)")
+            audit("startup_fail", code="admin_id_resolve_error",
+                  detail=str(exc)[:300], phase="config", security=True)
+            return 1
     # #1563 PR-4: config-load + secret validation failures are tagged
     # phase=config (NON-transient operator error) and the bind resolution
     # failure is tagged phase=bind (potentially-transient availability error),
