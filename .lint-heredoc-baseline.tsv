@@ -662,6 +662,7 @@ scripts/smoke/system-agent-class.sh	183	H3	ddaaba6a4af689c5541529ea4062fdfe92814
 scripts/smoke/telegram-relay-residue-cleanup.sh	141	C3	8a0fe72b065ef808604f05c68c205d21d341ce21ed6008bf62cc1e9dfac24544	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
 scripts/smoke/upgrade-conflicts-lifecycle.sh	73	C3	b134129d1da6bd48d4f881c4b672fe79997ec37d1e552d8350234fde95c1a979	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
 scripts/smoke/upgrade-conflicts-lifecycle.sh	251	C3	0182027337e83c775ede47f3bf6f9a5ac9b3819cf0c7bb832775648f4241195c	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke/upgrade-conflicts-lifecycle.sh	279	H3	c24f342c125a3d6f31aba0b19705e105b8afeaf2689e47568a3c86c9f5cf6be9	here-string/procsub, non-interpreter consumer	agb-dev-claude	#2089 conflict-marker fixture (#1653)
 scripts/smoke/upgrade-shared-settings-propagate.sh	31	C3	7f13750cc7aedd07037fe5dddc06b338b9ef3a8507c8b273d1c588b4412b00af	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
 scripts/smoke/upgrade-shared-settings-propagate.sh	94	C1	35aee50a6d1ce8076b1b781375e95a1e8c674b08026122f648120f6b1dcb1b26	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
 scripts/smoke/upgrade-shared-settings-propagate.sh	173	C1	23af0239be1f0f36408af55fafb879f3eafbf105c6cccf439af250b46b434a2a	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
