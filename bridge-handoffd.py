@@ -2630,29 +2630,34 @@ class HandoffHandler(BaseHTTPRequestHandler):
             self._reply(403, {"ok": False, "error": "unknown peer"})
             return
 
-        # --- remote_addr == authenticated peer's CURRENT address (before body) ---
+        # --- remote_addr ∈ authenticated peer's CURRENT address set (before body) ---
         # Resolve the configured SENDER peer (the authenticated X-AGB-Peer we
-        # just looked up) to its CURRENT address rather than trusting a
+        # just looked up) to its CURRENT address(es) rather than trusting a
         # literal/stale stored value. Transport-aware (#1595): for Tailscale a
         # peer keyed on `node_id`/`tailscale_name` live-resolves to its
         # current TailscaleIP; for cloudflare-warp-mesh the peer is keyed on
         # its raw Mesh device IP (Tailscale identity keys are rejected). A
-        # stale stored `address` would otherwise remain the inbound auth
-        # anchor (the very class P0 exists to close). FAIL CLOSED: any
-        # resolver / Tailscale/WARP error rejects the request (we never fall
-        # through to accept) and the check stays BEFORE the body is read off
-        # the socket.
+        # `hostname`-keyed peer (#16247) live-resolves (getaddrinfo) to its
+        # full current A/AAAA set, so a multi-homed peer is accepted on ANY of
+        # its current IPs (membership, not a single string). A stale stored
+        # `address` would otherwise remain the inbound auth anchor (the very
+        # class P0 exists to close). FAIL CLOSED: any resolver / Tailscale /
+        # WARP / DNS error (incl. a bounded-lookup timeout) rejects the request
+        # (we never fall through to accept) and the check stays BEFORE the body
+        # is read off the socket. Both sides are IP-normalized (IPv4-mapped
+        # collapsed) so a textual/AAAA form mismatch can't false-reject/accept.
         try:
-            peer_addr = a2a.resolve_peer_address_for_transport(
+            peer_addrs = a2a.peer_source_addresses(
                 a2a.transport_kind(cfg), peer)
         except a2a.A2AError as exc:
             audit("reject_addr_unresolved", peer=peer_id, client=client_ip,
                   reason=getattr(exc, "code", "resolve_error"), security=True)
             self._reply(403, {"ok": False, "error": "source address mismatch"})
             return
-        if not peer_addr or client_ip != peer_addr:
+        client_norm = a2a.normalize_ip(client_ip)
+        if not peer_addrs or client_norm not in peer_addrs:
             audit("reject_addr_mismatch", peer=peer_id, client=client_ip,
-                  expected=peer_addr, security=True)
+                  expected=",".join(sorted(peer_addrs)), security=True)
             self._reply(403, {"ok": False, "error": "source address mismatch"})
             return
 
@@ -3476,7 +3481,7 @@ class HandoffHandler(BaseHTTPRequestHandler):
         # any resolver / Tailscale/WARP error rejects BEFORE the body is read.
         # (Identical anchor to do_POST.)
         try:
-            peer_addr = a2a.resolve_peer_address_for_transport(
+            peer_addrs = a2a.peer_source_addresses(
                 a2a.transport_kind(cfg), peer)
         except a2a.A2AError as exc:
             audit("identity_update_reject", reason=getattr(exc, "code",
@@ -3484,10 +3489,11 @@ class HandoffHandler(BaseHTTPRequestHandler):
                   security=True)
             self._reply(403, {"ok": False, "error": "source address mismatch"})
             return
-        if not peer_addr or client_ip != peer_addr:
+        client_norm = a2a.normalize_ip(client_ip)
+        if not peer_addrs or client_norm not in peer_addrs:
             audit("identity_update_reject", reason="addr_mismatch",
-                  peer=peer_id, client=client_ip, expected=peer_addr,
-                  security=True)
+                  peer=peer_id, client=client_ip,
+                  expected=",".join(sorted(peer_addrs)), security=True)
             self._reply(403, {"ok": False, "error": "source address mismatch"})
             return
 
@@ -3842,7 +3848,7 @@ class HandoffHandler(BaseHTTPRequestHandler):
         # client_ip (never a body-asserted address), so this check still
         # enforces socket==registered-addr — it is the SAME gate, not a bypass.
         try:
-            peer_addr = a2a.resolve_peer_address_for_transport(
+            peer_addrs = a2a.peer_source_addresses(
                 a2a.transport_kind(cfg), peer)
         except a2a.A2AError as exc:
             audit("room_join_reject", reason=getattr(exc, "code",
@@ -3850,9 +3856,11 @@ class HandoffHandler(BaseHTTPRequestHandler):
                   security=True, bootstrapped=bootstrapped)
             self._reply(403, {"ok": False, "error": "source address mismatch"})
             return
-        if not peer_addr or client_ip != peer_addr:
+        client_norm = a2a.normalize_ip(client_ip)
+        if not peer_addrs or client_norm not in peer_addrs:
             audit("room_join_reject", reason="addr_mismatch",
-                  peer=peer_id, client=client_ip, expected=peer_addr,
+                  peer=peer_id, client=client_ip,
+                  expected=",".join(sorted(peer_addrs)),
                   security=True, bootstrapped=bootstrapped)
             self._reply(403, {"ok": False, "error": "source address mismatch"})
             return
@@ -4449,7 +4457,7 @@ class HandoffHandler(BaseHTTPRequestHandler):
         # Transport-aware resolution (#1595): Tailscale identity live-resolve
         # or WARP-Mesh raw device IP; fail closed on any resolver error.
         try:
-            peer_addr = a2a.resolve_peer_address_for_transport(
+            peer_addrs = a2a.peer_source_addresses(
                 a2a.transport_kind(cfg), peer)
         except a2a.A2AError as exc:
             audit("room_roster_reject", reason=getattr(exc, "code",
@@ -4457,10 +4465,11 @@ class HandoffHandler(BaseHTTPRequestHandler):
                   security=True)
             self._reply(403, {"ok": False, "error": "source address mismatch"})
             return
-        if not peer_addr or client_ip != peer_addr:
+        client_norm = a2a.normalize_ip(client_ip)
+        if not peer_addrs or client_norm not in peer_addrs:
             audit("room_roster_reject", reason="addr_mismatch",
-                  peer=peer_id, client=client_ip, expected=peer_addr,
-                  security=True)
+                  peer=peer_id, client=client_ip,
+                  expected=",".join(sorted(peer_addrs)), security=True)
             self._reply(403, {"ok": False, "error": "source address mismatch"})
             return
 
