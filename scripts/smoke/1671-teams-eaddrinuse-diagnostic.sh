@@ -376,7 +376,12 @@ test_t7_ci_select_registration() {
   fi
   local arm_block
   arm_block="$(sed -n "${arm_start},${arm_end}p" "$CI_SELECT")"
-  if ! printf '%s\n' "$arm_block" | grep -q "$SMOKE_NAME"; then
+  # Pure-bash membership ([[ == *..* ]]) — NOT `printf | grep -q`: under
+  # `set -o pipefail`, grep -q exits on first match and closes the pipe while
+  # printf is mid-write, so printf takes SIGPIPE and pipefail propagates that
+  # failure, flipping `if !` into a false negative as the block grows (the
+  # SIGPIPE-under-pipefail smoke-seam class).
+  if [[ "$arm_block" != *"$SMOKE_NAME"* ]]; then
     smoke_fail "T7: '$SMOKE_NAME' not registered under the teams/server.ts arm at lines $arm_start-$arm_end"
   fi
   # add_all_required_static membership.
@@ -390,7 +395,7 @@ test_t7_ci_select_registration() {
     smoke_fail "T7: add_all_required_static() function unterminated"
   fi
   req_block="$(sed -n "${req_static_start},${req_static_end}p" "$CI_SELECT")"
-  if ! printf '%s\n' "$req_block" | grep -q "$SMOKE_NAME"; then
+  if [[ "$req_block" != *"$SMOKE_NAME"* ]]; then
     smoke_fail "T7: '$SMOKE_NAME' not in add_all_required_static() list"
   fi
   smoke_log "T7 PASS"
