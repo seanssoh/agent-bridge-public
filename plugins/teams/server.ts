@@ -37,6 +37,7 @@ import {
 import { homedir } from 'os'
 import { basename, isAbsolute as pathIsAbsolute, join, resolve as pathResolve } from 'path'
 import { createRecentMessageDeduper, storedRowMatchesIncoming } from './dedupe.ts'
+import { renderOutbound } from './cardintent.ts'
 
 type GroupPolicy = {
   requireMention?: boolean
@@ -1979,9 +1980,29 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
 
       if (attachmentsArg.length === 0) {
-        // Text-only path — unchanged behavior, backwards-compatible.
+        // Text-only path. ADDITIVE Adaptive Card seam (Model B): if the turn
+        // text carries a ```cardintent fence, renderOutbound strips it and
+        // returns an Adaptive Card attachment to dual-send alongside the
+        // human-readable summary. When there's no fence (or any render/
+        // validation/§10 failure) renderOutbound returns the text with NO
+        // attachments and this path is byte-for-byte the prior behavior.
+        // renderOutbound never throws.
+        const rendered = renderOutbound(text)
+        if (rendered.warning) {
+          process.stderr.write(`teams channel: cardintent fallback: ${rendered.warning}\n`)
+        }
         await adapter.continueConversation(ref, async context => {
-          await context.sendActivity(text)
+          if (rendered.attachments.length > 0) {
+            await context.sendActivity({
+              type: ActivityTypes.Message,
+              text: rendered.text,
+              attachments: rendered.attachments as any,
+            })
+          } else {
+            // Unchanged plain-string send (preserves the prior wire shape when
+            // no card is produced).
+            await context.sendActivity(rendered.text)
+          }
         })
         return { content: [{ type: 'text', text: `sent: ${chatId}` }] }
       }
