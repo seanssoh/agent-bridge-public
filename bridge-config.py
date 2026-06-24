@@ -157,6 +157,19 @@ ENV_KEY_ALLOWLIST: dict[str, str] = {
     # default-OFF, discoverable via `agb config set-env` + `agb a2a daemon
     # restart` so the receiver inherits it. Non-secret feature toggle.
     "BRIDGE_A2A_ROOM_AUTOJOIN": ENV_KEY_TYPE_FLAG_ONE,
+    # Issue #16309: queue-gateway CLIENT read-wait timeout (seconds). An iso
+    # agent's `agb done/claim` proxies through the daemon's once-per-tick
+    # queue-gateway serve-once (bridge-queue.py:646 passes this to the gateway
+    # client `--timeout`, default 45). On a heavy daemon tick the cumulative
+    # pass weight can exceed 45s and starve the drain → "queue gateway timed
+    # out". Raising this (e.g. 90) lets the iso client ride out a heavy tick.
+    # Operator-settable here because the only sanctioned write path for the
+    # shell-export `agent-env.local.sh` is `agb config set-env` (a direct edit
+    # is blocked by the #341 config-path gate); a raw default-45 was otherwise
+    # un-tunable on a live install. Non-secret operational knob, read from
+    # os.environ by the gateway client. (Interim relief while #2 decouples the
+    # gateway drain from the heavy tick.)
+    "BRIDGE_QUEUE_GATEWAY_TIMEOUT_SECONDS": ENV_KEY_TYPE_POS_FLOAT,
 }
 
 # EXPLICIT DENY — keys that must NEVER be settable through set-env even if a
