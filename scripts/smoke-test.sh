@@ -11967,6 +11967,13 @@ bash "$REPO_ROOT/scripts/smoke/per-agent-settings-rendering.sh"
 log "running shared-settings-preserve-user-keys smoke (issue #613)"
 bash "$REPO_ROOT/scripts/smoke/shared-settings-preserve-user-keys.sh"
 
+# Issue #1990 — concurrent settings renders (the daemon plugin-MCP-liveness
+# restart racing a manual reseed) must never collide on a shared temp file:
+# no save_json traceback, no truncated/partial effective file published. The
+# per-writer unique-tmp fix is mutation-proven by this smoke.
+log "running 1990-settings-render-concurrent-tmp smoke (issue #1990)"
+bash "$REPO_ROOT/scripts/smoke/1990-settings-render-concurrent-tmp.sh"
+
 # v0.13.6 hotfix track 1 — ADMIN-PROTOCOL.md wire-up. The agent CLAUDE.md
 # managed block points admin sessions at ADMIN-PROTOCOL.md but until
 # this smoke landed the file was never propagated into <bridge_home>/
