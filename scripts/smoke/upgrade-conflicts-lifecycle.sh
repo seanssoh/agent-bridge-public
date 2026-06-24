@@ -11,6 +11,16 @@
 #     backups/upgrade-conflict-archive/<date>/.
 #  3. Reconcile skips the auto-archive when the live target hash has
 #     changed (operator may be mid-reconcile).
+#  3b. Issue #1653 (P1b): reconcile ALSO auto-archives when the live
+#     target equals the recorded upstream blob AND the `.upgrade-conflict`
+#     sidecar holds NO recoverable content (its bytes are byte-equal to
+#     that upstream blob) — a spurious sidecar adopted to upstream. It
+#     must NOT archive a GENUINE conflict (which also has live==upstream
+#     the instant apply finishes, but whose sidecar holds the operator's
+#     recoverable diff3/merge content that differs from upstream) — and
+#     that content gate is immune to a later innocuous touch/re-save of
+#     the live file. Still skips a pre-#1653 record that lacks the
+#     upstream hash on a drifted live hash (no regression).
 #  4. `conflicts adopt` replaces the live target with conflict content
 #     and removes the conflict file.
 #  5. `conflicts discard` removes the conflict file but leaves the
@@ -50,11 +60,16 @@ seed_conflict_fixture() {
   # entry whose at-write sha matches the *live target's* current sha,
   # so `conflicts reconcile` should treat it as auto-archive eligible.
   #
-  # Args: <relpath> <live-content> <conflict-content> <run-id>
+  # Args: <relpath> <live-content> <conflict-content> <run-id> [upstream-sha256]
+  # The optional 5th arg records `upstream_target_sha256_at_write` (Issue
+  # #1653) — the hash of the upstream blob the conflict was about, so the
+  # reconcile legitimate-adopt branch can be exercised. Omit it to mimic a
+  # pre-#1653 record that never carried the upstream hash.
   local relpath="$1"
   local live_content="$2"
   local conflict_content="$3"
   local run_id="$4"
+  local upstream_sha="${5:-}"
 
   local live_path="$BRIDGE_HOME/$relpath"
   local conflict_path="$live_path.upgrade-conflict"
@@ -70,6 +85,11 @@ import hashlib, sys
 print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())
 ' "$live_path")"
 
+  # Pass the optional upstream sha via env (FIXTURE_UPSTREAM_SHA) rather than
+  # as a positional arg so the heredoc-opener line below stays byte-identical
+  # to its baselined form (.lint-heredoc-baseline.tsv hash) — adding an argv
+  # would shift the snippet hash and force a full baseline rewrite.
+  FIXTURE_UPSTREAM_SHA="$upstream_sha" \
   python3 - "$record_path" "$run_id" "$conflict_path" "$live_path" "$relpath" "$live_sha" <<'PY'
 import json
 import os
@@ -80,23 +100,29 @@ from pathlib import Path
 record_path, run_id, conflict, live, relpath, live_sha = sys.argv[1:]
 Path(record_path).parent.mkdir(parents=True, exist_ok=True)
 st = Path(conflict).stat()
+entry = {
+    "path": conflict,
+    "live_target": live,
+    "live_target_relpath": relpath,
+    "size": st.st_size,
+    "mtime": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).astimezone().isoformat(timespec="seconds"),
+    "live_target_sha256_at_write": live_sha,
+}
+upstream_sha = os.environ.get("FIXTURE_UPSTREAM_SHA") or ""
+if upstream_sha:
+    entry["upstream_target_sha256_at_write"] = upstream_sha
 payload = {
     "run_id": run_id,
     "timestamp": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
     "target_root": os.environ.get("BRIDGE_HOME"),
-    "conflict_files": [
-        {
-            "path": conflict,
-            "live_target": live,
-            "live_target_relpath": relpath,
-            "size": st.st_size,
-            "mtime": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).astimezone().isoformat(timespec="seconds"),
-            "live_target_sha256_at_write": live_sha,
-        }
-    ],
+    "conflict_files": [entry],
 }
 Path(record_path).write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 PY
+}
+
+sha256_of_string() {
+  python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest())' "$1"
 }
 
 count_conflicts_json() {
@@ -170,6 +196,134 @@ assert_skip_auto_archive_when_changed() {
   # Drain for the next assertion.
   rm -f "$BRIDGE_HOME/scripts/install.sh.upgrade-conflict"
   rm -f "$BRIDGE_HOME/scripts/install.sh"
+}
+
+assert_auto_archive_when_legitimately_adopted() {
+  # Issue #1653 (P1b): a SPURIOUS sidecar must be clearable once the file is
+  # adopted to upstream. The spurious case (#1653: a clean file the prior
+  # classifier mis-flagged, whose 3-way merge with base == live collapses to
+  # upstream) leaves a sidecar that holds EXACTLY the upstream bytes — there
+  # is nothing to recover. After a later clean adopt, live == upstream too.
+  # Reconcile must clear it: live == upstream_target AND sidecar == upstream.
+  #
+  # The old reconcile (auto-archive only when live == at-write) could never
+  # clear this — a clean adopt changes the live hash away from at-write — so
+  # the sidecar stranded forever, especially on gated `hooks/` paths where
+  # manual discard is blocked.
+  #
+  # Mutation-proof: before the fix the live != at-write branch falls to
+  # "skip" → 1 pending. After the fix the sidecar==upstream branch archives
+  # → 0 pending.
+  drain_conflicts
+  local relpath="hooks/bridge_hook_common.py"
+  local upstream_content="adopted-upstream-blob-content"
+  local upstream_sha
+  upstream_sha="$(sha256_of_string "$upstream_content")"
+
+  # Seed with the pre-adopt content as the at-write hash and the SPURIOUS
+  # sidecar content == the upstream blob (nothing recoverable), recording the
+  # upstream blob this conflict was about.
+  seed_conflict_fixture "$relpath" "pre-adopt-live-content" "$upstream_content" "run-1653" "$upstream_sha"
+
+  # The later clean adopt rewrote live to the upstream blob.
+  printf '%s' "$upstream_content" >"$BRIDGE_HOME/$relpath"
+
+  local before after archived reason
+  before="$(count_conflicts_json)"
+  smoke_assert_eq "1" "$before" "before reconcile: 1 stranded conflict"
+
+  local recon
+  recon="$(python3 "$UPGRADE_PY" conflicts-reconcile --target-root "$BRIDGE_HOME" --auto-archive)"
+  archived="$(printf '%s' "$recon" | python3 -c 'import json, sys; print(json.load(sys.stdin)["archived_count"])')"
+  smoke_assert_eq "1" "$archived" "reconcile auto-archives the spurious (sidecar==upstream) conflict"
+
+  reason="$(printf '%s' "$recon" \
+    | python3 -c 'import json, sys; a=json.load(sys.stdin)["actions"][0]; print(a["reason"])')"
+  smoke_assert_contains "$reason" "no recoverable content" "reconcile reason names the no-recovery adopt case"
+
+  after="$(count_conflicts_json)"
+  smoke_assert_eq "0" "$after" "after reconcile: 0 pending conflicts (sidecar cleared)"
+
+  # And the archive landed under backups/upgrade-conflict-archive/<date>/.
+  local archive_root="$BRIDGE_HOME/backups/upgrade-conflict-archive"
+  local found
+  found="$(find "$archive_root" -type f -name 'bridge_hook_common.py.upgrade-conflict' | head -n 1)"
+  [[ -n "$found" ]] || smoke_fail "adopted conflict not archived under $archive_root"
+}
+
+assert_skip_genuine_fresh_conflict_live_equals_upstream() {
+  # Issue #1653 — the load-bearing false-positive guard (codex review catch):
+  # a GENUINE unresolved merge conflict already has live == upstream the
+  # instant apply finishes, because apply writes the upstream bytes to the
+  # live target and parks the operator's RECOVERABLE content (diff3 markers /
+  # operator bytes) in the sidecar. Reconcile must NOT archive it — doing so
+  # would destroy the operator's pending recovery artifact. The tamper-proof
+  # distinguisher is sidecar CONTENT: a genuine conflict's sidecar differs
+  # from upstream, so the new branch must not fire even when live==upstream
+  # and even if the live file is later touched/re-saved.
+  #
+  # Faithful state of a genuine fresh conflict:
+  #   at_write     = the operator's PRE-apply content (!= upstream)
+  #   live (now)   = the upstream blob (apply deployed it)
+  #   sidecar      = operator/merge content (!= upstream) — RECOVERABLE
+  #   upstream_tgt = sha(upstream blob)
+  # `current != at_write` (skips branch 1); `current == upstream_target` but
+  # `sidecar != upstream` so the new branch must NOT fire → skip.
+  drain_conflicts
+  local relpath="hooks/bridge_hook_common.py"
+  local upstream_content="fresh-conflict-upstream-blob"
+  local upstream_sha
+  upstream_sha="$(sha256_of_string "$upstream_content")"
+
+  # Sidecar holds genuine operator/merge content that differs from upstream.
+  seed_conflict_fixture "$relpath" "operator-pre-apply-content" "<<<<<<< live\noperator-edit\n=======\nupstream-edit\n>>>>>>> upstream\n" "run-fresh" "$upstream_sha"
+
+  # apply deployed the upstream blob to the live target.
+  printf '%s' "$upstream_content" >"$BRIDGE_HOME/$relpath"
+
+  # Adversarial: a later innocuous touch/re-save of the live file (still the
+  # upstream bytes) must NOT flip the decision — content gate is immune.
+  printf '%s' "$upstream_content" >"$BRIDGE_HOME/$relpath"
+
+  local before after archived
+  before="$(count_conflicts_json)"
+  smoke_assert_eq "1" "$before" "before reconcile: 1 genuine pending conflict"
+
+  local recon
+  recon="$(python3 "$UPGRADE_PY" conflicts-reconcile --target-root "$BRIDGE_HOME" --auto-archive)"
+  archived="$(printf '%s' "$recon" | python3 -c 'import json, sys; print(json.load(sys.stdin)["archived_count"])')"
+  smoke_assert_eq "0" "$archived" "reconcile must NOT archive a genuine fresh conflict (sidecar holds recoverable content)"
+
+  local decision
+  decision="$(printf '%s' "$recon" \
+    | python3 -c 'import json, sys; a=json.load(sys.stdin)["actions"][0]; print(a["decision"])')"
+  smoke_assert_eq "skip" "$decision" "decision is skip for the genuine fresh conflict"
+
+  after="$(count_conflicts_json)"
+  smoke_assert_eq "1" "$after" "genuine conflict still pending after reconcile (recovery artifact preserved)"
+
+  rm -f "$BRIDGE_HOME/$relpath.upgrade-conflict" "$BRIDGE_HOME/$relpath"
+}
+
+assert_skip_adopt_branch_for_pre_1653_record() {
+  # Issue #1653: a pre-#1653 record (no upstream_target hash) must NOT be
+  # affected by the new branch — only the existing at-write-equality branch
+  # applies. With the live hash changed and no recorded upstream blob to
+  # match, reconcile must still skip (no spurious archive, no regression).
+  drain_conflicts
+  seed_conflict_fixture "lib/bridge-state.sh" "live-pre1653-original" "conflict-pre1653" "run-1653b"
+  printf '%s' "live-pre1653-changed-but-not-upstream" >"$BRIDGE_HOME/lib/bridge-state.sh"
+
+  local archived after
+  archived="$(python3 "$UPGRADE_PY" conflicts-reconcile --target-root "$BRIDGE_HOME" --auto-archive \
+    | python3 -c 'import json, sys; print(json.load(sys.stdin)["archived_count"])')"
+  smoke_assert_eq "0" "$archived" "pre-#1653 record (no upstream hash) is not auto-archived on a drifted live hash"
+
+  after="$(count_conflicts_json)"
+  smoke_assert_eq "1" "$after" "pre-#1653 conflict still pending (no regression to the skip path)"
+
+  rm -f "$BRIDGE_HOME/lib/bridge-state.sh.upgrade-conflict"
+  rm -f "$BRIDGE_HOME/lib/bridge-state.sh"
 }
 
 assert_adopt_replaces_live_and_removes_conflict() {
@@ -368,6 +522,9 @@ main() {
   smoke_run "list --json reports the seeded conflict + structured record" assert_conflict_record_listed
   smoke_run "reconcile auto-archives when live hash unchanged" assert_auto_archive_when_unchanged
   smoke_run "reconcile skips when live hash changed" assert_skip_auto_archive_when_changed
+  smoke_run "reconcile auto-archives a spurious (sidecar==upstream) adopted conflict (#1653)" assert_auto_archive_when_legitimately_adopted
+  smoke_run "reconcile skips a GENUINE conflict whose sidecar holds recoverable content (#1653 FP guard)" assert_skip_genuine_fresh_conflict_live_equals_upstream
+  smoke_run "reconcile skips a pre-#1653 record on a drifted hash (no regression)" assert_skip_adopt_branch_for_pre_1653_record
   smoke_run "adopt replaces live target and removes conflict" assert_adopt_replaces_live_and_removes_conflict
   smoke_run "discard removes conflict, live unchanged" assert_discard_removes_conflict_only
   smoke_run "archive moves conflict to backups/upgrade-conflict-archive/<date>/" assert_archive_moves_conflict
