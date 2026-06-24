@@ -363,23 +363,78 @@ function toSubmitAction(a: Action): AcElement {
   }
 }
 
-// list render: a Container stack, one Container per Section, separator between
-// cards. Each section = headline + money mini-FactSet + per-card ActionSet.
+// quoteResult LIST columns (≤3). Column 1 is the section label
+// (accountName · productName). Columns 2–3 are matched out of the section's
+// rows by these STABLE labels — NOT the role-scoped 내용물/가공비 cost labels,
+// which the server rewrites per viewer role ("제시가" vs "견적"); 확정가 and
+// 산출상태 are stable across roles. A missing column → an em dash (never a raw
+// leak). `세트` (set), if present and truthy, decorates the status with a ✓.
+const COL_PRICE_LABELS: readonly string[] = ['확정가']
+const COL_STATUS_LABELS: readonly string[] = ['산출상태', '상태']
+const COL_SET_LABELS: readonly string[] = ['세트', 'set']
+const EMDASH: RenderedValue = { text: '—', color: 'Default' }
+
+function findRow(rows: Row[], labels: readonly string[]): Row | undefined {
+  return rows.find(r => labels.includes(r.label))
+}
+
+// A single Column carrying one TextBlock (AC 1.2). `width` is 'stretch' | 'auto'.
+function column(
+  text: string,
+  width: string,
+  opts: { weight?: string; color?: string; isSubtle?: boolean } = {},
+): AcElement {
+  return {
+    type: 'Column',
+    width,
+    items: [textBlock(text, { weight: opts.weight, color: opts.color, isSubtle: opts.isSubtle, wrap: true })],
+  }
+}
+
+function columnSetRow(columns: AcElement[], separator: boolean): AcElement {
+  return { type: 'ColumnSet', separator, columns }
+}
+
+// list render (AC 1.2): a compact ColumnSet "table" — a header row + one row
+// per RFQ section (≤3 columns: 고객·제품 | 확정가 | 상태), so multiple quote
+// results scan record-by-record. ColumnSet (NOT the AC 1.5 Table element) wraps
+// gracefully on a narrow screen; the #15157 mobile-LCD constraint keeps us on
+// AC 1.2 / no Table / no targetWidth. Per-section actions, if any, follow the
+// row as an ActionSet. cardintent contract is unchanged — the server still
+// sends generic sections/rows; this renderer just lays the list out as a table.
 function renderList(intent: CardIntent): AcElement[] {
   const body: AcElement[] = [textBlock(intent.title, { weight: 'Bolder', size: 'Medium' })]
-  intent.sections.forEach((section, idx) => {
-    const container: AcElement = {
-      type: 'Container',
-      separator: idx > 0,
-      items: [
-        textBlock(section.label, { weight: 'Bolder' }),
-        factSet(section.rows),
+  // header row
+  body.push(
+    columnSetRow(
+      [
+        column('고객·제품', 'stretch', { weight: 'Bolder', isSubtle: true }),
+        column('확정가', 'auto', { weight: 'Bolder', isSubtle: true }),
+        column('상태', 'auto', { weight: 'Bolder', isSubtle: true }),
       ],
-    }
+      false,
+    ),
+  )
+  intent.sections.forEach((section, idx) => {
+    const priceRow = findRow(section.rows, COL_PRICE_LABELS)
+    const statusRow = findRow(section.rows, COL_STATUS_LABELS)
+    const setRow = findRow(section.rows, COL_SET_LABELS)
+    const price = priceRow ? renderValueState(priceRow) : EMDASH
+    const status = statusRow ? renderValueState(statusRow) : EMDASH
+    const setMark = setRow && setRow.valueState === 'value' && setRow.value.trim() ? ' ✓' : ''
+    body.push(
+      columnSetRow(
+        [
+          column(section.label, 'stretch', { weight: 'Bolder' }),
+          column(price.text, 'auto', { color: price.color, isSubtle: price.isSubtle }),
+          column(status.text + setMark, 'auto', { color: status.color, isSubtle: status.isSubtle }),
+        ],
+        idx > 0,
+      ),
+    )
     if (section.actions && section.actions.length > 0) {
-      ;(container.items as AcElement[]).push(actionSet(section.actions))
+      body.push(actionSet(section.actions))
     }
-    body.push(container)
   })
   return body
 }

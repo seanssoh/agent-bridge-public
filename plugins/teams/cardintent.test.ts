@@ -36,11 +36,14 @@ function validListIntent(): CardIntent {
     title: 'RFQ 견적 결과',
     sections: [
       {
-        label: 'A사·세럼A 세트✓',
+        label: 'A사·세럼A',
         rows: [
           { label: '내용물', value: '₩1,200', valueState: 'value' },
           { label: '가공비', value: '₩300', valueState: 'value' },
           { label: '견적소계', value: '₩1,500', valueState: 'value' },
+          { label: '확정가', value: '₩2,380', valueState: 'masked' },
+          { label: '산출상태', value: '산출완료', valueState: 'value' },
+          { label: '세트', value: 'Y', valueState: 'value' },
         ],
         actions: [
           { actionId: 'openQuoteResultDetail', label: '상세', payload: { quoteId: 'q1' } },
@@ -50,9 +53,11 @@ function validListIntent(): CardIntent {
       {
         label: 'B사·크림B',
         rows: [
-          { label: '내용물', value: '₩2,000', valueState: 'calculating' },
+          { label: '내용물', value: '₩2,000', valueState: 'value' },
           { label: '가공비', value: '₩500', valueState: 'value' },
           { label: '견적소계', value: '₩2,500', valueState: 'masked' },
+          { label: '확정가', value: '₩2,500', valueState: 'calculating' },
+          { label: '산출상태', value: '산출중', valueState: 'value' },
         ],
       },
     ],
@@ -360,23 +365,34 @@ function walk(node: any, visit: (n: any) => void): void {
 }
 
 describe('buildAdaptiveCard render shape', () => {
-  test('list renders AC v1.2 with Containers + separators + FactSets', () => {
+  test('list renders AC v1.2 as a compact ColumnSet table (header + 1 row per RFQ, ≤3 cols)', () => {
     const card: any = buildAdaptiveCard(validListIntent())
     expect(card.type).toBe('AdaptiveCard')
     expect(card.version).toBe('1.2')
     // multi-section list is NOT a detail layout
     expect(isDetailLayout(validListIntent())).toBe(false)
-    const containers = card.body.filter((b: any) => b.type === 'Container')
-    expect(containers.length).toBe(2)
-    // first card no separator, subsequent cards separated
-    expect(containers[0].separator).toBe(false)
-    expect(containers[1].separator).toBe(true)
-    // money mini-FactSet present in each container
-    for (const c of containers) {
-      expect(c.items.some((i: any) => i.type === 'FactSet')).toBe(true)
-    }
+    const columnSets = card.body.filter((b: any) => b.type === 'ColumnSet')
+    // 1 header row + 1 row per RFQ section (2)
+    expect(columnSets.length).toBe(3)
+    for (const cs of columnSets) expect(cs.columns.length).toBeLessThanOrEqual(3)
+    // the list is a table now — NO per-RFQ FactSet (FactSet is a detail-only thing)
+    expect(card.body.some((b: any) => b.type === 'FactSet')).toBe(false)
+    // header row labels + no separator
+    const header = JSON.stringify(columnSets[0])
+    expect(header).toContain('고객·제품')
+    expect(header).toContain('확정가')
+    expect(header).toContain('상태')
+    expect(columnSets[0].separator).toBe(false)
+    // RFQ rows: section label in column 1; first row no separator, second separated
+    const rowA = columnSets[1]
+    const rowB = columnSets[2]
+    expect(JSON.stringify(rowA.columns[0])).toContain('A사·세럼A')
+    expect(rowA.separator).toBe(false)
+    expect(rowB.separator).toBe(true)
+    // 세트 truthy → ✓ decorates A's status column
+    expect(JSON.stringify(rowA)).toContain('✓')
     // per-card ActionSet present where the section had actions
-    expect(containers[0].items.some((i: any) => i.type === 'ActionSet')).toBe(true)
+    expect(card.body.some((b: any) => b.type === 'ActionSet')).toBe(true)
   })
 
   test('detail renders 4 sections with an emphasis Container', () => {
@@ -411,11 +427,13 @@ describe('buildAdaptiveCard render shape', () => {
     }
   })
 
-  test('valueState mapping flows into the rendered FactSet (calculating hides number)', () => {
+  test('valueState mapping flows into the ColumnSet columns (calculating hides number, masked hidden)', () => {
     const card = JSON.stringify(buildAdaptiveCard(validListIntent()))
-    expect(card).toContain('(계산중)')
-    expect(card).toContain('●●●')
-    // the masked underlying subtotal ₩2,500 must NOT appear
+    expect(card).toContain('(계산중)') // B 확정가 calculating column
+    expect(card).toContain('●●●') // A 확정가 masked column
+    // the masked confirmed price ₩2,380 must NOT leak (masked → ●●●)
+    expect(card).not.toContain('2,380')
+    // the masked subtotal ₩2,500 is not a list column at all → never rendered
     expect(card).not.toContain('2,500')
   })
 })
