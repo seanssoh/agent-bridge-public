@@ -161,6 +161,25 @@ there is nothing to carry *back up* into it. The LTS branch is simply the thing 
 and soaks" on its own schedule while `main` keeps moving. This is exactly why the forward line
 does not have to wait for the LTS to settle.
 
+### Branch hygiene — the LTS branch is protected; force-pushes are CI-gated
+
+`release/X.Y-lts` is updated far more often by **cherry-pick / rebase / force-push** than `main`
+is, and it has historically been treated as a casual working branch. That is the wrong default:
+**treat the LTS branch as protected, the same as `main`.** A `--force`/`--force-with-lease` push
+to `release/X.Y-lts` whose resulting HEAD has **not** passed CI is prohibited.
+
+- **Mechanism first (preferred):** branch protection on `release/X.Y-lts` — a required green CI
+  status check plus a block (or gate) on force-pushes, so an un-verified HEAD cannot become the
+  branch tip. A "let's be careful" memo is not enough.
+- **Floor (until protection is configured):** hold the `git push` → confirm the resulting HEAD is
+  **green on CI** → only then push. Put this in the LTS-cut preflight checklist.
+- **Why it matters:** an un-CI-verified force-push leaves the *branch HEAD* broken even when the
+  last tagged LTS release is fine (prod pins to the tag, not the branch HEAD), so it ships invisibly
+  to the *next* patch cut. This class has recurred (e.g. a bad cherry-pick merge; a wholesale
+  ci-select copy that referenced smoke files absent on the LTS branch; lint-baseline regressions
+  inherited from a force-pushed commit). Each one only surfaced when the *next* LTS PR's CI failed.
+  A green-gate on the branch HEAD removes the whole class.
+
 > **Pre-fork phase.** Before there is any feature divergence, there is **only one line: `main`**,
 > and the running `vX.Y.z` hardening sequence *is* the LTS line — it rides `main` directly. You do
 > **not** fork a `release/X.Y-lts` branch early: two branches kept in sync for no divergent work is
