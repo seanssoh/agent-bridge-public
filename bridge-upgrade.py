@@ -3717,6 +3717,7 @@ def apply_live(
                     "live_target": str(live_path),
                     "live_target_relpath": relpath,
                     "live_sha256_at_write": sha256_bytes(live),
+                    "upstream_sha256_at_write": sha256_bytes(upstream),
                 }
             )
             actions.append(
@@ -3740,6 +3741,7 @@ def apply_live(
                 "live_target": str(live_path),
                 "live_target_relpath": relpath,
                 "live_sha256_at_write": sha256_bytes(live),
+                "upstream_sha256_at_write": sha256_bytes(upstream),
             }
         )
         actions.append(
@@ -3851,6 +3853,12 @@ def apply_live(
                     "size": size,
                     "mtime": mtime_iso,
                     "live_target_sha256_at_write": entry["live_sha256_at_write"],
+                    # Issue #1653: record the upstream/target blob this conflict
+                    # was *about*, so a later `conflicts reconcile` can clear the
+                    # sidecar once the file is legitimately adopted to upstream
+                    # (live now == this hash) — the post-adopt case the
+                    # at-write-equality branch can never match.
+                    "upstream_target_sha256_at_write": entry.get("upstream_sha256_at_write", ""),
                 }
             )
         save_json(
@@ -5627,16 +5635,38 @@ def cmd_conflicts_archive(args: argparse.Namespace) -> int:
 
 
 def cmd_conflicts_reconcile(args: argparse.Namespace) -> int:
-    """Auto-archive conflict files whose live target hash has not changed
-    since the conflict was written.
+    """Auto-archive conflict files that are no longer informative.
 
-    Operator semantics: an unchanged hash means the operator either
-    explicitly kept the live version (their pre-write content survived
-    the upgrade) or never touched it AND the conflict has not been
-    re-deposited by a fresh merge in the meantime — either way the
-    conflict file is no longer informative. A changed hash means the
-    operator may be mid-reconcile (adopt-in-progress, partial edit), so
-    we leave it alone.
+    Two cases clear a sidecar:
+
+    1. Live target hash UNCHANGED since the conflict was written
+       (`current == at_write`): the operator either explicitly kept the
+       live version (their pre-write content survived the upgrade) or
+       never touched it AND the conflict has not been re-deposited by a
+       fresh merge — either way the conflict is stale.
+    2. Issue #1653: the `.upgrade-conflict` sidecar holds NO recoverable
+       content (its bytes are byte-equal to the upstream blob the conflict
+       was about) AND the live target was adopted to that same upstream
+       blob (`current == upstream_target`): the conflict was spurious —
+       the prior classifier mis-flagged a clean file whose 3-way merge
+       collapses to upstream — so keeping the sidecar preserves nothing.
+       Without this branch the stale sidecar strands forever (especially
+       on gated `hooks/` / `settings.json` paths where manual `discard`
+       is blocked by the config-gating guard).
+
+       The sidecar-content gate is load-bearing and tamper-proof: a
+       GENUINE fresh merge conflict ALSO has `current == upstream_target`
+       the instant apply finishes (apply writes the upstream bytes to the
+       live target), but its sidecar holds the operator's recoverable
+       content (diff3 markers, or the operator's live bytes) which differs
+       from upstream — so this branch does NOT fire and the recovery
+       artifact is preserved. Unlike a timestamp, sidecar bytes cannot be
+       innocently invalidated by a later `touch`/re-save of the live file.
+
+    Any other state (live drifted to neither the at-write value nor the
+    upstream blob, or the sidecar still carries recoverable content) means
+    the operator may be mid-reconcile or the conflict is still genuinely
+    pending, so we leave it alone.
 
     Only `--auto-archive` actually mutates state. Without the flag this
     is a read-only report (suitable for `agb status` integration).
@@ -5666,10 +5696,42 @@ def cmd_conflicts_reconcile(args: argparse.Namespace) -> int:
                 }
             )
             continue
+        # Issue #1653: the upstream/target blob this conflict was about,
+        # recorded at write time. Empty for pre-#1653 records (the field
+        # did not exist), in which case only the at-write branch applies.
+        upstream_target = str(record_entry.get("upstream_target_sha256_at_write") or "")
         current = file_sha256(live_target) if live_target.exists() else ""
+        # Issue #1653: a GENUINE fresh merge conflict already has live ==
+        # upstream the instant apply finishes — apply writes the upstream bytes
+        # to the live target and parks the operator's RECOVERABLE content (the
+        # diff3-merged-with-markers output, or the operator's live bytes on the
+        # no-base/binary path) in the `.upgrade-conflict` sidecar. So
+        # `current == upstream_target` alone is NOT proof of a stale adopt; it
+        # is also true for an unresolved real conflict, and archiving that
+        # would discard the operator's pending recovery artifact.
+        #
+        # The tamper-proof distinguisher is the SIDECAR CONTENT, not timing: a
+        # genuine conflict's sidecar differs from upstream (it holds markers /
+        # operator bytes), so keeping it preserves something. A spurious sidecar
+        # (the #1653 case: a clean file the prior classifier mis-flagged, whose
+        # 3-way merge with base == live collapses to upstream) holds EXACTLY the
+        # upstream bytes — keeping it preserves nothing. So only clear the
+        # sidecar when it is byte-equal to the upstream blob the file was
+        # adopted to: nothing is recoverable, regardless of mtime/touches/who
+        # last wrote the live file. `at_write`-equality stays the first,
+        # independent branch (operator kept live unchanged).
+        sidecar_sha = file_sha256(conflict) if conflict.exists() else ""  # noqa: raw-pathlib-controller-only — .upgrade-conflict sidecar is a controller-owned upgrade-flow artifact
+        sidecar_is_empty_of_recovery = (
+            bool(upstream_target)
+            and current == upstream_target
+            and sidecar_sha == upstream_target
+        )
         if current == at_write:
             decision = "auto-archive"
             reason = "live hash unchanged since conflict write"
+        elif sidecar_is_empty_of_recovery:
+            decision = "auto-archive"
+            reason = "sidecar holds the upstream blob (no recoverable content) and live was adopted to upstream"
         else:
             decision = "skip"
             reason = "live hash changed since conflict write"
@@ -5677,6 +5739,7 @@ def cmd_conflicts_reconcile(args: argparse.Namespace) -> int:
             "conflict": str(conflict),
             "live_target": str(live_target),
             "live_target_sha256_at_write": at_write,
+            "upstream_target_sha256_at_write": upstream_target,
             "live_target_sha256_now": current,
             "decision": decision,
             "reason": reason,

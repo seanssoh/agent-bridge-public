@@ -89,6 +89,7 @@ Agent Bridge runs an **LTS line + mainline**, not a single moving tag. Full poli
 - **Support window**: an LTS is supported until the next LTS is declared.
 - **Backport criteria** (LTS branch only): security · data loss · upgrade/rollback breakage · fleet-host-down regression. Not features/cosmetic/perf-only/refactors. Fix on `main` first, cherry-pick back only if it qualifies. When reviewing a backport PR, confirm it meets these criteria.
 - **Versioning**: LTS = patch bumps; mainline features = minor. **Channel enforcement**: `--channel stable` currently resolves to the highest global tag, so an `lts` version-line-pin channel (landing in v0.16.3, on the v0.16.x line) is what keeps LTS installs from auto-jumping when a higher minor ships. The upgrader is high-risk — review channel-resolver changes adversarially and confirm the default channel behavior is unchanged.
+- **`release/X.Y-lts` is protected — force-pushes are CI-gated.** A `--force`/`--force-with-lease` push to the LTS branch whose resulting HEAD has not passed CI is prohibited (prefer branch protection; floor = hold push → confirm green HEAD → push). An un-CI-verified force-push leaves the branch HEAD broken even when the tagged release is fine, shipping invisibly to the next patch cut (this class recurred 3×). See [`docs/release-lines.md`](./docs/release-lines.md) §"Branch hygiene".
 
 ### 4. Forbidden operations under shared worktree
 

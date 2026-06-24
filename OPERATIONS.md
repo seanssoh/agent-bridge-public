@@ -1771,6 +1771,21 @@ one urgent "claude token pool exhausted" notification on a cooldown latch
 (`BRIDGE_CLAUDE_POOL_EXHAUSTED_NOTICE_INTERVAL_SECONDS`, default 1800)
 rather than re-alerting on every monitor pass.
 
+The daemon also applies a **pool-level cooldown** to the rotation *attempt*
+itself (#1789 D2): once a pass reports `all_tokens_limited`, it records the
+pool's `soonest_reset` and **suppresses the `claude-token rotate` call on
+subsequent monitor passes until that window elapses**, instead of re-locking
+the registry and re-running the per-agent sync fanout every ~300s while the
+whole pool is saturated. The suppression window is clamped to
+`[BRIDGE_CLAUDE_POOL_EXHAUSTED_MIN_COOLDOWN_SECONDS` (default 60),
+`BRIDGE_CLAUDE_POOL_EXHAUSTED_MAX_COOLDOWN_SECONDS` (default 21600)`] so a
+missing/garbled or absurd far-future reset can never strand rotation
+permanently. Any non-saturated rotation outcome (a successful rotate, a
+no-alternate skip, or an error) clears the window so the gate re-arms
+immediately. The state lives at
+`$BRIDGE_STATE_DIR/usage/claude-pool-exhausted.env` and self-heals on a
+corrupt or expired stamp.
+
 The credential write path is hardened against two specific failure
 modes (see PR #799 r2-of-Path-A):
 

@@ -12,6 +12,7 @@ import shutil
 import shlex
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -390,15 +391,56 @@ def load_json(path: Path) -> Any:
         return json.load(handle)
 
 
+def _atomic_write_json(path: Path, payload: Any, mode: int) -> None:
+    # Issue #1990: write through a PER-WRITER unique temp file in the
+    # destination directory, then `os.replace` onto `path`. The previous
+    # idiom shared a single fixed `<name>.tmp` across every writer of the
+    # same target. When the daemon's plugin-MCP-liveness restart re-rendered
+    # an agent's `settings.effective.json` at the same moment a manual reseed
+    # (or a sibling restart) re-rendered the same file, both writers opened
+    # the SAME `.tmp` inode: one writer's `os.replace(tmp, path)` renamed the
+    # shared tmp out from under the other (→ the truncated `save_json`
+    # traceback the daemon logged as `plugin_mcp_liveness_restart_failed`),
+    # and in the worse interleaving the second `open("w")` truncated the tmp
+    # the first writer was mid-dump on, so a partially written effective file
+    # could be published (plugins/MCP off → the flap). A unique temp name per
+    # writer removes the shared-inode collision entirely; `os.replace` stays
+    # atomic because the temp lives in the destination directory (same
+    # filesystem). The last writer to `replace` wins — both produced a
+    # complete render, so either is a valid final state.
+    parent = path.parent
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(parent)
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        # Best-effort cleanup so a failed write never leaks a stray unique
+        # temp file next to the target.
+        try:
+            tmp.unlink()  # noqa: raw-pathlib-controller-only — cleanup of this writer's own unique temp; never the published target
+        except FileNotFoundError:
+            pass
+        raise
+    # The pre-replace chmod already fixed the final mode; this trailing chmod
+    # is belt-and-suspenders. A concurrent writer may have re-replaced `path`
+    # between our `os.replace` and here (#1990 race) — chmod'ing their
+    # identically-moded file is harmless, and a momentarily-absent path must
+    # not turn a successful publish into a failure.
+    try:
+        os.chmod(path, mode)
+    except FileNotFoundError:
+        pass
+
+
 def save_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — controller-owned hook scaffold; iso-routed callers stage via _ensure_dir_with_sudo upstream
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
-    os.chmod(tmp, 0o600)
-    tmp.replace(path)
-    os.chmod(path, 0o600)
+    _atomic_write_json(path, payload, 0o600)
 
 
 def merge_settings(base: Any, overlay: Any) -> Any:
@@ -3366,7 +3408,6 @@ def cmd_render_isolated_home_settings(args: argparse.Namespace) -> int:
     # can read it; ownership stays with whoever invoked us — controller
     # under the normal start path, root under sudo-backed reapply).
     effective_path.parent.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — already-staged by target_dir.mkdir above; sudo-backed reapply caller has write access
-    tmp = effective_path.with_suffix(effective_path.suffix + ".tmp")
     # E2E test on Ubuntu 24.04 VM (2026-05-16) caught a race: under
     # concurrent bootstrap (bridge-bootstrap.sh) + patch first-start +
     # watchdog firing, the parent dir occasionally gets recreated by
@@ -3376,12 +3417,15 @@ def cmd_render_isolated_home_settings(args: argparse.Namespace) -> int:
     # treat as a soft warning and continue (the effective_path may
     # have been written by another writer in the meantime, or the
     # next agent-start tick will re-render).
+    #
+    # Issue #1990: route through `_atomic_write_json` so each writer gets a
+    # PER-WRITER unique temp file. The previous fixed `<name>.tmp` was shared
+    # across every concurrent render of the same isolated home — exactly the
+    # daemon-liveness-restart vs. settings-render collision in #1990. The
+    # parent-dir-nuked retry below is preserved: `_atomic_write_json` raises
+    # FileNotFoundError when mkstemp cannot create the temp (parent gone).
     def _atomic_write_effective() -> None:
-        with tmp.open("w", encoding="utf-8") as handle:
-            json.dump(merged, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
-        os.chmod(tmp, 0o644)
-        os.replace(tmp, effective_path)
+        _atomic_write_json(effective_path, merged, 0o644)
 
     try:
         _atomic_write_effective()
