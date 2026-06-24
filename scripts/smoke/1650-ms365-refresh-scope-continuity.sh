@@ -77,7 +77,7 @@ else
   # no new refresh_token" Entra behavior.
   {
     printf '%s\n' "const realFetch = globalThis.fetch"
-    printf '%s\n' "const PROBE = process.env.PROBE_FILE!"
+    printf '%s\n' "const PROBE = process.env.PROBE_FILE!"  # noqa: iso-helper-boundary (JS process.env in a TS fixture, not an iso agent-env file)
     printf '%s\n' "import { appendFileSync } from 'fs'"
     printf '%s\n' "let n = 0"
     printf '%s\n' "globalThis.fetch = (async (input: any, init?: any) => {"
