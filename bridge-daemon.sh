@@ -1459,6 +1459,118 @@ bridge_claude_token_recovery_state_file() {
   printf '%s/claude-token-recovery.env' "$BRIDGE_STATE_DIR"
 }
 
+bridge_claude_pool_exhausted_state_file() {
+  printf '%s/usage/claude-pool-exhausted.env' "$BRIDGE_STATE_DIR"
+}
+
+# #1789 (D2 pool-level cooldown): convert an ISO-8601 timestamp to an epoch
+# integer on stdout, dual-path for GNU date (Linux, -d) and BSD date (macOS,
+# -j -f, which rejects colonized `+09:00` offsets). Prints nothing and returns
+# 1 on any unparseable input. Mirrors bridge_daemon_heartbeat_age_seconds.
+bridge_claude_iso_to_epoch() {
+  local raw="${1:-}"
+  local epoch=""
+  raw="${raw//[$'\t\r\n ']/}"
+  [[ -n "$raw" ]] || return 1
+  if [[ "$raw" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$raw"
+    return 0
+  fi
+  local raw_normalized="$raw"
+  if [[ "$raw_normalized" =~ ^(.+)([+-])([0-9]{2}):([0-9]{2})$ ]]; then
+    raw_normalized="${BASH_REMATCH[1]}${BASH_REMATCH[2]}${BASH_REMATCH[3]}${BASH_REMATCH[4]}"
+  fi
+  epoch="$(date -d "$raw_normalized" +%s 2>/dev/null || true)"
+  if [[ -z "$epoch" ]]; then
+    epoch="$(date -j -f "%Y-%m-%dT%H:%M:%S%z" "$raw_normalized" +%s 2>/dev/null || true)"
+  fi
+  [[ "$epoch" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$epoch"
+}
+
+# #1789 (D2): after the rotator reports `all_tokens_limited` the pool is
+# saturated — re-attempting the rotate every 300s monitor pass buys nothing
+# (the rotator just refuses again) and spends a registry lock + sync fanout
+# per pass. Record the soonest token-reset time so the next monitor passes can
+# SKIP the rotate attempt entirely until a window actually clears, instead of
+# round-robin-thrashing a saturated pool. ``soonest_reset`` is the 429-derived
+# reset already on the rotation status row.
+bridge_note_claude_pool_exhausted() {
+  local soonest_reset="${1:-}"
+  local file=""
+  local now=0
+  local until_ts=0
+  local min_floor="${BRIDGE_CLAUDE_POOL_EXHAUSTED_MIN_COOLDOWN_SECONDS:-60}"
+  local max_cap="${BRIDGE_CLAUDE_POOL_EXHAUSTED_MAX_COOLDOWN_SECONDS:-21600}"
+  [[ "$min_floor" =~ ^[0-9]+$ ]] || min_floor=60
+  [[ "$max_cap" =~ ^[0-9]+$ ]] || max_cap=21600
+  now="$(date +%s 2>/dev/null || true)"
+  [[ "$now" =~ ^[0-9]+$ ]] || return 0
+  # Derive the suppress-until epoch from the reset stamp when parseable;
+  # otherwise fall back to a short floor so a missing/garbled reset can never
+  # strand the pool in permanent suppression.
+  until_ts="$(bridge_claude_iso_to_epoch "$soonest_reset" 2>/dev/null || true)"
+  if [[ ! "$until_ts" =~ ^[0-9]+$ ]] || (( until_ts <= now )); then
+    until_ts=$(( now + min_floor ))
+  fi
+  # Clamp the window so an absurd far-future reset can't silently disable
+  # rotation indefinitely (the operator still gets the cooldown notification).
+  (( until_ts > now + max_cap )) && until_ts=$(( now + max_cap ))
+  (( until_ts < now + min_floor )) && until_ts=$(( now + min_floor ))
+  file="$(bridge_claude_pool_exhausted_state_file)"
+  mkdir -p "$(dirname "$file")" 2>/dev/null || return 0
+  cat >"$file" 2>/dev/null <<EOF || true
+CLAUDE_POOL_EXHAUSTED_TS=$now
+CLAUDE_POOL_EXHAUSTED_UNTIL_TS=$until_ts
+EOF
+}
+
+# #1789 (D2): clear the pool-exhausted suppression window. Called on any
+# non-exhausted rotation outcome (rotated / no_alternate / error) so the gate
+# re-arms immediately once the pool is no longer saturated.
+bridge_clear_claude_pool_exhausted() {
+  local file=""
+  file="$(bridge_claude_pool_exhausted_state_file)"
+  [[ -f "$file" ]] || return 0
+  rm -f "$file" 2>/dev/null || true
+}
+
+# #1789 (D2): returns 0 (SUPPRESS the rotate attempt) when a prior pass
+# recorded a pool-exhausted window that has not yet elapsed; returns 1
+# (ATTEMPT now) otherwise. Fail-open under set -euo pipefail: a missing,
+# corrupt, or expired stamp degrades to "attempt now" (return 1) so a bad
+# stamp can never permanently strand rotation. An expired stamp is removed so
+# the gate self-heals. The READER is the self-heal boundary for a corrupt-but-
+# numeric persisted window (partial flush, clock skew, hand-edit): a value
+# beyond `now + max_cap` is treated as corrupt — removed + attempt — so a stamp
+# like `9999999999` can never suppress rotation for centuries even though the
+# writer clamps its own inputs (defense in depth, codex review #1789).
+bridge_claude_pool_rotate_suppressed() {
+  local file=""
+  local now=0
+  local until_ts=0
+  local max_cap="${BRIDGE_CLAUDE_POOL_EXHAUSTED_MAX_COOLDOWN_SECONDS:-21600}"
+  [[ "$max_cap" =~ ^[0-9]+$ ]] || max_cap=21600
+  file="$(bridge_claude_pool_exhausted_state_file)"
+  [[ -f "$file" ]] || return 1
+  daemon_source_state_file "$file" "claude_pool_exhausted" 1 \
+    "CLAUDE_POOL_EXHAUSTED_UNTIL_TS" || return 1
+  until_ts="${CLAUDE_POOL_EXHAUSTED_UNTIL_TS:-0}"
+  [[ "$until_ts" =~ ^[0-9]+$ ]] || { rm -f "$file" 2>/dev/null || true; return 1; }
+  now="$(date +%s 2>/dev/null || true)"
+  [[ "$now" =~ ^[0-9]+$ ]] || return 1
+  # A window further out than the max cap is corrupt — never honor it.
+  if (( until_ts > now + max_cap )); then
+    rm -f "$file" 2>/dev/null || true
+    return 1
+  fi
+  if (( now < until_ts )); then
+    return 0
+  fi
+  rm -f "$file" 2>/dev/null || true
+  return 1
+}
+
 bridge_usage_due() {
   local interval="${BRIDGE_USAGE_MONITOR_INTERVAL_SECONDS:-300}"
   local file=""
@@ -2270,6 +2382,24 @@ process_usage_monitor() {
     # Rotate only once per monitor pass; bridge-usage.py already latches each
     # provider/account/window candidate once per usage reset cycle.
     (( rotation_count > 0 )) && continue
+    # #1789 (D2 pool-level cooldown): if a prior pass already found the whole
+    # pool saturated (`all_tokens_limited`), every enabled token is inside a
+    # known 429 window, so re-running the rotate here would just refuse again
+    # while spending a registry lock + sync fanout per 300s pass. Suppress the
+    # rotate ATTEMPT until the soonest recorded reset elapses — the rotator's
+    # own skip stops thrash WITHIN a pass, this stops thrash ACROSS passes.
+    # The operator still gets the periodic pool-exhausted reminder on its own
+    # cooldown latch. Fail-open: a missing/expired stamp attempts normally.
+    if bridge_claude_pool_rotate_suppressed; then
+      if bridge_daemon_pass_due claude_pool_exhausted_notice "${BRIDGE_CLAUDE_POOL_EXHAUSTED_NOTICE_INTERVAL_SECONDS:-1800}" \
+        && bridge_agent_has_notify_transport "$admin_agent"; then
+        bridge_notify_send "$admin_agent" "claude token pool exhausted" \
+          "All enabled Claude tokens are rate-limited; rotation is paused instead of cycling a saturated pool (#1789). Sessions may hit limit errors until a window resets." \
+          "" "urgent" "${BRIDGE_DAEMON_NOTIFY_DRY_RUN:-0}" >/dev/null 2>&1 || true
+      fi
+      rotation_count=$((rotation_count + 1))
+      continue
+    fi
     # #1789: hand the rotating-away token's reset window (already on this
     # candidate row) to the rotator so it can stamp `limited_until` on the
     # old token and stop round-robining into tokens that are themselves
@@ -2318,6 +2448,9 @@ process_usage_monitor() {
       --detail soonest_reset="$rotation_soonest_reset"
     case "$rotation_status:$rotation_reason" in
       rotated:*)
+        # Pool is no longer saturated — drop any cooldown window so the gate
+        # re-arms immediately for the next saturation event (#1789 D2).
+        bridge_clear_claude_pool_exhausted
         title="claude token rotated"
         body="Claude token rotated after ${window} usage reached ${used_percent}%. active_token=${rotation_to}; sync=${rotation_sync_status:-unknown}."
         priority="high"
@@ -2325,6 +2458,10 @@ process_usage_monitor() {
       skipped:all_tokens_limited)
         # #1789: every enabled token is inside a known 429 limit window —
         # rotating would re-enter a saturated token, so the rotator refused.
+        # Record the soonest reset so subsequent passes SKIP the rotate attempt
+        # entirely until a window clears (#1789 D2 pool-level cooldown), instead
+        # of re-locking the registry + re-running the sync fanout every pass.
+        bridge_note_claude_pool_exhausted "$rotation_soonest_reset"
         # This is one continuous condition, not a per-pass event: notify on a
         # cooldown latch (bridge_daemon_pass_due doubles as the latch — it
         # stamps when due), never once per 300s monitor pass.
@@ -2337,6 +2474,9 @@ process_usage_monitor() {
         fi
         ;;
       skipped:no_alternate_token|error:*)
+        # Not a saturated-pool condition — clear any stale cooldown window so a
+        # transient error never strands the rotate attempt (#1789 D2).
+        bridge_clear_claude_pool_exhausted
         title="claude token rotation needs attention"
         body="Claude usage reached ${used_percent}% for ${window}, but token rotation did not complete (${rotation_status:-unknown}${rotation_reason:+: $rotation_reason})."
         priority="high"
