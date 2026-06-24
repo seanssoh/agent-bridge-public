@@ -1573,7 +1573,7 @@ select_for_path() {
       # marker flips when the fix is removed). Pull on every ms365/server.ts
       # move so a refactor cannot silently drop the ms→sec normalize or the
       # proactive-margin param back to the never-refresh / 300s-only state.
-      add_required 1209-ms365-redirect-resolver 1210-ms365-scope-normalize 1215-ms365-dir-mode 1343-ms365-token-refresh 1650-ms365-get-valid-token 1825-ms365-token-key-by-claim 2035-ms365-token-freshness beta5-2-zeta-teams-mcp-dedup beta5-2-xi-misc-fixes
+      add_required 1209-ms365-redirect-resolver 1210-ms365-scope-normalize 1215-ms365-dir-mode 1343-ms365-token-refresh 1650-ms365-get-valid-token 1825-ms365-token-key-by-claim 2035-ms365-token-freshness beta5-2-zeta-teams-mcp-dedup beta5-2-xi-misc-fixes 1650-ms365-refresh-scope-continuity 2048-ms365-xproc-refresh-lock
       add_integration integration-minimal
       ;;
 

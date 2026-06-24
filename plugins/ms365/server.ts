@@ -227,6 +227,36 @@ export function normalizeScopes(raw: unknown): string {
   return s.split(/\s+/).filter(Boolean).join(' ')
 }
 
+// Issue #1650: guarantee `offline_access` is in the scope sent on a
+// refresh_token grant. `offline_access` is the scope that AUTHORIZES
+// refresh_token issuance + rotation; a refresh grant that omits it makes
+// Entra stop returning/rotating a refresh_token (and, under some tenant
+// conditional-access configs, reject the grant). The drift is silent and
+// cumulative: Microsoft's token-endpoint response `scope` echoes only the
+// RESOURCE-granted scopes (`User.Read Mail.Read …`) — it drops the OIDC
+// scopes `offline_access openid profile`. The plugin persisted that
+// narrowed response scope (`data.scope`) into the token file and then sent
+// it verbatim on the NEXT refresh, so the second refresh onward dropped
+// `offline_access`. Over time the refresh_token is never renewed and the
+// access_token "sits expired" with the next Graph call surfacing
+// `Authentication required` — exactly the #1650 symptom (the on-call
+// refresh path itself is correct; it was being fed a scope that defeats it).
+//
+// Re-adding `offline_access` is idempotent and order-preserving (it is
+// appended only when absent), and harmless when already present. We do NOT
+// re-add `openid`/`profile`: only `offline_access` governs refresh-token
+// continuity, and an interactive app may legitimately have paired without
+// the OIDC scopes (`MS365_DEFAULT_SCOPES` override). Keeping the surface
+// minimal avoids re-requesting consent for scopes the user did not grant.
+export function withOfflineAccess(scope: unknown): string {
+  const s = String(scope ?? '').trim()
+  const parts = s.split(/\s+/).filter(Boolean)
+  if (!parts.some(p => p.toLowerCase() === 'offline_access')) {
+    parts.push('offline_access')
+  }
+  return parts.join(' ')
+}
+
 if (!TENANT_ID || !CLIENT_ID || !CLIENT_SECRET) {
   process.stderr.write(
     `ms365: MS365_TENANT_ID, MS365_CLIENT_ID, and MS365_CLIENT_SECRET are required\n` +
@@ -680,7 +710,13 @@ async function doRefresh(upn: string): Promise<TokenFile> {
         grant_type: 'refresh_token',
         client_id: CLIENT_ID,
         refresh_token: cur.refresh_token,
-        scope: cur.scope || DEFAULT_SCOPES,
+        // Issue #1650: always include `offline_access` so Entra keeps issuing
+        // + rotating a refresh_token. The stored `cur.scope` is the narrowed
+        // response scope from the prior grant (Microsoft drops the OIDC
+        // scopes on the response), so sending it verbatim would omit
+        // `offline_access` from the second refresh onward and silently break
+        // refresh-token continuity.
+        scope: withOfflineAccess(cur.scope || DEFAULT_SCOPES),
         ...(CLIENT_SECRET ? { client_secret: CLIENT_SECRET } : {}),
       },
     )
@@ -766,7 +802,12 @@ async function doRefresh(upn: string): Promise<TokenFile> {
     access_token: data.access_token,
     refresh_token: newRefreshToken,
     expires_at: now + Number(data.expires_in ?? 3600),
-    scope: String(data.scope ?? cur.scope),
+    // Issue #1650: persist the scope WITH `offline_access` retained, so the
+    // stored scope cannot drift `offline_access` out across successive
+    // refreshes (the next refresh reads this back). The token endpoint's
+    // response `scope` omits the OIDC scopes; re-adding `offline_access` here
+    // keeps the file's scope refresh-capable and `pair_status` honest.
+    scope: withOfflineAccess(String(data.scope ?? cur.scope)),
     saved_at: now,
   }
   saveJson(tokenPath(upn), next)
