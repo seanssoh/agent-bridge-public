@@ -63,7 +63,7 @@ build_fixture() {
 
   BASE="$FIXTURE_BRIDGE_HOME/agents/.claude/settings.json"
   OVERLAY="$FIXTURE_BRIDGE_HOME/agents/.claude/settings.local.json"
-  EFFECTIVE="$FIXTURE_BRIDGE_HOME/agents/.claude/settings.effective.json"
+  EFFECTIVE="$FIXTURE_BRIDGE_HOME/agents/.claude/settings.effective.json"  # noqa: iso-helper-boundary (sandbox test-fixture path string, not a controller→iso boundary RW)
 
   STDERR_DIR="$SMOKE_TMP_ROOT/stderr"
   mkdir -p "$STDERR_DIR"
