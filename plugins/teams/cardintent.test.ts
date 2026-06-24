@@ -395,6 +395,33 @@ describe('buildAdaptiveCard render shape', () => {
     expect(card.body.some((b: any) => b.type === 'ActionSet')).toBe(true)
   })
 
+  test('status column matches ONLY the stable 산출상태 — a generic 상태 row is not picked up (→ em dash)', () => {
+    const intent: any = {
+      kind: 'quoteResult',
+      title: 't',
+      fallbackMarkdown: 'f',
+      // 2 sections → a LIST (not detail), so renderList/ColumnSet applies.
+      sections: [
+        {
+          label: 'A사·세럼A',
+          rows: [
+            { label: '확정가', value: '₩1,000', valueState: 'value' },
+            { label: '상태', value: '대기', valueState: 'value' }, // generic 상태, NOT 산출상태
+          ],
+        },
+        {
+          label: 'B사·크림B',
+          rows: [{ label: '확정가', value: '₩2,000', valueState: 'value' }], // no status row at all
+        },
+      ],
+    }
+    const card: any = buildAdaptiveCard(intent)
+    const rows = card.body.filter((b: any) => b.type === 'ColumnSet') // [0]=header, [1]=A, [2]=B
+    expect(rows[1].columns[2].items[0].text).toBe('—') // generic 상태 not picked up → em dash
+    expect(rows[2].columns[2].items[0].text).toBe('—') // no status row → em dash
+    expect(JSON.stringify(card)).not.toContain('대기') // the generic status value must not leak
+  })
+
   test('detail renders 4 sections with an emphasis Container', () => {
     const intent = validDetailIntent()
     expect(isDetailLayout(intent)).toBe(true)

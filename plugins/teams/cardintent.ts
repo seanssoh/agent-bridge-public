@@ -370,7 +370,10 @@ function toSubmitAction(a: Action): AcElement {
 // 산출상태 are stable across roles. A missing column → an em dash (never a raw
 // leak). `세트` (set), if present and truthy, decorates the status with a ✓.
 const COL_PRICE_LABELS: readonly string[] = ['확정가']
-const COL_STATUS_LABELS: readonly string[] = ['산출상태', '상태']
+// Strict single stable label only — a generic '상태' row (e.g. 결재상태) must
+// NOT be picked up for the 산출상태 column; a section without 산출상태 renders
+// an em dash, as promised (role-scope-safe, no incidental status leak).
+const COL_STATUS_LABELS: readonly string[] = ['산출상태']
 const COL_SET_LABELS: readonly string[] = ['세트', 'set']
 const EMDASH: RenderedValue = { text: '—', color: 'Default' }
 
