@@ -5720,7 +5720,7 @@ def cmd_conflicts_reconcile(args: argparse.Namespace) -> int:
         # adopted to: nothing is recoverable, regardless of mtime/touches/who
         # last wrote the live file. `at_write`-equality stays the first,
         # independent branch (operator kept live unchanged).
-        sidecar_sha = file_sha256(conflict) if conflict.exists() else ""
+        sidecar_sha = file_sha256(conflict) if conflict.exists() else ""  # noqa: raw-pathlib-controller-only — .upgrade-conflict sidecar is a controller-owned upgrade-flow artifact
         sidecar_is_empty_of_recovery = (
             bool(upstream_target)
             and current == upstream_target
