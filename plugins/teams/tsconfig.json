@@ -4,7 +4,7 @@
     "module": "esnext",
     "moduleResolution": "bundler",
     "lib": ["esnext", "dom"],
-    "types": ["bun-types", "node"],
+    "types": [],
     "strict": true,
     "noEmit": true,
     "skipLibCheck": true,
@@ -12,5 +12,5 @@
     "verbatimModuleSyntax": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["cardintent.ts", "cardintent.test.ts"]
+  "include": ["cardintent.ts", "cardintent.test.ts", "bun-test-shim.d.ts"]
 }
