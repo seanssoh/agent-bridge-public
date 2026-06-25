@@ -2371,6 +2371,18 @@ bridge_run_quarantine_rejected_resume() {
   if ! bridge_agent_resume_quarantine_add "$AGENT" "$rejected_id" "no-conversation-found" 2>/dev/null; then
     return 0
   fi
+  # Issue #2106 — `quarantine_add` returns rc=0 even when its foreign-guard
+  # REFUSES to record the id (the operator-session-hijack guard, #1893). Logging
+  # the "subsequent launches will skip this transcript" reassurance on a refusal
+  # is a lie that masks the crash-loop: nothing was recorded, so the next launch
+  # re-selects the same id. Confirm the id is genuinely present in the quarantine
+  # list before claiming the skip; on a refusal, surface the real reason instead.
+  local _quarantined_ids=""
+  _quarantined_ids="$(bridge_agent_resume_quarantine_ids "$AGENT" 2>/dev/null || true)"
+  if [[ ",${_quarantined_ids}," != *",${rejected_id},"* ]]; then
+    log_line "[quarantine] resume id rejected (exit=${exit_code}, source=${source}, duration=${duration}s) → ${rejected_id}; NOT quarantined (foreign/refused) — launch may retry this id"
+    return 0
+  fi
   log_line "[quarantine] resume id rejected (exit=${exit_code}, source=${source}, duration=${duration}s) → ${rejected_id}; subsequent launches will skip this transcript"
   archived_csv="$(bridge_agent_resume_quarantine_archive_transcript "$AGENT" "$rejected_id" 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
   if [[ -n "$archived_csv" ]]; then
