@@ -112,6 +112,22 @@ export const FORBIDDEN_COST_KEYS_PLACEHOLDER: readonly string[] = [
   'supplier_cost',
   'landedCost',
   'landed_cost',
+  // Korean/literal contract terms (the role-internal cost language that must
+  // NEVER reach Teams in the card OR the visible text). Note: `내용물 견적` and
+  // `가공비 견적` are the ALLOWED viewer-facing price labels and are deliberately
+  // NOT in this list.
+  '제시가',
+  '원가',
+  '마진',
+  '공헌이익',
+  '영업이익',
+  '네고율',
+  '회수율',
+  '작업장명',
+  '임률',
+  '고객요청가',
+  'manufacturingCostSuggested',
+  'standardCost',
 ]
 
 // ---------------------------------------------------------------------------
@@ -516,6 +532,12 @@ export function findForbiddenCostKey(
   return null
 }
 
+// §10-clean replacement for the visible prose when it carries a forbidden term.
+// It contains no forbidden key itself, so substituting it is unconditionally
+// safe. Used on the fence-present path only (the no-fence path is unchanged).
+export const SECTION10_TEXT_FALLBACK =
+  '[일부 내용은 보안 정책에 따라 카드로만 표시됩니다.]'
+
 // ---------------------------------------------------------------------------
 // The seam: renderOutbound(text) → { text, attachments }
 // ---------------------------------------------------------------------------
@@ -562,8 +584,16 @@ export function renderOutbound(
     }
   })()
 
+  // §10 also applies to the visible prose, not just the rendered card bytes: a
+  // forbidden cost term emitted OUTSIDE the fence would otherwise be sent
+  // unscanned. Hard-replace the whole visible text with a §10-clean fallback if
+  // it carries any forbidden term, on BOTH the success and the fail() paths.
+  const safeText = findForbiddenCostKey(strippedText, forbidden)
+    ? SECTION10_TEXT_FALLBACK
+    : strippedText
+
   const fail = (warning: string): RenderOutbound => ({
-    text: strippedText,
+    text: safeText,
     attachments: [],
     warning,
   })
@@ -604,7 +634,7 @@ export function renderOutbound(
   }
 
   return {
-    text: strippedText,
+    text: safeText,
     attachments: [{ contentType: AC_CONTENT_TYPE, content: card }],
   }
 }
