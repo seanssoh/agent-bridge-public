@@ -19,6 +19,7 @@ import {
   isDetailLayout,
   renderOutbound,
   renderValueState,
+  SECTION10_TEXT_FALLBACK,
   stripAllCardIntentFences,
   stripFence,
   validateCardIntent,
@@ -501,6 +502,89 @@ describe('§10 forbidden cost keys (mutation-proof)', () => {
     expect(out.attachments.length).toBe(1)
     expect(out.attachments[0].contentType).toBe('application/vnd.microsoft.card.adaptive')
     expect(out.warning).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// §10 visible-text fail-closed — MUTATION-PROOF
+//
+// The card scan alone is not enough: a forbidden cost term emitted in the
+// human-visible prose OUTSIDE the fence would be sent unscanned. renderOutbound
+// must hard-replace the whole visible text with a §10-clean fallback on the
+// fence-present path (success AND fail), while leaving the no-fence path
+// byte-for-byte unchanged.
+// ---------------------------------------------------------------------------
+
+describe('§10 visible-text fail-closed (mutation-proof)', () => {
+  test('forbidden term in prose + CLEAN card → text hard-replaced, card still attached', () => {
+    // The card is clean (no forbidden key) so it survives §10; the prose carries
+    // a forbidden cost term ("원가") and MUST be replaced wholesale. Revert the
+    // safeText substitution in renderOutbound → this fails: out.text would still
+    // contain "원가는 1000원" and leak the forbidden term to Teams.
+    const out = renderOutbound('원가는 1000원\n\n' + fence(validListIntent()))
+    expect(out.text).toBe(SECTION10_TEXT_FALLBACK)
+    expect(out.text).not.toContain('원가')
+    expect(out.attachments.length).toBe(1) // clean card still sent
+    expect(out.warning).toBeUndefined()
+  })
+
+  test('제시가 in the visible prose is hard-replaced (clean card still attached)', () => {
+    const out = renderOutbound('제시가 기준으로 안내드립니다.\n\n' + fence(validListIntent()))
+    expect(out.text).toBe(SECTION10_TEXT_FALLBACK)
+    expect(out.text).not.toContain('제시가')
+    expect(out.attachments.length).toBe(1)
+  })
+
+  test('clean prose + clean card → visible text unchanged (fence stripped), card attached', () => {
+    const summary = '견적 결과를 카드로 정리했습니다.'
+    const out = renderOutbound(summary + '\n\n' + fence(validListIntent()))
+    expect(out.text).toBe(summary) // NOT replaced — the fallback only fires on a hit
+    expect(out.text).not.toBe(SECTION10_TEXT_FALLBACK)
+    expect(out.text).not.toContain('cardintent')
+    expect(out.attachments.length).toBe(1)
+  })
+
+  test('forbidden key in the CARD still rejects, AND the text is §10-clean', () => {
+    // Card carries a forbidden key (rejected → no attachment) and the prose ALSO
+    // carries a forbidden term → text must be the §10 fallback, not the leak.
+    const intent: any = validListIntent()
+    intent.sections[0].actions[0].payload = { quoteId: 'q1', unitCost: 1200 }
+    const out = renderOutbound('마진은 30%입니다.\n\n' + fence(intent))
+    expect(out.attachments.length).toBe(0) // card rejected (existing behavior)
+    expect(out.warning).toContain('forbidden cost key')
+    expect(out.text).toBe(SECTION10_TEXT_FALLBACK)
+    expect(out.text).not.toContain('마진')
+  })
+
+  test('no-fence message is byte-for-byte unchanged even with a forbidden term (out of scope)', () => {
+    // The no-fence early return is deliberately NOT hardened (only cardintent
+    // turns are in scope). Revert that boundary (e.g. route the no-fence path
+    // through safeText) → this fails: the text would be replaced.
+    const plain = '원가는 1000원이고 마진은 30%입니다. 카드 없음.'
+    const out = renderOutbound(plain)
+    expect(out.text).toBe(plain) // byte-for-byte identical
+    expect(out.attachments.length).toBe(0)
+    expect(out.warning).toBeUndefined()
+  })
+
+  test('allowed price labels 내용물 견적 / 가공비 견적 in prose pass (not forbidden)', () => {
+    // These are the ALLOWED viewer-facing labels — they must NOT be on the
+    // forbidden list, so the prose carrying them is sent unchanged.
+    expect(findForbiddenCostKey('내용물 견적')).toBeNull()
+    expect(findForbiddenCostKey('가공비 견적')).toBeNull()
+    const summary = '내용물 견적과 가공비 견적을 안내드립니다.'
+    const out = renderOutbound(summary + '\n\n' + fence(validListIntent()))
+    expect(out.text).toBe(summary)
+    expect(out.text).not.toBe(SECTION10_TEXT_FALLBACK)
+    expect(out.attachments.length).toBe(1)
+  })
+
+  test('Korean + literal contract terms are on the forbidden list; 제시가 hit, labels clean', () => {
+    for (const term of ['제시가', '원가', '마진', '공헌이익', '영업이익', '네고율', '회수율', '작업장명', '임률', '고객요청가', 'manufacturingCostSuggested', 'standardCost']) {
+      expect(FORBIDDEN_COST_KEYS_PLACEHOLDER).toContain(term)
+    }
+    expect(FORBIDDEN_COST_KEYS_PLACEHOLDER).not.toContain('내용물 견적')
+    expect(FORBIDDEN_COST_KEYS_PLACEHOLDER).not.toContain('가공비 견적')
   })
 })
 
