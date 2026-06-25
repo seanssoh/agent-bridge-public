@@ -19,7 +19,7 @@ import tempfile
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -648,18 +648,74 @@ def collect_json_value(payload: Any, key: str) -> Any:
     return None
 
 
+def _resolve_month(token: str) -> int | None:
+    """Resolve a month token to its number (#17927).
+
+    Accepts a full name (``July``) or a 3+ letter abbreviation (``Jul``,
+    ``Sept``) — the real weekly-429 string uses the abbreviated form, which
+    the full-name-only ``MONTHS`` map never matched. The 3-letter prefixes of
+    the twelve months are all distinct, so the prefix match is unambiguous.
+    """
+    key = (token or "").strip().lower()
+    if not key:
+        return None
+    if key in MONTHS:
+        return MONTHS[key]
+    if len(key) >= 3:
+        for name, num in MONTHS.items():
+            if name[:3] == key[:3]:
+                return num
+    return None
+
+
+def _resolve_reset_tz(label: str) -> tzinfo | None:
+    """Resolve a 429 reset-string timezone label to a ``tzinfo`` (#17927).
+
+    Anthropic's weekly-limit message stamps a NAMED zone — e.g.
+    ``resets Jul 1 at 12pm (Asia/Seoul)`` — not always ``(UTC)``. ``UTC`` /
+    ``GMT`` / ``Z`` map to ``timezone.utc``; any other label is treated as an
+    IANA key and resolved via stdlib ``zoneinfo``. An unknown key or missing
+    tzdata returns ``None`` so the caller skips the stamp gracefully instead
+    of raising.
+    """
+    name = (label or "").strip()
+    if not name:
+        return None
+    if name.upper() in {"UTC", "GMT", "Z"}:
+        return timezone.utc
+    try:
+        from zoneinfo import ZoneInfo
+
+        return ZoneInfo(name)
+    except (KeyError, ValueError, OSError, ImportError):
+        # ZoneInfoNotFoundError subclasses KeyError; a malformed key raises
+        # ValueError; missing tzdata raises OSError/ImportError. All mean
+        # "cannot resolve" → fall back rather than crash the probe.
+        return None
+
+
 def parse_reset_at(text: str, reference: datetime | None = None) -> str:
     if not text:
         return ""
     reference = reference or now_utc()
+    # The weekly-429 string is ``resets Jul 1 at 12pm (Asia/Seoul)`` — an
+    # "at" separator (no comma) and a NAMED timezone — while the older form
+    # is ``resets May 13, 3am (UTC)``. Tolerate the three real separators
+    # between the day and the hour — a comma (``1, 12pm``), `` at `` (``1 at
+    # 12pm``), or a bare space (``1 12pm``) — but REQUIRE one of them: the
+    # separator must not be fully optional or ``resets Jul 112pm (UTC)``
+    # over-matches as ``Jul 11`` + ``2pm`` (#17927 codex r1). Accept either
+    # ``UTC`` or an IANA zone name in the parens.
     absolute = re.search(
-        r"\bresets?\s+([A-Za-z]+)\s+(\d{1,2}),\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*\(UTC\)",
+        r"\bresets?\s+([A-Za-z]+)\s+(\d{1,2})(?:\s*,\s*|\s+at\s+|\s+)"
+        r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*\(\s*([A-Za-z0-9_+\-/]+)\s*\)",
         text,
         re.IGNORECASE,
     )
     if absolute:
-        month = MONTHS.get(absolute.group(1).lower())
-        if month:
+        month = _resolve_month(absolute.group(1))
+        zone = _resolve_reset_tz(absolute.group(6))
+        if month and zone is not None:
             day = int(absolute.group(2))
             hour = int(absolute.group(3))
             minute = int(absolute.group(4) or "0")
@@ -668,9 +724,13 @@ def parse_reset_at(text: str, reference: datetime | None = None) -> str:
                 hour += 12
             if meridiem == "am" and hour == 12:
                 hour = 0
-            candidate = datetime(reference.year, month, day, hour, minute, tzinfo=timezone.utc)
+            # Build the reset instant in the stated zone, then normalize to
+            # UTC. For ``(UTC)`` this is byte-identical to the legacy
+            # direct-UTC construction.
+            local = datetime(reference.year, month, day, hour, minute, tzinfo=zone)
+            candidate = local.astimezone(timezone.utc)
             if candidate < reference - timedelta(days=1):
-                candidate = candidate.replace(year=reference.year + 1)
+                candidate = local.replace(year=reference.year + 1).astimezone(timezone.utc)
             return candidate.isoformat(timespec="seconds")
 
     relative = re.search(r"\bresets?\s+in\s+(\d+)h(?:\s+(\d+)m)?", text, re.IGNORECASE)
@@ -796,6 +856,61 @@ def update_row_from_probe(
 
     row["updated_at"] = timestamp
     return public_token_row(row, "")
+
+
+def recover_apply_clock_or_probe(
+    row: dict[str, Any],
+    probe: dict[str, Any],
+    *,
+    reference: datetime,
+    retry_seconds: int,
+) -> None:
+    """Re-enable a due quota_limited row on the clock, not the probe (#17927).
+
+    When the row carries a 429-derived reset stamp — ``limited_until``
+    (#1789), or ``disabled_until`` as the fallback gate — that stamp, not the
+    cheap ``claude -p`` probe, decides recovery:
+
+      * stamp elapsed  -> re-enable even when the probe is unavailable or
+        failing. A weekly-capped token can still pass a tiny probe, and a
+        healthy token can fail one transiently, so the probe is an unreliable
+        quota oracle. If the token is somehow still capped, the next real use
+        429s and the reactive path re-disables + re-stamps it (self-correcting).
+      * stamp in the future -> stay disabled even if the probe says
+        ``available`` (kills the over-recovery thrash that forced a manual
+        hold list); recheck only once the stamp passes.
+
+    A row with NO reset stamp at all (legacy/orphan, pre-#17927) keeps the
+    original probe-driven behavior so existing installs do not regress.
+    """
+    reset_stamp = token_limited_until(row)
+    if reset_stamp is None:
+        reset_stamp = iso_to_utc(str(row.get("disabled_until") or ""))
+    if reset_stamp is None:
+        update_row_from_probe(
+            row,
+            probe,
+            enable_on_ok=True,
+            disable_on_quota=True,
+            retry_seconds=retry_seconds,
+        )
+        return
+    timestamp = now_iso()
+    row["last_checked_at"] = timestamp
+    row["last_check_status"] = str(probe.get("status") or "failed")
+    row["last_check_api_error_status"] = str(probe.get("api_error_status") or "")
+    row["last_check_returncode"] = int(probe.get("returncode") or 0)
+    if reset_stamp <= reference:
+        row["enabled"] = True
+        clear_quota_disable_fields(row)
+        row.pop("limited_until", None)
+    else:
+        stamp_iso = reset_stamp.isoformat(timespec="seconds")
+        row["enabled"] = False
+        row["disabled_reason"] = "quota_limited"
+        row["disabled_until"] = stamp_iso
+        row["next_check_at"] = stamp_iso
+    row["updated_at"] = timestamp
 
 
 def quota_recheck_due(row: dict[str, Any], reference: datetime) -> bool:
@@ -1231,6 +1346,10 @@ def cmd_mark_quota(args: argparse.Namespace) -> int:
             if reset_at:
                 row["disabled_until"] = reset_at
                 row["next_check_at"] = reset_at
+                # #17927: also stamp the #1789 limit-window field so the
+                # clock-authoritative recovery sweep (and rotate-selection
+                # skip) read the real reset, not just the disable gate.
+                row["limited_until"] = reset_at
             else:
                 row["next_check_at"] = (
                     now_utc() + timedelta(seconds=retry_seconds)
@@ -1307,7 +1426,24 @@ def cmd_recover_due(args: argparse.Namespace) -> int:
         for snap in snapshots:
             token = snap["token"]
             validate_token(token)
-            probe = probe_claude_token(token, timeout_seconds)
+            try:
+                probe = probe_claude_token(token, timeout_seconds)
+            except Exception as exc:  # noqa: BLE001
+                # #17927: clock-authoritative recovery must not hinge on the
+                # probe. ``probe_claude_token`` only catches TimeoutExpired /
+                # FileNotFoundError; a harder failure (e.g. an OSError while
+                # setting up the temp config dir) would otherwise abort the
+                # whole sweep and strand every due token — including ones whose
+                # reset window has already elapsed. Degrade to a ``failed``
+                # probe so the locked-persist phase still re-enables a
+                # clock-elapsed row (and the legacy probe path simply retries).
+                probe = {
+                    "status": "failed",
+                    "returncode": 1,
+                    "api_error_status": "",
+                    "reset_at": "",
+                    "error": f"probe_exception: {type(exc).__name__}",
+                }
             probes.append((snap, probe))
 
         if probes:
@@ -1338,27 +1474,30 @@ def cmd_recover_due(args: argparse.Namespace) -> int:
                     if str(row.get("next_check_at") or "") != snap["next_check_at"]:
                         skipped_stale.append({"id": token_id, "reason": "next_check_at_changed"})
                         continue
-                    update_row_from_probe(
+                    recover_apply_clock_or_probe(
                         row,
                         probe,
-                        enable_on_ok=True,
-                        disable_on_quota=True,
+                        reference=reference,
                         retry_seconds=retry_seconds,
                     )
                     status = str(probe.get("status") or "failed")
                     reset_at = str(probe.get("reset_at") or "")
+                    enabled_now = bool(row.get("enabled", True))
                     checked.append(
                         {
                             "id": token_id,
                             "status": status,
                             "api_error_status": str(probe.get("api_error_status") or ""),
                             "reset_at": reset_at,
-                            "enabled": bool(row.get("enabled", True)),
+                            "enabled": enabled_now,
                         }
                     )
-                    if status == "available" and bool(row.get("enabled", True)):
+                    # A due token starts disabled, so "enabled now" == it was
+                    # re-enabled this pass — true whether recovery came from the
+                    # clock (#17927) or the legacy probe path.
+                    if enabled_now:
                         recovered.append(token_id)
-                    elif not bool(row.get("enabled", True)):
+                    else:
                         still_disabled.append(token_id)
                 if checked:
                     registry["last_recovery_check"] = {
