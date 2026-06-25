@@ -408,6 +408,98 @@ test_per_agent_home_populated_resolves_dir() {
     "T7d shared-mode per-agent-HOME with populated projects/ resolves the dir (#1439 Bug-1)"
 }
 
+# --- Issue #2106: resolver/launch config-dir split-brain -----------------
+#
+# THE crash-loop case the existing #1370 empty-scaffold heuristic could not
+# distinguish: a shared (non-iso) static/admin Claude agent whose launch path
+# (bridge_run_shared_launch) WILL pin CLAUDE_CONFIG_DIR=<agent-home>/.claude
+# because its per-agent credential is authed — but whose
+# <agent-home>/.claude/projects/ is EMPTY (the #1750 per-agent-identity
+# migration left the prior transcripts ORPHANED in the operator HOME).
+#
+# Pre-fix: empty projects/ + iso-ineffective → resolver returns EMPTY → falls
+# back to scanning the operator HOME → fs-selects an orphaned operator-home
+# transcript id → launch `--resume <orphan>` against the per-agent config that
+# lacks it → `No conversation found` → exit 1 → rapid-fail circuit-breaker
+# crash-loop. THIS smoke FAILS before the fix (resolver returns "" not the dir).
+#
+# Post-fix: the launch-pin proof (a `.credentials.json` under the per-agent
+# dir — the same proof bridge_run_shared_launch gates its export on) makes the
+# resolver return the per-agent dir even with an empty projects/, so detection-
+# dir == launch-dir. The resolver scans the (empty) per-agent dir, finds
+# nothing, resume resolves to "no eligible transcript", and the launch starts
+# FRESH — no orphan re-resume, no crash-loop.
+S2106_AGENT="rcd-2106-split-brain"
+BRIDGE_AGENT_IDS+=("$S2106_AGENT")
+BRIDGE_AGENT_DESC["$S2106_AGENT"]="$S2106_AGENT #2106 split-brain repro"
+BRIDGE_AGENT_ENGINE["$S2106_AGENT"]="claude"
+BRIDGE_AGENT_SESSION["$S2106_AGENT"]="$S2106_AGENT"
+BRIDGE_AGENT_WORKDIR["$S2106_AGENT"]="$ISO_WORKDIR"
+BRIDGE_AGENT_SOURCE["$S2106_AGENT"]="static"
+BRIDGE_AGENT_CREATED_AT["$S2106_AGENT"]="$(date +%s)"
+BRIDGE_AGENT_SESSION_ID["$S2106_AGENT"]=""
+BRIDGE_AGENT_ISOLATION_MODE["$S2106_AGENT"]="shared"
+S2106_DIR="$(bridge_agent_claude_config_dir "$S2106_AGENT")"
+# The #1750 split-brain shape: the per-agent .claude exists with an EMPTY
+# projects/ (no transcript dirs — the prior sessions are orphaned elsewhere).
+mkdir -p "$S2106_DIR/projects" "$S2106_DIR/sessions"
+
+# T11a — WITHOUT the launch-pin credential proof the agent is indistinguishable
+# from an empty #1316 scaffold, so the resolver still resolves EMPTY (the
+# #1370 contract holds; launch would NOT pin a per-agent dir for it either).
+test_split_brain_no_credential_resolves_empty() {
+  bridge_agent_linux_user_isolation_effective "$S2106_AGENT" 2>/dev/null \
+    && smoke_fail "T11a fixture should NOT be iso-effective (mode=shared)"
+  [[ ! -f "$S2106_DIR/.credentials.json" ]] \
+    || smoke_fail "T11a precondition: no credential should be present yet"
+  local resolved=""
+  resolved="$(bridge_resolve_agent_claude_config_dir "$S2106_AGENT")"
+  smoke_assert_eq "" "$resolved" \
+    "T11a empty per-agent dir with NO credential resolves empty (#1370 preserved)"
+}
+
+# T11b — WITH the per-agent `.credentials.json` (launch WILL pin the dir), the
+# resolver returns the per-agent dir despite the empty projects/. This is the
+# #2106 fix: detection-dir == launch-dir, so launch can no longer be handed an
+# orphaned operator-home id. FAILS before the fix.
+test_split_brain_credentialed_resolves_dir() {
+  printf '{"claudeAiOauth":{"accessToken":"x"}}\n' >"$S2106_DIR/.credentials.json"
+  local resolved=""
+  resolved="$(bridge_resolve_agent_claude_config_dir "$S2106_AGENT")"
+  smoke_assert_eq "$S2106_DIR" "$resolved" \
+    "T11b credentialed shared+agent_home with empty projects/ resolves the dir (#2106)"
+}
+
+# T11c — end-to-end alignment: the resume resolver scans the SAME (empty)
+# per-agent dir and finds NO eligible transcript (rc=1), so the launch starts
+# fresh instead of re-injecting the orphaned operator-home id. Even when an
+# orphan transcript exists in the per-call HOME (the operator HOME), the
+# credentialed per-agent dir wins and shields it from selection.
+test_split_brain_resume_resolves_fresh() {
+  # Plant an orphan transcript in the operator-HOME projects/<slug>/ — exactly
+  # what the #1750 migration leaves behind. Pre-fix this would be selected.
+  local op_home="$SMOKE_TMP_ROOT/op-home-2106"
+  local slug="${ISO_WORKDIR//\//-}"
+  local orphan_id="0a0a0a0a-2106-orphan-operator"
+  mkdir -p "$op_home/.claude/projects/$slug"
+  printf '{"sessionId":"%s"}\n' "$orphan_id" \
+    >"$op_home/.claude/projects/$slug/$orphan_id.jsonl"
+  local rc=0 resolved=""
+  set +e
+  resolved="$(HOME="$op_home" \
+    bridge_resolve_resume_session_id \
+    claude "$S2106_AGENT" "$ISO_WORKDIR" "" 2>/dev/null)"
+  rc=$?
+  set -e
+  # rc=1 (no eligible transcript under the per-agent dir) AND the orphan id was
+  # NOT selected. Pre-fix: the resolver falls back to $HOME/.claude, finds the
+  # orphan, returns it (rc=0/2) → the crash-loop.
+  smoke_assert_eq "1" "$rc" \
+    "T11c resume resolves to NO eligible transcript for the empty per-agent dir (#2106)"
+  [[ "$resolved" != "$orphan_id" ]] \
+    || smoke_fail "T11c resolver selected the orphaned operator-home id (split-brain re-broke)"
+}
+
 # T9 — bridge_detect_claude_session_id for an UNREGISTERED agent with a
 # per-call HOME must NOT shadow that HOME. The guard returns empty (agent
 # not in the roster) so the helper falls back to HOME/.claude — where the
@@ -455,6 +547,9 @@ smoke_run "T8 shim resolve for registered isolated agent" test_shim_resolve_isol
 smoke_run "T7b shared-mode agent resolves empty (#1370)"  test_shared_mode_resolves_empty
 smoke_run "T7c non-Linux host resolves empty (#1370)"     test_non_linux_host_resolves_empty
 smoke_run "T7d per-agent-HOME populated resolves dir (#1439)" test_per_agent_home_populated_resolves_dir
+smoke_run "T11a empty per-agent dir, no credential, resolves empty (#2106)" test_split_brain_no_credential_resolves_empty
+smoke_run "T11b credentialed empty per-agent dir resolves the dir (#2106)" test_split_brain_credentialed_resolves_dir
+smoke_run "T11c resume resolves fresh, orphan id shielded (#2106)" test_split_brain_resume_resolves_fresh
 smoke_run "T9 shim detect honours per-call HOME"          test_shim_detect_unregistered_home_fallback
 smoke_run "T10 shim resolve honours per-call HOME"        test_shim_resolve_unregistered_home_fallback
 

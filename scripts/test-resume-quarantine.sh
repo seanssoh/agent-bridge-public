@@ -48,6 +48,14 @@ awk '
 QUARANTINE_RECORDED=""
 ARCHIVE_CALLED=""
 LOG_LINES=""
+# Issue #2106: ids the (mocked) quarantine store actually holds. Each case that
+# expects a genuine record appends here too; the foreign-refusal case (A9)
+# leaves it EMPTY while still returning rc=0 from add — exactly the
+# bridge_agent_resume_quarantine_add foreign-guard shape (rc=0, recorded
+# nothing). QUARANTINE_IDS_OVERRIDE, when set, forces the ids reader's output
+# so a case can decouple "add was called" from "id is actually quarantined".
+QUARANTINE_IDS=""
+QUARANTINE_IDS_OVERRIDE="__unset__"
 
 # Stubs that mimic the helper's collaborators.
 ENGINE="claude"
@@ -55,7 +63,23 @@ AGENT="testagent"
 bridge_agent_resume_quarantine_add() {
   # args: agent session_id reason
   QUARANTINE_RECORDED+="$1|$2|$3"$'\n'
+  # Default: a successful record makes the id observable to the ids reader.
+  # A9 overrides QUARANTINE_IDS_OVERRIDE to simulate a foreign-guard refusal
+  # (add returns 0 but records nothing).
+  if [[ "$QUARANTINE_IDS_OVERRIDE" == "__unset__" ]]; then
+    QUARANTINE_IDS="${QUARANTINE_IDS:+$QUARANTINE_IDS,}$2"
+  fi
   return 0
+}
+# Issue #2106: the helper now re-reads the quarantine list to confirm the id was
+# genuinely recorded before logging "subsequent launches will skip" — so the
+# false-reassurance log can no longer fire on a foreign-guard refusal.
+bridge_agent_resume_quarantine_ids() {
+  if [[ "$QUARANTINE_IDS_OVERRIDE" != "__unset__" ]]; then
+    printf '%s' "$QUARANTINE_IDS_OVERRIDE"
+    return 0
+  fi
+  printf '%s' "$QUARANTINE_IDS"
 }
 bridge_agent_resume_quarantine_archive_transcript() {
   ARCHIVE_CALLED+="$1|$2"$'\n'
@@ -72,7 +96,11 @@ log_line() { LOG_LINES+="$*"$'\n'; }
 # shellcheck source=/dev/null
 source "$HOOK_TMP"
 
-reset_state() { QUARANTINE_RECORDED=""; ARCHIVE_CALLED=""; LOG_LINES=""; : >"$TMP/err.log"; }
+reset_state() {
+  QUARANTINE_RECORDED=""; ARCHIVE_CALLED=""; LOG_LINES=""
+  QUARANTINE_IDS=""; QUARANTINE_IDS_OVERRIDE="__unset__"
+  : >"$TMP/err.log"
+}
 
 UUID="11111111-2222-3333-4444-555555555555"
 LAUNCH_RESUME="claude --resume $UUID --dangerously-skip-permissions --name testagent"
@@ -162,6 +190,50 @@ if [[ -z "$QUARANTINE_RECORDED" ]]; then
   ok
 else
   err "expected clean-exit ignored; got [$QUARANTINE_RECORDED]"
+fi
+
+# Issue #2106 — fix #2: the "subsequent launches will skip this transcript"
+# reassurance must fire ONLY when the id is genuinely in the quarantine list,
+# and a foreign-guard REFUSAL (quarantine_add rc=0 but recorded nothing) must
+# log the truthful "NOT quarantined (foreign/refused)" line instead — never the
+# false skip claim that masked the crash-loop on the downstream install.
+step "A9a (genuine record): skip-reassurance log fires when id IS quarantined"
+reset_state
+printf 'No conversation found with session ID: %s\n' "$UUID" >"$TMP/err.log"
+sz=$(wc -c <"$TMP/err.log")
+bridge_run_quarantine_rejected_resume 1 3 "$LAUNCH_RESUME" "$TMP/err.log" 0 "$sz" || true
+if printf '%s' "$LOG_LINES" | grep -q 'subsequent launches will skip this transcript' \
+   && ! printf '%s' "$LOG_LINES" | grep -q 'NOT quarantined'; then
+  ok
+else
+  err "expected skip-reassurance log on genuine record; got [$LOG_LINES]"
+fi
+
+step "A9b (foreign refusal): NO false skip-reassurance; truthful refusal logged"
+reset_state
+# Simulate the foreign-guard refusal: add returns 0 (its historical contract)
+# but the id is NOT in the quarantine list afterward.
+QUARANTINE_IDS_OVERRIDE=""
+printf 'No conversation found with session ID: %s\n' "$UUID" >"$TMP/err.log"
+sz=$(wc -c <"$TMP/err.log")
+bridge_run_quarantine_rejected_resume 1 3 "$LAUNCH_RESUME" "$TMP/err.log" 0 "$sz" || true
+if ! printf '%s' "$LOG_LINES" | grep -q 'subsequent launches will skip this transcript' \
+   && printf '%s' "$LOG_LINES" | grep -q 'NOT quarantined'; then
+  ok
+else
+  err "expected NO false skip log + truthful refusal log on foreign refusal; got [$LOG_LINES]"
+fi
+
+step "A9c (foreign refusal): archive is NOT attempted on a refusal"
+reset_state
+QUARANTINE_IDS_OVERRIDE=""
+printf 'No conversation found with session ID: %s\n' "$UUID" >"$TMP/err.log"
+sz=$(wc -c <"$TMP/err.log")
+bridge_run_quarantine_rejected_resume 1 3 "$LAUNCH_RESUME" "$TMP/err.log" 0 "$sz" || true
+if [[ -z "$ARCHIVE_CALLED" ]]; then
+  ok
+else
+  err "expected NO archive on foreign refusal; got [$ARCHIVE_CALLED]"
 fi
 
 # ----------------------------------------------------------------------------
