@@ -1769,38 +1769,55 @@ def roster_epoch_reconcile(cfg: dict[str, Any],
     except Exception:  # noqa: BLE001 - a missing rooms module is "nothing to do"
         return step_noop("roster-epoch: rooms module unavailable")
 
-    # Cheap existence + pending probe on a READ-ONLY handle first (never CREATE
-    # rooms.db from the daemon tick — a fresh node with no rooms must no-op).
+    # Cheap EXISTENCE probe on a READ-ONLY handle first (never CREATE rooms.db
+    # from the daemon tick — a fresh node with no rooms must no-op, and the
+    # Lane-0 fixture has no rooms.db).
     try:
         ro = rooms.open_rooms_readonly()
     except Exception as exc:  # noqa: BLE001 - present-but-unreadable is an op error
         return step_error(f"roster-epoch: rooms.db unreadable ({exc})"[:200])
     if ro is None:
         return step_noop("roster-epoch: no rooms.db (nothing to anti-entropy)")
-    try:
-        try:
-            pending = rooms.pending_roster_outbox(ro)
-        except sqlite3.OperationalError:
-            # A rooms.db created BEFORE this table existed has no
-            # room_roster_outbox yet (open_rooms_readonly does not migrate). That
-            # simply means "no pending broadcasts" — the table is created lazily
-            # the next time the leader opens rooms.db writably (a membership
-            # change). Treat as a clean no-op, not an error.
-            return step_noop("roster-epoch: outbox table absent (no pending)")
-        except Exception as exc:  # noqa: BLE001 - other schema/db read error
-            return step_error(f"roster-epoch: outbox read failed ({exc})"[:200])
-    finally:
-        ro.close()
-    if not pending:
-        return step_noop("roster-epoch: no pending roster broadcasts")
+    ro.close()
 
-    # There is real work → open a WRITABLE handle and drain it through the shared
-    # sender (one signing path with the CLI). Any raise is contained (fail-safe).
+    # The db EXISTS → open a WRITABLE handle. This runs `_migrate_schema`, so the
+    # #2109 admin columns are ensured here (a lock during the upgrade window now
+    # propagates instead of silently leaving a half-migrated schema). Any raise
+    # is contained (fail-safe — never crash the tick).
     try:
         wconn = rooms.open_rooms()
     except Exception as exc:  # noqa: BLE001 - rooms.db open failure is an op error
         return step_error(f"roster-epoch: rooms.db open failed ({exc})"[:200])
     try:
+        # #2109 durable reclassification: backfill THIS node's admin bits from
+        # the local configured admin id and, as the leader, bump+enqueue a
+        # roster rebroadcast for any room whose admin bits changed. This is what
+        # converges a STABLE room's migrated -1 rows (no join/leave to bump the
+        # epoch otherwise). Local-authority + leader-only enforced inside. A
+        # raise here (e.g. AdminIdResolveError on an unreadable/malformed roster)
+        # is FAIL-CLOSED: surface it as a paced step_error so the backoff gate
+        # retries it, rather than backfilling/rebroadcasting with a wrong admin
+        # id. No admin bit was written on that path (the resolve raises first).
+        try:
+            rooms.reclassify_and_rebroadcast_local_admin(cfg, wconn)
+        except Exception as exc:  # noqa: BLE001 - fail-closed; do not write a wrong bit
+            return step_error(
+                f"roster-epoch: admin backfill failed ({exc})"[:200])
+
+        try:
+            pending = rooms.pending_roster_outbox(wconn)
+        except sqlite3.OperationalError:
+            # A rooms.db created BEFORE the outbox table existed has none yet;
+            # the writable open above migrates it, so this is effectively "no
+            # pending" — a clean no-op, not an error.
+            return step_noop("roster-epoch: outbox table absent (no pending)")
+        except Exception as exc:  # noqa: BLE001 - other schema/db read error
+            return step_error(f"roster-epoch: outbox read failed ({exc})"[:200])
+        if not pending:
+            return step_noop("roster-epoch: no pending roster broadcasts")
+
+        # There is real work → drain it through the shared sender (one signing
+        # path with the CLI).
         summary = rooms.heartbeat_rebroadcast_rosters(cfg, wconn)
     except Exception as exc:  # noqa: BLE001 - last-resort guard (never crash tick)
         return step_error(f"roster-epoch: rebroadcast raised ({exc})"[:200])
