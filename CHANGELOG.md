@@ -4,6 +4,14 @@ All notable changes to Agent Bridge are documented here. This project adheres
 loosely to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and tracks
 version bumps via the `VERSION` file.
 
+## [0.17.0-beta2.4] — 2026-06-25 (mainline · beta · Teams quoteResult live-feedback fixes)
+
+**v0.17.0-beta2.4 — two operator live-feedback fixes to the (now lit) Teams `quoteResult` card, on top of beta2.3.** Renderer-only; codex Phase-4 `implement-ok` (findings 0) on green CI.
+
+### Channels
+
+- **teams: add the RFQ FactSet row + suppress the duplicate prose on card success (#2111).** The per-RFQ stack gains an `RFQ` FactSet row (matched from the server's existing `RFQ` row; missing → em dash). On **successful** card render the visible message text is now suppressed (`text: ''`) so the card no longer renders alongside the legacy 10-column markdown table — the card is the content, the prose was a duplicate. This also **strengthens §10**: the success path now carries zero visible text (no leak surface), while the failure path keeps the §10-scanned text fallback and the no-fence path is byte-for-byte unchanged. teams plugin **0.1.4 → 0.1.5**.
+
 ## [0.17.0-beta2.3] — 2026-06-25 (mainline · beta · Teams quoteResult light-up-ready)
 
 **v0.17.0-beta2.3 — the Teams `quoteResult` Adaptive Card is light-up-ready: a 6-field per-RFQ layout + a renderer-supplied deeplink, on top of beta2.2.** Still **dark-launched / dormant** (`AC_QUOTE_RESULT_CARD` defaults OFF) — a beta2.3 install sees **zero behavior change** until the operator opts in; light-up is a separate, gated step (renderer reseed + server flag + sign-off). Three renderer PRs redesign the quoteResult card and extend the §10 fail-closed surface to the visible card prose; each carried a full codex Phase-4 pair-review (`implement-ok`, findings 0) on top of green Linux CI.
