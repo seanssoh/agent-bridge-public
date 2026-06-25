@@ -414,9 +414,11 @@ describe('buildAdaptiveCard render shape (6-field per-RFQ stack, card 8)', () =>
     const emph = first.items.find((i: any) => i.type === 'Container' && i.style === 'emphasis')
     expect(emph).toBeDefined()
     const factSet = emph.items.find((i: any) => i.type === 'FactSet')
-    expect(factSet.facts.map((f: any) => f.title)).toEqual(['용량', '랩넘버'])
+    expect(factSet.facts.map((f: any) => f.title)).toEqual(['용량', '랩넘버', 'RFQ'])
     expect(factSet.facts[0].value).toBe('306 g')
     expect(factSet.facts[1].value).toBe('TESTCTO1')
+    // no RFQ row in this fixture → factValue routes the missing field to em dash
+    expect(factSet.facts[2].value).toBe('—')
     const priceRows = emph.items.filter((i: any) => i.type === 'ColumnSet')
     expect(priceRows.length).toBe(2)
     expect(JSON.stringify(priceRows[0])).toContain('내용물 견적')
@@ -471,6 +473,44 @@ describe('buildAdaptiveCard render shape (6-field per-RFQ stack, card 8)', () =>
       .find((i: any) => i.type === 'FactSet').facts
     expect(facts.find((f: any) => f.title === '용량').value).toBe('—')
     expect(facts.find((f: any) => f.title === '랩넘버').value).toBe('—')
+  })
+
+  test('RFQ row renders in the FactSet; missing RFQ → em dash', () => {
+    // Operator live-feedback: the per-RFQ FactSet must carry the RFQ number. The
+    // server emit already supplies a { label:'RFQ', value:'RFQ900000385' } row.
+    const intent: any = {
+      kind: 'quoteResult',
+      title: 't',
+      fallbackMarkdown: 'f',
+      sections: [
+        {
+          label: 'A사 · 세럼A',
+          rows: [
+            { label: '용량', value: '306 g', valueState: 'value' },
+            { label: '랩넘버', value: 'TESTCTO1', valueState: 'value' },
+            { label: 'RFQ', value: 'RFQ900000385', valueState: 'value' },
+            { label: '내용물 견적', value: '1,000 원', valueState: 'value' },
+          ],
+        },
+        {
+          // no RFQ row → factValue routes the missing field to an em dash
+          label: 'B사 · 크림B',
+          rows: [{ label: '내용물 견적', value: '2,000 원', valueState: 'value' }],
+        },
+      ],
+    }
+    const card: any = buildAdaptiveCard(intent)
+    const factSetOf = (containerIdx: number) =>
+      card.body
+        .filter((b: any) => b.type === 'Container')[containerIdx]
+        .items.find((i: any) => i.type === 'Container').items
+        .find((i: any) => i.type === 'FactSet').facts
+    const rfqFact = factSetOf(0).find((f: any) => f.title === 'RFQ')
+    expect(rfqFact).toBeDefined()
+    expect(rfqFact.value).toBe('RFQ900000385')
+    expect(JSON.stringify(card)).toContain('RFQ900000385')
+    // section without an RFQ row → em dash, never a leak
+    expect(factSetOf(1).find((f: any) => f.title === 'RFQ').value).toBe('—')
   })
 
   test('a masked/calculating 용량·랩넘버 FactSet row NEVER leaks its raw value', () => {
@@ -742,37 +782,43 @@ describe('§10 forbidden cost keys (mutation-proof)', () => {
 // §10 visible-text fail-closed — MUTATION-PROOF
 //
 // The card scan alone is not enough: a forbidden cost term emitted in the
-// human-visible prose OUTSIDE the fence would be sent unscanned. renderOutbound
-// must hard-replace the whole visible text with a §10-clean fallback on the
-// fence-present path (success AND fail), while leaving the no-fence path
-// byte-for-byte unchanged.
+// human-visible prose OUTSIDE the fence would be sent unscanned. On the FAILURE
+// path (card rejected / parse / size) renderOutbound still emits the §10-clean
+// safeText fallback so the prose can never leak a forbidden term. On the SUCCESS
+// path the visible prose is suppressed entirely (text === '') — the card IS the
+// content, so a zero visible-text leak surface is strictly stronger than the old
+// hard-replace AND removes the duplicate no-card markdown table. The no-fence
+// path stays byte-for-byte unchanged.
 // ---------------------------------------------------------------------------
 
 describe('§10 visible-text fail-closed (mutation-proof)', () => {
-  test('forbidden term in prose + CLEAN card → text hard-replaced, card still attached', () => {
-    // The card is clean (no forbidden key) so it survives §10; the prose carries
-    // a forbidden cost term ("원가") and MUST be replaced wholesale. Revert the
-    // safeText substitution in renderOutbound → this fails: out.text would still
-    // contain "원가는 1000원" and leak the forbidden term to Teams.
+  test('forbidden term in prose + CLEAN card → visible text suppressed, card still attached', () => {
+    // The card is clean (no forbidden key) so it survives §10 and is attached.
+    // On card SUCCESS the visible prose is suppressed entirely (text === ''), so
+    // the forbidden cost term ("원가") in the prose can never reach Teams — a
+    // strictly stronger outcome than the old hard-replace. Revert the success
+    // text='' suppression in renderOutbound → this fails: out.text would carry
+    // "원가는 1000원" (or the §10 fallback), not the empty string.
     const out = renderOutbound('원가는 1000원\n\n' + fence(validListIntent()))
-    expect(out.text).toBe(SECTION10_TEXT_FALLBACK)
+    expect(out.text).toBe('')
     expect(out.text).not.toContain('원가')
     expect(out.attachments.length).toBe(1) // clean card still sent
     expect(out.warning).toBeUndefined()
   })
 
-  test('제시가 in the visible prose is hard-replaced (clean card still attached)', () => {
+  test('제시가 in the visible prose is suppressed on success (clean card still attached)', () => {
     const out = renderOutbound('제시가 기준으로 안내드립니다.\n\n' + fence(validListIntent()))
-    expect(out.text).toBe(SECTION10_TEXT_FALLBACK)
+    expect(out.text).toBe('')
     expect(out.text).not.toContain('제시가')
     expect(out.attachments.length).toBe(1)
   })
 
-  test('clean prose + clean card → visible text unchanged (fence stripped), card attached', () => {
+  test('clean prose + clean card → visible text suppressed on success (no duplicate table), card attached', () => {
     const summary = '견적 결과를 카드로 정리했습니다.'
     const out = renderOutbound(summary + '\n\n' + fence(validListIntent()))
-    expect(out.text).toBe(summary) // NOT replaced — the fallback only fires on a hit
-    expect(out.text).not.toBe(SECTION10_TEXT_FALLBACK)
+    // Even clean prose is suppressed on card success — the card is the content,
+    // the prose/markdown table is only a no-card fallback (the dedup fix).
+    expect(out.text).toBe('')
     expect(out.text).not.toContain('cardintent')
     expect(out.attachments.length).toBe(1)
   })
@@ -800,16 +846,34 @@ describe('§10 visible-text fail-closed (mutation-proof)', () => {
     expect(out.warning).toBeUndefined()
   })
 
-  test('allowed price labels 내용물 견적 / 가공비 견적 in prose pass (not forbidden)', () => {
+  test('allowed price labels 내용물 견적 / 가공비 견적 are not forbidden (prose suppressed on card success)', () => {
     // These are the ALLOWED viewer-facing labels — they must NOT be on the
-    // forbidden list, so the prose carrying them is sent unchanged.
+    // forbidden list. On card success the prose is suppressed regardless, so the
+    // §10 fallback never fires for them either.
     expect(findForbiddenCostKey('내용물 견적')).toBeNull()
     expect(findForbiddenCostKey('가공비 견적')).toBeNull()
     const summary = '내용물 견적과 가공비 견적을 안내드립니다.'
     const out = renderOutbound(summary + '\n\n' + fence(validListIntent()))
-    expect(out.text).toBe(summary)
+    expect(out.text).toBe('')
     expect(out.text).not.toBe(SECTION10_TEXT_FALLBACK)
     expect(out.attachments.length).toBe(1)
+  })
+
+  test('card success suppresses the visible prose (no duplicate table)', () => {
+    // Operator live-feedback dedup: the agent's no-card markdown table prose must
+    // NOT be sent alongside the rendered card. On a quoteResult success the card
+    // is the sole content → out.text === '' and exactly one attachment.
+    const prose = [
+      '견적 결과를 표로 정리했습니다:',
+      '',
+      '| 고객 | 제품 | 용량 | 랩넘버 | 내용물 견적 | 가공비 견적 |',
+      '| --- | --- | --- | --- | --- | --- |',
+      '| A사 | 제품1 | 306 g | TESTCTO1 | ₩1,500 | 산출중 |',
+    ].join('\n')
+    const out = renderOutbound(prose + '\n\n' + fence(validListIntent()))
+    expect(out.text).toBe('')
+    expect(out.attachments.length).toBe(1)
+    expect(out.warning).toBeUndefined()
   })
 
   test('Korean + literal contract terms are on the forbidden list; 제시가 hit, labels clean', () => {
@@ -834,20 +898,21 @@ describe('renderOutbound graceful fallback (mutation-proof)', () => {
     expect(out.warning).toBeUndefined()
   })
 
-  test('valid fence → fence stripped + Adaptive Card attached', () => {
+  test('valid fence → prose suppressed + Adaptive Card attached', () => {
     const summary = 'A사 ₩1,500, B사 계산중입니다.'
     const out = renderOutbound(summary + '\n\n' + fence(validListIntent()))
-    expect(out.text).toBe(summary)
+    // Card success suppresses the visible prose — the card is the content.
+    expect(out.text).toBe('')
     expect(out.text).not.toContain('cardintent')
     expect(out.attachments.length).toBe(1)
   })
 
-  test('multi-fence → renders the LAST, strips ALL fences (no earlier raw JSON leaks)', () => {
-    // codex r1 FAIL fix: the visible text must have EVERY cardintent fence
-    // stripped, not just the last one. An earlier fence's raw JSON in out.text
-    // would violate the "user must never see raw JSON" contract.
-    // (Revert renderOutbound's stripAllCardIntentFences back to the single-span
-    // stripFence(text, fence.full) → this fails: the first fence's marker leaks.)
+  test('multi-fence → renders the LAST, suppresses prose on success (no raw JSON leaks)', () => {
+    // codex r1 FAIL fix: on the card-success path the visible text is suppressed
+    // entirely (text === ''), so neither fence's raw JSON nor the surrounding
+    // prose can reach the user — strictly upholds the "user must never see raw
+    // JSON" contract. (Revert the success text='' suppression → this fails: the
+    // surrounding prose, or a non-fully-stripped fence marker, would leak.)
     const summary = '두 견적 요약입니다.'
     const first: any = validListIntent()
     first.title = 'FIRST_RAW_MARKER'
@@ -859,14 +924,12 @@ describe('renderOutbound graceful fallback (mutation-proof)', () => {
     expect(out.attachments.length).toBe(1)
     const cardBytes = JSON.stringify(out.attachments[0].content)
     expect(cardBytes).toContain('LAST_RENDERED_MARKER')
-    // NEITHER fence's raw JSON may remain in the visible text
+    // visible text fully suppressed on success → no raw JSON, no marker, no prose
+    expect(out.text).toBe('')
     expect(out.text).not.toContain('cardintent')
     expect(out.text).not.toContain('FIRST_RAW_MARKER')
     expect(out.text).not.toContain('LAST_RENDERED_MARKER')
     expect(out.text).not.toContain('"kind"')
-    // surrounding prose survives
-    expect(out.text).toContain('두 견적 요약입니다.')
-    expect(out.text).toContain('그리고')
   })
 
   test('invalid JSON fence → text-only, fence stripped, NEVER throws', () => {

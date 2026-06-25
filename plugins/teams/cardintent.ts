@@ -475,6 +475,7 @@ function toQuoteResultAction(a: Action): AcElement | null {
 // valueState (산출중/–) so a separate status column is redundant.
 const FIELD_VOLUME_LABELS: readonly string[] = ['용량']
 const FIELD_LABNO_LABELS: readonly string[] = ['랩넘버']
+const FIELD_RFQ_LABELS: readonly string[] = ['RFQ']
 const FIELD_CONTENT_PRICE_LABELS: readonly string[] = ['내용물 견적']
 const FIELD_PROCESSING_PRICE_LABELS: readonly string[] = ['가공비 견적']
 const EMDASH = '—'
@@ -558,6 +559,7 @@ function renderRfqContainer(section: Section): AcElement {
             facts: [
               { title: '용량', value: factValue(section.rows, FIELD_VOLUME_LABELS) },
               { title: '랩넘버', value: factValue(section.rows, FIELD_LABNO_LABELS) },
+              { title: 'RFQ', value: factValue(section.rows, FIELD_RFQ_LABELS) },
             ],
           },
           priceRow('내용물 견적', section.rows, FIELD_CONTENT_PRICE_LABELS),
@@ -755,8 +757,14 @@ export function renderOutbound(
     return fail(`cardintent rendered card too large: ${cardJson.length} > ${MAX_CARD_BYTES} bytes`)
   }
 
+  // Card success → the card IS the content; suppress the visible prose so the
+  // user does not see a duplicate of the agent's no-card markdown fallback
+  // alongside the rendered card. This is strictly stronger than the §10
+  // hard-replace on the success path: text === '' is a zero visible-text leak
+  // surface. The §10 prose scan still governs the fail() fallback via safeText,
+  // and the rendered-card §10 byte scan above still rejects a forbidden card.
   return {
-    text: safeText,
+    text: '',
     attachments: [{ contentType: AC_CONTENT_TYPE, content: card }],
   }
 }
