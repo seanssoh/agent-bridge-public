@@ -38,6 +38,7 @@ import { homedir } from 'os'
 import { basename, isAbsolute as pathIsAbsolute, join, resolve as pathResolve } from 'path'
 import { createRecentMessageDeduper, storedRowMatchesIncoming } from './dedupe.ts'
 import { renderOutbound } from './cardintent.ts'
+import { classifyReplyOutcome } from './outbound-result.ts'
 
 type GroupPolicy = {
   requireMention?: boolean
@@ -1991,20 +1992,49 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         if (rendered.warning) {
           process.stderr.write(`teams channel: cardintent fallback: ${rendered.warning}\n`)
         }
-        await adapter.continueConversation(ref, async context => {
-          if (rendered.attachments.length > 0) {
-            await context.sendActivity({
-              type: ActivityTypes.Message,
-              text: rendered.text,
-              attachments: rendered.attachments as any,
-            })
-          } else {
-            // Unchanged plain-string send (preserves the prior wire shape when
-            // no card is produced).
-            await context.sendActivity(rendered.text)
-          }
+        // Capture the Bot Framework ResourceResponse.id so a reply that was
+        // accepted-by-SDK but produced no message id (or threw) is no longer
+        // reported as a bare `sent:` success (#2112 — silent non-delivery).
+        // sentId is declared outside the continueConversation closure so it
+        // survives back to the tool result.
+        let sentId = ''
+        let sendErr: unknown
+        try {
+          await adapter.continueConversation(ref, async context => {
+            if (rendered.attachments.length > 0) {
+              const sent = await context.sendActivity({
+                type: ActivityTypes.Message,
+                text: rendered.text,
+                attachments: rendered.attachments as any,
+              })
+              sentId = String((sent as any)?.id ?? '').trim()
+            } else {
+              // Unchanged plain-string send (preserves the prior wire shape when
+              // no card is produced).
+              const sent = await context.sendActivity(rendered.text)
+              sentId = String((sent as any)?.id ?? '').trim()
+            }
+          })
+        } catch (err) {
+          sendErr = err
+        }
+        const convId = String((ref as any).conversation?.id ?? chatId)
+        const outcome = classifyReplyOutcome({
+          chatId,
+          convId,
+          sentId,
+          sendErr,
+          attachmentCount: rendered.attachments.length,
         })
-        return { content: [{ type: 'text', text: `sent: ${chatId}` }] }
+        // Single-line audit row so outbound delivery is observable.
+        process.stderr.write(`${outcome.auditLine}\n`)
+        if (outcome.throw) {
+          // sendActivity threw — surface a clear failure to the caller (the
+          // reply tool's convention is throw-on-error; the MCP SDK marks the
+          // tool result isError).
+          throw new Error(outcome.errorText)
+        }
+        return { content: [{ type: 'text', text: outcome.resultText }] }
       }
 
       // Attachment path. Phase 1 supports personal chats only — group/channel
