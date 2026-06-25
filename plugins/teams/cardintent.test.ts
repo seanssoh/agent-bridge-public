@@ -20,6 +20,7 @@ import {
   FORBIDDEN_COST_KEYS_PLACEHOLDER,
   isAllowedDeeplink,
   isDetailLayout,
+  quoteResultDeeplink,
   renderOutbound,
   renderValueState,
   SECTION10_TEXT_FALLBACK,
@@ -74,9 +75,11 @@ function validListIntent(): CardIntent {
     ],
     actions: [
       {
+        // actionId-only: crm-dev emits NO url. The renderer supplies the pinned
+        // deeplink for this gated actionId.
         actionId: 'openQuoteResultDetail',
         label: '전체 견적결과 보기 (web/d)',
-        payload: { url: 'https://crm-qa.cosmax.com/d/?screen=rfq-list' },
+        payload: {},
       },
     ],
     fallbackMarkdown: '셀트리온 5,754원 / 헤메코 3,836원 / 셀트리온 산출중',
@@ -112,7 +115,7 @@ function validDetailIntent(): CardIntent {
       {
         actionId: 'openQuoteResultDetail',
         label: '전체 견적결과 보기 (web/d)',
-        payload: { url: 'https://crm-qa.cosmax.com/d/?screen=rfq-list' },
+        payload: {},
       },
     ],
     fallbackMarkdown: 'A사 견적 상세',
@@ -309,10 +312,10 @@ describe('validateCardIntent', () => {
 })
 
 describe('renderer is authoritative / non-leaking (defense-in-depth)', () => {
-  test('Phase 1a: a non-deeplink action (no valid url) emits NO Action — never an Action.Submit', () => {
-    // A validated action without a domain-pinned url is dropped: Phase 1a emits
-    // no Submit. (Revert toQuoteResultAction back to a Submit fallback → this
-    // fails: card.actions[0] would be an Action.Submit.)
+  test('Phase 1a: the view action emits the renderer-supplied OpenUrl — never an Action.Submit', () => {
+    // The view actionId (no payload url) emits the renderer-supplied OpenUrl
+    // deeplink, and Phase 1a NEVER emits an Action.Submit. (Revert toQuoteResultAction
+    // to a Submit fallback → this fails: card.actions[0] would be an Action.Submit.)
     const card: any = buildAdaptiveCard({
       kind: 'quoteResult',
       title: 't',
@@ -322,7 +325,9 @@ describe('renderer is authoritative / non-leaking (defense-in-depth)', () => {
       ],
       actions: [{ actionId: 'openQuoteResultDetail', label: 'go', payload: { quoteId: 'q1' } }],
     })
-    expect(card.actions).toBeUndefined()
+    expect(card.actions.length).toBe(1)
+    expect(card.actions[0].type).toBe('Action.OpenUrl')
+    expect(card.actions[0].url).toBe('https://crm-qa.cosmax.com/d/?screen=rfq-list')
     expect(JSON.stringify(card)).not.toContain('Action.Submit')
   })
 
@@ -601,29 +606,74 @@ describe('openUrl domain-pin (Phase 1a)', () => {
     expect(isAllowedDeeplink('https://crm-qa.cosmax.com/d/', { BRIDGE_TEAMS_DEEPLINK_HOSTS: 'crm.cosmax.com' })).toBeNull()
   })
 
-  test('a valid deeplink is emitted as the card Action.OpenUrl', () => {
-    const card: any = buildAdaptiveCard(validListIntent())
+  test('quoteResultDeeplink builds the rfq-list url on the first configured host', () => {
+    expect(quoteResultDeeplink({})).toBe('https://crm-qa.cosmax.com/d/?screen=rfq-list')
+  })
+
+  test('actionId-only emit (NO payload url) renders the renderer-supplied Action.OpenUrl', () => {
+    // crm-dev sends {actionId:'openQuoteResultDetail', label:…} with NO url. The
+    // renderer must SUPPLY the pinned deeplink and emit the button. (Revert to
+    // sourcing a.payload?.url → this fails: no url, no button.)
+    const intent: any = validListIntent()
+    intent.actions = [{ actionId: 'openQuoteResultDetail', label: '전체 견적결과 보기' }]
+    const card: any = buildAdaptiveCard(intent)
     expect(card.actions.length).toBe(1)
     expect(card.actions[0].type).toBe('Action.OpenUrl')
     expect(card.actions[0].url).toBe('https://crm-qa.cosmax.com/d/?screen=rfq-list')
     expect(card.actions[0].title).toContain('전체 견적결과 보기')
   })
 
-  test('an off-domain deeplink is DROPPED — the action is not emitted, the card still renders', () => {
-    const intent: any = validListIntent()
-    intent.actions[0].payload.url = 'https://evil.example/d/?screen=rfq-list'
-    const card: any = buildAdaptiveCard(intent)
-    expect(card.actions).toBeUndefined() // dropped, not thrown
-    expect(JSON.stringify(card)).not.toContain('evil.example')
-    // the card body still rendered (graceful drop, not a whole-card failure)
-    expect(card.body.length).toBeGreaterThan(1)
+  test('a cardintent-supplied url is IGNORED — the renderer pins the destination (no open redirect)', () => {
+    // THE open-redirect-elimination test: even when the cardintent smuggles a
+    // payload.url (off-domain, or a different path on the allowed host), the
+    // emitted url is STILL the renderer's pinned rfq-list deeplink. The cardintent
+    // can NOT supply or influence the button destination. (Revert to sourcing
+    // a.payload?.url → this fails: the smuggled url would surface.)
+    for (const smuggled of [
+      'https://evil.example.com/x',
+      'https://crm-qa.cosmax.com/d/?screen=admin-export', // allowed host, attacker path
+      'javascript:alert(1)',
+    ]) {
+      const intent: any = validListIntent()
+      intent.actions = [
+        { actionId: 'openQuoteResultDetail', label: '전체 견적결과 보기', payload: { url: smuggled } },
+      ]
+      const card: any = buildAdaptiveCard(intent)
+      expect(card.actions.length).toBe(1)
+      expect(card.actions[0].type).toBe('Action.OpenUrl')
+      expect(card.actions[0].url).toBe('https://crm-qa.cosmax.com/d/?screen=rfq-list')
+      const cardStr = JSON.stringify(card)
+      expect(cardStr).not.toContain('evil.example')
+      expect(cardStr).not.toContain('admin-export')
+      expect(cardStr).not.toContain('javascript:')
+    }
   })
 
-  test('a NON-view actionId carrying a pinned (allowed-host) url is DROPPED — no url laundering', () => {
+  test('env host override changes the renderer-supplied url', () => {
+    // BRIDGE_TEAMS_DEEPLINK_HOSTS override flows through to the emitted deeplink
+    // (toQuoteResultAction builds it from the first configured host at call time
+    // via the ambient env). Read/write process.env through globalThis so this
+    // test typechecks under the plugin's node-types-free tsconfig (`types: []`),
+    // mirroring how the source module reads the env.
+    const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env ?? {}
+    const prev = env.BRIDGE_TEAMS_DEEPLINK_HOSTS
+    env.BRIDGE_TEAMS_DEEPLINK_HOSTS = 'crm.cosmax.com'
+    try {
+      const card: any = buildAdaptiveCard(validListIntent())
+      expect(card.actions[0].type).toBe('Action.OpenUrl')
+      expect(card.actions[0].url).toBe('https://crm.cosmax.com/d/?screen=rfq-list')
+    } finally {
+      if (prev === undefined) delete env.BRIDGE_TEAMS_DEEPLINK_HOSTS
+      else env.BRIDGE_TEAMS_DEEPLINK_HOSTS = prev
+    }
+  })
+
+  test('a NON-view actionId is DROPPED — only openQuoteResultDetail surfaces the deeplink', () => {
     // Only openQuoteResultDetail may surface as the card OpenUrl. A createQuoteDoc
-    // (or any other) action that smuggles an allowed-host url must NOT be emitted
-    // as an Action.OpenUrl. (Revert the actionId gate in toQuoteResultAction →
-    // this fails: the createQuoteDoc action would attach as an OpenUrl.)
+    // (or any other) action must NOT be emitted as an Action.OpenUrl — even though
+    // the renderer would supply the url, the actionId gate stops the laundering.
+    // (Revert the actionId gate in toQuoteResultAction → this fails: the
+    // createQuoteDoc action would attach as an OpenUrl.)
     const intent: any = validListIntent()
     intent.actions = [
       {
@@ -633,7 +683,7 @@ describe('openUrl domain-pin (Phase 1a)', () => {
       },
     ]
     const card: any = buildAdaptiveCard(intent)
-    expect(card.actions).toBeUndefined() // dropped despite the valid pinned url
+    expect(card.actions).toBeUndefined() // dropped: not the gated view actionId
     expect(JSON.stringify(card)).not.toContain('Action.OpenUrl')
   })
 })
