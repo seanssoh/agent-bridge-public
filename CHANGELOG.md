@@ -4,6 +4,19 @@ All notable changes to Agent Bridge are documented here. This project adheres
 loosely to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and tracks
 version bumps via the `VERSION` file.
 
+## [0.17.0-beta3] — 2026-06-25 (mainline · beta · Teams reply delivery-proof + devReqAutofill renderer + rooms migration)
+
+**v0.17.0-beta3 — a Teams reply reliability fix (a production silent non-delivery), the 개발의뢰 draft Adaptive Card renderer, and the #2079 rooms admin migration robustness, on top of beta2.4.** Three PRs, each with a codex Phase-4 `implement-ok` on green Linux CI.
+
+### Channels
+
+- **teams: the `reply` tool now surfaces the send outcome + emits an audit row (#2112, #2119).** The reply text-only path returned `sent: <chatId>` as soon as `sendActivity` awaited, discarding the Bot Framework `ResourceResponse.id` — so a reply the SDK accepted but never delivered read as success (a production customer agent saw 14 silent non-deliveries). A new pure, unit-tested `outbound-result.ts` classifier turns the send outcome into a three-way result: **confirmed** (non-empty id) → `sent: … message_id=…` (backward-compatible), **unconfirmed** (awaited OK, empty id) → `ok:false` + `teams_reply_unconfirmed:` (never a bare `sent:`), **failed** (threw) → `teams_reply_failed:`. A single-line `teams_outbound_reply` audit row (with newline+length sanitization on every interpolated field) makes outbound delivery observable. teams plugin **0.1.6 → 0.1.7**.
+- **teams: devReqAutofill Adaptive Card renderer — the 개발의뢰 draft card (#17471, #2116).** A second `cardintent` kind alongside `quoteResult`: a per-project grouped draft (an empty-rows section opens a per-project `emphasis` Container, content sections nest, a trailing `⚠ 보완` section becomes a warning Container) with renderer-supplied domain-pinned `Action.OpenUrl` deeplinks for `confirmDevReq` / `editDevReq` (the action payload's entity-id is never placed in the url → zero open-redirect surface). `Action.Submit` is never emitted (Phase-2 trusted-handler gate). §10 is inherited unchanged and the quoteResult path is byte-for-byte unchanged. **Dormant** until crm-dev's `preview_card` emit lands. teams plugin **0.1.5 → 0.1.6**.
+
+### A2A / rooms
+
+- **rooms: robust `room_members.admin` migration + local-admin backfill + leader rebroadcast (#2079, #2113 → #2114).** Backport to the v0.17 line of the rooms admin-migration hardening: `_migrate_schema` PRAGMA-prechecks each column and swallows only the duplicate-column race (a lock / readonly / disk error now re-raises instead of silently leaving the column missing); the reconcile roster-epoch step backfills this node's admin bits from the local configured admin id (local-node rows only, empty config leaves `-1`, never infers a remote admin) and, as the leader, atomically bumps the epoch + enqueues a durable roster rebroadcast.
+
 ## [0.17.0-beta2.4] — 2026-06-25 (mainline · beta · Teams quoteResult live-feedback fixes)
 
 **v0.17.0-beta2.4 — two operator live-feedback fixes to the (now lit) Teams `quoteResult` card, on top of beta2.3.** Renderer-only; codex Phase-4 `implement-ok` (findings 0) on green CI.
