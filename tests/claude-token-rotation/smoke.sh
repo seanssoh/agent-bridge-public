@@ -1075,6 +1075,265 @@ LIST_AFTER_RECOVER="$("$REPO_ROOT/agent-bridge" auth claude-token list --json)"
 json_assert "quota list recovered" "$LIST_AFTER_RECOVER" "next(row for row in payload['tokens'] if row['id'] == 'quota')['enabled'] is True"
 pass "quota-limited tokens store reset time and recover automatically when due"
 
+# ---------------------------------------------------------------------------
+# #17927 G1 — parse_reset_at must handle the REAL weekly-429 string
+# (``resets Jul 1 at 12pm (Asia/Seoul)`` — abbreviated month, "at" separator,
+# NAMED timezone), keep the legacy ``(UTC)``/comma + ``resets in Nh`` forms,
+# and gracefully return "" for an unknown zone instead of crashing.
+# ---------------------------------------------------------------------------
+"$PYTHON" - "$REPO_ROOT/bridge-auth.py" <<'PY'
+import importlib.util
+import sys
+from datetime import datetime, timezone
+
+spec = importlib.util.spec_from_file_location("bridge_auth", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+# Reference well before every case date so none rolls into next year.
+ref = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+# Legacy forms must be byte-identical.
+legacy = {
+    "You've hit your limit - resets May 13, 3am (UTC)": "2026-05-13T03:00:00+00:00",
+    "resets in 2h 30m": "2026-01-01T02:30:00+00:00",
+    "resets in 5h": "2026-01-01T05:00:00+00:00",
+}
+for text, expect in legacy.items():
+    got = mod.parse_reset_at(text, ref)
+    if got != expect:
+        raise SystemExit(f"legacy parse regressed: {text!r} -> {got!r} (want {expect!r})")
+
+# Named-tz weekly forms — only assert the converted instant when the host
+# actually resolves the zone (system tzdata present); otherwise the contract
+# is graceful "" (no crash), which we assert in that branch.
+named = {
+    "You've hit your weekly limit · resets Jul 1 at 12pm (Asia/Seoul)": ("Asia/Seoul", "2026-07-01T03:00:00+00:00"),
+    "resets Jul 1, 9:30am (Asia/Kolkata)": ("Asia/Kolkata", "2026-07-01T04:00:00+00:00"),
+}
+for text, (zone, expect) in named.items():
+    got = mod.parse_reset_at(text, ref)
+    if mod._resolve_reset_tz(zone) is not None:
+        if got != expect:
+            raise SystemExit(f"named-tz parse wrong: {text!r} -> {got!r} (want {expect!r})")
+    elif got != "":
+        raise SystemExit(f"unresolvable zone must yield '' not {got!r} for {text!r}")
+
+# (UTC) still works with the new "at"/abbrev-month tolerant regex.
+if mod.parse_reset_at("resets Jul 1 at 12pm (UTC)", ref) != "2026-07-01T12:00:00+00:00":
+    raise SystemExit("named-tz regex broke the (UTC) at-separator form")
+
+# Unknown/bogus zone -> graceful "" (never raises).
+for bad in ("resets Jul 1 at 12pm (Mars/Phobos)", "resets Jul 1 at 12pm (Not_A_Zone)"):
+    if mod.parse_reset_at(bad, ref) != "":
+        raise SystemExit(f"unknown tz should yield '' for {bad!r}")
+PY
+[[ $? -eq 0 ]] || fail "parse_reset_at named-tz / fallback unit cases failed (#17927 G1)"
+pass "parse_reset_at parses the named-tz weekly reset, keeps legacy forms, falls back on unknown tz"
+
+# ---------------------------------------------------------------------------
+# #17927 G1/G2 — mark-quota stamps limited_until from the parsed reset, and
+# recover-due is CLOCK-authoritative: a token whose window is still open stays
+# disabled even when the probe says available (over-recovery thrash killed),
+# and a token whose window has passed re-enables even when the probe FAILS
+# (probe-optional / clock-trust). Legacy no-stamp rows keep probe behavior.
+# ---------------------------------------------------------------------------
+
+# G1 stamping: mark-quota with a parsed reset now writes limited_until too.
+MARK_REGISTRY="$ROOT/runtime/secrets/mark-quota-stamp-tokens.json"
+"$PYTHON" "$REPO_ROOT/bridge-auth.py" --registry "$MARK_REGISTRY" \
+  add --id m --stdin --json <<<"fake-claude-oauth-token-m" >/dev/null
+MARK_JSON="$("$PYTHON" "$REPO_ROOT/bridge-auth.py" --registry "$MARK_REGISTRY" \
+  mark-quota m --reset-at "2026-07-01T03:00:00+00:00" --json)"
+json_assert "mark-quota stamps" "$MARK_JSON" \
+  "payload['status'] == 'quota_limited' and payload['reset_at'] == '2026-07-01T03:00:00+00:00'"
+"$PYTHON" - "$MARK_REGISTRY" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+rows = {r["id"]: r for r in json.loads(Path(sys.argv[1]).read_text())["tokens"]}
+row = rows["m"]
+if row.get("limited_until") != "2026-07-01T03:00:00+00:00":
+    raise SystemExit(f"mark-quota did not stamp limited_until: {row.get('limited_until')!r}")
+if row.get("disabled_until") != "2026-07-01T03:00:00+00:00":
+    raise SystemExit("mark-quota dropped disabled_until")
+PY
+[[ $? -eq 0 ]] || fail "mark-quota did not stamp limited_until from the parsed reset (#17927 G1)"
+pass "mark-quota stamps limited_until from the parsed reset window (#17927 G1)"
+
+CLOCK_REGISTRY="$ROOT/runtime/secrets/clock-recovery-tokens.json"
+G2_FUTURE_ISO="$("$PYTHON" -c 'import datetime; print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(hours=6)).isoformat(timespec="seconds"))')"
+G2_PAST_ISO="$("$PYTHON" -c 'import datetime; print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(hours=6)).isoformat(timespec="seconds"))')"
+
+# Seed a disabled quota_limited row. $1 = limited_until, $2 = disabled/next gate.
+seed_clock_registry() {
+  "$PYTHON" - "$CLOCK_REGISTRY" "$1" "$2" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(json.dumps({
+    "version": 1,
+    "active_token_id": "",
+    "auto_rotate_enabled": False,
+    "rotation_threshold": 99.0,
+    "tokens": [
+        {
+            "id": "capped",
+            "token": "fake-claude-oauth-token-capped",
+            "enabled": False,
+            "disabled_reason": "quota_limited",
+            "limited_until": sys.argv[2],
+            "disabled_until": sys.argv[3],
+            "next_check_at": sys.argv[3],
+            "created_at": "2026-05-11T00:00:00+00:00",
+            "updated_at": "2026-05-11T00:00:00+00:00",
+        }
+    ],
+    "last_rotation": {},
+}, indent=2) + "\n", encoding="utf-8")
+PY
+  chmod 600 "$CLOCK_REGISTRY"
+}
+
+# Case A — window OPEN (limited_until future) but DUE by next_check_at; the
+# probe is stubbed to SUCCEED. Clock wins: token stays DISABLED.
+seed_clock_registry "$G2_FUTURE_ISO" "$G2_PAST_ISO"
+RECOVER_OPEN_JSON="$(
+  PATH="$ROOT/bin:$PATH" FAKE_CLAUDE_MODE=ok \
+    "$PYTHON" "$REPO_ROOT/bridge-auth.py" --registry "$CLOCK_REGISTRY" recover-due --json
+)"
+json_assert "clock window-open stays disabled" "$RECOVER_OPEN_JSON" \
+  "payload['checked_count'] == 1 and payload['recovered_count'] == 0 and payload['recovered'] == [] and payload['still_disabled_count'] == 1"
+"$PYTHON" - "$CLOCK_REGISTRY" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+row = {r["id"]: r for r in json.loads(Path(sys.argv[1]).read_text())["tokens"]}["capped"]
+if row.get("enabled") is not False:
+    raise SystemExit("window-open token was prematurely re-enabled despite a passing probe")
+PY
+[[ $? -eq 0 ]] || fail "clock window-open token re-enabled on probe (#17927 G2 over-recovery not killed)"
+pass "recover-due keeps a future-limited token disabled even when the probe says available (#17927 G2)"
+
+# Case B — window PASSED (limited_until past), probe stubbed to FAIL (auth).
+# Clock wins: token re-enables WITHOUT requiring an 'available' probe.
+seed_clock_registry "$G2_PAST_ISO" "$G2_PAST_ISO"
+RECOVER_PASSED_JSON="$(
+  PATH="$ROOT/bin:$PATH" FAKE_CLAUDE_MODE=auth \
+    "$PYTHON" "$REPO_ROOT/bridge-auth.py" --registry "$CLOCK_REGISTRY" recover-due --json
+)"
+json_assert "clock window-passed re-enables" "$RECOVER_PASSED_JSON" \
+  "payload['checked_count'] == 1 and payload['recovered_count'] == 1 and payload['recovered'] == ['capped'] and payload['still_disabled_count'] == 0"
+"$PYTHON" - "$CLOCK_REGISTRY" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+row = {r["id"]: r for r in json.loads(Path(sys.argv[1]).read_text())["tokens"]}["capped"]
+if row.get("enabled") is not True:
+    raise SystemExit("window-passed token not re-enabled despite the clock (probe-optional broken)")
+if "limited_until" in row:
+    raise SystemExit("re-enabled token kept a stale limited_until stamp")
+PY
+[[ $? -eq 0 ]] || fail "clock window-passed token not re-enabled with a failing probe (#17927 G2)"
+pass "recover-due re-enables a window-passed token even when the probe fails (#17927 G2 clock-trust)"
+
+# Case C — legacy/orphan row with NO reset stamp keeps probe-driven behavior:
+# a passing probe re-enables it (no regression for pre-#17927 installs).
+"$PYTHON" - "$CLOCK_REGISTRY" "$G2_PAST_ISO" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+data = json.loads(path.read_text())
+for row in data["tokens"]:
+    if row["id"] == "capped":
+        row["enabled"] = False
+        row["disabled_reason"] = "quota_limited"
+        row.pop("limited_until", None)
+        row.pop("disabled_until", None)
+        row["next_check_at"] = sys.argv[2]  # due, but no reset stamp
+path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+PY
+chmod 600 "$CLOCK_REGISTRY"
+RECOVER_LEGACY_JSON="$(
+  PATH="$ROOT/bin:$PATH" FAKE_CLAUDE_MODE=ok \
+    "$PYTHON" "$REPO_ROOT/bridge-auth.py" --registry "$CLOCK_REGISTRY" recover-due --json
+)"
+json_assert "legacy no-stamp probe recovers" "$RECOVER_LEGACY_JSON" \
+  "payload['checked_count'] == 1 and payload['recovered_count'] == 1 and payload['recovered'] == ['capped']"
+pass "recover-due preserves probe-driven recovery for a legacy row with no reset stamp (#17927 G2)"
+
+# Case D — a clock-elapsed row must recover even when the probe RAISES a hard
+# error (e.g. an OSError during temp-config setup), not just a soft failure.
+# probe_claude_token only catches Timeout/FileNotFound; an uncaught exception
+# would otherwise abort the whole sweep and strand every due token. Drive
+# cmd_recover_due directly with the probe monkeypatched to raise.
+"$PYTHON" - "$REPO_ROOT/bridge-auth.py" "$ROOT/runtime/secrets/probe-raise-tokens.json" <<'PY'
+import argparse
+import importlib.util
+import io
+import json
+import sys
+from contextlib import redirect_stdout
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("bridge_auth", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+reg = Path(sys.argv[2])
+reg.parent.mkdir(parents=True, exist_ok=True)
+reg.write_text(json.dumps({
+    "version": 1,
+    "active_token_id": "",
+    "auto_rotate_enabled": False,
+    "rotation_threshold": 99.0,
+    "tokens": [{
+        "id": "capped",
+        "token": "fake-claude-oauth-token-capped-raise",
+        "enabled": False,
+        "disabled_reason": "quota_limited",
+        "limited_until": "2020-01-01T00:00:00+00:00",
+        "disabled_until": "2020-01-01T00:00:00+00:00",
+        "next_check_at": "2020-01-01T00:00:00+00:00",
+        "created_at": "2020-01-01T00:00:00+00:00",
+        "updated_at": "2020-01-01T00:00:00+00:00",
+    }],
+    "last_rotation": {},
+}, indent=2) + "\n", encoding="utf-8")
+reg.chmod(0o600)
+
+
+def boom(token, timeout):
+    raise OSError("simulated temp-config setup failure")
+
+
+mod.probe_claude_token = boom
+
+buf = io.StringIO()
+with redirect_stdout(buf):
+    rc = mod.cmd_recover_due(argparse.Namespace(
+        registry=str(reg), retry_seconds=1800, timeout=1, json=True,
+    ))
+payload = json.loads(buf.getvalue())
+if rc != 0:
+    raise SystemExit(f"recover-due aborted (rc={rc}) when the probe raised: {payload!r}")
+if payload.get("recovered") != ["capped"] or payload.get("recovered_count") != 1:
+    raise SystemExit(f"clock-elapsed row not recovered when probe raised: {payload!r}")
+row = {r["id"]: r for r in json.loads(reg.read_text())["tokens"]}["capped"]
+if row.get("enabled") is not True:
+    raise SystemExit("row left disabled after a raising-probe clock recovery")
+PY
+[[ $? -eq 0 ]] || fail "recover-due aborted instead of clock-recovering when the probe raised (#17927 G2)"
+pass "recover-due re-enables a window-passed token even when the probe RAISES a hard error (#17927 G2)"
+
 USAGE_ROOT="$ROOT/usage"
 USAGE_CACHE="$USAGE_ROOT/claude-usage.json"
 USAGE_CODEX="$USAGE_ROOT/codex"
