@@ -4,6 +4,17 @@ All notable changes to Agent Bridge are documented here. This project adheres
 loosely to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and tracks
 version bumps via the `VERSION` file.
 
+## [0.17.0-beta2.3] — 2026-06-25 (mainline · beta · Teams quoteResult light-up-ready)
+
+**v0.17.0-beta2.3 — the Teams `quoteResult` Adaptive Card is light-up-ready: a 6-field per-RFQ layout + a renderer-supplied deeplink, on top of beta2.2.** Still **dark-launched / dormant** (`AC_QUOTE_RESULT_CARD` defaults OFF) — a beta2.3 install sees **zero behavior change** until the operator opts in; light-up is a separate, gated step (renderer reseed + server flag + sign-off). Three renderer PRs redesign the quoteResult card and extend the §10 fail-closed surface to the visible card prose; each carried a full codex Phase-4 pair-review (`implement-ok`, findings 0) on top of green Linux CI.
+
+### Channels
+
+- **teams: §10 fail-closed scan of the visible card prose + Korean/literal forbidden list (#2104).** `renderOutbound` previously scanned only the rendered card bytes — a forbidden cost term in the human-visible prose accompanying a card (outside the `cardintent` fence) was sent unscanned. It now also scans the visible text and **hard-replaces** it with a fixed §10-clean fallback on a hit (both the success and the failure paths), and the forbidden list is extended with the Korean/literal contract terms (`제시가`/원가/마진/공헌이익/영업이익/네고율/회수율/작업장명/임률/고객요청가/manufacturingCostSuggested/standardCost). The no-fence path stays byte-for-byte unchanged.
+- **teams: quoteResult LIST → 6-field per-RFQ stack + Phase-1a contract primitives (#2107).** The quoteResult LIST is redesigned to the operator's #17138 6-field, mobile-safe **per-RFQ stack** (`고객 · 제품` header + `용량` / `랩넘버` + `내용물 견적` / `가공비 견적`), **superseding** the dormant beta2.2 3-col `견적 소계` / `산출상태` layout. Adds the Phase-1a contract primitives: **PriceCell string-only** (raw decimals rejected — zero path for a raw cost number), **`Action.OpenUrl` domain-pinned**, and **`Action.Submit` rejected** in Phase 1a. AC v1.2 only (no `Table` / `targetWidth`, ColumnSet ≤3).
+- **teams: renderer-supplied quoteResult deeplink url (#2108).** The `[전체 견적결과 보기]` deeplink URL is now **supplied by the renderer** (`https://<allowed-host>/d/?screen=rfq-list`, host configurable) and any cardintent-supplied URL is **ignored** — eliminating the open-redirect surface (smuggled / off-domain / `javascript:` URLs all resolve to the pinned destination). The server emits the action id only.
+- teams plugin **0.1.2 → 0.1.4** (version-triggered reseed loads the new renderer).
+
 ## [0.17.0-beta2.2] — 2026-06-25 (mainline · beta · Teams Adaptive Card layout)
 
 **v0.17.0-beta2.2 — the Teams `quoteResult` Adaptive Card renders its multi-RFQ LIST as a compact, mobile-safe ColumnSet table, on top of beta2.1.** The card feature stays **dark-launched / dormant** (`AC_QUOTE_RESULT_CARD` defaults OFF) — a beta2.2 install sees zero behavior change until a later opt-in light-up. This cut is renderer/layout only: the additive `renderOutbound` seam, fence parse/strip, fail-closed CardIntent validation, and the §10 forbidden-cost-key golden are unchanged. Carried a full codex pair-review convergence (r1→r3 `implement-ok`) on top of green Linux CI.
