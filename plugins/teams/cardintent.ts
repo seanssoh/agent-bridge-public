@@ -82,34 +82,56 @@ export type CardIntent = {
 // A SECOND, independent card kind that reuses the same fence + §10 + seam
 // machinery as quoteResult but renders a different shape: a per-project grouped
 // draft (one `emphasis` Container per project, each a stack of labelled
-// FactSets) + a tail "보완 필요" warning Container, with renderer-supplied
-// actions ONLY — a domain-pinned Action.OpenUrl deeplink to the CRM web draft
-// screen + a benign Action.ToggleVisibility. Action.Submit (confirmDevReq) is
-// Phase-2 (a trusted server-side handler is required) and is NEVER emitted here.
+// FactSets) + a trailing "보완 필요" warning Container, with renderer-supplied
+// deeplink actions ONLY. Action.Submit (confirmDevReq) is Phase-2 (a trusted
+// server-side handler is required) and is NEVER emitted here.
 //
-// FLAT input → grouped output: crm-dev emits flat sections; the renderer groups
-// them. A section.label of the form "P{n}·{subheader}" (e.g. "P1·프로젝트정보")
-// groups under project n with {subheader} as its sub-heading. A section whose
-// label does NOT carry the P{n}· prefix is rendered as its own standalone
-// Container — the flat safety-net, so the operator's 2-way de-risk falls out of
-// the same code path. Project display titles come from the optional
-// projectTitles map/array; an absent entry falls back to "프로젝트 {n}".
+// SECTION-ORDER grouping convention (LOCKED with crm-dev #17538, the preview_card
+// emit contract). crm-dev emits a flat ordered section list:
+//
+//   [ {label: projectTitle, rows: []},        // empty-rows = a new project header
+//     {label: '프로젝트정보', rows: [...]},     // content sections nest under it…
+//     {label: '제품정보',     rows: [...]},
+//     {label: '벌크1',        rows: [...]},
+//     {label: projectTitle2,  rows: []},        // …until the next empty-rows header
+//     {label: '프로젝트정보', rows: [...]},
+//     {label: '⚠ 보완 필요',  rows: [missing-field labels]} ]  // trailing warning
+//
+// The renderer walks the list: an EMPTY-rows section opens a new `emphasis`
+// Container (its label is the Accent project header); each following non-empty
+// content section nests as a subheader + FactSet until the next empty-rows
+// header; the trailing `⚠ 보완 …` section renders as a `warning` Container. A
+// content section with NO open project header renders standalone — the flat
+// safety-net, so the operator's 2-way de-risk falls out of the same code path.
+//
+// actions: crm-dev emits confirmDevReq / editDevReq actionIds (entity-id payload,
+// NO url); the RENDERER injects a domain-pinned OpenUrl deeplink (same as
+// quoteResult — the cardintent never supplies the url). Action.Submit is never
+// emitted; an unknown actionId is dropped.
 // ---------------------------------------------------------------------------
 
-export type DevReqWarning = {
-  label?: string
-  items: string[]
+// Closed enum of devReq action ids. An actionId outside this set is dropped (the
+// renderer never emits an action it cannot map to a domain-pinned deeplink).
+export const DEVREQ_ACTION_IDS = ['confirmDevReq', 'editDevReq'] as const
+export type DevReqActionId = (typeof DEVREQ_ACTION_IDS)[number]
+
+export type DevReqAction = {
+  actionId: DevReqActionId
+  // payload carries entity-identifier fields only and is NEVER read for the url
+  // (the renderer supplies a domain-pinned deeplink) — so a forbidden cost key
+  // smuggled here is still caught by the §10 byte scan over the rendered card.
+  label: string
+  payload?: Record<string, unknown>
 }
 
 export type DevReqAutofillIntent = {
   kind: 'devReqAutofill'
   title: string
   subtitle?: string
-  // Optional project display titles. Either an array (index n-1 → project n) or
-  // a record keyed by "P{n}" or "{n}". Absent → "프로젝트 {n}".
-  projectTitles?: string[] | Record<string, string>
+  // Flat ordered section list (see the convention above): empty-rows project
+  // headers interleaved with their content sections + a trailing 보완 section.
   sections: Section[]
-  warning?: DevReqWarning
+  actions?: DevReqAction[]
   fallbackMarkdown: string
 }
 
@@ -682,13 +704,16 @@ export function buildAdaptiveCard(intent: CardIntent): AcElement {
 // devReqAutofill: deeplink, validation, render
 // ---------------------------------------------------------------------------
 
-// The CRM web 개발의뢰 draft screen deeplink — replaces the Phase-2 confirmDevReq
-// Action.Submit for now. Domain-pinned exactly like the quoteResult deeplink: the
-// RENDERER supplies the url on the first configured allowed host, the cardintent
-// never carries/controls it (zero open-redirect surface). The screen slug is
-// operator-overridable via BRIDGE_TEAMS_DEVREQ_SCREEN (default 'dev-request');
-// it is constrained to a conservative slug charset so it can never smuggle an
-// extra path/query segment past the domain-pin.
+// The CRM web 개발의뢰 draft screen deeplink — the confirmDevReq / editDevReq
+// actions map to this (the Phase-2 Action.Submit confirm flow is deferred).
+// Domain-pinned exactly like the quoteResult deeplink: the RENDERER supplies the
+// url on the first configured allowed host, the cardintent never carries/controls
+// it (zero open-redirect surface). The screen slug is operator-overridable via
+// BRIDGE_TEAMS_DEVREQ_SCREEN (default 'dev-request'); it is constrained to a
+// conservative slug charset so it can never smuggle an extra path/query segment
+// past the domain-pin. The entity-id in the action payload is intentionally NOT
+// placed in the url (it lands on the dev-request screen, not a per-entity url —
+// the same zero-injection posture as quoteResult's rfq-list deeplink).
 const DEFAULT_DEVREQ_SCREEN = 'dev-request'
 
 export function devReqDeeplink(env: EnvBag = processEnv()): string {
@@ -697,22 +722,23 @@ export function devReqDeeplink(env: EnvBag = processEnv()): string {
   return `https://${deeplinkHosts(env)[0]}/d/?screen=${screen}`
 }
 
-const DEVREQ_EDIT_PANEL_ID = 'editDraftPanel'
-const DEVREQ_VIEW_ACTION_TITLE = '개발의뢰 초안 열기'
-const DEVREQ_EDIT_ACTION_TITLE = '✎ 수정'
+// The reserved label that marks the trailing 보완 필요 section (rendered as a
+// warning Container rather than a project content section). Matched by prefix so
+// "⚠ 보완 필요" / "⚠ 보완 필요사항 N건" both qualify.
+const DEVREQ_WARNING_RE = /^⚠\s*보완/
 
-function isStringArray(v: unknown): v is string[] {
-  return Array.isArray(v) && v.every(x => typeof x === 'string')
-}
-
-function validateDevReqWarning(w: unknown): string | null {
-  if (!isPlainObject(w)) return 'warning must be an object when present'
-  if (w.label !== undefined && typeof w.label !== 'string') {
-    return 'warning.label must be a string when present'
+function validateDevReqAction(a: unknown, where: string): string | null {
+  if (!isPlainObject(a)) return `${where}: action must be an object`
+  // Fail-closed: actionId must be a STRING in the devReq closed enum (a non-string
+  // like ["confirmDevReq"] would stringify past a String() check).
+  if (typeof a.actionId !== 'string' || !(DEVREQ_ACTION_IDS as readonly string[]).includes(a.actionId)) {
+    return `${where}: actionId "${String(a.actionId)}" not a string in the devReq allowed enum`
   }
-  if (!Array.isArray(w.items)) return 'warning.items must be an array'
-  for (let i = 0; i < w.items.length; i++) {
-    if (typeof w.items[i] !== 'string') return `warning.items[${i}] must be a string`
+  if (typeof a.label !== 'string' || a.label.length === 0) {
+    return `${where}: action.label must be a non-empty string`
+  }
+  if (a.payload !== undefined && !isPlainObject(a.payload)) {
+    return `${where}: action.payload must be an object when present`
   }
   return null
 }
@@ -723,9 +749,9 @@ export type DevReqValidationResult =
 
 // Strict validation for the devReqAutofill shape. Rows are validated by the same
 // validateSection/validateRow as quoteResult (string-only values, enum-checked
-// valueState — so a masked/calculating row can never leak its raw value). Any
-// `actions` on the cardintent are IGNORED (the rendered actions are
-// renderer-supplied only), so they are not validated or read.
+// valueState — so a masked/calculating row can never leak its raw value). An
+// empty-rows section is allowed (it is a project header). Top-level actions are
+// validated against the devReq action enum; section-level actions are not used.
 export function validateDevReqAutofill(value: unknown): DevReqValidationResult {
   if (!isPlainObject(value)) return { ok: false, reason: 'root is not an object' }
   if (value.kind !== 'devReqAutofill') {
@@ -744,17 +770,12 @@ export function validateDevReqAutofill(value: unknown): DevReqValidationResult {
     const err = validateSection(value.sections[i], `sections[${i}]`)
     if (err) return { ok: false, reason: err }
   }
-  if (value.projectTitles !== undefined) {
-    const pt = value.projectTitles
-    const okArr = isStringArray(pt)
-    const okRec = isPlainObject(pt) && Object.values(pt).every(x => typeof x === 'string')
-    if (!okArr && !okRec) {
-      return { ok: false, reason: 'projectTitles must be a string[] or a record of strings when present' }
+  if (value.actions !== undefined) {
+    if (!Array.isArray(value.actions)) return { ok: false, reason: 'actions must be an array when present' }
+    for (let i = 0; i < value.actions.length; i++) {
+      const err = validateDevReqAction(value.actions[i], `actions[${i}]`)
+      if (err) return { ok: false, reason: err }
     }
-  }
-  if (value.warning !== undefined) {
-    const err = validateDevReqWarning(value.warning)
-    if (err) return { ok: false, reason: err }
   }
   return { ok: true, intent: value as unknown as DevReqAutofillIntent }
 }
@@ -776,38 +797,11 @@ function devReqFactSet(rows: Row[]): AcElement {
   }
 }
 
-// Parse a "P{n}·{subheader}" section label → {project, subheader}, or null when
-// the prefix is absent (→ the section is rendered flat, the safety-net path).
-// Tolerant of whitespace around the · delimiter.
-const DEVREQ_GROUP_RE = /^P(\d+)\s*·\s*(.+)$/
-
-function parseDevReqSectionLabel(label: string): { project: number; subheader: string } | null {
-  const m = DEVREQ_GROUP_RE.exec(label.trim())
-  if (!m) return null
-  const project = Number.parseInt(m[1], 10)
-  if (!Number.isFinite(project) || project < 1) return null
-  const subheader = m[2].trim()
-  if (subheader.length === 0) return null
-  return { project, subheader }
+function isDevReqWarningSection(label: string): boolean {
+  return DEVREQ_WARNING_RE.test(label.trim())
 }
 
-function devReqProjectTitle(
-  n: number,
-  projectTitles: DevReqAutofillIntent['projectTitles'],
-): string {
-  const fallback = `프로젝트 ${n}`
-  if (!projectTitles) return fallback
-  const raw = Array.isArray(projectTitles)
-    ? projectTitles[n - 1]
-    : (projectTitles[`P${n}`] ?? projectTitles[String(n)])
-  if (typeof raw !== 'string') return fallback
-  const t = raw.trim()
-  if (t.length === 0) return fallback
-  // If the emit already prefixed "프로젝트 N …", use as-is; else compose.
-  return /^프로젝트\s*\d+/.test(t) ? t : `프로젝트 ${n} · ${t}`
-}
-
-// A subheader TextBlock + its FactSet (used inside a project Container).
+// A subheader TextBlock + its FactSet (nested inside a project Container).
 function devReqSubSection(subheader: string, rows: Row[]): AcElement[] {
   return [
     textBlock(subheader, { weight: 'Bolder', size: 'Small', isSubtle: true, spacing: 'Small' }),
@@ -815,33 +809,51 @@ function devReqSubSection(subheader: string, rows: Row[]): AcElement[] {
   ]
 }
 
+// The trailing 보완 필요 warning Container. Each row is a missing/needs-attention
+// field → a subtle bullet (label, plus ": value" when a value is carried). The
+// value still flows through renderValueState so a masked/calculating row can't
+// leak its raw value here either.
+function devReqWarningContainer(label: string, rows: Row[]): AcElement {
+  const items: AcElement[] = [textBlock(label, { weight: 'Bolder', color: 'Attention' })]
+  for (const r of rows) {
+    const v = r.valueState === 'value' ? (typeof r.value === 'string' ? r.value.trim() : '') : renderValueState(r).text
+    const text = v.length > 0 ? `${r.label}: ${v}` : r.label
+    items.push(textBlock(text, { isSubtle: true, spacing: 'Small' }))
+  }
+  return { type: 'Container', style: 'warning', separator: true, spacing: 'Medium', items }
+}
+
+// Walk the flat section list (the LOCKED #17538 convention): an EMPTY-rows
+// section opens a new emphasis Container (Accent project header); each following
+// non-empty content section nests as a subheader + FactSet until the next
+// empty-rows header; a trailing "⚠ 보완 …" section renders as a warning
+// Container; a content section with no open project header renders standalone
+// (the flat safety-net).
 function renderDevReqBody(intent: DevReqAutofillIntent): AcElement[] {
   const body: AcElement[] = [textBlock(intent.title, { weight: 'Bolder', size: 'Medium' })]
   if (intent.subtitle && intent.subtitle.trim().length > 0) {
     body.push(textBlock(intent.subtitle, { isSubtle: true, spacing: 'None' }))
   }
 
-  // Group P{n}·-prefixed sections into one emphasis Container per project (in
-  // first-seen order); a non-prefixed section renders as its own standalone
-  // Container (the flat safety-net).
-  const projectItems = new Map<number, AcElement[]>()
+  let currentProjectItems: AcElement[] | null = null
   for (const section of intent.sections) {
-    const parsed = parseDevReqSectionLabel(section.label)
-    if (parsed) {
-      let items = projectItems.get(parsed.project)
-      if (!items) {
-        items = [
-          textBlock(devReqProjectTitle(parsed.project, intent.projectTitles), {
-            weight: 'Bolder',
-            color: 'Accent',
-            size: 'Medium',
-          }),
-        ]
-        projectItems.set(parsed.project, items)
-        body.push({ type: 'Container', style: 'emphasis', separator: true, spacing: 'Medium', items })
-      }
-      items.push(...devReqSubSection(parsed.subheader, section.rows))
+    if (isDevReqWarningSection(section.label)) {
+      // Trailing 보완 필요 → standalone warning Container; ends any open group.
+      currentProjectItems = null
+      body.push(devReqWarningContainer(section.label, section.rows))
+      continue
+    }
+    if (section.rows.length === 0) {
+      // Empty-rows header → start a new per-project emphasis Container.
+      currentProjectItems = [
+        textBlock(section.label, { weight: 'Bolder', color: 'Accent', size: 'Medium' }),
+      ]
+      body.push({ type: 'Container', style: 'emphasis', separator: true, spacing: 'Medium', items: currentProjectItems })
+    } else if (currentProjectItems) {
+      // Content section nests under the open project Container.
+      currentProjectItems.push(...devReqSubSection(section.label, section.rows))
     } else {
+      // Flat safety-net: a content section with no open project header.
       body.push({
         type: 'Container',
         separator: true,
@@ -851,45 +863,24 @@ function renderDevReqBody(intent: DevReqAutofillIntent): AcElement[] {
     }
   }
 
-  // Tail: the 보완 필요 warning Container.
-  if (intent.warning && intent.warning.items.length > 0) {
-    const n = intent.warning.items.length
-    const label =
-      intent.warning.label && intent.warning.label.trim().length > 0
-        ? intent.warning.label
-        : `⚠ 보완 필요사항 ${n}건`
-    body.push({
-      type: 'Container',
-      style: 'warning',
-      separator: true,
-      spacing: 'Medium',
-      items: [
-        textBlock(label, { weight: 'Bolder', color: 'Attention' }),
-        ...intent.warning.items.map(it => textBlock(it, { isSubtle: true, spacing: 'Small' })),
-      ],
-    })
-  }
-
-  // The ToggleVisibility target — hidden by default. For Phase-1 (Submit
-  // deferred) editing happens in CRM web, so the panel carries that pointer.
-  body.push({
-    type: 'Container',
-    id: DEVREQ_EDIT_PANEL_ID,
-    isVisible: false,
-    separator: true,
-    spacing: 'Small',
-    items: [textBlock('수정은 [개발의뢰 초안 열기] 버튼으로 CRM web에서 진행하세요.', { isSubtle: true })],
-  })
-
   return body
 }
 
-// Build the devReqAutofill Adaptive Card. Renderer-supplied actions ONLY (the
-// cardintent's actions are ignored): an Action.OpenUrl to the domain-pinned CRM
-// web draft deeplink (replaces the Phase-2 confirmDevReq Action.Submit; the
-// renderer supplies the url, so zero open-redirect surface) and a benign
-// Action.ToggleVisibility revealing the hidden edit panel. Action.Submit
-// (confirmDevReq) is Phase-2 and is NEVER emitted here.
+// Map a validated devReq action → a domain-pinned Action.OpenUrl. The RENDERER
+// supplies the url (devReqDeeplink), IGNORING the action's payload entity-id/url
+// entirely → zero open-redirect surface (same posture as toQuoteResultAction).
+// Action.Submit is never produced regardless of input; an unmappable action → null.
+function toDevReqAction(a: DevReqAction): AcElement | null {
+  if (!(DEVREQ_ACTION_IDS as readonly string[]).includes(a.actionId)) return null
+  const href = isAllowedDeeplink(devReqDeeplink())
+  if (!href) return null
+  return { type: 'Action.OpenUrl', title: a.label, url: href }
+}
+
+// Build the devReqAutofill Adaptive Card. Actions are renderer-supplied
+// domain-pinned OpenUrl deeplinks ONLY (confirmDevReq / editDevReq → the CRM web
+// draft screen); Action.Submit is NEVER emitted (Phase-2 trusted-handler gate),
+// and a non-devReq actionId is dropped. No actions key when nothing survives.
 export function buildDevReqAutofillCard(intent: DevReqAutofillIntent): AcElement {
   const card: AcElement = {
     type: AC_TYPE,
@@ -897,17 +888,12 @@ export function buildDevReqAutofillCard(intent: DevReqAutofillIntent): AcElement
     version: AC_VERSION,
     body: renderDevReqBody(intent),
   }
-  const actions: AcElement[] = []
-  const href = isAllowedDeeplink(devReqDeeplink())
-  if (href) {
-    actions.push({ type: 'Action.OpenUrl', title: DEVREQ_VIEW_ACTION_TITLE, url: href })
+  if (intent.actions && intent.actions.length > 0) {
+    const actions = intent.actions.map(toDevReqAction).filter((a): a is AcElement => a !== null)
+    if (actions.length > 0) {
+      card.actions = actions
+    }
   }
-  actions.push({
-    type: 'Action.ToggleVisibility',
-    title: DEVREQ_EDIT_ACTION_TITLE,
-    targetElements: [DEVREQ_EDIT_PANEL_ID],
-  })
-  card.actions = actions
   return card
 }
 
