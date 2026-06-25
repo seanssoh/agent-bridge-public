@@ -2089,6 +2089,12 @@ def maybe_reactive_rotate(
         "cron_reactive_quota",
         "--json",
     ]
+    # #17927: stamp the rotating-away token's real reset window (parity with
+    # the proactive daemon usage-monitor rotate at bridge-daemon.sh) so the
+    # vacated token carries `limited_until` even if the follow-up `mark-quota`
+    # disable fails, and recovery stays clock-authoritative.
+    if summary["reset_at"]:
+        rotate_args += ["--limited-until", summary["reset_at"]]
     try:
         rotate_completed = _run_token_cli(rotate_args, timeout=120)
     except (OSError, subprocess.SubprocessError) as exc:
