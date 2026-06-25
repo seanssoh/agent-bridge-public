@@ -4,6 +4,30 @@ All notable changes to Agent Bridge are documented here. This project adheres
 loosely to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and tracks
 version bumps via the `VERSION` file.
 
+## [0.16.16-rc4] — 2026-06-25 (LTS · release candidate)
+
+**v0.16.16-rc4 — the fourth release candidate on the v0.16.16 LTS line: everything in rc3 plus nine post-rc3 fixes, bundled for a fleet-wide update.** Marquee is a **Teams reply silent-non-delivery fix (#2112)** — a production customer agent reported replies that the SDK accepted but never delivered while the reply tool reported success. Like rc1-rc3 this is a soak vehicle, not a promotion — `v0.16.15` stays the `lts` / Latest head and this prerelease is **not** marked Latest. Each PR carried its own codex / Phase-4 review; the rc4 cut is the integration gate (full Linux CI green). Promotion to `v0.16.16` follows the soak.
+
+### Channels
+
+- **teams: the `reply` tool surfaces the send outcome + emits an audit row (#2112 / #2120).** The reply path returned `sent: <chatId>` on SDK await alone, discarding the Bot Framework `ResourceResponse.id` — an accepted-but-undelivered reply read as success. A pure unit-tested `outbound-result.ts` classifier now returns a three-way result (**confirmed** → `sent: … message_id=…` / **unconfirmed** (empty id) → `ok:false` + `teams_reply_unconfirmed:` / **failed** → `teams_reply_failed:`) + a sanitized single-line `teams_outbound_reply` audit row. teams plugin **0.1.1 → 0.1.2**.
+- **ms365: always send `offline_access` on the refresh-token grant (#1650 / #2086).** Ensures a durable refresh token so the M365 session survives without recurring re-auth.
+
+### A2A / rooms
+
+- **rooms: robust `room_members.admin` migration + local-admin backfill + leader rebroadcast (#2109 / #2113).** `_migrate_schema` PRAGMA-prechecks each column and re-raises lock / readonly / disk errors (only the duplicate-column race is swallowed); the reconcile roster-epoch step backfills this node's admin bits from the local configured admin id (local-node only, empty config → `-1`, never a remote admin) and, as the leader, atomically bumps the epoch + enqueues a durable roster rebroadcast.
+
+### Daemon / reliability
+
+- **daemon: pool-level cooldown for saturated claude-token rotation (#1789 D2 / #2088).** Prevents rotation thrash when the token pool is saturated.
+- **upgrade: clear a spurious conflict sidecar that holds no recovery (#1653 / #2089).** Stops a phantom conflict marker from blocking an upgrade.
+- **hooks: per-writer unique tmp for settings render — fix the #1990 liveness/render race (#2091).** Closes a concurrent settings-render corruption window.
+- **config: allowlist `BRIDGE_QUEUE_GATEWAY_TIMEOUT_SECONDS` as a tunable knob (#16309 / #2083).**
+
+### CI / docs
+
+- **ci: restore main green after #2089 (#2092)** and **docs(release-lines): the LTS branch is protected — force-pushes are CI-gated (#2094).**
+
 ## [0.16.16-rc3] — 2026-06-23 (LTS · release candidate)
 
 **v0.16.16-rc3 — the third release candidate on the v0.16.16 LTS line: it carries everything in rc2 plus the wave of issues the rc2 soak surfaced (10 issues / 8 tracks, #2040-#2048 + #2051) AND the managed-block data-loss / interrupted-upgrade / daemon-safety / A2A-onboarding fixes plus two operator-mandated A2A cross-server features that landed after the original rc3 assembly (#2062, #2064, #2065, #2070, #2075, #2076, #2078, #68, #2079, #16247).** Like rc1/rc2 this is a soak vehicle, not a promotion — `v0.16.15` stays the `lts` / Latest head and this prerelease is **not** marked Latest. The batch is daemon/launchd reliability (the #2040 enabled-but-unloaded recovery + the #2051 admin self-restart split-brain guard + the #2064 interrupted-upgrade daemon re-enable), a **fleet-wide managed-block data-loss guard (#2062 / #1814)**, picker/cron/session correctness, doc-backfill, a root-cause auth fix (the #2048 ms365 cross-process refresh lock that ends the operator's recurring ~3h M365 re-auth), the #2065 false crash-loop-alarm retirement on a launch-cmd change, the A2A self-service-onboarding correctness fixes, a structural live-leak safety guard (#68), and — **operator-mandated onto the LTS line for the live multi-server rollout** — A2A cross-server admin↔admin routing authz (#2079) and A2A DNS-hostname peer keying (#16247). Each PR carried its own internal codex review; the rc3 cut is the integration gate (full Linux CI + per-fix codex / patch adversarial review).
