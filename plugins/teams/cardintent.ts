@@ -366,10 +366,14 @@ function toSubmitAction(a: Action): AcElement {
 // quoteResult LIST columns (≤3). Column 1 is the section label
 // (accountName · productName). Columns 2–3 are matched out of the section's
 // rows by these STABLE labels — NOT the role-scoped 내용물/가공비 cost labels,
-// which the server rewrites per viewer role ("제시가" vs "견적"); 확정가 and
+// which the server rewrites per viewer role ("제시가" vs "견적"); 견적 소계 and
 // 산출상태 are stable across roles. A missing column → an em dash (never a raw
 // leak). `세트` (set), if present and truthy, decorates the status with a ✓.
-const COL_PRICE_LABELS: readonly string[] = ['확정가']
+// col2 = 견적 소계 (quote subtotal), NOT 확정가: live RFQs leave 확정가 unset
+// (notRequested) until after customer agreement, so a 확정가 column reads as all
+// em dashes; 견적 소계 is the populated, stable quote headline. Match both the
+// spaced and unspaced spelling the server may emit.
+const COL_PRICE_LABELS: readonly string[] = ['견적 소계', '견적소계']
 // Strict single stable label only — a generic '상태' row (e.g. 결재상태) must
 // NOT be picked up for the 산출상태 column; a section without 산출상태 renders
 // an em dash, as promised (role-scope-safe, no incidental status leak).
@@ -412,7 +416,7 @@ function renderList(intent: CardIntent): AcElement[] {
     columnSetRow(
       [
         column('고객·제품', 'stretch', { weight: 'Bolder', isSubtle: true }),
-        column('확정가', 'auto', { weight: 'Bolder', isSubtle: true }),
+        column('견적 소계', 'auto', { weight: 'Bolder', isSubtle: true }),
         column('상태', 'auto', { weight: 'Bolder', isSubtle: true }),
       ],
       false,

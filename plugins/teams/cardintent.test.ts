@@ -380,7 +380,7 @@ describe('buildAdaptiveCard render shape', () => {
     // header row labels + no separator
     const header = JSON.stringify(columnSets[0])
     expect(header).toContain('고객·제품')
-    expect(header).toContain('확정가')
+    expect(header).toContain('견적 소계')
     expect(header).toContain('상태')
     expect(columnSets[0].separator).toBe(false)
     // RFQ rows: section label in column 1; first row no separator, second separated
@@ -454,14 +454,14 @@ describe('buildAdaptiveCard render shape', () => {
     }
   })
 
-  test('valueState mapping flows into the ColumnSet columns (calculating hides number, masked hidden)', () => {
+  test('valueState mapping flows into the ColumnSet columns (value shows number, masked hidden)', () => {
     const card = JSON.stringify(buildAdaptiveCard(validListIntent()))
-    expect(card).toContain('(계산중)') // B 확정가 calculating column
-    expect(card).toContain('●●●') // A 확정가 masked column
-    // the masked confirmed price ₩2,380 must NOT leak (masked → ●●●)
-    expect(card).not.toContain('2,380')
-    // the masked subtotal ₩2,500 is not a list column at all → never rendered
+    expect(card).toContain('1,500') // A 견적 소계 value → number shown in the column
+    expect(card).toContain('●●●') // B 견적 소계 masked column → number hidden
+    // the masked subtotal ₩2,500 must NOT leak (masked → ●●●)
     expect(card).not.toContain('2,500')
+    // 확정가 is not a list column → the confirmed price ₩2,380 is never rendered
+    expect(card).not.toContain('2,380')
   })
 })
 
