@@ -77,6 +77,43 @@ export type CardIntent = {
 }
 
 // ---------------------------------------------------------------------------
+// devReqAutofill CardIntent (the 개발의뢰 draft autofill card — #17471).
+//
+// A SECOND, independent card kind that reuses the same fence + §10 + seam
+// machinery as quoteResult but renders a different shape: a per-project grouped
+// draft (one `emphasis` Container per project, each a stack of labelled
+// FactSets) + a tail "보완 필요" warning Container, with renderer-supplied
+// actions ONLY — a domain-pinned Action.OpenUrl deeplink to the CRM web draft
+// screen + a benign Action.ToggleVisibility. Action.Submit (confirmDevReq) is
+// Phase-2 (a trusted server-side handler is required) and is NEVER emitted here.
+//
+// FLAT input → grouped output: crm-dev emits flat sections; the renderer groups
+// them. A section.label of the form "P{n}·{subheader}" (e.g. "P1·프로젝트정보")
+// groups under project n with {subheader} as its sub-heading. A section whose
+// label does NOT carry the P{n}· prefix is rendered as its own standalone
+// Container — the flat safety-net, so the operator's 2-way de-risk falls out of
+// the same code path. Project display titles come from the optional
+// projectTitles map/array; an absent entry falls back to "프로젝트 {n}".
+// ---------------------------------------------------------------------------
+
+export type DevReqWarning = {
+  label?: string
+  items: string[]
+}
+
+export type DevReqAutofillIntent = {
+  kind: 'devReqAutofill'
+  title: string
+  subtitle?: string
+  // Optional project display titles. Either an array (index n-1 → project n) or
+  // a record keyed by "P{n}" or "{n}". Absent → "프로젝트 {n}".
+  projectTitles?: string[] | Record<string, string>
+  sections: Section[]
+  warning?: DevReqWarning
+  fallbackMarkdown: string
+}
+
+// ---------------------------------------------------------------------------
 // §10 forbidden cost keys.
 //
 // Contract-derived PLACEHOLDER. The authoritative list is shipped by crm-dev
@@ -408,6 +445,7 @@ function textBlock(
     isSubtle?: boolean
     wrap?: boolean
     horizontalAlignment?: string
+    spacing?: string
   } = {},
 ): AcElement {
   const el: AcElement = { type: 'TextBlock', text, wrap: opts.wrap ?? true }
@@ -416,6 +454,7 @@ function textBlock(
   if (opts.color) el.color = opts.color
   if (opts.isSubtle) el.isSubtle = true
   if (opts.horizontalAlignment) el.horizontalAlignment = opts.horizontalAlignment
+  if (opts.spacing) el.spacing = opts.spacing
   return el
 }
 
@@ -640,6 +679,239 @@ export function buildAdaptiveCard(intent: CardIntent): AcElement {
 }
 
 // ---------------------------------------------------------------------------
+// devReqAutofill: deeplink, validation, render
+// ---------------------------------------------------------------------------
+
+// The CRM web 개발의뢰 draft screen deeplink — replaces the Phase-2 confirmDevReq
+// Action.Submit for now. Domain-pinned exactly like the quoteResult deeplink: the
+// RENDERER supplies the url on the first configured allowed host, the cardintent
+// never carries/controls it (zero open-redirect surface). The screen slug is
+// operator-overridable via BRIDGE_TEAMS_DEVREQ_SCREEN (default 'dev-request');
+// it is constrained to a conservative slug charset so it can never smuggle an
+// extra path/query segment past the domain-pin.
+const DEFAULT_DEVREQ_SCREEN = 'dev-request'
+
+export function devReqDeeplink(env: EnvBag = processEnv()): string {
+  const raw = (env.BRIDGE_TEAMS_DEVREQ_SCREEN ?? '').trim()
+  const screen = /^[a-z0-9-]+$/i.test(raw) ? raw : DEFAULT_DEVREQ_SCREEN
+  return `https://${deeplinkHosts(env)[0]}/d/?screen=${screen}`
+}
+
+const DEVREQ_EDIT_PANEL_ID = 'editDraftPanel'
+const DEVREQ_VIEW_ACTION_TITLE = '개발의뢰 초안 열기'
+const DEVREQ_EDIT_ACTION_TITLE = '✎ 수정'
+
+function isStringArray(v: unknown): v is string[] {
+  return Array.isArray(v) && v.every(x => typeof x === 'string')
+}
+
+function validateDevReqWarning(w: unknown): string | null {
+  if (!isPlainObject(w)) return 'warning must be an object when present'
+  if (w.label !== undefined && typeof w.label !== 'string') {
+    return 'warning.label must be a string when present'
+  }
+  if (!Array.isArray(w.items)) return 'warning.items must be an array'
+  for (let i = 0; i < w.items.length; i++) {
+    if (typeof w.items[i] !== 'string') return `warning.items[${i}] must be a string`
+  }
+  return null
+}
+
+export type DevReqValidationResult =
+  | { ok: true; intent: DevReqAutofillIntent }
+  | { ok: false; reason: string }
+
+// Strict validation for the devReqAutofill shape. Rows are validated by the same
+// validateSection/validateRow as quoteResult (string-only values, enum-checked
+// valueState — so a masked/calculating row can never leak its raw value). Any
+// `actions` on the cardintent are IGNORED (the rendered actions are
+// renderer-supplied only), so they are not validated or read.
+export function validateDevReqAutofill(value: unknown): DevReqValidationResult {
+  if (!isPlainObject(value)) return { ok: false, reason: 'root is not an object' }
+  if (value.kind !== 'devReqAutofill') {
+    return { ok: false, reason: `kind must be "devReqAutofill" (got ${JSON.stringify(value.kind)})` }
+  }
+  if (typeof value.title !== 'string') return { ok: false, reason: 'title must be a string' }
+  if (typeof value.fallbackMarkdown !== 'string') {
+    return { ok: false, reason: 'fallbackMarkdown must be a string' }
+  }
+  if (value.subtitle !== undefined && typeof value.subtitle !== 'string') {
+    return { ok: false, reason: 'subtitle must be a string when present' }
+  }
+  if (!Array.isArray(value.sections)) return { ok: false, reason: 'sections must be an array' }
+  if (value.sections.length === 0) return { ok: false, reason: 'sections must be non-empty' }
+  for (let i = 0; i < value.sections.length; i++) {
+    const err = validateSection(value.sections[i], `sections[${i}]`)
+    if (err) return { ok: false, reason: err }
+  }
+  if (value.projectTitles !== undefined) {
+    const pt = value.projectTitles
+    const okArr = isStringArray(pt)
+    const okRec = isPlainObject(pt) && Object.values(pt).every(x => typeof x === 'string')
+    if (!okArr && !okRec) {
+      return { ok: false, reason: 'projectTitles must be a string[] or a record of strings when present' }
+    }
+  }
+  if (value.warning !== undefined) {
+    const err = validateDevReqWarning(value.warning)
+    if (err) return { ok: false, reason: err }
+  }
+  return { ok: true, intent: value as unknown as DevReqAutofillIntent }
+}
+
+// A devReq FactSet: each row → {title,value}, value via renderValueState so a
+// masked/calculating/notRequested row never leaks its raw value; an empty value
+// renders as an em dash (matches the 미입력→— convention in the sign-off design).
+function devReqFactSet(rows: Row[]): AcElement {
+  return {
+    type: 'FactSet',
+    spacing: 'Small',
+    facts: rows.map(r => {
+      if (r.valueState === 'value') {
+        const v = typeof r.value === 'string' ? r.value.trim() : ''
+        return { title: r.label, value: v.length > 0 ? v : EMDASH }
+      }
+      return { title: r.label, value: renderValueState(r).text }
+    }),
+  }
+}
+
+// Parse a "P{n}·{subheader}" section label → {project, subheader}, or null when
+// the prefix is absent (→ the section is rendered flat, the safety-net path).
+// Tolerant of whitespace around the · delimiter.
+const DEVREQ_GROUP_RE = /^P(\d+)\s*·\s*(.+)$/
+
+function parseDevReqSectionLabel(label: string): { project: number; subheader: string } | null {
+  const m = DEVREQ_GROUP_RE.exec(label.trim())
+  if (!m) return null
+  const project = Number.parseInt(m[1], 10)
+  if (!Number.isFinite(project) || project < 1) return null
+  const subheader = m[2].trim()
+  if (subheader.length === 0) return null
+  return { project, subheader }
+}
+
+function devReqProjectTitle(
+  n: number,
+  projectTitles: DevReqAutofillIntent['projectTitles'],
+): string {
+  const fallback = `프로젝트 ${n}`
+  if (!projectTitles) return fallback
+  const raw = Array.isArray(projectTitles)
+    ? projectTitles[n - 1]
+    : (projectTitles[`P${n}`] ?? projectTitles[String(n)])
+  if (typeof raw !== 'string') return fallback
+  const t = raw.trim()
+  if (t.length === 0) return fallback
+  // If the emit already prefixed "프로젝트 N …", use as-is; else compose.
+  return /^프로젝트\s*\d+/.test(t) ? t : `프로젝트 ${n} · ${t}`
+}
+
+// A subheader TextBlock + its FactSet (used inside a project Container).
+function devReqSubSection(subheader: string, rows: Row[]): AcElement[] {
+  return [
+    textBlock(subheader, { weight: 'Bolder', size: 'Small', isSubtle: true, spacing: 'Small' }),
+    devReqFactSet(rows),
+  ]
+}
+
+function renderDevReqBody(intent: DevReqAutofillIntent): AcElement[] {
+  const body: AcElement[] = [textBlock(intent.title, { weight: 'Bolder', size: 'Medium' })]
+  if (intent.subtitle && intent.subtitle.trim().length > 0) {
+    body.push(textBlock(intent.subtitle, { isSubtle: true, spacing: 'None' }))
+  }
+
+  // Group P{n}·-prefixed sections into one emphasis Container per project (in
+  // first-seen order); a non-prefixed section renders as its own standalone
+  // Container (the flat safety-net).
+  const projectItems = new Map<number, AcElement[]>()
+  for (const section of intent.sections) {
+    const parsed = parseDevReqSectionLabel(section.label)
+    if (parsed) {
+      let items = projectItems.get(parsed.project)
+      if (!items) {
+        items = [
+          textBlock(devReqProjectTitle(parsed.project, intent.projectTitles), {
+            weight: 'Bolder',
+            color: 'Accent',
+            size: 'Medium',
+          }),
+        ]
+        projectItems.set(parsed.project, items)
+        body.push({ type: 'Container', style: 'emphasis', separator: true, spacing: 'Medium', items })
+      }
+      items.push(...devReqSubSection(parsed.subheader, section.rows))
+    } else {
+      body.push({
+        type: 'Container',
+        separator: true,
+        spacing: 'Medium',
+        items: [textBlock(section.label, { weight: 'Bolder' }), devReqFactSet(section.rows)],
+      })
+    }
+  }
+
+  // Tail: the 보완 필요 warning Container.
+  if (intent.warning && intent.warning.items.length > 0) {
+    const n = intent.warning.items.length
+    const label =
+      intent.warning.label && intent.warning.label.trim().length > 0
+        ? intent.warning.label
+        : `⚠ 보완 필요사항 ${n}건`
+    body.push({
+      type: 'Container',
+      style: 'warning',
+      separator: true,
+      spacing: 'Medium',
+      items: [
+        textBlock(label, { weight: 'Bolder', color: 'Attention' }),
+        ...intent.warning.items.map(it => textBlock(it, { isSubtle: true, spacing: 'Small' })),
+      ],
+    })
+  }
+
+  // The ToggleVisibility target — hidden by default. For Phase-1 (Submit
+  // deferred) editing happens in CRM web, so the panel carries that pointer.
+  body.push({
+    type: 'Container',
+    id: DEVREQ_EDIT_PANEL_ID,
+    isVisible: false,
+    separator: true,
+    spacing: 'Small',
+    items: [textBlock('수정은 [개발의뢰 초안 열기] 버튼으로 CRM web에서 진행하세요.', { isSubtle: true })],
+  })
+
+  return body
+}
+
+// Build the devReqAutofill Adaptive Card. Renderer-supplied actions ONLY (the
+// cardintent's actions are ignored): an Action.OpenUrl to the domain-pinned CRM
+// web draft deeplink (replaces the Phase-2 confirmDevReq Action.Submit; the
+// renderer supplies the url, so zero open-redirect surface) and a benign
+// Action.ToggleVisibility revealing the hidden edit panel. Action.Submit
+// (confirmDevReq) is Phase-2 and is NEVER emitted here.
+export function buildDevReqAutofillCard(intent: DevReqAutofillIntent): AcElement {
+  const card: AcElement = {
+    type: AC_TYPE,
+    $schema: 'http://adaptivecards.io/schemas/adaptive-card.json',
+    version: AC_VERSION,
+    body: renderDevReqBody(intent),
+  }
+  const actions: AcElement[] = []
+  const href = isAllowedDeeplink(devReqDeeplink())
+  if (href) {
+    actions.push({ type: 'Action.OpenUrl', title: DEVREQ_VIEW_ACTION_TITLE, url: href })
+  }
+  actions.push({
+    type: 'Action.ToggleVisibility',
+    title: DEVREQ_EDIT_ACTION_TITLE,
+    targetElements: [DEVREQ_EDIT_PANEL_ID],
+  })
+  card.actions = actions
+  return card
+}
+
+// ---------------------------------------------------------------------------
 // §10 forbidden-key golden over the rendered bytes
 // ---------------------------------------------------------------------------
 
@@ -730,18 +1002,31 @@ export function renderOutbound(
     return fail(`cardintent JSON parse failed: ${(err as Error).message}`)
   }
 
-  // Validate shape.
-  const validation = validateCardIntent(parsed)
-  if (!validation.ok) {
-    return fail(`cardintent validation failed: ${validation.reason}`)
-  }
-
-  // Render.
+  // Validate shape + render — branch on the card kind. quoteResult is the
+  // original path (untouched); devReqAutofill is the 개발의뢰 draft card. Both
+  // share the §10 byte-scan, size guard, and success-suppression tail below.
   let card: AcElement
-  try {
-    card = buildAdaptiveCard(validation.intent)
-  } catch (err) {
-    return fail(`cardintent render failed: ${(err as Error).message}`)
+  const kind = isPlainObject(parsed) ? parsed.kind : undefined
+  if (kind === 'devReqAutofill') {
+    const validation = validateDevReqAutofill(parsed)
+    if (!validation.ok) {
+      return fail(`cardintent validation failed: ${validation.reason}`)
+    }
+    try {
+      card = buildDevReqAutofillCard(validation.intent)
+    } catch (err) {
+      return fail(`cardintent render failed: ${(err as Error).message}`)
+    }
+  } else {
+    const validation = validateCardIntent(parsed)
+    if (!validation.ok) {
+      return fail(`cardintent validation failed: ${validation.reason}`)
+    }
+    try {
+      card = buildAdaptiveCard(validation.intent)
+    } catch (err) {
+      return fail(`cardintent render failed: ${(err as Error).message}`)
+    }
   }
 
   // §10 golden over the rendered bytes.

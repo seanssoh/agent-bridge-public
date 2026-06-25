@@ -13,8 +13,10 @@ import { describe, expect, test } from 'bun:test'
 import {
   ACTION_IDS,
   buildAdaptiveCard,
+  buildDevReqAutofillCard,
   DEFAULT_QUOTE_RESULT_DEEPLINK,
   deeplinkHosts,
+  devReqDeeplink,
   extractLastCardIntentFence,
   findForbiddenCostKey,
   FORBIDDEN_COST_KEYS_PLACEHOLDER,
@@ -27,7 +29,9 @@ import {
   stripAllCardIntentFences,
   stripFence,
   validateCardIntent,
+  validateDevReqAutofill,
   type CardIntent,
+  type DevReqAutofillIntent,
   type Row,
 } from './cardintent.ts'
 
@@ -969,5 +973,222 @@ describe('renderOutbound graceful fallback (mutation-proof)', () => {
       expect(() => renderOutbound(i)).not.toThrow()
       expect(renderOutbound(i).attachments.length).toBe(0)
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// devReqAutofill (개발의뢰 draft autofill card — #17471)
+// ---------------------------------------------------------------------------
+
+// A two-project grouped draft mirroring the operator sign-off design: flat
+// P{n}·{subheader} sections + projectTitles + a 보완 필요 warning block.
+function validDevReqIntent(): DevReqAutofillIntent {
+  return {
+    kind: 'devReqAutofill',
+    title: '📋 개발의뢰 초안 — 프로젝트 2건',
+    subtitle: '메일 첨부 xlsx에서 자동으로 채운 초안입니다. 확인 후 등록하세요.',
+    projectTitles: { P1: '리안후 애프터필러 립케어 세트', P2: '비타토닝 크림' },
+    sections: [
+      {
+        label: 'P1·프로젝트정보',
+        rows: [
+          { label: '프로젝트명', value: '리안후 애프터필러 립케어 세트', valueState: 'value' },
+          { label: '고객 / 브랜드', value: '주식회사 온닥터 / 리안후', valueState: 'value' },
+          { label: '연간 예상매출(억원)', value: '', valueState: 'notRequested' },
+        ],
+      },
+      {
+        label: 'P1·제품정보',
+        rows: [{ label: '제품명', value: '리안후 애프터필러 립케어 세트', valueState: 'value' }],
+      },
+      {
+        label: 'P2·프로젝트정보',
+        rows: [{ label: '프로젝트명', value: '비타토닝 크림', valueState: 'value' }],
+      },
+    ],
+    warning: { items: ['#1 의뢰인 CRM 미등록 — 신규 등록 필요', '#4 연간 예상매출 각각 확인'] },
+    fallbackMarkdown: '개발의뢰 초안(2건). 카드를 확인하세요.',
+  }
+}
+
+function devReqFence(intent: unknown): string {
+  return '초안입니다.\n\n```cardintent\n' + JSON.stringify(intent) + '\n```'
+}
+
+// Collect every {type} string in a rendered card tree (for action/element scans).
+function collectTypes(node: unknown, acc: string[] = []): string[] {
+  if (Array.isArray(node)) {
+    for (const n of node) collectTypes(n, acc)
+  } else if (node && typeof node === 'object') {
+    const o = node as Record<string, unknown>
+    if (typeof o.type === 'string') acc.push(o.type)
+    for (const v of Object.values(o)) collectTypes(v, acc)
+  }
+  return acc
+}
+
+describe('devReqAutofill validation', () => {
+  test('accepts a valid intent', () => {
+    const r = validateDevReqAutofill(validDevReqIntent())
+    expect(r.ok).toBe(true)
+  })
+  test('rejects the wrong kind', () => {
+    const r = validateDevReqAutofill({ ...validDevReqIntent(), kind: 'quoteResult' })
+    expect(r.ok).toBe(false)
+  })
+  test('rejects a non-string row value (unformatted cost leak shape)', () => {
+    const bad = validDevReqIntent()
+    ;(bad.sections[0].rows[0] as unknown as Record<string, unknown>).value = 12345
+    const r = validateDevReqAutofill(bad)
+    expect(r.ok).toBe(false)
+  })
+  test('rejects a non-enum valueState (fail-closed)', () => {
+    const bad = validDevReqIntent()
+    ;(bad.sections[0].rows[0] as unknown as Record<string, unknown>).valueState = ['value']
+    const r = validateDevReqAutofill(bad)
+    expect(r.ok).toBe(false)
+  })
+  test('rejects empty sections', () => {
+    const r = validateDevReqAutofill({ ...validDevReqIntent(), sections: [] })
+    expect(r.ok).toBe(false)
+  })
+  test('rejects a malformed warning (items not an array)', () => {
+    const r = validateDevReqAutofill({ ...validDevReqIntent(), warning: { items: 'oops' } })
+    expect(r.ok).toBe(false)
+  })
+  test('accepts projectTitles as an array OR a record', () => {
+    expect(validateDevReqAutofill({ ...validDevReqIntent(), projectTitles: ['a', 'b'] }).ok).toBe(true)
+    expect(validateDevReqAutofill({ ...validDevReqIntent(), projectTitles: { P1: 'a' } }).ok).toBe(true)
+    expect(validateDevReqAutofill({ ...validDevReqIntent(), projectTitles: 42 }).ok).toBe(false)
+  })
+})
+
+describe('devReqAutofill render shape (per-project grouping)', () => {
+  test('groups P{n}·-prefixed sections into one emphasis Container per project', () => {
+    const card = buildDevReqAutofillCard(validDevReqIntent()) as Record<string, unknown>
+    const body = card.body as Array<Record<string, unknown>>
+    const emphasis = body.filter(el => el.type === 'Container' && el.style === 'emphasis')
+    // P1 (two sections) collapses to ONE Container; P2 is a second.
+    expect(emphasis.length).toBe(2)
+    const head = (c: Record<string, unknown>) =>
+      ((c.items as Array<Record<string, unknown>>)[0].text as string)
+    expect(head(emphasis[0])).toBe('프로젝트 1 · 리안후 애프터필러 립케어 세트')
+    expect(head(emphasis[1])).toBe('프로젝트 2 · 비타토닝 크림')
+    // P1's container carries BOTH subheaders (프로젝트정보 + 제품정보).
+    const p1 = JSON.stringify(emphasis[0])
+    expect(p1).toContain('프로젝트정보')
+    expect(p1).toContain('제품정보')
+  })
+
+  test('AC v1.2 only — no Table / targetWidth / Action.Submit', () => {
+    const card = buildDevReqAutofillCard(validDevReqIntent())
+    const types = collectTypes(card)
+    expect(types).not.toContain('Table')
+    expect(types).not.toContain('Action.Submit')
+    const bytes = JSON.stringify(card)
+    expect(bytes).not.toContain('targetWidth')
+    expect((card as Record<string, unknown>).version).toBe('1.2')
+  })
+
+  test('renderer-supplied actions ONLY: OpenUrl deeplink + ToggleVisibility', () => {
+    const card = buildDevReqAutofillCard(validDevReqIntent()) as Record<string, unknown>
+    const actions = card.actions as Array<Record<string, unknown>>
+    expect(actions.map(a => a.type)).toEqual(['Action.OpenUrl', 'Action.ToggleVisibility'])
+    // The deeplink is the renderer-supplied domain-pinned url (never from input).
+    expect(actions[0].url).toBe(devReqDeeplink())
+    expect((actions[1].targetElements as string[])[0]).toBe('editDraftPanel')
+  })
+
+  test('an editDraftPanel target exists and is hidden', () => {
+    const card = buildDevReqAutofillCard(validDevReqIntent()) as Record<string, unknown>
+    const body = card.body as Array<Record<string, unknown>>
+    const panel = body.find(el => el.id === 'editDraftPanel')
+    expect(panel).toBeDefined()
+    expect(panel!.isVisible).toBe(false)
+  })
+
+  test('a 보완 필요 warning Container is emitted with the item count', () => {
+    const card = buildDevReqAutofillCard(validDevReqIntent()) as Record<string, unknown>
+    const body = card.body as Array<Record<string, unknown>>
+    const warn = body.find(el => el.type === 'Container' && el.style === 'warning')
+    expect(warn).toBeDefined()
+    expect(JSON.stringify(warn)).toContain('보완 필요사항 2건')
+  })
+
+  test('a non-prefixed section renders as a flat standalone Container (safety-net)', () => {
+    const intent = validDevReqIntent()
+    intent.sections = [{ label: '단일 섹션', rows: [{ label: 'a', value: 'b', valueState: 'value' }] }]
+    const card = buildDevReqAutofillCard(intent) as Record<string, unknown>
+    const body = card.body as Array<Record<string, unknown>>
+    // No emphasis (project) container; one plain Container whose head is the label.
+    expect(body.some(el => el.type === 'Container' && el.style === 'emphasis')).toBe(false)
+    const flat = body.find(
+      el => el.type === 'Container' && !el.style && (el.items as Array<Record<string, unknown>>)?.[0]?.text === '단일 섹션',
+    )
+    expect(flat).toBeDefined()
+  })
+
+  test('a notRequested/empty field renders an em dash, never the raw value', () => {
+    const card = buildDevReqAutofillCard(validDevReqIntent())
+    const bytes = JSON.stringify(card)
+    // 연간 예상매출 was notRequested with empty value → em dash, not an empty string fact.
+    expect(bytes).toContain('—')
+  })
+})
+
+describe('devReqAutofill via renderOutbound (seam + §10 + suppression)', () => {
+  test('success → card attachment + suppressed visible text', () => {
+    const out = renderOutbound(devReqFence(validDevReqIntent()))
+    expect(out.attachments.length).toBe(1)
+    expect(out.text).toBe('')
+    expect(out.warning).toBeUndefined()
+    expect((out.attachments[0].content as Record<string, unknown>).type).toBe('AdaptiveCard')
+  })
+
+  // MUTATION-PROOF: a §10 forbidden cost key anywhere in the devReq card bytes
+  // (here smuggled into a row value) must reject the WHOLE card → text-only. If
+  // the §10 byte-scan is reverted, this test fails (an attachment would appear).
+  test('§10 forbidden cost key in a devReq row → text-only fallback', () => {
+    const bad = validDevReqIntent()
+    bad.sections[0].rows.push({ label: '비고', value: '원가 12000', valueState: 'value' })
+    const out = renderOutbound(devReqFence(bad))
+    expect(out.attachments.length).toBe(0)
+    expect(out.warning).toContain('§10')
+    // The visible text is the §10-clean fallback (the forbidden term never ships).
+    expect(out.text).not.toContain('원가')
+  })
+
+  test('an invalid devReq intent degrades to text-only, never throws', () => {
+    const bad = { ...validDevReqIntent(), title: 123 }
+    expect(() => renderOutbound(devReqFence(bad))).not.toThrow()
+    const out = renderOutbound(devReqFence(bad))
+    expect(out.attachments.length).toBe(0)
+    expect(out.warning).toContain('validation failed')
+  })
+})
+
+describe('quoteResult path is unchanged by the devReqAutofill addition (regression)', () => {
+  test('a valid quoteResult intent still renders a card', () => {
+    const out = renderOutbound(
+      '```cardintent\n' +
+        JSON.stringify({
+          kind: 'quoteResult',
+          title: '💰 견적결과 — 1건',
+          sections: [
+            {
+              label: '고객 · 제품',
+              rows: [{ label: '내용물 견적', value: '5,754 원', valueState: 'value' }],
+            },
+          ],
+          actions: [{ actionId: 'openQuoteResultDetail', label: '전체 견적결과 보기', payload: {} }],
+          fallbackMarkdown: '견적결과 1건.',
+        }) +
+        '\n```',
+    )
+    expect(out.attachments.length).toBe(1)
+    const card = out.attachments[0].content as Record<string, unknown>
+    const actions = (card.actions as Array<Record<string, unknown>>) ?? []
+    // quoteResult still emits ONLY the OpenUrl deeplink (no Submit, no Toggle).
+    expect(actions.map(a => a.type)).toEqual(['Action.OpenUrl'])
   })
 })
