@@ -1166,6 +1166,23 @@ def now_ts() -> int:
     return int(time.time())
 
 
+def _table_has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    """True iff `table` already has `column` (PRAGMA table_info precheck).
+
+    A read-only probe used to decide whether an ADD COLUMN migration still needs
+    to run. `PRAGMA table_info` takes no write lock, so the precheck itself can't
+    be the operation that contends with the daemon's WAL writer during an upgrade
+    window — only the ALTER for a genuinely-absent column does, and that lock now
+    SURFACES (re-raises) instead of being swallowed (#2109 gap 1).
+    """
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    for r in rows:
+        # row[1] is the column name across both tuple- and Row-factory results.
+        if str(r[1]) == column:
+            return True
+    return False
+
+
 def _migrate_schema(conn: sqlite3.Connection) -> None:
     """Idempotently add columns introduced AFTER P1 to an existing rooms.db.
 
@@ -1174,30 +1191,55 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     room_join_requests.{verified,via_node,ttl_expiry}). We add them with the
     same defaults the schema declares, so a migrated P1 row reads identically to
     a freshly-created one. ALTER TABLE ADD COLUMN is cheap + non-rewriting in
-    SQLite; the per-column try/except makes re-runs (column already present) a
-    no-op rather than an error. NEVER drops/rewrites data.
+    SQLite. NEVER drops/rewrites data.
+
+    Robustness (#2109 gap 1): we PRECHECK each (table, column) with
+    `PRAGMA table_info` and only run the ALTER when the column is actually
+    absent, so a re-run is a no-op WITHOUT relying on the engine to raise. The
+    ALTER is still wrapped, but the wrapper swallows ONLY the idempotent
+    "duplicate column name" race (a concurrent connection added it between our
+    precheck and our ALTER) — every OTHER `OperationalError` (database is
+    locked / readonly / no such table / disk full) RE-RAISES so the open fails
+    and the next CLI/daemon retry re-runs the migration, rather than silently
+    leaving a half-migrated schema whose next `SELECT admin` crashes.
     """
+    # (table, column, ALTER statement). The ALTER's column name must match the
+    # column we precheck so the precheck actually gates the right statement.
     migrations = (
-        "ALTER TABLE rooms ADD COLUMN invite_token_ttl INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE room_join_requests ADD COLUMN verified INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE room_join_requests ADD COLUMN via_node TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE room_join_requests ADD COLUMN ttl_expiry INTEGER NOT NULL DEFAULT 0",
+        ("rooms", "invite_token_ttl",
+         "ALTER TABLE rooms ADD COLUMN invite_token_ttl INTEGER NOT NULL DEFAULT 0"),
+        ("room_join_requests", "verified",
+         "ALTER TABLE room_join_requests ADD COLUMN verified INTEGER NOT NULL DEFAULT 0"),
+        ("room_join_requests", "via_node",
+         "ALTER TABLE room_join_requests ADD COLUMN via_node TEXT NOT NULL DEFAULT ''"),
+        ("room_join_requests", "ttl_expiry",
+         "ALTER TABLE room_join_requests ADD COLUMN ttl_expiry INTEGER NOT NULL DEFAULT 0"),
         # Lane 4 (#1695): token-bootstrap key seed. Nullable (no NOT NULL) so a
         # migrated P1/P4.1 row reads NULL == "no seed" rather than a fake value.
-        "ALTER TABLE rooms ADD COLUMN invite_key_seed TEXT",
+        ("rooms", "invite_key_seed",
+         "ALTER TABLE rooms ADD COLUMN invite_key_seed TEXT"),
         # #2079 admin-signal: existing member rows predate the classification, so
         # default to -1 (unknown) — they fail-close admin-involved cross-node
         # delivery until the leader rebroadcasts a v2 roster that reclassifies
         # them. Existing join-request rows likewise carry no attested admin bit.
-        "ALTER TABLE room_members ADD COLUMN admin INTEGER NOT NULL DEFAULT -1",
-        "ALTER TABLE room_join_requests ADD COLUMN joiner_admin INTEGER NOT NULL DEFAULT -1",
+        ("room_members", "admin",
+         "ALTER TABLE room_members ADD COLUMN admin INTEGER NOT NULL DEFAULT -1"),
+        ("room_join_requests", "joiner_admin",
+         "ALTER TABLE room_join_requests ADD COLUMN joiner_admin INTEGER NOT NULL DEFAULT -1"),
     )
-    for stmt in migrations:
+    for table, column, stmt in migrations:
+        if _table_has_column(conn, table, column):
+            continue
         try:
             conn.execute(stmt)
-        except sqlite3.OperationalError:
-            # duplicate column name (already migrated) → idempotent no-op.
-            pass
+        except sqlite3.OperationalError as exc:
+            # Swallow ONLY the idempotent duplicate-column race (a concurrent
+            # connection added the column between our precheck and this ALTER).
+            # A lock / readonly / no-such-table / disk error must propagate so
+            # the open fails and the next retry re-runs the migration instead of
+            # silently leaving the column missing (#2109 gap 1).
+            if "duplicate column name" not in str(exc).lower():
+                raise
     conn.commit()
 
 
@@ -1700,7 +1742,8 @@ def record_join_attempt(conn: sqlite3.Connection, token: str, source: str,
 # Membership + join requests + epoch
 # --------------------------------------------------------------------------
 
-def bump_epoch(conn: sqlite3.Connection, room_id: str) -> int:
+def bump_epoch(conn: sqlite3.Connection, room_id: str,
+               *, commit: bool = True) -> int:
     """Monotonically increment a room's epoch + RE-PERSIST the roster cache.
 
     Called on EVERY membership change (join-approve / leave / kick). This is
@@ -1714,6 +1757,12 @@ def bump_epoch(conn: sqlite3.Connection, room_id: str) -> int:
     roster-cache contract P4 consumes (epoch == rooms.epoch, members == the
     canonical sorted roster) thus holds after every verb, not just the ones
     that happened to call `_recompute_roster_cache` explicitly.
+
+    `commit=False` lets a caller fold this epoch bump into a LARGER transaction
+    it commits itself (e.g. the #2109 admin backfill, which must make the bit
+    UPDATE + the bump + the outbox enqueue durable atomically — see
+    `reclassify_and_rebroadcast_local_admin`). The default `commit=True`
+    preserves every existing membership-change caller.
     """
     require_room(conn, room_id)
     # Single transaction: the epoch UPDATE and the room_roster_cache write
@@ -1727,9 +1776,10 @@ def bump_epoch(conn: sqlite3.Connection, room_id: str) -> int:
         "SELECT epoch FROM rooms WHERE room_id=?", (room_id,)
     ).fetchone()
     # Recompute against the POST-bump membership + epoch WITHOUT an intermediate
-    # commit, then commit both writes atomically.
+    # commit, then commit both writes atomically (unless the caller defers).
     _recompute_roster_cache(conn, room_id, commit=False)
-    conn.commit()
+    if commit:
+        conn.commit()
     return int(row["epoch"])
 
 
@@ -2280,7 +2330,8 @@ def _target_member_nodes(conn: sqlite3.Connection, room_id: str,
 
 def enqueue_roster_broadcast(conn: sqlite3.Connection, room_id: str,
                              epoch: int, leader_node: str,
-                             extra_nodes: Optional[list[str]] = None
+                             extra_nodes: Optional[list[str]] = None,
+                             *, commit: bool = True
                              ) -> list[str]:
     """Record a durable convergence target for every remote member node (F).
 
@@ -2301,6 +2352,12 @@ def enqueue_roster_broadcast(conn: sqlite3.Connection, room_id: str,
     ack clears the row; if it never acks it ages out under the heartbeat's bounded
     retries (no permanent zombie — it is not re-enqueued on later changes since it
     is no longer a member).
+
+    `commit=False` lets a caller fold the outbox enqueue into a LARGER atomic
+    transaction it commits itself (the #2109 admin backfill folds the bit
+    UPDATE + epoch bump + this enqueue into ONE commit so a failed enqueue rolls
+    back the bit change too — see `reclassify_and_rebroadcast_local_admin`). The
+    default `commit=True` preserves every existing membership-change caller.
     """
     targets = _target_member_nodes(conn, room_id, leader_node)
     seen = set(targets)
@@ -2324,8 +2381,236 @@ def enqueue_roster_broadcast(conn: sqlite3.Connection, room_id: str,
             "  status='pending', attempts=0, last_error='', updated_ts=excluded.updated_ts",
             (room_id, node, int(epoch), ts, ts),
         )
-    conn.commit()
+    if commit:
+        conn.commit()
     return targets
+
+
+def backfill_local_admin(conn: sqlite3.Connection, local_node: str,
+                         *, commit: bool = True) -> set[str]:
+    """Reclassify THIS node's `admin` bits from the local configured admin id.
+
+    The #2109 (durable) half of the #2079 fix. The `room_members.admin` /
+    `room_join_requests.joiner_admin` columns are added by `_migrate_schema` at
+    DEFAULT -1 (unknown), which correctly fail-closes admin-involved cross-node
+    delivery — but on a STABLE room (no join/leave to bump the epoch) those rows
+    stay -1 forever, so an existing admin member's cross-node room delivery is
+    permanently fail-closed. This backfill recomputes the admin bit for the
+    rows we have LOCAL AUTHORITY over and returns the rooms whose
+    `room_members.admin` actually changed (so the caller can leader-rebroadcast).
+
+    Authority boundary (SECURITY — do NOT widen):
+      - Only rows where `node == local_node` are touched. `local_node` is THIS
+        node's `bridge_id` (`''` for a single-node install, where local member
+        rows carry `node=''`). A row on ANY OTHER node is left exactly as it is
+        (its own node attests its admin via a verified roster broadcast; we
+        NEVER infer a remote endpoint's admin from local config or agent name).
+      - The local admin id comes ONLY from `resolve_admin_agent_id()`
+        (`$BRIDGE_ADMIN_AGENT_ID` env-first, then the on-disk roster) — the same
+        source `classify_local_admin` uses. We never trust an agent NAME.
+      - If the local admin id is empty/unresolved, we leave EVERY row at -1
+        (unknown) and change nothing — unknown is safer than asserting "no
+        admins" (writing 0 would be a false non-admin downgrade). We recompute
+        only when we actually know the local admin id.
+      - When known, we recompute ALL local rows (not just the -1 ones) so a
+        STALE classification (e.g. the admin id was reconfigured) self-corrects:
+        `admin=1` where `agent == admin_id`, `admin=0` for every other local
+        member. This only ever REDUCES unknowns to a known bit for the local
+        node; it never flips a genuine non-admin into an admin.
+
+    `commit=False` leaves the writes uncommitted so the caller can fold them
+    into a LARGER atomic transaction (the #2109 leader path commits the bit
+    UPDATE together with the epoch bump + outbox enqueue). On `commit=True`
+    (the default) the backfill is self-contained.
+
+    Raises AdminIdResolveError (propagated from `resolve_admin_agent_id`) when an
+    existing roster is unreadable/malformed — the caller fail-closes (does NOT
+    rebroadcast) rather than backfill with a wrong/absent admin id.
+    """
+    admin_id = resolve_admin_agent_id()
+    if not admin_id:
+        # No locally-configured admin → cannot classify any local endpoint as
+        # admin/non-admin. Leave every row UNKNOWN (-1); never write 0.
+        return set()
+
+    node = str(local_node or "")
+    # Rooms whose room_members.admin actually changes (drives the rebroadcast).
+    changed_member_rooms: set[str] = set()
+    member_rows = conn.execute(
+        "SELECT room_id, agent, admin FROM room_members WHERE node=?",
+        (node,),
+    ).fetchall()
+    for r in member_rows:
+        want = ADMIN_COL_ADMIN if str(r["agent"]) == admin_id else ADMIN_COL_NON_ADMIN
+        if int(r["admin"]) != want:
+            conn.execute(
+                "UPDATE room_members SET admin=? WHERE room_id=? AND agent=? AND node=?",
+                (want, r["room_id"], r["agent"], node),
+            )
+            changed_member_rooms.add(str(r["room_id"]))
+
+    # room_join_requests.joiner_admin: same local-only backfill for this node's
+    # PENDING rows. A remote pending row stays -1 (its own node attests on the
+    # verified cross-node join). This does not drive a rebroadcast (a pending
+    # request is not a roster member yet), so it is not collected.
+    join_rows = conn.execute(
+        "SELECT room_id, agent, joiner_admin FROM room_join_requests "
+        "WHERE node=? AND status=?",
+        (node, JOIN_PENDING),
+    ).fetchall()
+    for r in join_rows:
+        want = ADMIN_COL_ADMIN if str(r["agent"]) == admin_id else ADMIN_COL_NON_ADMIN
+        if int(r["joiner_admin"]) != want:
+            conn.execute(
+                "UPDATE room_join_requests SET joiner_admin=? "
+                "WHERE room_id=? AND agent=? AND node=? AND status=?",
+                (want, r["room_id"], r["agent"], node, JOIN_PENDING),
+            )
+
+    if commit:
+        conn.commit()
+    return changed_member_rooms
+
+
+def _backfill_room_member_admin(conn: sqlite3.Connection, room_id: str,
+                                node: str, admin_id: str) -> bool:
+    """Recompute room_members.admin for ONE (room, local-node) — no commit.
+
+    Returns True iff at least one row's bit actually changed. The per-room slice
+    of `backfill_local_admin` so the #2109 leader path can apply the bit change,
+    bump the epoch, and enqueue the broadcast for THIS room inside a single
+    transaction it commits atomically (so a failed enqueue rolls the bit change
+    back and the next tick re-detects + retries it).
+    """
+    changed = False
+    rows = conn.execute(
+        "SELECT agent, admin FROM room_members WHERE room_id=? AND node=?",
+        (room_id, node),
+    ).fetchall()
+    for r in rows:
+        want = ADMIN_COL_ADMIN if str(r["agent"]) == admin_id else ADMIN_COL_NON_ADMIN
+        if int(r["admin"]) != want:
+            conn.execute(
+                "UPDATE room_members SET admin=? WHERE room_id=? AND agent=? AND node=?",
+                (want, room_id, r["agent"], node),
+            )
+            changed = True
+    return changed
+
+
+def reclassify_and_rebroadcast_local_admin(
+        cfg: dict, conn: sqlite3.Connection) -> dict[str, int]:
+    """Backfill local admin bits, then leader-rebroadcast the changed rooms.
+
+    The durable convergence entry point for #2109: recompute THIS node's local
+    admin bits and, for each room whose `room_members` admin bits actually
+    changed AND which THIS node leads, bump the epoch and enqueue a durable
+    roster re-broadcast so remote members materialize the corrected admin bits
+    (recovering admin-member cross-node delivery). Reuses ONLY the existing
+    signed-v2-roster durable path (`bump_epoch` + `enqueue_roster_broadcast` →
+    `heartbeat_rebroadcast_rosters`); it builds no new sender and preserves the
+    pairwise-HMAC roster contract.
+
+    ATOMICITY (codex r1): for a LEADER-led changed room, the bit UPDATE + the
+    epoch bump + the outbox enqueue are folded into ONE transaction committed
+    together. If the bump or enqueue raises, the bit change ROLLS BACK with it —
+    so the room's bits stay at their old (e.g. -1) value and the NEXT tick
+    re-detects the change and retries the whole sequence. Committing the bit
+    change before the enqueue is durable would lose the rebroadcast forever (the
+    next tick would see the bits already correct and never re-enqueue).
+
+    Leader-only (SECURITY): a non-leader MUST NOT forge a roster broadcast, so a
+    changed room is rebroadcast ONLY when `rooms.leader_node == local_node`. A
+    non-leader still backfills its OWN local member bits (correct for its local
+    reads) but does not bump/enqueue — its leader owns the authoritative roster
+    and will rebroadcast the corrected bits from ITS side.
+
+    Returns {"backfilled_rooms": n, "rebroadcast_rooms": m} for the caller's
+    step result. Idempotent: a second call with no further config/membership
+    change backfills nothing and rebroadcasts nothing.
+    """
+    local_node = str(cfg.get("bridge_id", "") or "").strip()
+    admin_id = resolve_admin_agent_id()
+    if not admin_id:
+        # No locally-configured admin → cannot classify any local endpoint.
+        # Leave every row UNKNOWN (-1); never write 0, never rebroadcast.
+        return {"backfilled_rooms": 0, "rebroadcast_rooms": 0}
+
+    node = str(local_node or "")
+    # The set of rooms that have ANY local member row needing reclassification.
+    # We slice the work per room so each leader rebroadcast is atomic with its
+    # bit change. (Read-only probe; the writes happen per room below.)
+    candidate_rooms = sorted({
+        str(r["room_id"]) for r in conn.execute(
+            "SELECT DISTINCT room_id FROM room_members WHERE node=?", (node,)
+        ).fetchall()
+    })
+
+    backfilled = 0
+    rebroadcast = 0
+    # Roll any uncommitted state forward atomically per room: each iteration
+    # ends in exactly one commit (the leader bump/enqueue path) or one rollback
+    # (a raise), never a partial. Start clean.
+    conn.commit()
+    for room_id in candidate_rooms:
+        room = get_room(conn, room_id)
+        if room is None:
+            continue
+        is_leader = str(room["leader_node"] or "") == node and bool(node)
+        try:
+            changed = _backfill_room_member_admin(conn, room_id, node, admin_id)
+            if not changed:
+                # Nothing to write for this room; discard the (no-op) txn.
+                conn.rollback()
+                continue
+            if is_leader:
+                # Fold the bit change + epoch bump + outbox enqueue into ONE
+                # commit so a failed enqueue rolls the bit change back too.
+                epoch = bump_epoch(conn, room_id, commit=False)
+                enqueue_roster_broadcast(conn, room_id, epoch, node, commit=False)
+                conn.commit()
+                rebroadcast += 1
+            else:
+                # Non-leader: persist only the local bit change (no forging).
+                conn.commit()
+            backfilled += 1
+        except Exception:
+            # Any failure (e.g. a transient enqueue/db error) rolls THIS room's
+            # bit change back so the next tick re-detects + retries it. Re-raise
+            # so the reconcile step records a paced error (it never crashes the
+            # tick — the caller's last-resort guard contains it).
+            conn.rollback()
+            raise
+
+    # room_join_requests.joiner_admin backfill for this node's PENDING rows. It
+    # does not drive a rebroadcast (a pending request is not a roster member
+    # yet), so it is a self-contained commit, separate from the per-room loop.
+    _backfill_local_join_request_admin(conn, node, admin_id)
+
+    return {"backfilled_rooms": backfilled, "rebroadcast_rooms": rebroadcast}
+
+
+def _backfill_local_join_request_admin(conn: sqlite3.Connection, node: str,
+                                       admin_id: str) -> None:
+    """Recompute joiner_admin for THIS node's PENDING join requests (own commit).
+
+    Local-only: a remote pending row (node != local) stays -1 (its own node
+    attests on the verified cross-node join). Never drives a rebroadcast.
+    """
+    rows = conn.execute(
+        "SELECT room_id, agent, joiner_admin FROM room_join_requests "
+        "WHERE node=? AND status=?",
+        (node, JOIN_PENDING),
+    ).fetchall()
+    for r in rows:
+        want = ADMIN_COL_ADMIN if str(r["agent"]) == admin_id else ADMIN_COL_NON_ADMIN
+        if int(r["joiner_admin"]) != want:
+            conn.execute(
+                "UPDATE room_join_requests SET joiner_admin=? "
+                "WHERE room_id=? AND agent=? AND node=? AND status=?",
+                (want, r["room_id"], r["agent"], node, JOIN_PENDING),
+            )
+    conn.commit()
 
 
 def pending_roster_outbox(conn: sqlite3.Connection,
