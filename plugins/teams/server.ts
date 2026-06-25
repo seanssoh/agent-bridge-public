@@ -1979,11 +1979,31 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
 
       if (attachmentsArg.length === 0) {
-        // Text-only path — unchanged behavior, backwards-compatible.
+        // Text-only path. Capture the ResourceResponse.id for delivery proof and
+        // emit an outbound audit row, mirroring the send_message proactive path.
+        // sendActivity exceptions propagate out through the awaited
+        // continueConversation, so a real failure surfaces as a tool error.
+        let sentId: string | null = null
         await adapter.continueConversation(ref, async context => {
-          await context.sendActivity(text)
+          const sent = await context.sendActivity(text)
+          sentId = (sent as any)?.id ?? null
         })
-        return { content: [{ type: 'text', text: `sent: ${chatId}` }] }
+        process.stderr.write(
+          JSON.stringify({
+            event: 'teams_outbound_reply',
+            chat_id: chatId,
+            message_id: sentId,
+            ts: Date.now(),
+          }) + '\n',
+        )
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({ ok: true, conversation_id: chatId, message_id: sentId }),
+            },
+          ],
+        }
       }
 
       // Attachment path. Phase 1 supports personal chats only — group/channel
