@@ -1123,6 +1123,16 @@ for text, (zone, expect) in named.items():
 if mod.parse_reset_at("resets Jul 1 at 12pm (UTC)", ref) != "2026-07-01T12:00:00+00:00":
     raise SystemExit("named-tz regex broke the (UTC) at-separator form")
 
+# #17927 codex r1: the day/hour separator must be REQUIRED, not fully optional.
+# A malformed string with no separator (``resets Jul 112pm``) must REJECT, not
+# over-match as ``Jul 11`` + ``2pm``. Bare-space and comma-no-space stay valid.
+if mod.parse_reset_at("resets Jul 112pm (UTC)", ref) != "":
+    raise SystemExit("missing day/hour separator must reject, not over-match")
+if mod.parse_reset_at("resets Jul 1 12pm (UTC)", ref) != "2026-07-01T12:00:00+00:00":
+    raise SystemExit("bare-space day/hour separator must still parse")
+if mod.parse_reset_at("resets Jul 1,12pm (UTC)", ref) != "2026-07-01T12:00:00+00:00":
+    raise SystemExit("comma-no-space day/hour separator must still parse")
+
 # Unknown/bogus zone -> graceful "" (never raises).
 for bad in ("resets Jul 1 at 12pm (Mars/Phobos)", "resets Jul 1 at 12pm (Not_A_Zone)"):
     if mod.parse_reset_at(bad, ref) != "":

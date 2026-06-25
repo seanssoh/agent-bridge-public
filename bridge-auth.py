@@ -700,11 +700,14 @@ def parse_reset_at(text: str, reference: datetime | None = None) -> str:
     reference = reference or now_utc()
     # The weekly-429 string is ``resets Jul 1 at 12pm (Asia/Seoul)`` — an
     # "at" separator (no comma) and a NAMED timezone — while the older form
-    # is ``resets May 13, 3am (UTC)``. Tolerate both separators (``,``,
-    # `` at``, or bare space) and accept either ``UTC`` or an IANA zone name
-    # in the parens (#17927).
+    # is ``resets May 13, 3am (UTC)``. Tolerate the three real separators
+    # between the day and the hour — a comma (``1, 12pm``), `` at `` (``1 at
+    # 12pm``), or a bare space (``1 12pm``) — but REQUIRE one of them: the
+    # separator must not be fully optional or ``resets Jul 112pm (UTC)``
+    # over-matches as ``Jul 11`` + ``2pm`` (#17927 codex r1). Accept either
+    # ``UTC`` or an IANA zone name in the parens.
     absolute = re.search(
-        r"\bresets?\s+([A-Za-z]+)\s+(\d{1,2})\s*(?:,)?\s*(?:at\s+)?"
+        r"\bresets?\s+([A-Za-z]+)\s+(\d{1,2})(?:\s*,\s*|\s+at\s+|\s+)"
         r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*\(\s*([A-Za-z0-9_+\-/]+)\s*\)",
         text,
         re.IGNORECASE,
