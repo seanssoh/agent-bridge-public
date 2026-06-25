@@ -37,6 +37,7 @@ import {
 import { homedir } from 'os'
 import { basename, isAbsolute as pathIsAbsolute, join, resolve as pathResolve } from 'path'
 import { createRecentMessageDeduper, storedRowMatchesIncoming } from './dedupe.ts'
+import { classifyReplyOutcome } from './outbound-result.ts'
 
 type GroupPolicy = {
   requireMention?: boolean
@@ -1979,11 +1980,32 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
 
       if (attachmentsArg.length === 0) {
-        // Text-only path — unchanged behavior, backwards-compatible.
-        await adapter.continueConversation(ref, async context => {
-          await context.sendActivity(text)
-        })
-        return { content: [{ type: 'text', text: `sent: ${chatId}` }] }
+        // Text-only path. Capture the Bot Framework ResourceResponse.id so a reply
+        // that was accepted-by-SDK but produced no message id (or threw) is no
+        // longer reported as a bare `sent:` success (#2112 — silent non-delivery).
+        // sentId is declared outside the continueConversation closure so it
+        // survives back to the tool result; classifyReplyOutcome maps the three
+        // Bot Framework outcomes (confirmed / unconfirmed / failed).
+        let sentId = ''
+        let sendErr: unknown
+        try {
+          await adapter.continueConversation(ref, async context => {
+            const sent = await context.sendActivity(text)
+            sentId = String((sent as any)?.id ?? '').trim()
+          })
+        } catch (err) {
+          sendErr = err
+        }
+        const convId = String((ref as any).conversation?.id ?? chatId)
+        const outcome = classifyReplyOutcome({ chatId, convId, sentId, sendErr, attachmentCount: 0 })
+        // Single-line audit row so outbound delivery is observable.
+        process.stderr.write(`${outcome.auditLine}\n`)
+        if (outcome.throw) {
+          // sendActivity threw — surface a clear failure (the reply tool's
+          // convention is throw-on-error; the MCP SDK marks the result isError).
+          throw new Error(outcome.errorText)
+        }
+        return { content: [{ type: 'text', text: outcome.resultText }] }
       }
 
       // Attachment path. Phase 1 supports personal chats only — group/channel
