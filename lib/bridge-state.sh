@@ -5053,64 +5053,62 @@ bridge_resolve_agent_claude_config_dir() {
   # HOME fall-through.)
   [[ -n "$config_dir" && -d "$config_dir" ]] || return 0
 
-  # Issue #2106 — resolver/launch config-dir alignment for shared+agent_home
-  # (#1750) agents. When the shared (non-iso) Claude launch path WILL pin a
-  # per-agent CLAUDE_CONFIG_DIR=<agent-home>/.claude (bridge_run_shared_launch:
-  # ENGINE=claude, non-dynamic, credential authed), the launched `claude`
-  # reads ONLY that dir. Detection MUST scan the SAME dir or it diverges: the
-  # empty-#1316-scaffold heuristic below would fall back to the operator HOME,
-  # fs-scan an ORPHANED operator-home transcript (left behind by the #1750
-  # per-agent-identity migration), and launch `--resume <orphan>` against a
-  # per-agent config that lacks it → `No conversation found` → exit 1 →
-  # rapid-fail circuit-breaker crash-loop. The resume-quarantine self-heal
-  # cannot escape it (the same split-brain mis-classifies the operator-home id
-  # as "foreign" and refuses to record it), so this is the load-bearing fix.
-  #
-  # Gate on the SAME on-disk credential proof launch uses (no side effects,
-  # no seed): a per-agent `.credentials.json`, OR keychain-free auth enabled
-  # with a per-agent `settings.json` (the apiKeyHelper path). An empty #1316
-  # scaffold (T7b/T7c) carries NEITHER, so it still falls through to the
-  # scaffold check and resolves empty (operator-HOME fallback) — #1370 intact.
-  # An empty projects/ under a credentialed per-agent dir means "fresh agent,
-  # scan my own (empty) dir, start fresh" — NOT "share the operator HOME".
-  if bridge_resume_shared_launch_pins_config_dir "$agent" "$config_dir"; then
-    printf '%s' "$config_dir"
-    return 0
-  fi
-
-  # Issue #1370 (beta5-2 #1316 regression) gated this purely on linux-user
-  # isolation being *effective*: when it is NOT (every non-Linux host, and
-  # shared-mode Linux agents) the agent was assumed to share the controller
-  # HOME ~/.claude, so a derived <agent-home>/.claude looked like an empty
-  # #1316 scaffold that must NOT shadow the controller HOME.
-  #
-  # That assumption is false for shared agents that launch Claude with a
-  # per-agent CLAUDE_CONFIG_DIR. HOME may now be the operator HOME again,
-  # but Claude still writes session JSON under <agent-home>/.claude/projects,
-  # which is the live session location. Discriminate an empty #1316
-  # scaffold from a live per-agent config dir by whether projects/ holds
-  # data; this keeps stale scaffolds from shadowing the operator HOME while
-  # still allowing live shared-agent resumes.
-  #
-  # iso-effective Linux agents own a private config dir unconditionally and
-  # skip the scaffold check (the controller cannot stat their iso-UID
-  # projects/ tree anyway). Everyone else — shared-mode, non-Linux, AND any
-  # context where the helper is absent (standalone / minimal / smoke) — runs
-  # the scaffold check. Treating a missing helper as "not effective" is the
-  # safe default: it keeps running the check instead of blindly returning the
-  # dir, preserving the #1370 protection where the helper is unavailable.
+  # iso-effective Linux agents own a private config dir unconditionally — they
+  # resolve to their own dir, and NEITHER the #2106 shared-launch alignment NOR
+  # the #1370 scaffold check below applies to them (the controller cannot stat
+  # their iso-UID projects/ tree anyway). Compute this FIRST and return early so
+  # both shared+agent_home branches stay scoped to NON-iso agents (issue #2106
+  # review: the resolver must not reach the shared-launch branch for an
+  # iso-effective agent). Treating a MISSING helper as "not effective" is the
+  # safe default — it keeps the #1370 scaffold check running where the helper is
+  # unavailable (standalone / minimal / smoke).
   local _iso_effective=0
   if command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
     _iso_effective=1
   fi
-  if [[ "$_iso_effective" != "1" ]]; then
-    # `-type d`: a live per-agent home has projects/<workdir-slug>/ DIRECTORIES;
-    # an empty #1316 scaffold has none. Matching only directories ignores stray
-    # files (e.g. a macOS projects/.DS_Store) that would otherwise read as live.
-    if [[ -z "$(find "$config_dir/projects" -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null)" ]]; then
-      return 0
-    fi
+  if [[ "$_iso_effective" == "1" ]]; then
+    printf '%s' "$config_dir"
+    return 0
+  fi
+
+  # Issue #2106 — resolver/launch config-dir alignment for SHARED+agent_home
+  # (#1750) agents (iso-effective already returned above, so this is non-iso).
+  # When the shared Claude launch path WILL pin a per-agent
+  # CLAUDE_CONFIG_DIR=<agent-home>/.claude (bridge_run_shared_launch: ENGINE=
+  # claude, non-dynamic, credential authed), the launched `claude` reads ONLY
+  # that dir. Detection MUST scan the SAME dir or it diverges: the empty-#1316-
+  # scaffold heuristic below would fall back to the operator HOME, fs-scan an
+  # ORPHANED operator-home transcript (left behind by the #1750 per-agent-
+  # identity migration), and launch `--resume <orphan>` against a per-agent
+  # config that lacks it → `No conversation found` → exit 1 → rapid-fail
+  # circuit-breaker crash-loop. The resume-quarantine self-heal cannot escape it
+  # (the same split-brain mis-classifies the operator-home id as "foreign" and
+  # refuses to record it), so this is the load-bearing fix.
+  #
+  # Gate on the SAME on-disk credential proof launch uses (no side effects, no
+  # seed): a per-agent `.credentials.json`, OR keychain-free auth enabled with a
+  # per-agent `settings.json` (the apiKeyHelper path). An empty #1316 scaffold
+  # (T7b/T7c) carries NEITHER, so it falls through to the scaffold check and
+  # resolves empty (operator-HOME fallback) — #1370 intact. An empty projects/
+  # under a credentialed per-agent dir means "fresh agent, scan my own (empty)
+  # dir, start fresh" — NOT "share the operator HOME".
+  if bridge_resume_shared_launch_pins_config_dir "$agent" "$config_dir"; then
+    printf '%s' "$config_dir"
+    return 0
+  fi
+
+  # Issue #1370 (beta5-2 #1316 regression), non-iso path: a derived
+  # <agent-home>/.claude can be an empty #1316 scaffold that must NOT shadow the
+  # operator HOME, OR a live per-agent config dir (a shared agent that launches
+  # Claude with a per-agent CLAUDE_CONFIG_DIR — HOME may be the operator HOME
+  # again, but Claude writes session JSON under <agent-home>/.claude/projects).
+  # Discriminate by whether projects/ holds data. `-type d`: a live per-agent
+  # home has projects/<workdir-slug>/ DIRECTORIES; an empty scaffold has none.
+  # Matching only directories ignores stray files (e.g. a macOS
+  # projects/.DS_Store) that would otherwise read as live.
+  if [[ -z "$(find "$config_dir/projects" -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null)" ]]; then
+    return 0
   fi
   printf '%s' "$config_dir"
 }
