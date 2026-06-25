@@ -13,9 +13,12 @@ import { describe, expect, test } from 'bun:test'
 import {
   ACTION_IDS,
   buildAdaptiveCard,
+  DEFAULT_QUOTE_RESULT_DEEPLINK,
+  deeplinkHosts,
   extractLastCardIntentFence,
   findForbiddenCostKey,
   FORBIDDEN_COST_KEYS_PLACEHOLDER,
+  isAllowedDeeplink,
   isDetailLayout,
   renderOutbound,
   renderValueState,
@@ -31,39 +34,52 @@ import {
 // Fixtures
 // ---------------------------------------------------------------------------
 
+// quoteResult LIST = the #17138 6-field per-RFQ stack (appendix card 8). Golden
+// sample values from the spec appendix (cards 7/8): 셀트리온 내용물 5,754 / 가공비
+// – (notRequested), 헤메코 3,836 / 570, and a 산출중 (calculating) case. The
+// per-RFQ fields are 고객·제품 (section.label), 용량, 랩넘버, 내용물 견적,
+// 가공비 견적. NO 견적 소계 / 산출상태 columns. The deeplink is the only action.
 function validListIntent(): CardIntent {
   return {
     kind: 'quoteResult',
-    title: 'RFQ 견적 결과',
+    title: '💰 견적결과 — 3건',
     sections: [
       {
-        label: 'A사·세럼A',
+        label: '(주) 셀트리온스킨큐어 · 셀트리온스킨큐어 바디크림 (호수1)',
         rows: [
-          { label: '내용물', value: '₩1,200', valueState: 'value' },
-          { label: '가공비', value: '₩300', valueState: 'value' },
-          { label: '견적소계', value: '₩1,500', valueState: 'value' },
-          { label: '확정가', value: '₩2,380', valueState: 'masked' },
-          { label: '산출상태', value: '산출완료', valueState: 'value' },
-          { label: '세트', value: 'Y', valueState: 'value' },
-        ],
-        actions: [
-          { actionId: 'openQuoteResultDetail', label: '상세', payload: { quoteId: 'q1' } },
-          { actionId: 'selectForQuoteDoc', label: '선택', payload: { quoteId: 'q1' } },
+          { label: '용량', value: '306 g', valueState: 'value' },
+          { label: '랩넘버', value: 'TESTCTO1', valueState: 'value' },
+          { label: '내용물 견적', value: '5,754 원', valueState: 'value' },
+          { label: '가공비 견적', value: '', valueState: 'notRequested' },
         ],
       },
       {
-        label: 'B사·크림B',
+        label: '주식회사 헤메코 · 헤메코 바디크림 200ml',
         rows: [
-          { label: '내용물', value: '₩2,000', valueState: 'value' },
-          { label: '가공비', value: '₩500', valueState: 'value' },
-          { label: '견적소계', value: '₩2,500', valueState: 'masked' },
-          { label: '확정가', value: '₩2,500', valueState: 'calculating' },
-          { label: '산출상태', value: '산출중', valueState: 'value' },
+          { label: '용량', value: '204 ml', valueState: 'value' },
+          { label: '랩넘버', value: 'TESTHMC0609', valueState: 'value' },
+          { label: '내용물 견적', value: '3,836 원', valueState: 'value' },
+          { label: '가공비 견적', value: '570 원', valueState: 'value' },
+        ],
+      },
+      {
+        label: '(주) 셀트리온스킨큐어 · 셀트리온스킨큐어 바디크림 300ml',
+        rows: [
+          { label: '용량', value: '306 ml', valueState: 'value' },
+          { label: '랩넘버', value: 'TESTCTO1', valueState: 'value' },
+          { label: '내용물 견적', value: '7,451 원', valueState: 'value' },
+          { label: '가공비 견적', value: '', valueState: 'calculating' },
         ],
       },
     ],
-    actions: [{ actionId: 'loadMoreQuotes', label: '더보기', payload: {} }],
-    fallbackMarkdown: 'A사 ₩1,500 / B사 (계산중)',
+    actions: [
+      {
+        actionId: 'openQuoteResultDetail',
+        label: '전체 견적결과 보기 (web/d)',
+        payload: { url: 'https://crm-qa.cosmax.com/d/?screen=rfq-list' },
+      },
+    ],
+    fallbackMarkdown: '셀트리온 5,754원 / 헤메코 3,836원 / 셀트리온 산출중',
   }
 }
 
@@ -92,7 +108,13 @@ function validDetailIntent(): CardIntent {
         rows: [{ label: '상태', value: '대기', valueState: 'notRequested' }],
       },
     ],
-    actions: [{ actionId: 'openApprovalTrail', label: '결재내역', payload: { quoteId: 'q1' } }],
+    actions: [
+      {
+        actionId: 'openQuoteResultDetail',
+        label: '전체 견적결과 보기 (web/d)',
+        payload: { url: 'https://crm-qa.cosmax.com/d/?screen=rfq-list' },
+      },
+    ],
     fallbackMarkdown: 'A사 견적 상세',
   }
 }
@@ -287,9 +309,10 @@ describe('validateCardIntent', () => {
 })
 
 describe('renderer is authoritative / non-leaking (defense-in-depth)', () => {
-  test('toSubmitAction: validated actionId wins over a payload.actionId', () => {
-    // Even if a payload.actionId slipped past validation, the rendered card's
-    // data.actionId must be the validated, enum-checked id.
+  test('Phase 1a: a non-deeplink action (no valid url) emits NO Action — never an Action.Submit', () => {
+    // A validated action without a domain-pinned url is dropped: Phase 1a emits
+    // no Submit. (Revert toQuoteResultAction back to a Submit fallback → this
+    // fails: card.actions[0] would be an Action.Submit.)
     const card: any = buildAdaptiveCard({
       kind: 'quoteResult',
       title: 't',
@@ -297,11 +320,10 @@ describe('renderer is authoritative / non-leaking (defense-in-depth)', () => {
       sections: [
         { label: '금액강조', rows: [{ label: 'a', value: '1', valueState: 'value' }] },
       ],
-      actions: [
-        { actionId: 'openQuoteResultDetail', label: 'go', payload: { actionId: 'deleteEverything' } as any },
-      ],
+      actions: [{ actionId: 'openQuoteResultDetail', label: 'go', payload: { quoteId: 'q1' } }],
     })
-    expect(card.actions[0].data.actionId).toBe('openQuoteResultDetail')
+    expect(card.actions).toBeUndefined()
+    expect(JSON.stringify(card)).not.toContain('Action.Submit')
   })
 
   test('renderValueState: unexpected state renders masked, never the raw value', () => {
@@ -328,16 +350,16 @@ describe('renderValueState', () => {
     expect(r.color).toBe('Default')
   })
 
-  test('calculating → (계산중), Warning, NO number shown', () => {
+  test('calculating → 산출중, Warning, NO number shown', () => {
     const r = renderValueState(mk('calculating', '₩9,999'))
-    expect(r.text).toBe('(계산중)')
+    expect(r.text).toBe('산출중')
     expect(r.color).toBe('Warning')
     expect(r.text).not.toContain('9,999')
   })
 
-  test('notRequested → (해당없음), subtle, Default', () => {
+  test('notRequested → –, subtle, Default', () => {
     const r = renderValueState(mk('notRequested'))
-    expect(r.text).toBe('(해당없음)')
+    expect(r.text).toBe('–')
     expect(r.isSubtle).toBe(true)
     expect(r.color).toBe('Default')
   })
@@ -365,65 +387,123 @@ function walk(node: any, visit: (n: any) => void): void {
   }
 }
 
-describe('buildAdaptiveCard render shape', () => {
-  test('list renders AC v1.2 as a compact ColumnSet table (header + 1 row per RFQ, ≤3 cols)', () => {
-    const card: any = buildAdaptiveCard(validListIntent())
+describe('buildAdaptiveCard render shape (6-field per-RFQ stack, card 8)', () => {
+  test('list renders one per-RFQ Container with 고객·제품 header + 용량/랩넘버 FactSet + 내용물/가공비 견적 price rows', () => {
+    const intent = validListIntent()
+    const card: any = buildAdaptiveCard(intent)
     expect(card.type).toBe('AdaptiveCard')
     expect(card.version).toBe('1.2')
     // multi-section list is NOT a detail layout
-    expect(isDetailLayout(validListIntent())).toBe(false)
-    const columnSets = card.body.filter((b: any) => b.type === 'ColumnSet')
-    // 1 header row + 1 row per RFQ section (2)
-    expect(columnSets.length).toBe(3)
-    for (const cs of columnSets) expect(cs.columns.length).toBeLessThanOrEqual(3)
-    // the list is a table now — NO per-RFQ FactSet (FactSet is a detail-only thing)
-    expect(card.body.some((b: any) => b.type === 'FactSet')).toBe(false)
-    // header row labels + no separator
-    const header = JSON.stringify(columnSets[0])
-    expect(header).toContain('고객·제품')
-    expect(header).toContain('견적 소계')
-    expect(header).toContain('상태')
-    expect(columnSets[0].separator).toBe(false)
-    // RFQ rows: section label in column 1; first row no separator, second separated
-    const rowA = columnSets[1]
-    const rowB = columnSets[2]
-    expect(JSON.stringify(rowA.columns[0])).toContain('A사·세럼A')
-    expect(rowA.separator).toBe(false)
-    expect(rowB.separator).toBe(true)
-    // 세트 truthy → ✓ decorates A's status column
-    expect(JSON.stringify(rowA)).toContain('✓')
-    // per-card ActionSet present where the section had actions
-    expect(card.body.some((b: any) => b.type === 'ActionSet')).toBe(true)
+    expect(isDetailLayout(intent)).toBe(false)
+    // title + one Container per RFQ (3)
+    const containers = card.body.filter((b: any) => b.type === 'Container')
+    expect(containers.length).toBe(3)
+    // first RFQ: 고객·제품 header is the section label, Accent
+    const first = containers[0]
+    expect(first.separator).toBe(true)
+    const header = first.items.find((i: any) => i.type === 'TextBlock')
+    expect(header.text).toBe(intent.sections[0].label)
+    expect(header.color).toBe('Accent')
+    expect(header.weight).toBe('Bolder')
+    // emphasis sub-container holds the FactSet[용량, 랩넘버] + 2 price ColumnSets
+    const emph = first.items.find((i: any) => i.type === 'Container' && i.style === 'emphasis')
+    expect(emph).toBeDefined()
+    const factSet = emph.items.find((i: any) => i.type === 'FactSet')
+    expect(factSet.facts.map((f: any) => f.title)).toEqual(['용량', '랩넘버'])
+    expect(factSet.facts[0].value).toBe('306 g')
+    expect(factSet.facts[1].value).toBe('TESTCTO1')
+    const priceRows = emph.items.filter((i: any) => i.type === 'ColumnSet')
+    expect(priceRows.length).toBe(2)
+    expect(JSON.stringify(priceRows[0])).toContain('내용물 견적')
+    expect(JSON.stringify(priceRows[1])).toContain('가공비 견적')
+    // golden values: 내용물 5,754 원 (value, bold) / 가공비 – (notRequested, subtle)
+    expect(JSON.stringify(priceRows[0])).toContain('5,754 원')
+    const contentValueCell = priceRows[0].columns[1].items[0]
+    expect(contentValueCell.weight).toBe('Bolder')
+    const procValueCell = priceRows[0 + 1].columns[1].items[0]
+    expect(procValueCell.text).toBe('–')
+    expect(procValueCell.isSubtle).toBe(true)
   })
 
-  test('status column matches ONLY the stable 산출상태 — a generic 상태 row is not picked up (→ em dash)', () => {
+  test('DROPS 견적 소계 / 산출상태 — neither column nor its data appears anywhere', () => {
+    const card = JSON.stringify(buildAdaptiveCard(validListIntent()))
+    expect(card).not.toContain('견적 소계')
+    expect(card).not.toContain('견적소계')
+    expect(card).not.toContain('산출상태')
+  })
+
+  test('calculating price → 산출중 (Warning), value → bold number, notRequested → – subtle', () => {
+    const card: any = buildAdaptiveCard(validListIntent())
+    const cardStr = JSON.stringify(card)
+    // RFQ 3's 가공비 is calculating → 산출중 Warning, never the (empty) value
+    expect(cardStr).toContain('산출중')
+    // RFQ 2's 가공비 570 원 value → number shown
+    expect(cardStr).toContain('570 원')
+    // the calculating cell carries Warning color
+    const containers = card.body.filter((b: any) => b.type === 'Container')
+    const rfq3 = containers[2]
+    const emph3 = rfq3.items.find((i: any) => i.type === 'Container' && i.style === 'emphasis')
+    const procRow3 = emph3.items.filter((i: any) => i.type === 'ColumnSet')[1]
+    const cell3 = procRow3.columns[1].items[0]
+    expect(cell3.text).toBe('산출중')
+    expect(cell3.color).toBe('Warning')
+  })
+
+  test('용량/랩넘버 missing → em dash (—), never a raw leak', () => {
     const intent: any = {
       kind: 'quoteResult',
       title: 't',
       fallbackMarkdown: 'f',
-      // 2 sections → a LIST (not detail), so renderList/ColumnSet applies.
+      sections: [
+        { label: 'A사 · 세럼A', rows: [{ label: '내용물 견적', value: '1,000 원', valueState: 'value' }] },
+        { label: 'B사 · 크림B', rows: [{ label: '내용물 견적', value: '2,000 원', valueState: 'value' }] },
+      ],
+    }
+    const card: any = buildAdaptiveCard(intent)
+    const facts = card.body
+      .filter((b: any) => b.type === 'Container')[0]
+      .items.find((i: any) => i.type === 'Container').items
+      .find((i: any) => i.type === 'FactSet').facts
+    expect(facts.find((f: any) => f.title === '용량').value).toBe('—')
+    expect(facts.find((f: any) => f.title === '랩넘버').value).toBe('—')
+  })
+
+  test('a masked/calculating 용량·랩넘버 FactSet row NEVER leaks its raw value', () => {
+    // The FactSet path must not fall through to row.value for a non-value state
+    // (a masked 랩넘버 or a calculating 용량 would otherwise leak underlying data).
+    // (Revert factValue to return the raw string unconditionally → this fails.)
+    const intent: any = {
+      kind: 'quoteResult',
+      title: 't',
+      fallbackMarkdown: 'f',
       sections: [
         {
-          label: 'A사·세럼A',
+          label: 'A사 · 세럼A',
           rows: [
-            { label: '확정가', value: '₩1,000', valueState: 'value' },
-            { label: '상태', value: '대기', valueState: 'value' }, // generic 상태, NOT 산출상태
+            { label: '용량', value: 'SECRET-VOL-9999', valueState: 'calculating' },
+            { label: '랩넘버', value: 'SECRET-LAB-0001', valueState: 'masked' },
+            { label: '내용물 견적', value: '1,000 원', valueState: 'value' },
           ],
         },
         {
-          label: 'B사·크림B',
-          rows: [{ label: '확정가', value: '₩2,000', valueState: 'value' }], // no status row at all
+          label: 'B사 · 크림B',
+          rows: [{ label: '내용물 견적', value: '2,000 원', valueState: 'value' }],
         },
       ],
     }
     const card: any = buildAdaptiveCard(intent)
-    const rows = card.body.filter((b: any) => b.type === 'ColumnSet') // [0]=header, [1]=A, [2]=B
-    expect(rows[1].columns[2].items[0].text).toBe('—') // generic 상태 not picked up → em dash
-    expect(rows[2].columns[2].items[0].text).toBe('—') // no status row → em dash
-    expect(JSON.stringify(card)).not.toContain('대기') // the generic status value must not leak
+    const cardStr = JSON.stringify(card)
+    expect(cardStr).not.toContain('SECRET-VOL-9999') // calculating → 산출중, not the raw value
+    expect(cardStr).not.toContain('SECRET-LAB-0001') // masked → ●●●, not the raw value
+    const facts = card.body
+      .filter((b: any) => b.type === 'Container')[0]
+      .items.find((i: any) => i.type === 'Container').items
+      .find((i: any) => i.type === 'FactSet').facts
+    expect(facts.find((f: any) => f.title === '용량').value).toBe('산출중')
+    expect(facts.find((f: any) => f.title === '랩넘버').value).toBe('●●●')
   })
 
-  test('detail renders 4 sections with an emphasis Container', () => {
+  test('detail renders 4 sections with an emphasis Container; top-level deeplink is Action.OpenUrl', () => {
     const intent = validDetailIntent()
     expect(isDetailLayout(intent)).toBe(true)
     const card: any = buildAdaptiveCard(intent)
@@ -431,12 +511,12 @@ describe('buildAdaptiveCard render shape', () => {
     const containers = card.body.filter((b: any) => b.type === 'Container')
     expect(containers.length).toBe(4)
     expect(containers.some((c: any) => c.style === 'emphasis')).toBe(true)
-    // top-level actions → root ActionSet (card.actions)
+    // Phase 1a: the only root action is the domain-pinned deeplink (NO Submit)
     expect(Array.isArray(card.actions)).toBe(true)
-    expect(card.actions[0].type).toBe('Action.Submit')
+    expect(card.actions[0].type).toBe('Action.OpenUrl')
   })
 
-  test('NO forbidden AC element types (Table) and NO targetWidth anywhere', () => {
+  test('NO forbidden AC element types (Table) and NO targetWidth anywhere; ColumnSet ≤3', () => {
     for (const intent of [validListIntent(), validDetailIntent()]) {
       const card = buildAdaptiveCard(intent)
       let sawTable = false
@@ -454,15 +534,118 @@ describe('buildAdaptiveCard render shape', () => {
       expect(maxColumns).toBeLessThanOrEqual(3)
     }
   })
+})
 
-  test('valueState mapping flows into the ColumnSet columns (value shows number, masked hidden)', () => {
-    const card = JSON.stringify(buildAdaptiveCard(validListIntent()))
-    expect(card).toContain('1,500') // A 견적 소계 value → number shown in the column
-    expect(card).toContain('●●●') // B 견적 소계 masked column → number hidden
-    // the masked subtotal ₩2,500 must NOT leak (masked → ●●●)
-    expect(card).not.toContain('2,500')
-    // 확정가 is not a list column → the confirmed price ₩2,380 is never rendered
-    expect(card).not.toContain('2,380')
+// ---------------------------------------------------------------------------
+// Contract primitives (Phase-1a): PriceCell string-only, openUrl domain-pin,
+// submit-reject — MUTATION-PROOF
+// ---------------------------------------------------------------------------
+
+describe('PriceCell string-only (Phase 1a)', () => {
+  test('a raw-number price value fails closed — no attachment', () => {
+    // PriceCell.value MUST be a string. A raw number is an unformatted/un-masked
+    // cost leak; the card must NOT attach. (Revert the row.value string guard →
+    // this fails: the number would render into a price cell and attach.)
+    const intent: any = validListIntent()
+    intent.sections[1].rows[2].value = 5754 // raw number, not "5,754 원"
+    const out = renderOutbound(fence(intent))
+    expect(out.attachments.length).toBe(0)
+    expect(out.warning).toContain('validation failed')
+  })
+
+  test('a numeric-only decimal string is still a string but renders verbatim (no arithmetic)', () => {
+    // The renderer does NO arithmetic — whatever string the SKILL formatted is
+    // shown as-is. (This pins "no arithmetic": a value of "5754" is not reformatted.)
+    const intent: any = validListIntent()
+    intent.sections[1].rows[2].value = '5754'
+    const card = JSON.stringify(buildAdaptiveCard(intent))
+    expect(card).toContain('5754')
+  })
+})
+
+describe('openUrl domain-pin (Phase 1a)', () => {
+  test('the canonical deeplink resolves to the crm-qa rfq-list screen', () => {
+    expect(DEFAULT_QUOTE_RESULT_DEEPLINK).toBe('https://crm-qa.cosmax.com/d/?screen=rfq-list')
+  })
+
+  test('default host allowlist is crm-qa.cosmax.com', () => {
+    expect(deeplinkHosts({})).toEqual(['crm-qa.cosmax.com'])
+  })
+
+  test('on-domain https url is accepted (normalized href returned)', () => {
+    expect(isAllowedDeeplink('https://crm-qa.cosmax.com/d/?screen=rfq-list', {})).toBe(
+      'https://crm-qa.cosmax.com/d/?screen=rfq-list',
+    )
+  })
+
+  test('off-domain / wrong-proto / userinfo / freeform urls are rejected (null)', () => {
+    for (const bad of [
+      'https://evil.example/d/?screen=rfq-list', // off-domain
+      'http://crm-qa.cosmax.com/d/', // wrong protocol
+      'https://crm-qa.cosmax.com@example.com/d/', // userinfo smuggle (real host off-allowlist)
+      'javascript:alert(1)', // freeform scheme
+      'crm-qa.cosmax.com/d/', // not parseable as absolute
+      '', // empty
+    ]) {
+      expect(isAllowedDeeplink(bad, {})).toBeNull()
+    }
+  })
+
+  test('host allowlist is env-overridable for QA/prod', () => {
+    const env = { BRIDGE_TEAMS_DEEPLINK_HOSTS: 'crm.cosmax.com, crm-qa.cosmax.com' }
+    expect(deeplinkHosts(env)).toEqual(['crm.cosmax.com', 'crm-qa.cosmax.com'])
+    expect(isAllowedDeeplink('https://crm.cosmax.com/d/?screen=rfq-list', env)).toBe(
+      'https://crm.cosmax.com/d/?screen=rfq-list',
+    )
+    // a host NOT in the override is still rejected
+    expect(isAllowedDeeplink('https://crm-qa.cosmax.com/d/', { BRIDGE_TEAMS_DEEPLINK_HOSTS: 'crm.cosmax.com' })).toBeNull()
+  })
+
+  test('a valid deeplink is emitted as the card Action.OpenUrl', () => {
+    const card: any = buildAdaptiveCard(validListIntent())
+    expect(card.actions.length).toBe(1)
+    expect(card.actions[0].type).toBe('Action.OpenUrl')
+    expect(card.actions[0].url).toBe('https://crm-qa.cosmax.com/d/?screen=rfq-list')
+    expect(card.actions[0].title).toContain('전체 견적결과 보기')
+  })
+
+  test('an off-domain deeplink is DROPPED — the action is not emitted, the card still renders', () => {
+    const intent: any = validListIntent()
+    intent.actions[0].payload.url = 'https://evil.example/d/?screen=rfq-list'
+    const card: any = buildAdaptiveCard(intent)
+    expect(card.actions).toBeUndefined() // dropped, not thrown
+    expect(JSON.stringify(card)).not.toContain('evil.example')
+    // the card body still rendered (graceful drop, not a whole-card failure)
+    expect(card.body.length).toBeGreaterThan(1)
+  })
+
+  test('a NON-view actionId carrying a pinned (allowed-host) url is DROPPED — no url laundering', () => {
+    // Only openQuoteResultDetail may surface as the card OpenUrl. A createQuoteDoc
+    // (or any other) action that smuggles an allowed-host url must NOT be emitted
+    // as an Action.OpenUrl. (Revert the actionId gate in toQuoteResultAction →
+    // this fails: the createQuoteDoc action would attach as an OpenUrl.)
+    const intent: any = validListIntent()
+    intent.actions = [
+      {
+        actionId: 'createQuoteDoc',
+        label: '견적서 생성',
+        payload: { url: 'https://crm-qa.cosmax.com/d/?screen=rfq-list' },
+      },
+    ]
+    const card: any = buildAdaptiveCard(intent)
+    expect(card.actions).toBeUndefined() // dropped despite the valid pinned url
+    expect(JSON.stringify(card)).not.toContain('Action.OpenUrl')
+  })
+})
+
+describe('submit rejected (Phase 1a)', () => {
+  test('a submit-type action (no deeplink url) in a quoteResult intent is NOT emitted', () => {
+    const intent: any = validListIntent()
+    intent.actions = [{ actionId: 'createQuoteDoc', label: '견적서 생성', payload: { quoteId: 'q1' } }]
+    const out = renderOutbound(fence(intent))
+    expect(out.attachments.length).toBe(1) // card still attaches
+    const card = JSON.stringify(out.attachments[0].content)
+    expect(card).not.toContain('Action.Submit')
   })
 })
 
@@ -484,10 +667,10 @@ describe('§10 forbidden cost keys (mutation-proof)', () => {
   })
 
   test('renderOutbound falls back to text-only when a forbidden key leaks into the card', () => {
-    // Smuggle a forbidden key through an action payload — it lands in the
-    // rendered card's Action.Submit.data and must trip the §10 golden.
+    // Smuggle a forbidden cost key through a rendered Row.value — it lands in the
+    // card's price cell text and must trip the §10 golden over the card bytes.
     const intent: any = validListIntent()
-    intent.sections[0].actions[0].payload = { quoteId: 'q1', unitCost: 1200 }
+    intent.sections[0].rows[2].value = 'unitCost 1,200'
     const out = renderOutbound(fence(intent))
     // §10 guard MUST reject → no attachment, text-only graceful, fence stripped.
     // (Revert the findForbiddenCostKey check in renderOutbound → this fails:
@@ -548,7 +731,7 @@ describe('§10 visible-text fail-closed (mutation-proof)', () => {
     // Card carries a forbidden key (rejected → no attachment) and the prose ALSO
     // carries a forbidden term → text must be the §10 fallback, not the leak.
     const intent: any = validListIntent()
-    intent.sections[0].actions[0].payload = { quoteId: 'q1', unitCost: 1200 }
+    intent.sections[0].rows[2].value = 'unitCost 1,200'
     const out = renderOutbound('마진은 30%입니다.\n\n' + fence(intent))
     expect(out.attachments.length).toBe(0) // card rejected (existing behavior)
     expect(out.warning).toContain('forbidden cost key')

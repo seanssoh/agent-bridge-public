@@ -300,10 +300,11 @@ export function renderValueState(row: Row): RenderedValue {
     case 'value':
       return { text: row.value, color: 'Default' }
     case 'calculating':
-      // Do NOT show a number while calculating.
-      return { text: '(계산중)', color: 'Warning' }
+      // 미산출 = "산출중" (Warning/앰버). Do NOT show a number while calculating.
+      return { text: '산출중', color: 'Warning' }
     case 'notRequested':
-      return { text: '(해당없음)', color: 'Default', isSubtle: true }
+      // 미의뢰 = "–" subtle.
+      return { text: '–', color: 'Default', isSubtle: true }
     case 'masked':
       return { text: '●●●', color: 'Accent' }
     default:
@@ -327,15 +328,83 @@ const AC_CONTENT_TYPE = 'application/vnd.microsoft.card.adaptive'
 // Keep cards comfortably under the practical Teams payload ceiling.
 const MAX_CARD_BYTES = 28 * 1024
 
+// ---------------------------------------------------------------------------
+// Deeplink domain-pin (Phase-1a contract primitive)
+//
+// The quoteResult card carries ONE [전체 견적결과 보기] button = Action.OpenUrl
+// into the web/d 견적결과 화면. The url MUST be domain-pinned: an off-domain /
+// wrong-protocol / freeform url is dropped (the action is not emitted) so a
+// compromised SKILL emit cannot turn the card into an open redirect. The host
+// allowlist is env-overridable (QA vs prod) via BRIDGE_TEAMS_DEEPLINK_HOSTS
+// (comma-separated); default is the QA host.
+// ---------------------------------------------------------------------------
+
+const DEFAULT_DEEPLINK_HOST = 'crm-qa.cosmax.com'
+
+// Read the process env without pulling @types/node into this standalone-tested
+// module (tsconfig `types: []`). The deeplink host override is read from the
+// ambient env at call time; tests pass an explicit env to stay hermetic.
+type EnvBag = Record<string, string | undefined>
+function processEnv(): EnvBag {
+  const g = globalThis as { process?: { env?: EnvBag } }
+  return g.process?.env ?? {}
+}
+
+export function deeplinkHosts(env: EnvBag = processEnv()): readonly string[] {
+  const raw = (env.BRIDGE_TEAMS_DEEPLINK_HOSTS ?? '').trim()
+  if (!raw) return [DEFAULT_DEEPLINK_HOST]
+  const hosts = raw
+    .split(',')
+    .map(h => h.trim().toLowerCase())
+    .filter(h => h.length > 0)
+  return hosts.length > 0 ? hosts : [DEFAULT_DEEPLINK_HOST]
+}
+
+// The canonical web/d 견적결과 deeplink (rfq-list screen). Built from the default
+// host; if the host allowlist is env-overridden, the SKILL is expected to emit a
+// payload.url on that host and it is validated by isAllowedDeeplink below.
+export const DEFAULT_QUOTE_RESULT_DEEPLINK = `https://${DEFAULT_DEEPLINK_HOST}/d/?screen=rfq-list`
+
+// Validate a candidate deeplink url against the domain-pin rules: parseable,
+// exact https: protocol, host EXACTLY in the allowlist, no userinfo. Returns the
+// normalized href when valid, or null (→ the action is dropped, never thrown).
+export function isAllowedDeeplink(
+  url: unknown,
+  env: EnvBag = processEnv(),
+): string | null {
+  if (typeof url !== 'string' || url.length === 0) return null
+  let parsed: URL
+  try {
+    parsed = new URL(url)
+  } catch {
+    return null
+  }
+  if (parsed.protocol !== 'https:') return null
+  // Reject userinfo embedded in the authority (a `user:pass@host` smuggle that
+  // points the real host off-allowlist while the prefix mimics the pinned host).
+  if (parsed.username !== '' || parsed.password !== '') return null
+  const allowed = deeplinkHosts(env)
+  if (!allowed.includes(parsed.hostname.toLowerCase())) return null
+  return parsed.href
+}
+
 function textBlock(
   text: string,
-  opts: { weight?: string; size?: string; color?: string; isSubtle?: boolean; wrap?: boolean } = {},
+  opts: {
+    weight?: string
+    size?: string
+    color?: string
+    isSubtle?: boolean
+    wrap?: boolean
+    horizontalAlignment?: string
+  } = {},
 ): AcElement {
   const el: AcElement = { type: 'TextBlock', text, wrap: opts.wrap ?? true }
   if (opts.weight) el.weight = opts.weight
   if (opts.size) el.size = opts.size
   if (opts.color) el.color = opts.color
   if (opts.isSubtle) el.isSubtle = true
+  if (opts.horizontalAlignment) el.horizontalAlignment = opts.horizontalAlignment
   return el
 }
 
@@ -353,112 +422,143 @@ function factSet(rows: Row[]): AcElement {
   }
 }
 
-// An ActionSet from a list of Actions. Only Submit/OpenUrl are emitted (the
-// renderer maps every action to Action.Submit carrying the actionId + payload;
-// a deep-link payload, if present, becomes Action.OpenUrl). ShowCard is
-// root-only and not emitted from per-section sets.
-function actionSet(actions: Action[]): AcElement {
-  return {
-    type: 'ActionSet',
-    actions: actions.map(toSubmitAction),
+// The single actionId allowed to surface as a card action in Phase 1a: the
+// [전체 견적결과 보기] view deeplink. Every other actionId (createQuoteDoc,
+// reQuote, …) is Phase-2 territory and is dropped here — gating on the id (not
+// just on "has a pinned url") stops an arbitrary action from laundering itself
+// into an Action.OpenUrl by carrying an allowed-host url.
+const QUOTE_RESULT_VIEW_ACTION_ID: ActionId = 'openQuoteResultDetail'
+
+// Phase-1a quoteResult action mapping: the ONLY action the card may emit is the
+// [전체 견적결과 보기] domain-pinned Action.OpenUrl deeplink. Action.Submit is
+// Phase-2 territory and is never emitted, and a non-view actionId is dropped
+// even if it carries a valid pinned url. The OpenUrl candidate is domain-pinned:
+// an off-domain / wrong-protocol / freeform url is dropped too (action not
+// emitted), never thrown. Returns the AC element or null (caller filters it out).
+function toQuoteResultAction(a: Action): AcElement | null {
+  if (a.actionId !== QUOTE_RESULT_VIEW_ACTION_ID) return null
+  const validHref = isAllowedDeeplink(a.payload?.url)
+  if (validHref) {
+    return { type: 'Action.OpenUrl', title: a.label, url: validHref }
   }
+  // The view action carries no valid pinned deeplink → drop (never a Submit, and
+  // an off-domain url is rejected rather than emitted as an open redirect).
+  return null
 }
 
-function toSubmitAction(a: Action): AcElement {
-  const url = typeof a.payload?.url === 'string' ? (a.payload.url as string) : ''
-  if (url) {
-    return { type: 'Action.OpenUrl', title: a.label, url }
-  }
-  return {
-    type: 'Action.Submit',
-    title: a.label,
-    // actionId LAST so the validated, enum-checked id is authoritative and a
-    // payload key can never override it (defense-in-depth; validateAction also
-    // rejects a payload carrying actionId).
-    data: { ...a.payload, actionId: a.actionId },
-  }
-}
-
-// quoteResult LIST columns (≤3). Column 1 is the section label
-// (accountName · productName). Columns 2–3 are matched out of the section's
-// rows by these STABLE labels — NOT the role-scoped 내용물/가공비 cost labels,
-// which the server rewrites per viewer role ("제시가" vs "견적"); 견적 소계 and
-// 산출상태 are stable across roles. A missing column → an em dash (never a raw
-// leak). `세트` (set), if present and truthy, decorates the status with a ✓.
-// col2 = 견적 소계 (quote subtotal), NOT 확정가: live RFQs leave 확정가 unset
-// (notRequested) until after customer agreement, so a 확정가 column reads as all
-// em dashes; 견적 소계 is the populated, stable quote headline. Match both the
-// spaced and unspaced spelling the server may emit.
-const COL_PRICE_LABELS: readonly string[] = ['견적 소계', '견적소계']
-// Strict single stable label only — a generic '상태' row (e.g. 결재상태) must
-// NOT be picked up for the 산출상태 column; a section without 산출상태 renders
-// an em dash, as promised (role-scope-safe, no incidental status leak).
-const COL_STATUS_LABELS: readonly string[] = ['산출상태']
-const COL_SET_LABELS: readonly string[] = ['세트', 'set']
-const EMDASH: RenderedValue = { text: '—', color: 'Default' }
+// quoteResult per-RFQ fields (#17138 6-field design). The card is the SINGLE
+// mobile-safe per-product stack (appendix card 8): one Container per RFQ with a
+// 고객·제품 header + a 용량/랩넘버 FactSet + 내용물 견적 / 가공비 견적 price rows.
+// The wide 6-column desktop table (appendix card 7) is NOT rendered in chat — it
+// lives behind the [전체 견적결과 보기] deeplink (the renderer cannot detect the
+// Teams client device, so the narrow layout is the only safe one to push).
+//
+// 용량/랩넘버 are matched out of the section's rows by stable labels; missing →
+// an em dash. The price cells are PriceCells (string-only Row.value) matched by
+// the viewer-facing 내용물 견적 / 가공비 견적 labels (these are the ALLOWED §10
+// price labels — never the role-internal cost language). The dropped beta2.2
+// 견적 소계 / 산출상태 columns are gone: each price cell carries its own
+// valueState (산출중/–) so a separate status column is redundant.
+const FIELD_VOLUME_LABELS: readonly string[] = ['용량']
+const FIELD_LABNO_LABELS: readonly string[] = ['랩넘버']
+const FIELD_CONTENT_PRICE_LABELS: readonly string[] = ['내용물 견적']
+const FIELD_PROCESSING_PRICE_LABELS: readonly string[] = ['가공비 견적']
+const EMDASH = '—'
 
 function findRow(rows: Row[], labels: readonly string[]): Row | undefined {
   return rows.find(r => labels.includes(r.label))
 }
 
-// A single Column carrying one TextBlock (AC 1.2). `width` is 'stretch' | 'auto'.
-function column(
-  text: string,
-  width: string,
-  opts: { weight?: string; color?: string; isSubtle?: boolean } = {},
-): AcElement {
+// A FactSet value for a non-price field (용량/랩넘버). These are plain spec
+// fields, normally valueState:'value' — but a non-value state must NEVER fall
+// through to the raw row.value (a masked/calculating row would otherwise leak
+// its underlying data into the FactSet). Route every non-value state through
+// renderValueState (masked→●●●, calculating→산출중, notRequested→–) and emit an
+// em dash for a missing field / empty value.
+function factValue(rows: Row[], labels: readonly string[]): string {
+  const row = findRow(rows, labels)
+  if (!row) return EMDASH
+  if (row.valueState !== 'value') return renderValueState(row).text
+  const v = typeof row.value === 'string' ? row.value.trim() : ''
+  return v.length > 0 ? v : EMDASH
+}
+
+// A 내용물/가공비 견적 price row laid out per card-8: a [stretch: label subtle]
+// [auto: PriceCell] ColumnSet (≤2 columns). A missing price row → an em dash
+// (notRequested-style subtle). The PriceCell text/color comes from the row's
+// valueState (value→bold number / calculating→산출중 Warning / notRequested→–).
+function priceRow(label: string, rows: Row[], labels: readonly string[]): AcElement {
+  const row = findRow(rows, labels)
+  const rv: RenderedValue = row ? renderValueState(row) : { text: EMDASH, color: 'Default', isSubtle: true }
   return {
-    type: 'Column',
-    width,
-    items: [textBlock(text, { weight: opts.weight, color: opts.color, isSubtle: opts.isSubtle, wrap: true })],
+    type: 'ColumnSet',
+    columns: [
+      {
+        type: 'Column',
+        width: 'stretch',
+        verticalContentAlignment: 'Center',
+        items: [textBlock(label, { isSubtle: true })],
+      },
+      {
+        type: 'Column',
+        width: 'auto',
+        verticalContentAlignment: 'Center',
+        items: [
+          textBlock(rv.text, {
+            weight: row && row.valueState === 'value' ? 'Bolder' : undefined,
+            color: rv.color,
+            isSubtle: rv.isSubtle,
+            wrap: false,
+            horizontalAlignment: 'Right',
+          }),
+        ],
+      },
+    ],
   }
 }
 
-function columnSetRow(columns: AcElement[], separator: boolean): AcElement {
-  return { type: 'ColumnSet', separator, columns }
+// list render (AC 1.2) = the mobile-safe per-product stack (appendix card 8):
+// the title, then one Container (separator) per RFQ section. Each RFQ Container
+// holds a 고객·제품 header (Accent, Bolder) + an `emphasis` Container with a
+// 용량/랩넘버 FactSet and the 내용물 견적 / 가공비 견적 PriceCell rows. This is
+// the ONLY chat layout — the wide 6-column desktop table (card 7) lives behind
+// the [전체 견적결과 보기] deeplink. ColumnSet (NOT the AC 1.5 Table element)
+// keeps us on AC 1.2 / no Table / no targetWidth, ≤3 columns per ColumnSet.
+// Per-section actions are NOT emitted in Phase 1a (the only card action is the
+// root domain-pinned deeplink); cardintent contract is unchanged — the server
+// still sends generic sections/rows.
+function renderRfqContainer(section: Section): AcElement {
+  return {
+    type: 'Container',
+    separator: true,
+    spacing: 'Medium',
+    items: [
+      textBlock(section.label, { weight: 'Bolder', color: 'Accent' }),
+      {
+        type: 'Container',
+        style: 'emphasis',
+        spacing: 'Small',
+        items: [
+          {
+            type: 'FactSet',
+            facts: [
+              { title: '용량', value: factValue(section.rows, FIELD_VOLUME_LABELS) },
+              { title: '랩넘버', value: factValue(section.rows, FIELD_LABNO_LABELS) },
+            ],
+          },
+          priceRow('내용물 견적', section.rows, FIELD_CONTENT_PRICE_LABELS),
+          priceRow('가공비 견적', section.rows, FIELD_PROCESSING_PRICE_LABELS),
+        ],
+      },
+    ],
+  }
 }
 
-// list render (AC 1.2): a compact ColumnSet "table" — a header row + one row
-// per RFQ section (≤3 columns: 고객·제품 | 확정가 | 상태), so multiple quote
-// results scan record-by-record. ColumnSet (NOT the AC 1.5 Table element) wraps
-// gracefully on a narrow screen; the #15157 mobile-LCD constraint keeps us on
-// AC 1.2 / no Table / no targetWidth. Per-section actions, if any, follow the
-// row as an ActionSet. cardintent contract is unchanged — the server still
-// sends generic sections/rows; this renderer just lays the list out as a table.
 function renderList(intent: CardIntent): AcElement[] {
   const body: AcElement[] = [textBlock(intent.title, { weight: 'Bolder', size: 'Medium' })]
-  // header row
-  body.push(
-    columnSetRow(
-      [
-        column('고객·제품', 'stretch', { weight: 'Bolder', isSubtle: true }),
-        column('견적 소계', 'auto', { weight: 'Bolder', isSubtle: true }),
-        column('상태', 'auto', { weight: 'Bolder', isSubtle: true }),
-      ],
-      false,
-    ),
-  )
-  intent.sections.forEach((section, idx) => {
-    const priceRow = findRow(section.rows, COL_PRICE_LABELS)
-    const statusRow = findRow(section.rows, COL_STATUS_LABELS)
-    const setRow = findRow(section.rows, COL_SET_LABELS)
-    const price = priceRow ? renderValueState(priceRow) : EMDASH
-    const status = statusRow ? renderValueState(statusRow) : EMDASH
-    const setMark = setRow && setRow.valueState === 'value' && setRow.value.trim() ? ' ✓' : ''
-    body.push(
-      columnSetRow(
-        [
-          column(section.label, 'stretch', { weight: 'Bolder' }),
-          column(price.text, 'auto', { color: price.color, isSubtle: price.isSubtle }),
-          column(status.text + setMark, 'auto', { color: status.color, isSubtle: status.isSubtle }),
-        ],
-        idx > 0,
-      ),
-    )
-    if (section.actions && section.actions.length > 0) {
-      body.push(actionSet(section.actions))
-    }
-  })
+  for (const section of intent.sections) {
+    body.push(renderRfqContainer(section))
+  }
   return body
 }
 
@@ -506,11 +606,18 @@ export function buildAdaptiveCard(intent: CardIntent): AcElement {
     version: AC_VERSION,
     body,
   }
-  // Top-level CardIntent.actions → root ActionSet (Submit/OpenUrl). ShowCard is
-  // permitted at the root only; we do not currently emit ShowCard but reserve
-  // the root position for it.
+  // Top-level CardIntent.actions → root actions, Phase-1a contract: the ONLY
+  // action emitted is the domain-pinned [전체 견적결과 보기] Action.OpenUrl
+  // deeplink. Action.Submit is dropped (Phase 2), and an off-domain / wrong-proto
+  // deeplink is dropped too. If nothing survives the filter, no actions key is
+  // emitted (an empty actions array would render an empty action bar).
   if (intent.actions && intent.actions.length > 0) {
-    card.actions = intent.actions.map(toSubmitAction)
+    const actions = intent.actions
+      .map(toQuoteResultAction)
+      .filter((a): a is AcElement => a !== null)
+    if (actions.length > 0) {
+      card.actions = actions
+    }
   }
   return card
 }
