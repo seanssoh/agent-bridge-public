@@ -19,6 +19,17 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
+# Shared disposable-`claude -p` launch hardening (#17957). `_llm_summarize`
+# below runs in the agent's real config-dir, so without this it would auto-load
+# the singleton telegram/discord plugins and steal the admin's live poller. The
+# overlay suppresses ONLY those singleton channels and preserves all other
+# plugins/MCP.
+_BRIDGE_MEMORY_LIB_DIR = Path(__file__).resolve().parent / "lib"
+if _BRIDGE_MEMORY_LIB_DIR.is_dir() and str(_BRIDGE_MEMORY_LIB_DIR) not in sys.path:  # noqa: raw-pathlib-controller-only — import-time controller-side lib dir probe
+    sys.path.insert(0, str(_BRIDGE_MEMORY_LIB_DIR))
+
+from bridge_disposable_claude import singleton_channel_suppression_argv  # noqa: E402
+
 
 USER_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 SEARCH_SCOPES = ("wiki", "all", "user", "daily", "shared", "project", "decision", "raw")
@@ -1712,7 +1723,7 @@ def _llm_summarize(prompt: str, model: str = "") -> str | None:
     claude = shutil.which("claude")
     if not claude:
         return None
-    command = [claude, "-p", "--no-session-persistence", "--dangerously-skip-permissions", "--output-format", "text"]
+    command = [claude, "-p", *singleton_channel_suppression_argv(), "--no-session-persistence", "--dangerously-skip-permissions", "--output-format", "text"]
     if model:
         command.extend(["--model", model])
     command.append(prompt)

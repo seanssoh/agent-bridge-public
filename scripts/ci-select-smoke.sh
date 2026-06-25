@@ -4312,6 +4312,25 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # unreadable tree AND a fully-unreadable home; re-run whenever the
       # rebuild/collect read path moves.
       add_required 1947-memory-rebuild-graceful-skip
+      # Issue #17957 (path B): bridge-memory.py's _llm_summarize disposable
+      # `claude -p` now launches with a --settings overlay that suppresses the
+      # singleton channel plugins (telegram/discord) so it can't steal the
+      # admin's live getUpdates poller, while preserving other plugins/MCP.
+      # Re-run the no-poller contract smoke whenever this spawn moves.
+      add_required 17957-disposable-no-poller
+      add_integration integration-minimal
+      ;;
+
+    bridge-knowledge.py|lib/bridge_disposable_claude.py)
+      # Issue #17957 (path B): the disposable `claude -p` spawns in
+      # bridge-knowledge.py (LLM review + related-page suggestion) and the
+      # shared lib/bridge_disposable_claude.py overlay helper must launch
+      # WITHOUT the singleton channel plugins (telegram/discord) so a
+      # disposable child cannot SIGTERM-steal the admin's live poller, while
+      # preserving every other plugin + MCP. The smoke asserts the spawned
+      # argv carries the singleton-only --settings overlay (no
+      # --strict-mcp-config) and that a per-key merge keeps other plugins/MCP.
+      add_required 17957-disposable-no-poller
       add_integration integration-minimal
       ;;
 
