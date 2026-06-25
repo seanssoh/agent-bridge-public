@@ -332,11 +332,12 @@ const MAX_CARD_BYTES = 28 * 1024
 // Deeplink domain-pin (Phase-1a contract primitive)
 //
 // The quoteResult card carries ONE [전체 견적결과 보기] button = Action.OpenUrl
-// into the web/d 견적결과 화면. The url MUST be domain-pinned: an off-domain /
-// wrong-protocol / freeform url is dropped (the action is not emitted) so a
-// compromised SKILL emit cannot turn the card into an open redirect. The host
+// into the web/d 견적결과 화면. The RENDERER supplies the url (the rfq-list screen
+// on the first configured allowed host) — the cardintent never carries/controls
+// it — so a compromised SKILL emit has zero open-redirect surface. The host
 // allowlist is env-overridable (QA vs prod) via BRIDGE_TEAMS_DEEPLINK_HOSTS
-// (comma-separated); default is the QA host.
+// (comma-separated); default is the QA host. isAllowedDeeplink remains the
+// belt-and-suspenders validator the renderer-built url is checked against.
 // ---------------------------------------------------------------------------
 
 const DEFAULT_DEEPLINK_HOST = 'crm-qa.cosmax.com'
@@ -361,9 +362,19 @@ export function deeplinkHosts(env: EnvBag = processEnv()): readonly string[] {
 }
 
 // The canonical web/d 견적결과 deeplink (rfq-list screen). Built from the default
-// host; if the host allowlist is env-overridden, the SKILL is expected to emit a
-// payload.url on that host and it is validated by isAllowedDeeplink below.
+// host; when the host allowlist is env-overridden, the renderer builds the url on
+// the first configured host (see quoteResultDeeplink) — the cardintent never
+// supplies the url, so there is no open-redirect surface.
 export const DEFAULT_QUOTE_RESULT_DEEPLINK = `https://${DEFAULT_DEEPLINK_HOST}/d/?screen=rfq-list`
+
+// The renderer-supplied 견적결과 deeplink for the current env: the rfq-list screen
+// on the FIRST configured allowed host (default crm-qa.cosmax.com, overridable via
+// BRIDGE_TEAMS_DEEPLINK_HOSTS). This is the ONLY source of the [전체 견적결과 보기]
+// url — the cardintent's payload.url is never read — so a compromised SKILL emit
+// cannot point the button off-domain (zero open-redirect surface).
+export function quoteResultDeeplink(env: EnvBag = processEnv()): string {
+  return `https://${deeplinkHosts(env)[0]}/d/?screen=rfq-list`
+}
 
 // Validate a candidate deeplink url against the domain-pin rules: parseable,
 // exact https: protocol, host EXACTLY in the allowlist, no userinfo. Returns the
@@ -424,25 +435,28 @@ function factSet(rows: Row[]): AcElement {
 
 // The single actionId allowed to surface as a card action in Phase 1a: the
 // [전체 견적결과 보기] view deeplink. Every other actionId (createQuoteDoc,
-// reQuote, …) is Phase-2 territory and is dropped here — gating on the id (not
-// just on "has a pinned url") stops an arbitrary action from laundering itself
-// into an Action.OpenUrl by carrying an allowed-host url.
+// reQuote, …) is Phase-2 territory and is dropped here — gating on the id stops
+// an arbitrary action from laundering itself into the renderer-supplied
+// Action.OpenUrl deeplink.
 const QUOTE_RESULT_VIEW_ACTION_ID: ActionId = 'openQuoteResultDetail'
 
 // Phase-1a quoteResult action mapping: the ONLY action the card may emit is the
-// [전체 견적결과 보기] domain-pinned Action.OpenUrl deeplink. Action.Submit is
-// Phase-2 territory and is never emitted, and a non-view actionId is dropped
-// even if it carries a valid pinned url. The OpenUrl candidate is domain-pinned:
-// an off-domain / wrong-protocol / freeform url is dropped too (action not
-// emitted), never thrown. Returns the AC element or null (caller filters it out).
+// [전체 견적결과 보기] Action.OpenUrl deeplink, and the RENDERER supplies its url.
+// The cardintent's `a.payload?.url` is ignored entirely — crm-dev emits actionId
+// only — so a compromised SKILL emit cannot influence the destination (zero
+// open-redirect surface). The url is the rfq-list screen on the first configured
+// allowed host; it is re-validated through isAllowedDeeplink (belt-and-suspenders:
+// the constructed host is always allowed, so this never drops a legitimate emit).
+// Action.Submit is Phase-2 territory and is never emitted, and a non-view actionId
+// is dropped. Returns the AC element or null (caller filters it out).
 function toQuoteResultAction(a: Action): AcElement | null {
   if (a.actionId !== QUOTE_RESULT_VIEW_ACTION_ID) return null
-  const validHref = isAllowedDeeplink(a.payload?.url)
+  const validHref = isAllowedDeeplink(quoteResultDeeplink())
   if (validHref) {
     return { type: 'Action.OpenUrl', title: a.label, url: validHref }
   }
-  // The view action carries no valid pinned deeplink → drop (never a Submit, and
-  // an off-domain url is rejected rather than emitted as an open redirect).
+  // Unreachable in practice (the renderer-built host is always allowlisted), but
+  // fail-closed: never emit an action without a validated pinned url.
   return null
 }
 
@@ -607,10 +621,11 @@ export function buildAdaptiveCard(intent: CardIntent): AcElement {
     body,
   }
   // Top-level CardIntent.actions → root actions, Phase-1a contract: the ONLY
-  // action emitted is the domain-pinned [전체 견적결과 보기] Action.OpenUrl
-  // deeplink. Action.Submit is dropped (Phase 2), and an off-domain / wrong-proto
-  // deeplink is dropped too. If nothing survives the filter, no actions key is
-  // emitted (an empty actions array would render an empty action bar).
+  // action emitted is the [전체 견적결과 보기] Action.OpenUrl deeplink, whose url
+  // the RENDERER supplies (the cardintent never carries/controls it). Action.Submit
+  // is dropped (Phase 2) and a non-view actionId is dropped. If nothing survives
+  // the filter, no actions key is emitted (an empty actions array would render an
+  // empty action bar).
   if (intent.actions && intent.actions.length > 0) {
     const actions = intent.actions
       .map(toQuoteResultAction)
