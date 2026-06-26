@@ -783,6 +783,18 @@ file, so `a2a daemon status` reflects the real long-lived listener. A
 fail-closed bind error still surfaces synchronously as a non-zero exit
 from `start` (the bind happens before the detach).
 
+After detaching, the launcher re-`exec`s a **fresh interpreter** for the
+long-lived serving process (internal `--already-detached` +
+`--inherited-listen-fd N`), which **adopts the already-proven listener fd**
+rather than re-binding. This keeps the reconcile loop's periodic bind
+re-prove (`resolve_bind` → `getaddrinfo`) out of a fork-polluted image —
+macOS `Network.framework` / `getaddrinfo` is not fork-safe in a process
+that double-forked *without* an exec, which segfaulted the receiver on a
+NAT64 network (#2140). The bind proof itself is unchanged: the re-exec'd
+process still re-proves the in-set tailnet bind on every reconcile tick;
+only the interpreter provenance changed. A missing/invalid inherited fd
+fails closed (it never silently re-binds an unproven socket).
+
 ## Setup wizard (`agb a2a setup`)
 
 `agb a2a setup` is an **agent-driven, decision-gated, idempotent/resumable**
