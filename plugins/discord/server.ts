@@ -109,10 +109,15 @@ const THREAD_OWNER_CONFIG_DIR = firstNonEmptyEnv('CLAUDE_CONFIG_DIR')
 // Thread auto-session: threads under this parent channel get auto-registered on first message.
 // Set DISCORD_THREAD_AUTO_SESSION_CHANNEL_ID per-agent to the parent channel snowflake to enable.
 const THREAD_AUTO_SESSION_CHANNEL_ID = process.env.DISCORD_THREAD_AUTO_SESSION_CHANNEL_ID ?? ''
-// #14577: lifecycle awareness signals to the MAIN leg. Default 'created' = the
-// one-time thread_created signal only (delete/archive OFF). 'all' additionally
-// enables the threadDelete / threadUpdate(archived) close signals (opt-in).
-const THREAD_LIFECYCLE_NOTIFY = process.env.DISCORD_THREAD_LIFECYCLE_NOTIFY ?? 'created'
+// #14577 / #14641: lifecycle awareness signals to the MAIN leg. The core
+// thread_created signal ALWAYS fires for configured channels (independent of this
+// env). This env governs ONLY the thread ARCHIVE signal, which now defaults ON:
+// an archived thread is a "summarize & absorb" trigger for the main leg. Set
+// DISCORD_THREAD_LIFECYCLE_NOTIFY='created' to opt OUT of the archive signal (then
+// only the inline thread_created signal fires); ANY other value — including unset
+// (the default) — leaves archive ON. Thread DELETE is intentionally a no-op.
+const THREAD_LIFECYCLE_NOTIFY = process.env.DISCORD_THREAD_LIFECYCLE_NOTIFY ?? ''
+const THREAD_ARCHIVE_NOTIFY = THREAD_LIFECYCLE_NOTIFY !== 'created'
 // #14577: the thread-task producer shim. Defaults to the one bundled in this
 // plugin (resolved relative to the plugin dir, like the dispatcher above).
 const THREAD_TASK_CREATE =
@@ -591,14 +596,15 @@ function threadLedgerRoot(): string {
   return join(workdir, '.threads')
 }
 
-// #14577: best-effort one-time lifecycle awareness signal to the MAIN leg via
-// the thread-task producer shim. STATIC metadata only — NEVER the inbound
-// thread message text (no-body-leak). Wrapped by every caller in its own
-// try/catch (fail-closed: log to stderr, never throw out of the reply/listener
-// path). messageId is a STABLE synthetic id per lifecycle kind so re-delivery
-// dedupes (correlation ledger) while create vs close stay distinct rows.
+// #14577 / #14641: best-effort lifecycle awareness signal to the MAIN leg via the
+// thread-task producer shim. STATIC metadata only (plus a directive for the
+// archive case) — NEVER the inbound thread conversation text (no-body-leak).
+// Wrapped by every caller in its own try/catch (fail-closed: log to stderr, never
+// throw out of the reply/listener path). messageId is a STABLE synthetic id per
+// lifecycle kind so re-delivery dedupes (correlation ledger) while create vs
+// archive stay distinct rows.
 async function emitThreadLifecycleSignal(opts: {
-  kind: 'thread_created' | 'thread_closed'
+  kind: 'thread_created' | 'thread_archived'
   threadId: string
   parentId: string
   threadName: string
@@ -612,19 +618,34 @@ async function emitThreadLifecycleSignal(opts: {
 
   const name = safeArgText(opts.threadName)
   const user = safeArgText(opts.username)
-  // Body is STATIC awareness metadata only — explicitly NOT the thread message.
-  const title =
-    opts.kind === 'thread_created'
-      ? `[thread-created] ${name || opts.threadId}`
-      : `[thread-closed] ${name || opts.threadId}`
-  const body =
-    `Thread lifecycle awareness signal (one-time).\n` +
-    `event: ${opts.kind}\n` +
-    `thread_id: ${opts.threadId}\n` +
-    `parent_channel_id: ${opts.parentId}\n` +
-    `thread_name: ${name}\n` +
-    `opened_by: ${user}\n` +
-    `A thread-session leg is bound to this thread; its conversation body is NOT relayed here.`
+  // Body is STATIC metadata (+ a directive for the archive case) — explicitly
+  // NEVER the thread's conversation text (no-body-leak).
+  let title: string
+  let body: string
+  if (opts.kind === 'thread_created') {
+    title = `[thread-created] ${name || opts.threadId}`
+    body =
+      `Thread lifecycle awareness signal (one-time).\n` +
+      `event: ${opts.kind}\n` +
+      `thread_id: ${opts.threadId}\n` +
+      `parent_channel_id: ${opts.parentId}\n` +
+      `thread_name: ${name}\n` +
+      `opened_by: ${user}\n` +
+      `A thread-session leg is bound to this thread; its conversation body is NOT relayed here.`
+  } else {
+    // thread_archived: a "summarize & absorb" TRIGGER, not a bare notice. The
+    // main leg and the thread leg are the SAME agent, so main summarizes by
+    // reading its OWN thread corpus via thread_recall — the signal itself stays
+    // metadata-only (no thread conversation text is relayed here).
+    title = `[thread-archived] ${name || opts.threadId} — summarize & absorb`
+    body =
+      `Thread ${opts.threadId} ('${name}') under ${opts.parentId} was archived — ` +
+      `work in it is likely complete. ACTION: summarize what happened in this thread ` +
+      `and absorb it into the main session — use thread_recall to search your OWN ` +
+      `thread corpus for this thread_id, inject the outcome into your working context, ` +
+      `and update memory if warranted. This signal carries only metadata; the thread ` +
+      `content is available through your own recall tool (same-agent boundary, not relayed here).`
+  }
 
   // --root MUST precede the `create` subcommand (top-level parser arg), mirroring
   // migrate_one_legacy_egress in the dispatcher. This is the explicit root that
@@ -1206,39 +1227,19 @@ client.once('ready', c => {
   process.stderr.write(`discord channel: gateway connected as ${c.user.tag}\n`)
 })
 
-// #14577: OPT-IN thread close/archive lifecycle signals to the MAIN leg. Behind
-// DISCORD_THREAD_LIFECYCLE_NOTIFY: default 'created' = OFF here (only the inline
-// thread_created signal fires); 'all' enables these delete/archive close
-// signals. Gated EXACTLY like maybeHandleThreadSession (parentId ===
-// THREAD_AUTO_SESSION_CHANNEL_ID) inside emitThreadLifecycleSignal. Each
-// listener is fully self-contained try/catch — it must NEVER throw out of the
-// event handler. Stable synthetic message ids ('lifecycle-delete'/'-archive')
-// dedupe re-delivery while staying distinct from the create row.
-if (THREAD_LIFECYCLE_NOTIFY === 'all') {
-  // threadDelete: the thread may be partial/uncached — read id/parentId
-  // defensively, skip if parentId is unavailable, never throw.
-  client.on('threadDelete', thread => {
-    void (async () => {
-      try {
-        const threadId = thread?.id
-        const parentId = thread?.parentId ?? ''
-        if (!threadId || !parentId) return
-        // must-fix B: skip if the bot itself owns the thread (its own activity).
-        if (thread.ownerId && thread.ownerId === client.user?.id) return
-        await emitThreadLifecycleSignal({
-          kind: 'thread_closed',
-          threadId,
-          parentId,
-          threadName: thread.name ?? '',
-          username: '',
-          messageId: 'lifecycle-delete',
-        })
-      } catch (err) {
-        process.stderr.write(`discord thread-delete signal failed: ${err}\n`)
-      }
-    })()
-  })
-
+// #14577 / #14641: thread ARCHIVE awareness signal to the MAIN leg — DEFAULT ON.
+// An archived thread is a "summarize & absorb" trigger: the main leg summarizes
+// its OWN thread corpus via thread_recall (same-agent boundary), so the signal
+// stays metadata-only. Opt OUT with DISCORD_THREAD_LIFECYCLE_NOTIFY='created'.
+// Gated EXACTLY like maybeHandleThreadSession (parentId ===
+// THREAD_AUTO_SESSION_CHANNEL_ID) inside emitThreadLifecycleSignal. The listener
+// is fully self-contained try/catch — it must NEVER throw out of the event
+// handler. Stable synthetic message id 'lifecycle-archive' dedupes re-delivery
+// while staying a distinct row from the create signal.
+//
+// Thread DELETE is intentionally a NO-OP (#14641): deletion needs no main action,
+// so there is deliberately no threadDelete listener registered at all.
+if (THREAD_ARCHIVE_NOTIFY) {
   // threadUpdate: fire ONLY on the archived transition (!oldT.archived &&
   // newT.archived). archived is boolean|null; if oldThread.archived is not
   // strictly false (null/undefined = partial/uncached) treat as unknown and
@@ -1253,7 +1254,7 @@ if (THREAD_LIFECYCLE_NOTIFY === 'all') {
         // must-fix B: skip the bot's own thread (archive caused by bot activity).
         if (newThread.ownerId && newThread.ownerId === client.user?.id) return
         await emitThreadLifecycleSignal({
-          kind: 'thread_closed',
+          kind: 'thread_archived',
           threadId,
           parentId,
           threadName: newThread.name ?? '',
@@ -1261,7 +1262,7 @@ if (THREAD_LIFECYCLE_NOTIFY === 'all') {
           messageId: 'lifecycle-archive',
         })
       } catch (err) {
-        process.stderr.write(`discord thread-update signal failed: ${err}\n`)
+        process.stderr.write(`discord thread-archive signal failed: ${err}\n`)
       }
     })()
   })

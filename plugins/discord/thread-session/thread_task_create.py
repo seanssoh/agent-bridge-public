@@ -30,14 +30,16 @@ SCHEMA_VERSION = 1
 # default — if neither is set the producer shim fails closed rather than guess.
 DEFAULT_TRANSPORT = "discord"
 DEFAULT_KIND = "thread_task"
-# #14577: one-time thread-lifecycle awareness signals delivered to the MAIN leg.
-# These are STATIC awareness metadata only — never the inbound thread message
-# text (no-body-leak). The --kind arg stays free-form (no choices= enforcement)
-# so these flow through create_or_get → run_queue_create → post_fresh_arrival_marker
+# #14577 / #14641: thread-lifecycle awareness signals delivered to the MAIN leg.
+# thread_created is a one-time body-free awareness row; thread_archived is a
+# "summarize & absorb" trigger whose body directs main to recall its OWN thread
+# corpus (the thread conversation text is never carried in the signal — same-agent
+# boundary). The --kind arg stays free-form (no choices= enforcement) so these
+# flow through create_or_get → run_queue_create → post_fresh_arrival_marker
 # unchanged; this map only gives them a stable, human-legible default title.
 LIFECYCLE_KIND_TITLES = {
     "thread_created": "[thread-created]",
-    "thread_closed": "[thread-closed]",
+    "thread_archived": "[thread-archived]",
 }
 CRED_DIR_NAMES = {".discord", ".telegram", "launch-secrets"}
 CRED_FILE_NAMES = {"access.json"}
@@ -489,32 +491,32 @@ def command_selftest(_args: argparse.Namespace) -> int:
         assert created_second["deduped"] is True
         assert created_second["task_id"] == 401
 
-        # L1: thread_closed with its OWN stable synthetic message_id is a DISTINCT
-        # ledger row (create vs close stay separate), and re-running it dedupes.
-        closed_args = argparse.Namespace(
+        # L1: thread_archived with its OWN stable synthetic message_id is a DISTINCT
+        # ledger row (create vs archive stay separate), and re-running it dedupes.
+        archived_args = argparse.Namespace(
             **{
                 **vars(created_args),
                 "message_id": "lifecycle-archive",
-                "kind": "thread_closed",
+                "kind": "thread_archived",
                 "mock_task_id": 402,
             }
         )
-        closed_first = create_or_get(closed_args)
-        assert closed_first["task_id"] == 402
-        assert closed_first["deduped"] is False
-        assert task_title(closed_args) == "[thread-closed] thread-life"
-        closed_second = create_or_get(closed_args)
-        assert closed_second["deduped"] is True
-        assert closed_second["task_id"] == 402
+        archived_first = create_or_get(archived_args)
+        assert archived_first["task_id"] == 402
+        assert archived_first["deduped"] is False
+        assert task_title(archived_args) == "[thread-archived] thread-life"
+        archived_second = create_or_get(archived_args)
+        assert archived_second["deduped"] is True
+        assert archived_second["task_id"] == 402
 
         life_ledger = load_ledger(life_root)
-        # Two distinct rows: one for create, one for close (kind is part of the key).
+        # Two distinct rows: one for create, one for archive (kind is part of the key).
         assert len(life_ledger["events"]) == 2
         created_event_id = event_id_for(key_parts(created_args))
-        closed_event_id = event_id_for(key_parts(closed_args))
-        assert created_event_id != closed_event_id
+        archived_event_id = event_id_for(key_parts(archived_args))
+        assert created_event_id != archived_event_id
         assert life_ledger["events"][created_event_id]["task_id"] == 401
-        assert life_ledger["events"][closed_event_id]["task_id"] == 402
+        assert life_ledger["events"][archived_event_id]["task_id"] == 402
     print(json.dumps({"ok": True, "selftest": "passed"}, sort_keys=True))
     return 0
 

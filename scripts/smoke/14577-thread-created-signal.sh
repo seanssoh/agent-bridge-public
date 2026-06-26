@@ -28,12 +28,15 @@
 #   S2  first_dispatch!=true -> NO create.
 #   B1  no-body-leak: the inbound message string is ABSENT from the rendered task
 #       body (only static awareness metadata is relayed).
+#   A1  archive signal body carries the summarize/absorb directive (summarize +
+#       thread_recall) and is body-free (inbound message string ABSENT).
 #   I1  two identical thread_created creates dedupe to ONE task.
-#   L1  thread_closed lifecycle synthetic message_id is a DISTINCT ledger row and
-#       re-runs dedupe.
+#   L1  thread_archived lifecycle synthetic message_id is a DISTINCT ledger row
+#       (vs the create row) and re-runs dedupe.
 #   G1  gate: unset/mismatched parent channel -> no signal (server.ts gate).
-#   G2  DISCORD_THREAD_LIFECYCLE_NOTIFY=created -> delete/archive emit nothing;
-#       =all -> they emit (server.ts source gate).
+#   G2  archive default ON: unset DISCORD_THREAD_LIFECYCLE_NOTIFY -> archive
+#       listener fires; =created -> archive suppressed; NO threadDelete listener
+#       at all (delete = no-op) (server.ts source gate).
 #
 # Footgun: every python3 subprocess reads inputs via argv or file paths, never
 # stdin; the agb stub records to a file.
@@ -120,9 +123,17 @@ dispatch_real_json() {
 }
 
 # emit_signal: model server.ts's emit — shell the producer shim the SAME way,
-# with the explicit ledger --root (must-fix A) and STATIC body (no-body-leak).
+# with the explicit ledger --root (must-fix A) and a kind-appropriate STATIC body
+# (no-body-leak). thread_created -> static awareness metadata; thread_archived ->
+# the "summarize & absorb" directive that points main at its OWN thread_recall
+# corpus. Neither body ever carries the inbound thread conversation text.
 emit_signal() {
-  local kind="$1" message_id="$2"
+  local kind="$1" message_id="$2" body
+  if [[ "$kind" == "thread_archived" ]]; then
+    body="Thread $THREAD_ID ('qa thread') under $PARENT_CHANNEL was archived — work in it is likely complete. ACTION: summarize what happened in this thread and absorb it into the main session — use thread_recall to search your OWN thread corpus for this thread_id, inject the outcome into your working context, and update memory if warranted. This signal carries only metadata; the thread content is available through your own recall tool (same-agent boundary, not relayed here)."
+  else
+    body="Thread lifecycle awareness signal (one-time). event: $kind thread_id: $THREAD_ID — body NOT relayed."
+  fi
   BRIDGE_HOME="$BRIDGE_HOME_STUB" \
   BRIDGE_AGENT_ID="$PARENT_AGENT" \
   BRIDGE_THREAD_PARENT_AGENT="$PARENT_AGENT" \
@@ -136,7 +147,7 @@ emit_signal() {
       --source-user tester \
       --risk low \
       --title "" \
-      --body "Thread lifecycle awareness signal (one-time). event: $kind thread_id: $THREAD_ID — body NOT relayed." \
+      --body "$body" \
       --reply-channel-id "$THREAD_ID" \
       --reply-thread-id "$THREAD_ID" \
       --parent-channel-id "$PARENT_CHANNEL"
@@ -233,6 +244,22 @@ smoke_run "B1 no-body-leak: inbound message string is ABSENT from the rendered t
     "B1 the signal body carries static awareness metadata (event kind)"
 }
 
+smoke_run "A1 archive signal body carries the summarize/absorb directive (body-free)" : ; {
+  # #14641: the thread_archived signal is a "summarize & absorb" TRIGGER. Its body
+  # must DIRECT main to summarize and recall its OWN thread corpus (thread_recall)
+  # — and, like every lifecycle signal, must NEVER carry the inbound thread text.
+  rm -f "$SMOKE_TMP_ROOT/last-body.md"
+  emit_signal thread_archived "lifecycle-archive-a1" >/dev/null
+  [[ -f "$SMOKE_TMP_ROOT/last-body.md" ]] || smoke_fail "A1 no body-file content captured"
+  body="$(cat "$SMOKE_TMP_ROOT/last-body.md")"
+  smoke_assert_contains "$body" "summarize" \
+    "A1 the archive signal body must direct the main leg to summarize the thread"
+  smoke_assert_contains "$body" "thread_recall" \
+    "A1 the archive signal body must point main at its OWN thread_recall corpus"
+  smoke_assert_not_contains "$body" "$INBOUND_MSG" \
+    "A1 the inbound thread message body must NEVER appear in the archive signal body"
+}
+
 # =====================================================================
 # I1 / L1 — correlation-ledger idempotency + distinct lifecycle rows.
 # =====================================================================
@@ -249,18 +276,18 @@ assert a["event_id"] == b["event_id"], "same synthetic message_id -> same event 
 ' "$first" "$second" || smoke_fail "I1 idempotency failed"
 }
 
-smoke_run "L1 thread_closed synthetic message_id is a DISTINCT ledger row; re-run dedupes" : ; {
+smoke_run "L1 thread_archived synthetic message_id is a DISTINCT ledger row; re-run dedupes" : ; {
   created="$(emit_signal thread_created "lifecycle-create-l1-$THREAD_ID")"
-  closed_first="$(emit_signal thread_closed "lifecycle-archive")"
-  closed_again="$(emit_signal thread_closed "lifecycle-archive")"
+  archived_first="$(emit_signal thread_archived "lifecycle-archive")"
+  archived_again="$(emit_signal thread_archived "lifecycle-archive")"
   python3 -c '
 import json, sys
 c, k1, k2 = (json.loads(a) for a in sys.argv[1:4])
-assert c["event_id"] != k1["event_id"], "create vs close must be DISTINCT ledger rows"
-assert k1["deduped"] is False, "first close create should not be deduped"
-assert k2["deduped"] is True, "re-run of the close signal MUST dedupe"
-assert k1["event_id"] == k2["event_id"], "stable close message_id -> same row on re-run"
-' "$created" "$closed_first" "$closed_again" || smoke_fail "L1 distinct-row / dedupe failed"
+assert c["event_id"] != k1["event_id"], "create vs archive must be DISTINCT ledger rows"
+assert k1["deduped"] is False, "first archive create should not be deduped"
+assert k2["deduped"] is True, "re-run of the archive signal MUST dedupe"
+assert k1["event_id"] == k2["event_id"], "stable archive message_id -> same row on re-run"
+' "$created" "$archived_first" "$archived_again" || smoke_fail "L1 distinct-row / dedupe failed"
 }
 
 # =====================================================================
@@ -277,16 +304,28 @@ smoke_run "G1 gate: unset/mismatched parent channel -> no signal (server.ts gate
 }
 
 # =====================================================================
-# G2 — DISCORD_THREAD_LIFECYCLE_NOTIFY gate for delete/archive listeners.
+# G2 — archive default-ON env gate + delete is a no-op (no listener).
 # =====================================================================
 
-smoke_run "G2 lifecycle env gate: default 'created' = delete/archive OFF; 'all' = ON" : ; {
-  grep -q "THREAD_LIFECYCLE_NOTIFY = process.env.DISCORD_THREAD_LIFECYCLE_NOTIFY ?? 'created'" "$SERVER_TS" \
-    || smoke_fail "G2 DISCORD_THREAD_LIFECYCLE_NOTIFY must default to 'created'"
-  grep -q "if (THREAD_LIFECYCLE_NOTIFY === 'all') {" "$SERVER_TS" \
-    || smoke_fail "G2 delete/archive listeners must be behind THREAD_LIFECYCLE_NOTIFY === 'all'"
-  grep -q "client.on('threadDelete'" "$SERVER_TS" \
-    || smoke_fail "G2 threadDelete listener missing"
+smoke_run "G2 archive default ON; =created suppresses; NO threadDelete listener (delete=no-op)" : ; {
+  # Default-ON archive gate: unset env -> '' -> THREAD_ARCHIVE_NOTIFY true; only
+  # the literal 'created' opts OUT. Pin the new default-on gate expression.
+  grep -q "const THREAD_LIFECYCLE_NOTIFY = process.env.DISCORD_THREAD_LIFECYCLE_NOTIFY ?? ''" "$SERVER_TS" \
+    || smoke_fail "G2 DISCORD_THREAD_LIFECYCLE_NOTIFY must default to '' (unset) so archive stays ON"
+  grep -q "const THREAD_ARCHIVE_NOTIFY = THREAD_LIFECYCLE_NOTIFY !== 'created'" "$SERVER_TS" \
+    || smoke_fail "G2 archive must default ON: THREAD_ARCHIVE_NOTIFY = NOTIFY !== 'created' ('created' = opt-out)"
+  # The archive listener is behind the new default-on gate.
+  grep -q "if (THREAD_ARCHIVE_NOTIFY) {" "$SERVER_TS" \
+    || smoke_fail "G2 the threadUpdate-archived listener must be behind THREAD_ARCHIVE_NOTIFY"
+  # The old opt-in 'all' gate is GONE.
+  if grep -q "THREAD_LIFECYCLE_NOTIFY === 'all'" "$SERVER_TS"; then
+    smoke_fail "G2 the old THREAD_LIFECYCLE_NOTIFY === 'all' gate must be removed"
+  fi
+  # Delete is intentionally a no-op: there must be NO threadDelete listener at all.
+  if grep -q "client.on('threadDelete'" "$SERVER_TS"; then
+    smoke_fail "G2 threadDelete listener must be REMOVED (delete = no-op)"
+  fi
+  # Archive still rides threadUpdate, only on the archived transition.
   grep -q "client.on('threadUpdate'" "$SERVER_TS" \
     || smoke_fail "G2 threadUpdate listener missing"
   # threadUpdate fires ONLY on the archived transition; ambiguous prior state skips.
