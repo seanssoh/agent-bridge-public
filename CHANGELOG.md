@@ -4,6 +4,14 @@ All notable changes to Agent Bridge are documented here. This project adheres
 loosely to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and tracks
 version bumps via the `VERSION` file.
 
+## [0.16.17-rc1] — 2026-06-26 (LTS · security patch · release candidate)
+
+**Security point release on the v0.16.x LTS line.** Backports the **#2137 keychain-free auth-hijack root-fix** (PR #2138, originally merged to `main` / v0.17) onto the released `v0.16.16` LTS base. Cut as a **release candidate** for sean-mac soak + joint-test before promotion to an official `v0.16.17`. No other changes — this is a single-fix security patch.
+
+### Security
+
+- **auth: scope-guard the keychain-free backfill + fail-closed `keychain-free enable` (#2137 / #2138).** The keychain-free backfill base (`process_keychain_free_backfill`, `backfill-settings`) shipped on the LTS line (#1855 / #1520), but a broad-scope keychain-free write could silently move the **admin / attached-interactive agent** onto the managed `apiKeyHelper` (API-key billing → an "Invalid API key" break on a live admin), and `backfill-settings --help` mutated settings before printing usage. Now every broad-scope write (`sync` / `backfill-settings` / daemon backfill) consults `bridge_auth_apikeyhelper_allowed_for` and **excludes the admin** from the managed helper while still syncing its OAuth credential; the admin opts in only via an explicit `--agents <admin>`. `--help` no longer mutates, unknown flags fail closed, and a sanctioned `claude-token keychain-free enable|disable|status` verb does an atomic gate write with a fail-closed enable-time preflight + a settings-write audit row. New acceptance smoke `2137-keychain-free-scope-guard` (A1–A8, incl. broad-sync admin exclusion with the OAuth credential still synced); `1855-keychain-free-backfill` no-regression. Full Linux CI gate green on the backport.
+
 ## [0.16.16] — 2026-06-26 (LTS)
 
 **v0.16.16 — promotion of the v0.16.16 LTS line (rc1–rc4, soaked 2026-06-17 → 2026-06-25) to an official LTS release, and the LTS endpoint of the v0.16.x line.** Marquee is a **Teams reply silent-non-delivery fix (#2112)** — a production customer agent reported replies that the SDK accepted but never delivered while the reply tool reported success — bundled with the full rc1–rc4 reliability/hardening set below. This **supersedes `v0.16.15` as the `lts` / Latest head**; conservative / production installs tracking the `lts` channel advance here. With this LTS endpoint cut, **mainline development moves to `v0.17`**: the v0.17 feature line (bridge-official Discord plugin, Teams Adaptive Cards, and more) merges to `main`, so `main` now carries the latest features while the `lts` channel stays pinned to this line. Each bundled PR carried its own codex / Phase-4 review; the full Linux CI gate is green.
