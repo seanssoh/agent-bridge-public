@@ -151,6 +151,20 @@ if [[ -x "$repo_root/scripts/iso-helper-ratchet.sh" ]]; then
   fi
 fi
 
+# Plugin version-sync guard (internal incident #18177). Hard-fails when an
+# in-repo plugin's version drifts between its .claude-plugin/marketplace.json
+# entry and its own plugins/<name>/.claude-plugin/plugin.json — the drift that
+# makes a per-agent version-gated reseed skip changed plugin content (stale
+# content ships dark). Also emits advisory WARNs (package.json npm-namespace
+# drift; tracked content changed vs origin/main without a version bump). See
+# scripts/lint-plugin-version-sync.py for the policy + tradeoffs.
+if [[ -f "$repo_root/scripts/lint-plugin-version-sync.py" ]]; then
+  if ! python3 "$repo_root/scripts/lint-plugin-version-sync.py"; then
+    echo "[oss] plugin version-sync guard failed — see scripts/lint-plugin-version-sync.py"
+    exit 1
+  fi
+fi
+
 # Beta20 L2 Variant 3A — release-side ratchet for the daemon-refresh
 # sudoers template + helper module. The runtime preflight row
 # (daemon_group_refresh_sudoers=ok|missing|invalid|sudo-refresh-no-gid)

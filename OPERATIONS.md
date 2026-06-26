@@ -906,6 +906,54 @@ marketplace gets the auto-provisioning. Caveat: a wholesale marketplace version
 sync that overwrites the plugin's `plugin.json` will drop a `requires` added
 out-of-band — declare it in the plugin's source so syncs preserve it.
 
+## Plugin reseed — version gate + external-marketplace mirror (#18177)
+
+A bot only re-pulls a plugin's content when the plugin's **version bumps** (the
+per-agent version-gated cache). If a plugin's SKILL/content changes but its
+version does *not* bump, the reseed is skipped and the bot keeps serving stale
+content — a feature you "shipped" stays dark. The version that gates the reseed
+is the pair `.claude-plugin/marketplace.json` entry `version` ↔
+`plugins/<name>/.claude-plugin/plugin.json` `version`; they must always agree.
+
+For **in-repo** plugins this is enforced at CI time by
+`scripts/lint-plugin-version-sync.py` (wired into `scripts/oss-preflight.sh`):
+it hard-fails when those two versions drift and advisory-warns when tracked
+plugin content changed vs `origin/main` without a version bump. Run it locally
+with `python3 scripts/lint-plugin-version-sync.py`.
+
+For **external / private marketplaces** (e.g. a `cosmax-crm` clone or any
+`add-marketplace`'d private marketplace) the guard does not apply — the source
+of truth is outside this repo — so the version-bump discipline is manual, and
+the reseed has an extra mirror step that is easy to miss:
+
+1. **Bump the version in the external marketplace clone first.** Edit the
+   plugin's `plugin.json` `version` *and* the clone's
+   `.claude-plugin/marketplace.json` entry for that plugin, and bring the clone
+   up to date with its upstream (`git pull` / rsync from the source of truth).
+   No bump → the bot's version gate skips the reseed no matter how you seed.
+2. **`agb plugins seed` alone is NOT enough.** Bare `agb plugins seed` re-seeds
+   only the bundled in-repo `agent-bridge` marketplace cache — it does **not**
+   touch an external marketplace's entries, so the bot's install source for that
+   marketplace is left at the old version.
+3. **Re-mirror the external marketplace into the shared cache.** Re-run the
+   integrated verb so the updated clone is re-registered, re-seeded, and
+   canonical-moded into `$BRIDGE_SHARED_ROOT/plugins-cache/`:
+
+   ```bash
+   agb plugins add-marketplace /path/to/cosmax-crm-clone   # clone/register + seed + chmod
+   # or, to re-seed an already-registered external marketplace in place:
+   agb plugins seed --marketplace-root /path/to/cosmax-crm-clone
+   ```
+
+   This rsync-mirror of the clone into the shared plugins-cache is what refreshes
+   the bot's install source; without it the cache (and therefore the bot) keeps
+   the stale version even after you bumped the clone.
+4. **Restart the affected bots** so they re-resolve the now-bumped version and
+   pull the fresh content.
+
+Verify with `agb plugins list --json` (shows `name@marketplace` + `version` +
+install path) that the cached version matches what you bumped in the clone.
+
 ## Daemon supervision (#1563)
 
 (v0.16.0-rc1) The daemon is **crash-only and self-supervising**: when it detects
