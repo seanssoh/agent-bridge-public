@@ -17,6 +17,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone, tzinfo
@@ -770,6 +772,18 @@ def public_token_row(row: dict[str, Any], active_id: str) -> dict[str, Any]:
         "disabled_until": row.get("disabled_until") or "",
         "next_check_at": row.get("next_check_at") or "",
         "note": row.get("note") or "",
+        # #18849 Part 1b — per-token verified account identity (non-secret).
+        # ``account_email``/``account_subject`` are the LAST values a
+        # ``user:profile`` probe VERIFIED; ``account_email_probe_status`` carries
+        # the explicit stale/unknown semantics for the displayed-identity sync;
+        # ``account_email_probe_reason`` keeps the GRANULAR last-probe outcome
+        # (verified/no_scope/no_email/probe_failed) so the doctor surface can say
+        # WHY the displayed identity never converged.
+        "account_email": row.get("account_email") or "",
+        "account_email_verified_at": row.get("account_email_verified_at") or "",
+        "account_subject": row.get("account_subject") or "",
+        "account_email_probe_status": row.get("account_email_probe_status") or "",
+        "account_email_probe_reason": row.get("account_email_probe_reason") or "",
     }
 
 
@@ -2637,6 +2651,573 @@ def patch_global_claude_credentials(
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Identity sync (#18849 Part 1b) — sync the DISPLAYED Claude account to the
+# active token's VERIFIED account on a gated global token sync.
+#
+# Part 1a syncs the active TOKEN into ~/.claude/.credentials.json and only
+# DETECTS the identity shadow (oauthAccount.emailAddress in ~/.claude.json can
+# stay stale → /status / statusLine misreport the account). Part 1b closes that
+# by, after a gated credential PATCH, PATCHing ~/.claude.json's displayed email
+# to the account the active token actually belongs to.
+#
+# The email is NEVER trusted metadata — it is the result of a `user:profile`
+# probe against the active token (in-process urllib, token only in the
+# Authorization header, never logged / never env-exported). Edge cases are
+# fail-safe: a token without the scope, a probe that fails (network/429/timeout),
+# or a profile that carries no email all converge to NO WRITE — the last-verified
+# value is kept and marked stale/unknown, never replaced with a guess.
+#
+# The ~/.claude.json writer reuses the Part 1a r3 single-pinned-dir_fd discipline
+# verbatim (``claude_global_credentials_lock`` yields the validated parent fd;
+# the read + the write run dir_fd-relative on that SAME fd via
+# ``_write_text_at_dirfd`` — no second ``os.open(str(parent))``), so the
+# parent-swap-after-lock TOCTOU stays closed. It PATCHes only
+# ``oauthAccount.emailAddress`` (+ ``accountUuid`` when the subject is verified)
+# and preserves ``projects`` / ``mcpServers`` / every unknown key — ~/.claude.json
+# is large and load-bearing. Same double-gate default-OFF + the SAME
+# ``BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC`` opt-in; fails closed as root.
+CLAUDE_PROFILE_ENDPOINT = "https://api.anthropic.com/api/oauth/profile"
+CLAUDE_OAUTH_BETA = "oauth-2025-04-20"
+CLAUDE_PROFILE_PROBE_UA_VERSION = "2.1.0"
+CLAUDE_PROFILE_PROBE_TIMEOUT_SECONDS = 10
+# Bound re-probing when the gate is on but no identity has ever verified (e.g. a
+# down network): re-probe at most once per this window. A real credential
+# rotation always forces a fresh probe regardless.
+CLAUDE_IDENTITY_PROBE_COOLDOWN_SECONDS = 300
+# Test-only injection seam (mirrors bridge-usage-probe's HTTP seam): a JSON
+# fixture file that simulates the profile HTTP response so smokes never touch
+# the network. Shape: {"transport_error": true} → a simulated transport failure;
+# or {"http_status": <int>, "body": <obj|str>} → a fake response the classifier
+# then maps. Honored ONLY when the env var is set; production always probes live.
+CLAUDE_PROFILE_PROBE_FIXTURE_ENV = "BRIDGE_CLAUDE_PROFILE_PROBE_FIXTURE"
+# Test-only seam: force the keychain-exists guard's result without a real
+# `security(1)` call. Accepts a truthy/falsey string; absent → real detection.
+KEYCHAIN_PRESENT_FORCE_ENV = "BRIDGE_AUTH_FORCE_KEYCHAIN_PRESENT"
+
+
+def _identity_probe_timeout_seconds() -> int:
+    raw = os.environ.get("BRIDGE_CLAUDE_IDENTITY_PROBE_TIMEOUT_SECONDS", "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return CLAUDE_PROFILE_PROBE_TIMEOUT_SECONDS
+    return value if value > 0 else CLAUDE_PROFILE_PROBE_TIMEOUT_SECONDS
+
+
+def _identity_probe_cooldown_seconds() -> int:
+    raw = os.environ.get("BRIDGE_CLAUDE_IDENTITY_PROBE_COOLDOWN_SECONDS", "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return CLAUDE_IDENTITY_PROBE_COOLDOWN_SECONDS
+    return value if value >= 0 else CLAUDE_IDENTITY_PROBE_COOLDOWN_SECONDS
+
+
+def _load_profile_probe_fixture(path: str) -> tuple[int, str]:
+    """Resolve a test fixture into a ``(http_status, body_text)`` pair.
+
+    Raises ``urllib.error.URLError`` for a ``transport_error`` fixture so the
+    probe's transport-degrade path is exercised exactly as a real socket error
+    would. Never touches the network.
+    """
+    with open(path, encoding="utf-8") as fh:  # noqa: raw-pathlib-controller-only - controller-side test fixture read (never an isolated-agent path)
+        spec = json.loads(fh.read())
+    if not isinstance(spec, dict):
+        raise ValueError("profile probe fixture must be a JSON object")
+    if spec.get("transport_error"):
+        raise urllib.error.URLError("profile probe fixture transport error")
+    status = int(spec.get("http_status", 200))
+    body = spec.get("body", "")
+    body_text = body if isinstance(body, str) else json.dumps(body)
+    return status, body_text
+
+
+def _http_get_claude_profile(token: str, *, timeout: float) -> tuple[int, str]:
+    """Perform the `user:profile` GET and return ``(http_status, body_text)``.
+
+    INJECTION SEAM: when ``BRIDGE_CLAUDE_PROFILE_PROBE_FIXTURE`` is set the call
+    is served from a local fixture so no live request is ever made in CI. The
+    token lives ONLY in the in-process Authorization header — there is no
+    subprocess, so there is no env-leak surface, and it is never logged.
+    """
+    fixture = os.environ.get(CLAUDE_PROFILE_PROBE_FIXTURE_ENV, "").strip()
+    if fixture:
+        return _load_profile_probe_fixture(fixture)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "anthropic-beta": CLAUDE_OAUTH_BETA,
+        "User-Agent": f"claude-code/{CLAUDE_PROFILE_PROBE_UA_VERSION}",
+        "Accept": "application/json",
+    }
+    req = urllib.request.Request(CLAUDE_PROFILE_ENDPOINT, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            charset = resp.headers.get_content_charset() or "utf-8"
+            return int(getattr(resp, "status", 200) or 200), resp.read().decode(
+                charset, errors="replace"
+            )
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001 - error body is best-effort context only
+            body = ""
+        return int(exc.code), body
+
+
+def _extract_profile_identity(payload: Any) -> tuple[str, str]:
+    """Pull ``(email, subject)`` from a `user:profile` response, defensively.
+
+    Accepts the common Anthropic shapes (``account.email_address`` /
+    ``account.uuid``) plus camelCase / top-level variants so a minor response
+    rename does not silently degrade to "no email". Returns ``("", "")`` when no
+    email can be found — the caller treats that as ``no_email`` (no write).
+    """
+    if not isinstance(payload, dict):
+        return "", ""
+    account = payload.get("account")
+    account = account if isinstance(account, dict) else payload
+    email = ""
+    for key in ("email_address", "emailAddress", "email"):
+        value = account.get(key)
+        if isinstance(value, str) and value.strip():
+            email = value.strip()
+            break
+    subject = ""
+    for key in ("uuid", "account_uuid", "accountUuid", "id"):
+        value = account.get(key)
+        if isinstance(value, str) and value.strip():
+            subject = value.strip()
+            break
+    return email, subject
+
+
+def classify_profile_response(http_status: int, body_text: str) -> dict[str, Any]:
+    """Classify a profile probe response into a fail-safe identity outcome.
+
+    Status values:
+      - ``verified``     — HTTP 200 carrying a non-empty account email.
+      - ``no_email``     — HTTP 200 but the profile carries no email (unknown).
+      - ``no_scope``     — HTTP 403: the token authenticated but lacks
+                           ``user:profile`` access (unknown).
+      - ``probe_failed`` — any other status / unparseable body (keep last
+                           verified, mark stale; NEVER write a guess).
+    """
+    if http_status == 403:
+        return {"status": "no_scope", "email": "", "subject": "",
+                "detail": "http 403 — token lacks user:profile scope"}
+    if http_status != 200:
+        return {"status": "probe_failed", "email": "", "subject": "",
+                "detail": f"http {http_status}"}
+    try:
+        payload = json.loads(body_text)
+    except Exception:  # noqa: BLE001 - unparseable body → degrade, never guess
+        return {"status": "probe_failed", "email": "", "subject": "",
+                "detail": "unparseable profile body"}
+    email, subject = _extract_profile_identity(payload)
+    if not email:
+        return {"status": "no_email", "email": "", "subject": subject,
+                "detail": "profile carried no account email"}
+    return {"status": "verified", "email": email, "subject": subject,
+            "detail": "verified via user:profile"}
+
+
+def probe_claude_account_identity(token: str, *, timeout_seconds: int) -> dict[str, Any]:
+    """Verified-source account identity probe (#18849 Part 1b).
+
+    Returns ``{"status", "email", "subject", "detail"}``. The ONLY path that
+    yields ``status == "verified"`` with a non-empty email is a 200 response
+    carrying an account email; every transport error / timeout / non-200 /
+    no-email outcome degrades to a no-write result, so the displayed identity is
+    never set to a guessed value.
+    """
+    try:
+        http_status, body_text = _http_get_claude_profile(token, timeout=timeout_seconds)
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        return {"status": "probe_failed", "email": "", "subject": "",
+                "detail": f"transport: {type(exc).__name__}"}
+    return classify_profile_response(http_status, body_text)
+
+
+def operator_keychain_credentials_present() -> bool:
+    """Detect whether the operator's Claude auth lives in the macOS keychain.
+
+    When the operator logged in with the keychain credential store (not the
+    ``.credentials.json`` file), the keychain — not us — owns the displayed
+    identity, so Part 1b must NOT silently diverge ~/.claude.json from it. This
+    is the detection half of the keychain-exists guard (the caller warns + skips
+    the identity write when this is True).
+
+    Best-effort + fail-OPEN-to-absent: a `security(1)` error / non-Darwin host /
+    missing binary all report ``False`` (the gated, fd-pinned write then
+    proceeds — a missed detection is not a divergence, since the write only ever
+    lands a freshly VERIFIED email). The test seam forces the result without a
+    real keychain call.
+    """
+    forced = os.environ.get(KEYCHAIN_PRESENT_FORCE_ENV, "").strip().lower()
+    if forced in ("1", "true", "yes", "on"):
+        return True
+    if forced in ("0", "false", "no", "off"):
+        return False
+    if host_platform() != "Darwin":
+        return False
+    service = (
+        os.environ.get("BRIDGE_CLAUDE_KEYCHAIN_SERVICE", "").strip()
+        or "Claude Code-credentials"
+    )
+    try:
+        proc = subprocess.run(
+            ["security", "find-generic-password", "-s", service],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+    except Exception:  # noqa: BLE001 - detection is best-effort, never fatal
+        return False
+    return proc.returncode == 0
+
+
+def _probe_cooldown_elapsed(row: dict[str, Any]) -> bool:
+    last = iso_to_utc(str(row.get("account_email_last_probe_at") or ""))
+    if last is None:
+        return True
+    return (now_utc() - last).total_seconds() >= _identity_probe_cooldown_seconds()
+
+
+# Human-readable labels for the granular last-probe outcome, surfaced on the
+# read-only ``global-auth-status`` doctor line so an operator can see WHY the
+# displayed identity never converged (e.g. a pool token that lacks
+# ``user:profile`` 403s → ``no_scope`` → identity-sync is a permanent no-op).
+_IDENTITY_PROBE_REASON_LABELS = {
+    "verified": "verified (user:profile)",
+    "no_scope": "no_scope (token lacks user:profile)",
+    "no_email": "no_email (profile carried no account email)",
+    "probe_failed": "probe_failed (network/timeout/429 — last verified kept)",
+    "token_replaced": "token_replaced (active token changed mid-probe)",
+    "row_deleted": "row_deleted (active token removed mid-probe)",
+}
+
+
+def _identity_probe_reason_label(reason: str) -> str:
+    if not reason:
+        return "not_probed"
+    return _IDENTITY_PROBE_REASON_LABELS.get(reason, reason)
+
+
+def _identity_row_token_skip_reason(
+    row: dict[str, Any] | None, probed_fingerprint: str
+) -> str:
+    """Token-replace recheck shared by the registry persist and the config write.
+
+    The profile probe runs on ``active_token`` — snapshotted BEFORE the registry
+    lock was released in ``_global_auth_gate_state`` — so a concurrent
+    ``cmd_add --replace`` / rotation can swap the active row's token value (same
+    id) while the probe is in flight. Returns ``""`` if ``row``'s CURRENT token
+    still matches ``probed_fingerprint``, else the skip reason
+    (``"row_deleted"`` / ``"token_replaced"``). The caller MUST hold the
+    registry lock around this check so the verdict stays valid through the write
+    it guards. The fingerprint compare keeps the raw token off disk / the audit
+    log (mirrors ``cmd_check``'s PR #799 r3 recheck).
+    """
+    if row is None:
+        return "row_deleted"
+    current_token = str(row.get("token") or "")
+    current_fingerprint = token_fingerprint(current_token) if current_token else ""
+    if current_fingerprint != probed_fingerprint:
+        return "token_replaced"
+    return ""
+
+
+def _stamp_identity_probe_outcome(
+    row: dict[str, Any], *, status: str, reason: str, email: str = "", subject: str = ""
+) -> None:
+    """Stamp a probe outcome onto an already-locked, fingerprint-verified row.
+
+    On ``verified`` the email / subject / verified-at are updated. On ``stale`` /
+    ``unknown`` the last-verified ``account_email`` / ``account_subject`` are KEPT
+    untouched (never cleared, never guessed) and only the probe markers + the
+    last-probe stamp (which drives the re-probe cooldown) are refreshed.
+    ``reason`` records the GRANULAR outcome (``verified`` / ``no_scope`` /
+    ``no_email`` / ``probe_failed``) into ``account_email_probe_reason`` for the
+    doctor surface — the coarse ``status`` alone cannot say WHY the displayed
+    identity never converged.
+    """
+    row["account_email_probe_status"] = status
+    row["account_email_probe_reason"] = reason or status
+    row["account_email_last_probe_at"] = now_iso()
+    if status == "verified" and email:
+        row["account_email"] = email
+        row["account_email_verified_at"] = now_iso()
+        if subject:
+            row["account_subject"] = subject
+
+
+def record_token_account_identity(
+    registry_path: Path,
+    token_id: str,
+    *,
+    status: str,
+    probed_fingerprint: str,
+    email: str = "",
+    subject: str = "",
+    reason: str = "",
+) -> str:
+    """Persist a non-verified `user:profile` probe outcome onto the active row.
+
+    Used for the ``stale`` / ``unknown`` branches, which have NO downstream
+    ``~/.claude.json`` write, so the recheck-under-lock here fully guards them.
+    The ``verified`` branch does its own recheck + write under a SINGLE held
+    registry lock (see ``run_global_identity_sync``) so the displayed-identity
+    write cannot race a token replace either. Returns ``""`` on persist, or a
+    skip reason (``"row_deleted"`` / ``"token_replaced"``).
+    """
+    with registry_lock(registry_path):
+        registry = load_registry(registry_path)
+        row = find_token(registry, token_id)
+        skip_reason = _identity_row_token_skip_reason(row, probed_fingerprint)
+        if skip_reason:
+            return skip_reason
+        _stamp_identity_probe_outcome(
+            row, status=status, reason=reason, email=email, subject=subject
+        )
+        save_registry(registry_path, registry)
+    return ""
+
+
+def patch_global_claude_identity(
+    config_path: Path,
+    *,
+    email: str,
+    subject: str = "",
+    owner_uid: int | None = None,
+    allowed_root: Path | None = None,
+) -> dict[str, Any]:
+    """PATCH ~/.claude.json's displayed identity to a VERIFIED account email.
+
+    Reuses the Part 1a r3 single-pinned-dir_fd hardening verbatim:
+    ``claude_global_credentials_lock`` opens the parent ``O_DIRECTORY|O_NOFOLLOW``,
+    fd-identity-validates it against ``allowed_root``, and YIELDS that fd; the
+    existing file is read fd-relative (``O_RDONLY|O_NOFOLLOW``) and the new
+    payload is written via ``_write_text_at_dirfd`` on the SAME fd — there is NO
+    second ``os.open(str(parent))``, so a parent-swap after the lock cannot
+    redirect the read or the write.
+
+    PATCH-not-overwrite: replaces ONLY ``oauthAccount.emailAddress`` (+
+    ``accountUuid`` when a verified subject is supplied) and preserves
+    ``projects`` / ``mcpServers`` / every unknown key and the file's existing
+    mode. Fails closed as root; an unparseable existing file is refused (never
+    clobbered); an ABSENT ~/.claude.json is a skip (we never synthesize a
+    degenerate config that would lose onboarding/projects).
+
+    Returns ``{"changed", "created", "skipped", "reason"}``.
+    """
+    if not email:
+        raise ValueError("refusing to write an empty/unverified identity email")
+    if _global_credential_writer_is_root():
+        raise PermissionError(
+            "refusing to write the operator-global ~/.claude.json as root "
+            "(geteuid==0) — identity sync must run as the operator UID, not root"
+        )
+    config_path = Path(config_path).expanduser()
+    name = config_path.name
+    with claude_global_credentials_lock(config_path, allowed_root=allowed_root) as dir_fd:
+        try:
+            cfg_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+        except FileNotFoundError:
+            # ~/.claude.json is large + load-bearing; a degenerate file carrying
+            # only oauthAccount would lose onboarding/projects, so an absent
+            # config is a no-op skip (there is no stale identity to correct).
+            return {"changed": False, "created": False, "skipped": True,
+                    "reason": "config_absent"}
+        except OSError as exc:  # ELOOP on a symlinked final component → refuse
+            raise PermissionError(
+                f"refusing to read ~/.claude.json via a symlinked final "
+                f"component: {config_path}: {exc}"
+            ) from exc
+        existing_mode = stat.S_IMODE(os.fstat(cfg_fd).st_mode) or 0o600
+        with os.fdopen(cfg_fd, "rb") as fh:
+            preimage = fh.read()
+        try:
+            payload = json.loads(preimage.decode("utf-8"))
+        except Exception as exc:  # noqa: BLE001 - corrupt → refuse, never clobber
+            raise ValueError(
+                f"~/.claude.json is not valid JSON; refusing to overwrite a "
+                f"possibly mid-login file: {config_path}: {exc}"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise ValueError(f"~/.claude.json must contain a JSON object: {config_path}")
+
+        account = payload.get("oauthAccount")
+        account = dict(account) if isinstance(account, dict) else {}
+        already = account.get("emailAddress") == email and (
+            not subject or account.get("accountUuid") == subject
+        )
+        if already:
+            return {"changed": False, "created": False, "skipped": False,
+                    "reason": "already_current"}
+        account["emailAddress"] = email
+        if subject:
+            account["accountUuid"] = subject
+        payload["oauthAccount"] = account
+
+        text = json.dumps(payload, ensure_ascii=True, indent=2) + "\n"
+        # Write FD-RELATIVE via the lock's pinned dir_fd — NO second
+        # os.open(str(parent)). Preserve the operator's existing file mode rather
+        # than force a new one (we are PATCHing one field of a personal file).
+        _write_text_at_dirfd(
+            dir_fd,
+            name,
+            text,
+            mode=existing_mode,
+            prefix=".claude.json.",
+            owner_uid=owner_uid,
+        )
+        return {"changed": True, "created": False, "skipped": False,
+                "reason": "identity_synced"}
+
+
+def run_global_identity_sync(
+    registry_path: Path,
+    active_id: str,
+    active_token: str,
+    config_path: Path,
+    *,
+    credential_changed: bool,
+    allowed_root: Path | None,
+) -> dict[str, Any]:
+    """Sync the displayed identity to the active token's verified account.
+
+    Called from ``cmd_sync_global`` AFTER a gated credential PATCH. Best-effort:
+    every failure path returns a structured result and NEVER raises, so an
+    identity hiccup can never demote the token-sync convergence the daemon
+    reports. Probes only on a real rotation (``credential_changed``) or until a
+    first verification lands (cooldown-bounded) — steady state makes no network
+    call.
+
+    Result ``status`` ∈ ``{synced, converged, unverified, skipped, write_failed}``
+    with ``converged`` (displayed == verified) + ``verified_email`` /
+    ``displayed_email`` / ``probe_status`` for the doctor surface. ``skipped``
+    with reason ``token_replaced`` / ``row_deleted`` means a concurrent token
+    swap during the in-flight probe was detected and BOTH the registry record
+    and the ~/.claude.json write were skipped.
+
+    Inert-by-design: when the active token lacks the ``user:profile`` scope the
+    probe 403s → ``no_scope`` → no write ever lands (a permanent, fail-safe
+    no-op the operator can see via ``global-auth-status``); identity-sync lights
+    up automatically once a ``user:profile``-scoped token is active.
+    """
+    displayed_email = read_oauth_account_email(config_path)
+    # Keychain-exists guard: when auth is keychain-backed, the keychain owns the
+    # displayed identity — detect + warn + skip rather than diverge the JSON.
+    if operator_keychain_credentials_present():
+        print(
+            "warning: operator Claude auth is keychain-backed; skipping "
+            "~/.claude.json identity sync to avoid diverging the displayed "
+            "identity from the keychain login",
+            file=sys.stderr,
+        )
+        return {"status": "skipped", "reason": "keychain_present", "synced": False,
+                "converged": False, "displayed_email": displayed_email,
+                "verified_email": "", "probe_status": "keychain"}
+
+    registry = load_registry(registry_path)
+    row = find_token(registry, active_id) or {}
+    verified_email = str(row.get("account_email") or "")
+    have_verified = bool(verified_email)
+    should_probe = credential_changed or (not have_verified and _probe_cooldown_elapsed(row))
+    if not should_probe:
+        converged = bool(verified_email) and displayed_email == verified_email
+        return {"status": "converged" if converged else "unverified",
+                "reason": "steady_state", "synced": False, "converged": converged,
+                "displayed_email": displayed_email, "verified_email": verified_email,
+                "probe_status": str(row.get("account_email_probe_status") or "")}
+
+    # ``active_token`` was snapshotted under the registry lock in
+    # ``_global_auth_gate_state`` and the lock then released, so the probe below
+    # runs unlocked. Carry the probed token's fingerprint into the persist path
+    # so a concurrent token replace (same id, new value) during the in-flight
+    # probe cannot stamp this probe's email onto the replacement token — and, on
+    # a verified probe, so the displayed-identity write is skipped too.
+    probed_fingerprint = token_fingerprint(active_token)
+
+    probe = probe_claude_account_identity(
+        active_token, timeout_seconds=_identity_probe_timeout_seconds()
+    )
+    pstatus = str(probe.get("status") or "probe_failed")
+    if pstatus != "verified":
+        # No write, never a guess: probe_failed → stale (keep last verified);
+        # no_scope / no_email → unknown.
+        reg_status = "stale" if pstatus == "probe_failed" else "unknown"
+        skipped = record_token_account_identity(
+            registry_path, active_id, status=reg_status,
+            probed_fingerprint=probed_fingerprint, reason=pstatus,
+        )
+        if skipped:
+            # Row deleted / token replaced mid-probe — do not record onto the
+            # replacement token (there is no write to skip on this branch).
+            return {"status": "skipped", "reason": skipped, "synced": False,
+                    "converged": False, "displayed_email": displayed_email,
+                    "verified_email": verified_email, "probe_status": skipped}
+        return {"status": "unverified", "reason": pstatus, "synced": False,
+                "converged": False, "displayed_email": displayed_email,
+                "verified_email": verified_email, "probe_status": reg_status,
+                "detail": str(probe.get("detail") or "")}
+
+    email = str(probe.get("email") or "")
+    subject = str(probe.get("subject") or "")
+    # Persist the verified identity AND write ~/.claude.json while HOLDING the
+    # registry lock the entire time. A concurrent cmd_add --replace must take
+    # the same registry lock to swap the active token, so it cannot interleave
+    # between the fingerprint recheck and the displayed-identity write — this
+    # closes the post-persist/pre-patch window the per-call recheck alone leaves
+    # open. Lock order is always registry_lock -> claude_global_credentials_lock
+    # (the config writer takes the latter internally); no path takes them in
+    # reverse, and the config write is a fast LOCAL op (not a network call), so
+    # the nesting neither deadlocks nor holds the registry lock across slow I/O.
+    skip_reason = ""
+    write_result: dict[str, Any] | None = None
+    try:
+        with registry_lock(registry_path):
+            registry = load_registry(registry_path)
+            row = find_token(registry, active_id)
+            skip_reason = _identity_row_token_skip_reason(row, probed_fingerprint)
+            if not skip_reason:
+                _stamp_identity_probe_outcome(
+                    row, status="verified", reason="verified",
+                    email=email, subject=subject,
+                )
+                save_registry(registry_path, registry)
+                write_result = patch_global_claude_identity(
+                    config_path, email=email, subject=subject,
+                    allowed_root=allowed_root,
+                )
+    except Exception as exc:  # noqa: BLE001 - identity write is best-effort on top of token sync
+        print(f"warning: ~/.claude.json identity sync write failed: {exc}",
+              file=sys.stderr)
+        return {"status": "write_failed", "reason": str(exc), "synced": False,
+                "converged": False, "displayed_email": displayed_email,
+                "verified_email": email, "probe_status": "verified"}
+    if skip_reason:
+        # Row deleted or its token replaced while the verified probe was in
+        # flight: the verified email belongs to a token that is no longer the
+        # active row. Skipped BOTH the registry record AND the ~/.claude.json
+        # write — never persist a stale identity onto the replacement token.
+        return {"status": "skipped", "reason": skip_reason, "synced": False,
+                "converged": False, "displayed_email": displayed_email,
+                "verified_email": "", "probe_status": skip_reason}
+    if write_result.get("skipped"):
+        return {"status": "skipped", "reason": write_result.get("reason"),
+                "synced": False, "converged": False,
+                "displayed_email": displayed_email, "verified_email": email,
+                "probe_status": "verified"}
+    synced = bool(write_result.get("changed"))
+    return {"status": "synced" if synced else "converged",
+            "reason": write_result.get("reason"), "synced": synced, "converged": True,
+            "displayed_email": email, "verified_email": email,
+            "probe_status": "verified"}
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Credential-generation state (Q4 groundwork, #1469 enabler, #1470 P1).
 #
 # A later #1469 set-scoped re-wake must answer "which agents were running
@@ -3820,8 +4401,9 @@ def cmd_sync_global(args: argparse.Namespace) -> int:
     #18849 Part 1: the seamless dynamic-vanilla rotation step. Double-gated
     default-OFF (``auto_rotate_enabled`` AND ``BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC``);
     PATCHes (never overwrites) ``~/.claude/.credentials.json`` so a running
-    dynamic agent re-reads the new token at its next prompt boundary. Identity
-    (``oauthAccount`` email) is DETECTED + WARNED on, never synced (Part 2).
+    dynamic agent re-reads the new token at its next prompt boundary. Part 1b
+    then ALSO syncs the displayed ``oauthAccount`` identity in ~/.claude.json to
+    the active token's VERIFIED account (``run_global_identity_sync``).
     """
     json_mode = bool(args.json)
     registry_path = Path(args.registry).expanduser()
@@ -3892,31 +4474,19 @@ def cmd_sync_global(args: argparse.Namespace) -> int:
         # fleet picked up the new token.
         return fail(f"global auth sync write failed: {exc}", json_mode)
 
-    # Identity-shadow DETECTION (gate 7): the registry has no account-identity
-    # field, so we cannot SYNC oauthAccount in Part 1. Surface the displayed
-    # email and WARN that it is NOT updated by the token write, so a doctor /
-    # statusLine consumer (and the operator) can see an auth/identity mismatch
-    # rather than silently trusting a stale displayed account.
-    displayed_email = read_oauth_account_email(config_path)
-    identity_shadow = {
-        "displayed_email": displayed_email,
-        "synced": False,
-        "detection_only": True,
-    }
-    if result["changed"] and displayed_email:
-        identity_shadow["warning"] = (
-            "displayed oauthAccount identity is NOT updated by the token sync "
-            "(Part 1 syncs the token only); if the active token belongs to a "
-            "different account the displayed identity will be stale until the "
-            "operator re-logs in or the #18849 Part 2 identity-sync lands"
-        )
-        print(
-            f"warning: global auth token synced (fingerprint={result['fingerprint']}) "
-            f"but displayed identity '{displayed_email}' is unchanged — identity "
-            "is detection-only in Part 1; verify the displayed account matches "
-            "the active token's account.",
-            file=sys.stderr,
-        )
+    # Identity SYNC (#18849 Part 1b): the token write above only converges the
+    # active TOKEN; the DISPLAYED oauthAccount identity in ~/.claude.json can be
+    # stale. Sync it to the active token's VERIFIED account (probe-verified, never
+    # guessed). Best-effort — run_global_identity_sync never raises, so an
+    # identity hiccup cannot demote the token-sync convergence the daemon reports.
+    identity_shadow = run_global_identity_sync(
+        registry_path,
+        active_id,
+        active_token,
+        config_path,
+        credential_changed=bool(result["changed"]),
+        allowed_root=allowed_root,
+    )
 
     status = "synced" if result["changed"] else "converged"
     payload = {
@@ -3943,10 +4513,10 @@ def cmd_global_auth_status(args: argparse.Namespace) -> int:
 
     Reports the default-OFF double-gate state, whether the operator-global
     credential currently converges on the active registry token (by
-    fingerprint), and the identity-shadow DETECTION (displayed oauthAccount
-    email vs the synced token). Never writes — this is the gate-7 detection
-    surface for ``agent-bridge auth claude-token global-auth-status`` and any
-    doctor consumer.
+    fingerprint), and the Part 1b identity convergence (displayed oauthAccount
+    email vs the last VERIFIED account email). Never writes / never probes —
+    this is the read-only doctor surface for
+    ``agent-bridge auth claude-token global-auth-status``.
     """
     json_mode = bool(args.json)
     registry_path = Path(args.registry).expanduser()
@@ -3985,6 +4555,40 @@ def cmd_global_auth_status(args: argparse.Namespace) -> int:
     converged = bool(enabled and active_fp and global_fp and active_fp == global_fp)
     displayed_email = read_oauth_account_email(config_path)
 
+    # #18849 Part 1b: report the VERIFIED account identity from the active token
+    # row + whether the displayed identity has CONVERGED on it. Read-only — the
+    # status surface NEVER probes (a network call belongs to sync-global) and
+    # never writes; it reflects the last verification sync-global recorded.
+    identity_row: dict[str, Any] = {}
+    try:
+        identity_row = find_token(load_registry(registry_path), active_id) or {}
+    except Exception:  # noqa: BLE001 - status must surface even on a bad registry
+        identity_row = {}
+    verified_email = str(identity_row.get("account_email") or "")
+    identity_converged = bool(verified_email) and displayed_email == verified_email
+    probe_reason = str(identity_row.get("account_email_probe_reason") or "")
+    identity_shadow = {
+        "displayed_email": displayed_email,
+        "verified_email": verified_email,
+        "verified_at": str(identity_row.get("account_email_verified_at") or ""),
+        "probe_status": str(identity_row.get("account_email_probe_status") or ""),
+        # Granular last-probe outcome (verified/no_scope/no_email/probe_failed)
+        # so the operator can see WHY identity never converged — e.g. a pool
+        # token without user:profile reports ``no_scope`` and identity-sync is a
+        # permanent (fail-safe) no-op.
+        "probe_reason": probe_reason,
+        "synced": identity_converged,
+        "converged": identity_converged,
+    }
+    # Part 1a's detection WARNING is now flipped: warn ONLY when the identity is
+    # known to be OUT OF SYNC (displayed != verified), not whenever a displayed
+    # identity merely exists. A converged identity is the quiet success state.
+    if enabled and verified_email and displayed_email and not identity_converged:
+        identity_shadow["warning"] = (
+            "displayed oauthAccount identity does not match the verified account "
+            "— re-run sync-global to converge the displayed identity"
+        )
+
     payload = {
         "status": "ok",
         "enabled": enabled,
@@ -3994,29 +4598,22 @@ def cmd_global_auth_status(args: argparse.Namespace) -> int:
         "global_present": global_present,
         "global_fingerprint": global_fp,
         "converged": converged,
-        "identity_shadow": {
-            "displayed_email": displayed_email,
-            "synced": False,
-            "detection_only": True,
-        },
+        "identity_converged": identity_converged,
+        "identity_shadow": identity_shadow,
         "global_path": str(global_path),
     }
-    # gate 7 detection: an enabled, written-through global credential whose
-    # displayed identity exists but is never synced is a possible shadow.
-    if enabled and converged and displayed_email:
-        payload["identity_shadow"]["warning"] = (
-            "displayed oauthAccount identity is not synced by Part 1 — verify it "
-            "matches the active token's account"
-        )
     if json_mode:
         print(json.dumps(payload, ensure_ascii=True, indent=2))
     else:
         state = "enabled" if enabled else "disabled"
         conv = "converged" if converged else "not-converged"
+        ident = "identity-converged" if identity_converged else "identity-unsynced"
         print(
             f"global auth sync: {state} (auto_rotate={auto_rotate} "
-            f"opt_in={opt_in}); {conv}; displayed_identity="
-            f"{displayed_email or '<none>'}"
+            f"opt_in={opt_in}); {conv}; {ident}; identity probe: "
+            f"{_identity_probe_reason_label(probe_reason)}; displayed_identity="
+            f"{displayed_email or '<none>'}; verified_identity="
+            f"{verified_email or '<none>'}"
         )
     return 0
 
@@ -4985,7 +5582,20 @@ def build_parser() -> argparse.ArgumentParser:
     sync_global_parser.add_argument("--json", action="store_true")
     sync_global_parser.set_defaults(handler=cmd_sync_global)
 
-    global_status_parser = sub.add_parser("global-auth-status")
+    global_status_parser = sub.add_parser(
+        "global-auth-status",
+        help="report operator-global auth + displayed-identity convergence",
+        description=(
+            "Read-only doctor surface for the gated operator-global auth sync "
+            "(#18849). Default-OFF: needs BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC AND "
+            "auto_rotate. The Part 1b displayed-identity sync is INERT (a "
+            "permanent, fail-safe no-op) when the active token lacks the "
+            "user:profile scope — the profile probe 403s, the 'identity probe:' "
+            "line / identity_shadow.probe_reason surface 'no_scope', and "
+            "~/.claude.json is never written. It lights up automatically once a "
+            "user:profile-scoped token is the active token."
+        ),
+    )
     global_status_parser.add_argument("--global-credentials", default=None)
     global_status_parser.add_argument("--claude-config", default=None)
     global_status_parser.add_argument("--json", action="store_true")
