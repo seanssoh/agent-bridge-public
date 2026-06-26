@@ -153,7 +153,7 @@ TEAMS_OUTBOUND_ATTACHMENT_MAX_BYTES=52428800            # default: 50 MB; clampe
 
 ## Inbound delivery
 
-Delivered via direct MCP push to the live Claude session — no configuration required. A delivery failure surfaces as a non-2xx so Teams retries; the local message log is appended only after delivery succeeds, so retries cannot duplicate already delivered messages.
+Delivered via direct MCP push to the live Claude session — no configuration required. Delivery uses a bounded retry-with-backoff. If every attempt fails the plugin emits a structured `teams_mcp_notification_failed_permanent` audit line and queues a high-priority admin task, then acks Teams (2xx) so Bot Framework stops re-driving the same activity against a degraded MCP transport (the in-process dedup entry is preserved). The stored conversation reference (`conversations.json`) and the local message log (`messages.jsonl`) are both advanced only **after** a confirmed delivery, so a stalled or failed delivery never records the inbound as received and retries cannot duplicate an already-delivered message (issue #2105).
 
 ## Current Scope
 

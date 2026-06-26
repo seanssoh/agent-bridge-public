@@ -2269,8 +2269,11 @@ async function handleActivity(context: TurnContext): Promise<void> {
     return
   }
 
-  storeReference(activity)
-
+  // NOTE: the conversation reference (conversations.json) is advanced only
+  // AFTER a confirmed channel delivery — see the delivered branch below.
+  // Advancing it here on receipt let conversations.json record an inbound the
+  // Claude session never received when MCP delivery stalled/failed, leaving the
+  // agent silently deaf with health still green (issue #2105).
   const userName = String(activity.from?.name ?? activity.from?.id ?? 'teams-user')
   const userIds = idsFor(activity)
   const aad = userIds[0] ?? ''
@@ -2348,6 +2351,16 @@ async function handleActivity(context: TurnContext): Promise<void> {
     emitMcpDeliveryFailurePermanent(chatId, messageId, deliverResult.attempts, deliverResult.errors)
     return
   }
+
+  // Delivery confirmed — advance durable inbound state only now (issue #2105).
+  // The conversation reference must not move ahead of a confirmed Claude
+  // delivery: advancing it on receipt let a stalled/failed MCP push leave
+  // conversations.json pointing at an inbound that messages.jsonl and the
+  // session never received, a silent deaf-channel with no surfaced signal
+  // (health stayed green). storeReference runs before appendMessage so the
+  // reference is available to the reply path the moment Claude acts on the
+  // notification; appendMessage stays best-effort below.
+  storeReference(activity)
 
   try {
     appendMessage(stored)
