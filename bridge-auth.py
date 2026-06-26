@@ -359,10 +359,15 @@ def auth_write_audit(detail: dict[str, Any]) -> None:
     keychain-free gate). Records agent/writer/action plus the resolved pid+ppid —
     never a secret value. Best-effort: an unwritable log must never fail the auth
     op (the credential write is the source of truth, not the audit row)."""
-    log_path = auth_audit_log_path()
-    if log_path is None:
-        return
+    # The ENTIRE body is wrapped — including auth_audit_log_path()'s path
+    # resolution and now_iso() — and catches Exception (not just OSError), so no
+    # failure here (a malformed env path, an exotic now_iso() input, a serialize
+    # error) can escape AFTER the credential/settings/gate write has already
+    # succeeded. The audit row is strictly best-effort (codex r2 finding).
     try:
+        log_path = auth_audit_log_path()
+        if log_path is None:
+            return
         log_path.parent.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only - controller audit dir
         record = {
             "ts": now_iso(),
@@ -374,7 +379,7 @@ def auth_write_audit(detail: dict[str, Any]) -> None:
         }
         with log_path.open("a", encoding="utf-8") as fh:  # noqa: raw-pathlib-controller-only - controller audit append
             fh.write(json.dumps(record, ensure_ascii=True) + "\n")
-    except OSError:
+    except Exception:  # noqa: BLE001 - audit is best-effort; never fail the auth op
         return
 
 
