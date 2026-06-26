@@ -5050,6 +5050,13 @@ process_keychain_free_backfill() {
 
   summary_file="$(mktemp "${TMPDIR:-/tmp}/bridge-keychain-free-backfill.json.XXXXXX")"
 
+  # Issue #2137 (fix #3): the daemon backfill stays on the BROAD `--agents
+  # static` scope on purpose. bridge_auth_backfill_settings_agents now excludes
+  # the admin/interactive agent from a broad-scope WRITE, so this once-a-day
+  # hygiene pass can never silently flip the interactive admin onto the managed
+  # apiKeyHelper on a global gate enable (the live incident that left `patch`
+  # on `Invalid API key`). The admin is only ever backfilled by an explicit
+  # operator-run `--agents <admin>` — never by the daemon.
   bridge_with_timeout 120 keychain_free_backfill \
     "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token backfill-settings \
       --agents static --json \

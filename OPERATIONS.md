@@ -1803,7 +1803,20 @@ modes (see PR #799 r2-of-Path-A):
 Same-UID FS readability of the credential file is documented as a
 defense-in-depth residual in [`KNOWN_ISSUES.md` §25](./KNOWN_ISSUES.md#25-claude-oauth-credential--same-uid-fs-readability-residual-799-r2-of-path-a).
 On headless macOS hosts that must avoid Claude Code's native login-Keychain
-fallback, enable the default-off helper path in runtime config:
+fallback, enable the default-off helper path through the **sanctioned verb**
+(issue #2137 — do *not* hand-edit `runtime/bridge-config.json`; the raw edit
+sidesteps the audit + preflight, and the `set-env` path rejects the
+`KEYCHAIN`-bearing name via the secret-substring guard):
+
+```bash
+# Validates first, then flips the gate. Fails closed (no change) if it would
+# immediately break interactive Claude.
+agent-bridge auth claude-token keychain-free enable
+agent-bridge auth claude-token keychain-free status     # current gate + preflight
+agent-bridge auth claude-token keychain-free disable     # roll back the gate
+```
+
+The verb writes the underlying runtime-config state for you:
 
 ```json
 {
@@ -1812,13 +1825,31 @@ fallback, enable the default-off helper path in runtime config:
 }
 ```
 
-After changing the flag, run `agent-bridge auth claude-token sync --agents ...`
-so each selected agent's `settings.json` includes the managed `apiKeyHelper`
-path. The helper (`scripts/claude-oat-api-key-helper.sh`) reads the locked
-OAT registry and prints only the active token to stdout for Claude Code; no
-OAuth token is placed in `launch-secrets.env` or `CLAUDE_CODE_OAUTH_TOKEN`.
+**Enable-time preflight (fail closed).** `keychain-free enable` runs a preflight
+before flipping the gate — it verifies the host is macOS, the helper
+(`scripts/claude-oat-api-key-helper.sh`) is executable, and the active registry
+OAT is healthy (registered, enabled, structurally valid, not last-probed
+`auth_failed`). If any check fails the gate is **left unchanged and nothing is
+written**, so a broken/expired OAT can never move interactive Claude onto
+`apiKeyHelper` / API-key billing and produce `Invalid API key` (the #2137
+incident). No secret is printed by the preflight.
+
+After enabling, run `agent-bridge auth claude-token sync --agents ...` (or the
+explicit backfill below) so each selected agent's `settings.json` includes the
+managed `apiKeyHelper` path. The helper reads the locked OAT registry and prints
+only the active token to stdout for Claude Code; no OAuth token is placed in
+`launch-secrets.env` or `CLAUDE_CODE_OAUTH_TOKEN`.
 `CLAUDE_CODE_API_KEY_HELPER_TTL_MS` is exported as non-secret launch metadata
 and defaults to 60000 ms so active-id rotation is picked up promptly.
+
+**Backfill scope (admin is opt-in only).** `claude-token backfill-settings`
+create-if-absent-wires `apiKeyHelper` into pre-existing agents' `settings.json`.
+Under a **broad scope** (the default, or `--agents static|all|claude`, including
+the daily daemon hygiene pass) the admin / interactive agent is **excluded** — it
+is only backfilled when an explicit `--agents <admin>` names it. This prevents a
+global gate flip from silently moving the interactive admin onto API-key billing
+(#2137). `--check` stays fleet-wide read-only. The verb also rejects unknown
+flags and prints usage for `--help` *before* touching any agent.
 
 On Darwin, `bridge-run.sh` and `bridge-cron-runner.py` fail closed before
 launching `claude` when `claude_keychain_free_auth` is enabled but the helper,
