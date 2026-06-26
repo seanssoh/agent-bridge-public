@@ -145,11 +145,16 @@ RESET="2026-07-01T00:00:00+00:00"
 MONITOR_JSON="$(printf '{"rotation_candidates":[{"provider":"claude","account":"subscription","window":"weekly","used_percent":96,"reset_at":"%s","source":"native-oauth-probe","rotation_trigger":"preemptive","message":"m"}]}' "$RESET")"
 ROW="$(python3 "$REPO_ROOT/bridge-daemon-helpers.py" usage-rotation-candidates-parse "$MONITOR_JSON")"
 dec_reset=""; dec_trigger=""
+# #17927 P2 (codex r2): read the parsed row from a temp file rather than a
+# here-string, which lint-heredoc-ban flags as an H3 non-interpreter site.
+ROW_FILE="$(mktemp)"
+printf '%s\n' "$ROW" >"$ROW_FILE"
 while IFS=$'\t' read -r d_provider d_account d_window d_used d_reset d_source d_agent d_trigger d_body; do
   [[ "$d_reset" == "-" ]] && d_reset=""
   [[ "$d_trigger" == "-" ]] && d_trigger=""
   dec_reset="$d_reset"; dec_trigger="$d_trigger"
-done <<<"$ROW"
+done <"$ROW_FILE"
+rm -f "$ROW_FILE"
 [[ "$dec_reset" == "$RESET" && "$dec_trigger" == "preemptive" ]] \
   && ok "contract: decoded reset_at='$dec_reset' trigger='$dec_trigger' (limited-until + audit intact)" \
   || fail "contract: expected reset_at='$RESET'/preemptive, got reset='$dec_reset' trigger='$dec_trigger'"
