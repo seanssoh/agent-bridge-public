@@ -388,7 +388,10 @@ test_2137_and_1444_intact_under_kind_gate() {
 # B7 — classify_token_kind direct unit cases.
 # ===========================================================================
 test_classify_token_kind_units() {
-  python3 - "$AUTH_PY" "$API_TOKEN" "$OAT_TOKEN" "$UNKNOWN_TOKEN" <<'PY'
+  # NB: python3 -c with the script as an argument, NOT stdin via a heredoc — a
+  # heredoc piped to a subprocess is the footgun #11 anti-pattern the
+  # lint-heredoc-ban --baseline-check rejects (Bash 5.3.9 read_comsub deadlock).
+  python3 -c '
 import importlib.util
 import sys
 
@@ -409,10 +412,10 @@ for token, expected in cases:
     if got != expected:
         raise SystemExit(f"classify_token_kind({token[:12]!r}...) = {got!r}, expected {expected!r}")
 # A None / non-str is fail-closed unknown, never api_key.
-if classify(None) != "unknown":  # type: ignore[arg-type]
-    raise SystemExit("classify_token_kind(None) must be 'unknown' (fail-closed)")
+if classify(None) != "unknown":
+    raise SystemExit("classify_token_kind(None) must be unknown (fail-closed)")
 print("classify_token_kind units OK")
-PY
+' "$AUTH_PY" "$API_TOKEN" "$OAT_TOKEN" "$UNKNOWN_TOKEN"
   smoke_assert_eq "0" "$?" "B7 classify_token_kind unit cases pass"
 }
 
@@ -428,9 +431,10 @@ test_cron_runner_oat_native_fallback() {
   local cfg out rc
   cfg="$(cfg_dir_for "$USER_AGENT")"   # legacy settings.json, NO apiKeyHelper
   set +e
+  # NB: python3 -c (not heredoc-stdin) — see B7 / footgun #11.
   out="$(BRIDGE_HOST_PLATFORM_OVERRIDE=Darwin BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH=1 \
     BRIDGE_CLAUDE_TOKEN_REGISTRY="$REGISTRY" \
-    python3 - "$REPO_ROOT/bridge-cron-runner.py" "$cfg" <<'PY' 2>&1
+    python3 -c '
 import importlib.util, sys
 from pathlib import Path
 spec = importlib.util.spec_from_file_location("bridge_cron_runner", sys.argv[1])
@@ -440,7 +444,7 @@ spec.loader.exec_module(mod)
 # not the old helper-required preflight that raised before launch.
 mod.validate_claude_keychain_free_auth(Path(sys.argv[2]))
 print("cron keychain-free preflight: native fallback (no raise) for OAT")
-PY
+' "$REPO_ROOT/bridge-cron-runner.py" "$cfg" 2>&1
 )"
   rc=$?
   set -e
