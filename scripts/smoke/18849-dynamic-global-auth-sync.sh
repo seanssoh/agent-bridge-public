@@ -26,6 +26,9 @@
 #   T7  write failure (allowed-root mismatch) -> fail-closed, original preserved (gates 4,5)
 #   T8  read-only status surface              -> enabled, converged, identity DETECTED (gate 7)
 #   T9  bash wrapper plumbing                 -> bridge-auth.sh -> bridge-auth.py PATCH
+#   T11 existing file lacking claudeAiOauth   -> fail-closed, untouched (PATCH-only)
+#   T12 symlinked parent (#18887 finding 1)   -> fail-closed, NO .lock leak outside root
+#   T13 containment reject (#18887 finding 2) -> credential INODE unchanged (no rollback-rewrite)
 #   T10 ci-select routing                     -> bridge-auth.py + this smoke selected
 #
 # Footgun #11 (heredoc_write deadlock class): this driver and its helper avoid
@@ -84,6 +87,12 @@ run_py() {
 }
 
 cred_cksum() { cksum <"$OP_CRED" 2>/dev/null || printf 'ABSENT'; }
+# Portable inode of a path (BSD/macOS `stat -f %i`, GNU/Linux `stat -c %i`).
+# Inode (not checksum) is the discriminating signal for finding-2: a rollback
+# that re-writes the SAME bytes via the unhardened writer keeps the checksum
+# identical but CHANGES the inode (unlink+recreate). "untouched" must mean the
+# original inode survives, not just matching content.
+path_inode() { stat -f %i "$1" 2>/dev/null || stat -c %i "$1" 2>/dev/null || printf 'ABSENT'; }
 field() { python3 "$HELPER" json-field "$1"; }
 
 # ── T1 ────────────────────────────────────────────────────────────────
@@ -238,6 +247,66 @@ test_existing_no_claudeoauth_fail_closed() {
   smoke_assert_eq "$before" "$(cred_cksum)" "T11 unrecognized existing credential left untouched (PATCH-only)"
 }
 
+# ── T12 ───────────────────────────────────────────────────────────────
+# #18887 finding 1 (adversarial): a SYMLINKED parent must never let the lock
+# leak a .lock file outside the allowed root. The old code created the lock via
+# a string-path os.open() that FOLLOWED the symlinked ~/.claude BEFORE any
+# symlink/allowed-root validation, dropping a .credentials.json.lock at the
+# symlink target outside the operator home. The dirfd-pinned lock opens the
+# parent O_DIRECTORY|O_NOFOLLOW (ELOOP on a symlinked final component) so it
+# fails closed with ZERO filesystem writes — no .lock anywhere.
+test_symlinked_parent_no_lock_leak() {
+  local evil="$SMOKE_TMP_ROOT/evil-claude"
+  rm -rf "$evil" "$OP_HOME/.claude"
+  mkdir -p "$evil"
+  # ~/.claude is now a symlink pointing OUT of the allowed root ($OP_HOME).
+  ln -s "$evil" "$OP_HOME/.claude"
+  # Seed a credential + config through the symlink so a follow-the-link writer
+  # would have a plausible file to patch (and a place to drop the .lock).
+  python3 "$HELPER" seed-registry "$REGISTRY" "$ACTIVE_TOKEN" true
+  python3 "$HELPER" seed-cred "$OP_CRED"
+  python3 "$HELPER" seed-config "$OP_CFG" "$DISPLAY_EMAIL"
+  local leak="$evil/.credentials.json.lock"
+  rm -f "$leak"
+  local out rc
+  set +e
+  out="$(run_py 1 sync-global --global-credentials "$OP_CRED" --claude-config "$OP_CFG" --allowed-root "$OP_HOME" --json)"
+  rc=$?
+  set -e 2>/dev/null || true
+  [[ "$rc" -ne 0 ]] || smoke_fail "T12 sync-global returned rc=0 under a symlinked parent (must fail closed)"
+  smoke_assert_eq "error" "$(printf '%s' "$out" | field status)" "T12 status=error under symlinked parent"
+  [[ ! -e "$leak" ]] || smoke_fail "T12 LOCK LEAK: .lock created at the symlink target outside allowed root: $leak"
+  # Restore a real ~/.claude dir for any later case / reset_state.
+  rm -f "$OP_HOME/.claude"
+  mkdir -p "$OP_HOME/.claude"
+}
+
+# ── T13 ───────────────────────────────────────────────────────────────
+# #18887 finding 2 (adversarial): on a containment-failure the operator's
+# credential INODE must be unchanged — proving the file was never touched, not
+# rewritten-with-identical-bytes. T7's checksum-only assertion false-greened the
+# old rollback path (which re-wrote the preimage through the unhardened
+# string-path writer: same checksum, NEW inode). The atomic dirfd writer raises
+# before any rename, so the original inode survives byte-for-byte.
+test_containment_failure_inode_unchanged() {
+  reset_state
+  local before_ck before_ino out rc after_ck after_ino
+  before_ck="$(cred_cksum)"
+  before_ino="$(path_inode "$OP_CRED")"
+  [[ "$before_ino" != "ABSENT" ]] || smoke_fail "T13 precondition: seeded credential missing"
+  set +e
+  out="$(run_py 1 sync-global --global-credentials "$OP_CRED" --claude-config "$OP_CFG" --allowed-root "$SMOKE_TMP_ROOT/elsewhere" --json)"
+  rc=$?
+  set -e 2>/dev/null || true
+  [[ "$rc" -ne 0 ]] || smoke_fail "T13 sync-global returned rc=0 on containment reject (must fail closed)"
+  smoke_assert_eq "error" "$(printf '%s' "$out" | field status)" "T13 status=error on containment reject"
+  after_ck="$(cred_cksum)"
+  after_ino="$(path_inode "$OP_CRED")"
+  smoke_assert_eq "$before_ck" "$after_ck" "T13 credential bytes unchanged on containment reject"
+  smoke_assert_eq "$before_ino" "$after_ino" \
+    "T13 credential INODE unchanged on containment reject (no rollback-rewrite — finding 2)"
+}
+
 # ── T10 ───────────────────────────────────────────────────────────────
 test_ci_select_routing() {
   [[ -f "$CI_SELECT" ]] || smoke_fail "T10 missing ci-select-smoke.sh: $CI_SELECT"
@@ -260,6 +329,8 @@ smoke_run "T7 write failure -> fail-closed, original preserved"              tes
 smoke_run "T8 status surface -> enabled, converged, identity DETECTED"        test_status_surface_detects_identity
 smoke_run "T9 bash wrapper plumbing -> sync-global PATCH end-to-end"          test_bash_wrapper_plumbing
 smoke_run "T11 existing file lacking claudeAiOauth -> fail-closed, untouched" test_existing_no_claudeoauth_fail_closed
+smoke_run "T12 symlinked parent -> fail-closed, NO .lock leak outside root"   test_symlinked_parent_no_lock_leak
+smoke_run "T13 containment reject -> credential INODE unchanged (no rewrite)" test_containment_failure_inode_unchanged
 smoke_run "T10 ci-select routing -> bridge-auth.py + smoke selected"          test_ci_select_routing
 
 smoke_log "all checks passed"

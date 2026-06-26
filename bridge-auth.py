@@ -2424,7 +2424,11 @@ def write_private_file_atomic_dirfd(
 #     replaces ONLY ``claudeAiOauth.accessToken`` (+ ``expiresAt``), preserving
 #     ``refreshToken`` and every unknown field (a fresh login carries more than
 #     the synthetic minimal writer emits — clobbering it would break /login);
-#   * takes a per-write rollback preimage and restores it on any failure;
+#   * writes via the fd-pinned/no-follow atomic writer, which stages a temp
+#     under the validated parent dir and ``rename()``s into place — the final
+#     file's inode is never touched until the atomic swap, so a failed write
+#     leaves the existing credential byte-identical (no rollback-rewrite that
+#     could itself change the inode on a containment failure);
 #   * FAILS CLOSED when the effective writer is root (``geteuid()==0``) — the
 #     operator file must be written by the operator UID, never root;
 #   * holds a real ``~/.claude/.credentials.json.lock`` flock for the whole
@@ -2473,6 +2477,7 @@ def _global_credential_writer_is_root() -> bool:
 def claude_global_credentials_lock(
     credentials_path: Path,
     *,
+    allowed_root: Path | None = None,
     timeout_seconds: int = REGISTRY_LOCK_DEFAULT_TIMEOUT_SECONDS,
 ) -> Iterator[None]:
     """Exclusive flock around the operator-global credential read-patch-write.
@@ -2483,15 +2488,56 @@ def claude_global_credentials_lock(
     a concurrent login and a daemon-driven token sync cannot interleave into a
     torn write. Mirrors ``registry_lock``: a sibling ``<path>.lock`` file,
     non-blocking poll until ``timeout_seconds``, 0600 so it stays operator-only.
+
+    #18887 finding 1 (codex review): NO filesystem write — not even the lock
+    file — happens before the parent is opened ``O_DIRECTORY|O_NOFOLLOW`` (which
+    FAILS on a symlinked parent) and, when ``allowed_root`` is given, verified
+    inside the root BY THE FD's OWN IDENTITY (procfs / ``F_GETPATH``, never a
+    string re-resolution). The lock is then created ``dir_fd``-relative inside
+    that pinned, validated directory, so a symlinked / out-of-root parent can
+    never leak a ``.lock`` file outside the operator home. Mirrors
+    ``write_private_file_atomic_dirfd``. The parent is NOT created here: a
+    missing parent fails loud rather than racing a mkdir through a swappable path.
     """
     credentials_path = Path(credentials_path).expanduser()
-    lock_path = credentials_path.with_suffix(
-        credentials_path.suffix + REGISTRY_LOCK_SUFFIX
-    )
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    parent = credentials_path.parent
+    lock_name = credentials_path.name + REGISTRY_LOCK_SUFFIX
+    dir_fd = -1
+    fd = -1
     acquired = False
     try:
+        try:
+            dir_fd = os.open(
+                str(parent), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            )
+        except OSError as exc:
+            raise PermissionError(
+                f"refusing to lock operator-global credentials under a "
+                f"symlinked/missing parent {parent}: {exc}"
+            ) from exc
+        if allowed_root is not None:
+            real_parent = _dir_fd_real_path(dir_fd)
+            try:
+                allowed = str(allowed_root.resolve(strict=True))
+            except OSError as exc:
+                raise PermissionError(
+                    f"cannot resolve allowed root {allowed_root}: {exc}"
+                ) from exc
+            if real_parent != allowed and not real_parent.startswith(
+                allowed + os.sep
+            ):
+                raise PermissionError(
+                    f"operator-global credentials parent resolves outside "
+                    f"allowed root: {real_parent} not under {allowed}"
+                )
+        # Create the lock fd-relative in the pinned, validated directory
+        # (O_NOFOLLOW so a pre-placed lock-name symlink is refused too).
+        fd = os.open(
+            lock_name,
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=dir_fd,
+        )
         deadline = time.monotonic() + max(1, int(timeout_seconds))
         while True:
             try:
@@ -2506,7 +2552,7 @@ def claude_global_credentials_lock(
             if time.monotonic() >= deadline:
                 raise TimeoutError(
                     f"claude_global_credentials_lock timeout after "
-                    f"{timeout_seconds}s on {lock_path}"
+                    f"{timeout_seconds}s on {parent}/{lock_name}"
                 )
             time.sleep(0.1)
         yield
@@ -2516,10 +2562,16 @@ def claude_global_credentials_lock(
                 fcntl.flock(fd, fcntl.LOCK_UN)
             except OSError:
                 pass
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if dir_fd >= 0:
+            try:
+                os.close(dir_fd)
+            except OSError:
+                pass
 
 
 def resolve_operator_claude_config_path(credentials_path: Path) -> Path:
@@ -2569,14 +2621,19 @@ def patch_global_claude_credentials(
     Read the existing ``~/.claude/.credentials.json`` payload and replace ONLY
     ``claudeAiOauth.accessToken`` (and ``expiresAt`` when supplied), preserving
     ``refreshToken`` and every other field. Atomic, fd-pinned/no-follow write at
-    0600 via ``write_private_file_atomic_dirfd``. Fails closed as root, holds the
-    credential flock, takes a per-write preimage and rolls it back on any error.
+    0600 via ``write_private_file_atomic_dirfd``: the new payload is staged under
+    the dirfd-validated parent and ``rename()``d into place, so the existing
+    credential file's inode is never mutated until the atomic swap. A failed
+    write therefore leaves the prior credential byte-identical with no
+    rollback-rewrite — the unhardened restore path that could itself re-touch
+    the inode on a containment failure has been removed. Fails closed as root,
+    holds the credential flock for the whole read-patch-write.
 
     Returns a result dict with ``changed`` (False when the file already carried
     this exact access token — idempotent no-op), ``created`` (the file was
     absent and a fresh minimal payload was written), and ``fingerprint``.
-    Raises on root, symlinked target, unparseable existing payload, or write
-    failure (after rollback).
+    Raises on root, symlinked target/parent, unparseable existing payload, or
+    write failure (existing file left intact by the atomic writer).
     """
     if _global_credential_writer_is_root():
         raise PermissionError(
@@ -2586,9 +2643,13 @@ def patch_global_claude_credentials(
             "effective writer"
         )
     path = Path(path).expanduser()
-    with claude_global_credentials_lock(path):
-        # Symlink target / symlinked-parent are refused — never follow a swapped
-        # path out of the operator home (mirrors the controller-cred reader).
+    # #18887 finding 1: the lock now opens the parent O_DIRECTORY|O_NOFOLLOW +
+    # allowed-root-validates BEFORE creating the lock fd-relative, so a symlinked
+    # parent is refused at lock time and no .lock leaks out of the operator home.
+    with claude_global_credentials_lock(path, allowed_root=allowed_root):
+        # Symlink target (final component) is still refused before we read it —
+        # never read a swapped credential file. The symlinked-PARENT case is now
+        # closed at lock time by the O_NOFOLLOW parent open above.
         if path.is_symlink():
             raise PermissionError(
                 f"refusing to write symlinked operator-global credentials: {path}"
@@ -2653,27 +2714,24 @@ def patch_global_claude_credentials(
         payload["claudeAiOauth"] = oauth
 
         text = json.dumps(payload, ensure_ascii=True, indent=2) + "\n"
-        try:
-            write_private_file_atomic_dirfd(
-                path,
-                text,
-                mode=0o600,
-                prefix=".credentials.",
-                owner_uid=owner_uid,
-                allowed_root=allowed_root,
-            )
-        except Exception:
-            # Per-write rollback (gate 3/5): the atomic writer never half-writes
-            # the final path, but restore the preimage as belt-and-suspenders so
-            # a partial state can never strand the operator's login.
-            try:
-                if existed and preimage is not None:
-                    write_private_file_atomic(path, preimage.decode("utf-8"), mode=0o600, prefix=".credentials.")
-                elif not existed and path.exists():
-                    path.unlink()
-            except Exception:  # noqa: BLE001 - rollback best-effort; original error wins
-                pass
-            raise
+        # #18887 finding 2: NO rollback-rewrite. write_private_file_atomic_dirfd
+        # is atomic (dir_fd-relative tempfile + rename) and chowns the tempfile
+        # BEFORE the rename, so ANY pre-rename failure — including an allowed-root
+        # containment rejection or an O_NOFOLLOW refusal — leaves the original
+        # final path BYTE-FOR-BYTE untouched: there is no half-written state to
+        # roll back. The previous belt-and-suspenders rollback re-wrote the
+        # preimage via the OLDER string-path writer, which itself bypassed the
+        # no-follow / allowed-root / fd-pin hardening and CHANGED the credential
+        # inode on a rejected write (a no-write/fail-closed violation). Let the
+        # error propagate; the operator's login file is never touched on failure.
+        write_private_file_atomic_dirfd(
+            path,
+            text,
+            mode=0o600,
+            prefix=".credentials.",
+            owner_uid=owner_uid,
+            allowed_root=allowed_root,
+        )
         return {
             "changed": True,
             "created": not existed,
