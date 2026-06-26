@@ -898,6 +898,218 @@ export function buildDevReqAutofillCard(intent: DevReqAutofillIntent): AcElement
 }
 
 // ---------------------------------------------------------------------------
+// devStatus CardIntent (the 개발현황 card — #17992).
+//
+// A THIRD, independent card kind that reuses the same fence + §10 + seam
+// machinery as quoteResult/devReqAutofill but renders a near-clone of the
+// quoteResult LIST shape: one Container per dev-product (NOT devReqAutofill's
+// empty-rows grouping). Each Container carries the section.label (제품 · 상태)
+// as an Accent header, a status badge whose color is derived from the 상태 row
+// value, and a FactSet of the 8 dev-product fields rendered VERBATIM (a literal
+// '—' value is a real datum here — there is NO empty/session fallback). The
+// single card-level action openDevStatusDetail maps to a renderer-supplied,
+// domain-pinned Action.OpenUrl (devStatusDeeplink — the cardintent never carries
+// the url, so zero open-redirect surface). Action.Submit is NEVER emitted.
+//
+// LOCKED golden (the render must match it):
+// ~/.agent-bridge/shared/2026-06-26-devstatus-golden.json (4 dev-products, 8
+// value-rows each: 생성일/고객/프로젝트/제품/벌크/연구원/랩넘버/상태).
+// ---------------------------------------------------------------------------
+
+// Closed enum of devStatus action ids. An actionId outside this set is dropped
+// (the renderer never emits an action it cannot map to a domain-pinned deeplink).
+export const DEVSTATUS_ACTION_IDS = ['openDevStatusDetail'] as const
+export type DevStatusActionId = (typeof DEVSTATUS_ACTION_IDS)[number]
+
+export type DevStatusAction = {
+  actionId: DevStatusActionId
+  // payload carries entity-identifier fields only and is NEVER read for the url
+  // (the renderer supplies a domain-pinned deeplink) — so a forbidden cost key
+  // smuggled here is still caught by the §10 byte scan over the rendered card.
+  label: string
+  payload?: Record<string, unknown>
+}
+
+export type DevStatusIntent = {
+  kind: 'devStatus'
+  title: string
+  // One Section per dev-product: label = "<제품> · <상태>", rows = the 8 fields.
+  sections: Section[]
+  actions?: DevStatusAction[]
+  fallbackMarkdown: string
+}
+
+// The CRM web 개발현황 screen deeplink — openDevStatusDetail maps to this.
+// Domain-pinned exactly like the quoteResult/devReq deeplinks: the RENDERER
+// supplies the url on the first configured allowed host, the cardintent never
+// carries/controls it (zero open-redirect surface). The screen slug is
+// operator-overridable via BRIDGE_TEAMS_DEVSTATUS_SCREEN (default 'dev-status');
+// it is constrained to a conservative slug charset so it can never smuggle an
+// extra path/query segment past the domain-pin.
+const DEFAULT_DEVSTATUS_SCREEN = 'dev-status'
+
+export function devStatusDeeplink(env: EnvBag = processEnv()): string {
+  const raw = (env.BRIDGE_TEAMS_DEVSTATUS_SCREEN ?? '').trim()
+  const screen = /^[a-z0-9-]+$/i.test(raw) ? raw : DEFAULT_DEVSTATUS_SCREEN
+  return `https://${deeplinkHosts(env)[0]}/d/?screen=${screen}`
+}
+
+// The row label that carries the dev-product status (the 상태 field). Its value
+// drives the status-badge color (crm-dev's info/warning/success/danger mapping).
+const FIELD_STATUS_LABELS: readonly string[] = ['상태']
+
+// Map a 상태 value → an AC v1.2 TextBlock color for the status badge:
+//   진행 중 / 단가확정 → Accent (info)   보류 → Warning (warning)
+//   출시 완료          → Good (success)   드롭 → Attention (danger)
+//   anything else      → Default
+// (Trimmed compare; an unknown/empty status falls back to Default, never throws.)
+export function devStatusBadgeColor(status: string): string {
+  const s = typeof status === 'string' ? status.trim() : ''
+  switch (s) {
+    case '진행 중':
+    case '단가확정':
+      return 'Accent'
+    case '보류':
+      return 'Warning'
+    case '출시 완료':
+      return 'Good'
+    case '드롭':
+      return 'Attention'
+    default:
+      return 'Default'
+  }
+}
+
+function validateDevStatusAction(a: unknown, where: string): string | null {
+  if (!isPlainObject(a)) return `${where}: action must be an object`
+  // Fail-closed: actionId must be a STRING in the devStatus closed enum (a
+  // non-string like ["openDevStatusDetail"] would stringify past a String() check).
+  if (typeof a.actionId !== 'string' || !(DEVSTATUS_ACTION_IDS as readonly string[]).includes(a.actionId)) {
+    return `${where}: actionId "${String(a.actionId)}" not a string in the devStatus allowed enum`
+  }
+  if (typeof a.label !== 'string' || a.label.length === 0) {
+    return `${where}: action.label must be a non-empty string`
+  }
+  if (a.payload !== undefined && !isPlainObject(a.payload)) {
+    return `${where}: action.payload must be an object when present`
+  }
+  return null
+}
+
+export type DevStatusValidationResult =
+  | { ok: true; intent: DevStatusIntent }
+  | { ok: false; reason: string }
+
+// Strict validation for the devStatus shape. Rows are validated by the same
+// validateSection/validateRow as quoteResult (string-only values, enum-checked
+// valueState — so a masked/calculating row can never leak its raw value).
+// Top-level actions are validated against the devStatus action enum;
+// section-level actions are not used.
+export function validateDevStatus(value: unknown): DevStatusValidationResult {
+  if (!isPlainObject(value)) return { ok: false, reason: 'root is not an object' }
+  if (value.kind !== 'devStatus') {
+    return { ok: false, reason: `kind must be "devStatus" (got ${JSON.stringify(value.kind)})` }
+  }
+  if (typeof value.title !== 'string') return { ok: false, reason: 'title must be a string' }
+  if (typeof value.fallbackMarkdown !== 'string') {
+    return { ok: false, reason: 'fallbackMarkdown must be a string' }
+  }
+  if (!Array.isArray(value.sections)) return { ok: false, reason: 'sections must be an array' }
+  if (value.sections.length === 0) return { ok: false, reason: 'sections must be non-empty' }
+  for (let i = 0; i < value.sections.length; i++) {
+    const err = validateSection(value.sections[i], `sections[${i}]`)
+    if (err) return { ok: false, reason: err }
+  }
+  if (value.actions !== undefined) {
+    if (!Array.isArray(value.actions)) return { ok: false, reason: 'actions must be an array when present' }
+    for (let i = 0; i < value.actions.length; i++) {
+      const err = validateDevStatusAction(value.actions[i], `actions[${i}]`)
+      if (err) return { ok: false, reason: err }
+    }
+  }
+  return { ok: true, intent: value as unknown as DevStatusIntent }
+}
+
+// A devStatus FactSet: each row → {title,value}. A 'value'-state row is rendered
+// VERBATIM (a literal '—' is a real datum in this card — there is NO empty/session
+// fallback like devReqFactSet's). A non-'value' state (masked/calculating/
+// notRequested) NEVER falls through to the raw row.value — route it through
+// renderValueState (defense-in-depth: a masked row must not leak its data).
+function devStatusFactSet(rows: Row[]): AcElement {
+  return {
+    type: 'FactSet',
+    facts: rows.map(r => {
+      if (r.valueState === 'value') {
+        return { title: r.label, value: r.value }
+      }
+      return { title: r.label, value: renderValueState(r).text }
+    }),
+  }
+}
+
+// One dev-product Container: an Accent header (section.label = 제품 · 상태), a
+// status badge colored by the 상태 row value, then the 8-field FactSet. Mobile-
+// safe (no wide grid / Table / targetWidth). The wide desktop view lives behind
+// the [전체 개발현황 보기] deeplink (the renderer can't detect the Teams client).
+function renderDevStatusContainer(section: Section): AcElement {
+  const statusRow = findRow(section.rows, FIELD_STATUS_LABELS)
+  const statusText =
+    statusRow && statusRow.valueState === 'value' && typeof statusRow.value === 'string'
+      ? statusRow.value.trim()
+      : ''
+  const items: AcElement[] = [textBlock(section.label, { weight: 'Bolder', color: 'Accent' })]
+  if (statusText.length > 0) {
+    items.push(textBlock(statusText, { weight: 'Bolder', color: devStatusBadgeColor(statusText), spacing: 'None' }))
+  }
+  items.push(devStatusFactSet(section.rows))
+  return { type: 'Container', separator: true, spacing: 'Medium', items }
+}
+
+function renderDevStatusBody(intent: DevStatusIntent): AcElement[] {
+  const body: AcElement[] = [textBlock(intent.title, { weight: 'Bolder', size: 'Medium' })]
+  for (const section of intent.sections) {
+    body.push(renderDevStatusContainer(section))
+  }
+  return body
+}
+
+// The single actionId allowed to surface as a card action: the [전체 개발현황 보기]
+// view deeplink. Every other actionId is dropped — gating on the id stops an
+// arbitrary action from laundering itself into the renderer-supplied OpenUrl.
+const DEVSTATUS_VIEW_ACTION_ID: DevStatusActionId = 'openDevStatusDetail'
+
+// Map a validated devStatus action → a domain-pinned Action.OpenUrl. The RENDERER
+// supplies the url (devStatusDeeplink), IGNORING the action's payload entity-id/url
+// entirely → zero open-redirect surface (same posture as toQuoteResultAction).
+// Action.Submit is never produced; a non-view actionId → null (dropped).
+function toDevStatusAction(a: DevStatusAction): AcElement | null {
+  if (a.actionId !== DEVSTATUS_VIEW_ACTION_ID) return null
+  const href = isAllowedDeeplink(devStatusDeeplink())
+  if (!href) return null
+  return { type: 'Action.OpenUrl', title: a.label, url: href }
+}
+
+// Build the devStatus Adaptive Card. The only action emitted is the renderer-
+// supplied domain-pinned [전체 개발현황 보기] OpenUrl deeplink; Action.Submit is
+// NEVER emitted, and a non-view actionId is dropped. No actions key when nothing
+// survives the filter (an empty actions array renders an empty action bar).
+export function buildDevStatusCard(intent: DevStatusIntent): AcElement {
+  const card: AcElement = {
+    type: AC_TYPE,
+    $schema: 'http://adaptivecards.io/schemas/adaptive-card.json',
+    version: AC_VERSION,
+    body: renderDevStatusBody(intent),
+  }
+  if (intent.actions && intent.actions.length > 0) {
+    const actions = intent.actions.map(toDevStatusAction).filter((a): a is AcElement => a !== null)
+    if (actions.length > 0) {
+      card.actions = actions
+    }
+  }
+  return card
+}
+
+// ---------------------------------------------------------------------------
 // §10 forbidden-key golden over the rendered bytes
 // ---------------------------------------------------------------------------
 
@@ -989,8 +1201,9 @@ export function renderOutbound(
   }
 
   // Validate shape + render — branch on the card kind. quoteResult is the
-  // original path (untouched); devReqAutofill is the 개발의뢰 draft card. Both
-  // share the §10 byte-scan, size guard, and success-suppression tail below.
+  // original path (untouched); devReqAutofill is the 개발의뢰 draft card;
+  // devStatus is the 개발현황 card. All three share the §10 byte-scan, size
+  // guard, and success-suppression tail below.
   let card: AcElement
   const kind = isPlainObject(parsed) ? parsed.kind : undefined
   if (kind === 'devReqAutofill') {
@@ -1000,6 +1213,16 @@ export function renderOutbound(
     }
     try {
       card = buildDevReqAutofillCard(validation.intent)
+    } catch (err) {
+      return fail(`cardintent render failed: ${(err as Error).message}`)
+    }
+  } else if (kind === 'devStatus') {
+    const validation = validateDevStatus(parsed)
+    if (!validation.ok) {
+      return fail(`cardintent validation failed: ${validation.reason}`)
+    }
+    try {
+      card = buildDevStatusCard(validation.intent)
     } catch (err) {
       return fail(`cardintent render failed: ${(err as Error).message}`)
     }

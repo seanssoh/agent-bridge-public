@@ -14,9 +14,12 @@ import {
   ACTION_IDS,
   buildAdaptiveCard,
   buildDevReqAutofillCard,
+  buildDevStatusCard,
   DEFAULT_QUOTE_RESULT_DEEPLINK,
   deeplinkHosts,
   devReqDeeplink,
+  devStatusBadgeColor,
+  devStatusDeeplink,
   extractLastCardIntentFence,
   findForbiddenCostKey,
   FORBIDDEN_COST_KEYS_PLACEHOLDER,
@@ -30,8 +33,10 @@ import {
   stripFence,
   validateCardIntent,
   validateDevReqAutofill,
+  validateDevStatus,
   type CardIntent,
   type DevReqAutofillIntent,
+  type DevStatusIntent,
   type Row,
 } from './cardintent.ts'
 
@@ -1200,5 +1205,328 @@ describe('quoteResult path is unchanged by the devReqAutofill addition (regressi
     const card = out.attachments[0].content as Record<string, unknown>
     const actions = (card.actions as Array<Record<string, unknown>>) ?? []
     expect(actions.map(a => a.type)).toEqual(['Action.OpenUrl'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// devStatus (개발현황 card — #17992)
+//
+// A THIRD card kind, a near-clone of the quoteResult LIST shape: one Container
+// per dev-product (NOT devReqAutofill's empty-rows grouping), each with an Accent
+// header (제품 · 상태), a status badge colored by the 상태 row value, and a
+// FactSet of the 8 dev-product fields rendered VERBATIM (a literal '—' is a real
+// datum — no empty/session fallback). One card-level openDevStatusDetail action
+// → a renderer-supplied domain-pinned OpenUrl (payload.url ignored). Submit never.
+// ---------------------------------------------------------------------------
+
+// VENDORED copy of the LOCKED golden:
+// ~/.agent-bridge/shared/2026-06-26-devstatus-golden.json (4 dev-products). The
+// copy is embedded (NOT read from disk) so the suite stays hermetic in CI where
+// the shared/ runtime path does not exist. Kept byte-identical to the golden so
+// a drift between this fixture and the on-disk golden is caught by review.
+function goldenDevStatusIntent(): DevStatusIntent {
+  return {
+    kind: 'devStatus',
+    title: '🧪 개발현황 — 개발제품 4건',
+    sections: [
+      {
+        label: '케이프 요철크림 · 보류',
+        rows: [
+          { label: '생성일', value: '2026-06-20', valueState: 'value' },
+          { label: '고객', value: '케이프 주식회사', valueState: 'value' },
+          { label: '프로젝트', value: '케이프 요철크림', valueState: 'value' },
+          { label: '제품', value: '케이프 요철크림', valueState: 'value' },
+          { label: '벌크', value: '2건', valueState: 'value' },
+          { label: '연구원', value: '김연구', valueState: 'value' },
+          { label: '랩넘버', value: 'L-2026-0042', valueState: 'value' },
+          { label: '상태', value: '보류', valueState: 'value' },
+        ],
+      },
+      {
+        label: '수분 진정 토너 · 진행 중',
+        rows: [
+          { label: '생성일', value: '2026-06-22', valueState: 'value' },
+          { label: '고객', value: '뷰티랩(주)', valueState: 'value' },
+          { label: '프로젝트', value: '수분 진정 토너', valueState: 'value' },
+          { label: '제품', value: '수분 진정 토너', valueState: 'value' },
+          { label: '벌크', value: '1건', valueState: 'value' },
+          { label: '연구원', value: '박선임', valueState: 'value' },
+          { label: '랩넘버', value: 'L-2026-0051', valueState: 'value' },
+          { label: '상태', value: '진행 중', valueState: 'value' },
+        ],
+      },
+      {
+        label: '선쿠션 SPF50 · 출시 완료',
+        rows: [
+          { label: '생성일', value: '2026-06-18', valueState: 'value' },
+          { label: '고객', value: '코스메디(주)', valueState: 'value' },
+          { label: '프로젝트', value: '선쿠션 SPF50', valueState: 'value' },
+          { label: '제품', value: '선쿠션 SPF50', valueState: 'value' },
+          { label: '벌크', value: '3건', valueState: 'value' },
+          { label: '연구원', value: '—', valueState: 'value' },
+          { label: '랩넘버', value: 'L-2026-0033', valueState: 'value' },
+          { label: '상태', value: '출시 완료', valueState: 'value' },
+        ],
+      },
+      {
+        label: '립밤 틴트 · 드롭',
+        rows: [
+          { label: '생성일', value: '2026-06-25', valueState: 'value' },
+          { label: '고객', value: '아우라코스(주)', valueState: 'value' },
+          { label: '프로젝트', value: '립밤 틴트', valueState: 'value' },
+          { label: '제품', value: '립밤 틴트', valueState: 'value' },
+          { label: '벌크', value: '—', valueState: 'value' },
+          { label: '연구원', value: '이책임', valueState: 'value' },
+          { label: '랩넘버', value: '—', valueState: 'value' },
+          { label: '상태', value: '드롭', valueState: 'value' },
+        ],
+      },
+    ],
+    actions: [{ actionId: 'openDevStatusDetail', label: '전체 개발현황 보기' }],
+    fallbackMarkdown:
+      '| 생성일 | 고객 | 프로젝트 | 제품 | 벌크 | 연구원 | 랩넘버 | 상태 |\n|---|---|---|---|---|---|---|---|\n| 2026-06-20 | 케이프 주식회사 | 케이프 요철크림 | 케이프 요철크림 | 2건 | 김연구 | L-2026-0042 | 보류 |\n| 2026-06-22 | 뷰티랩(주) | 수분 진정 토너 | 수분 진정 토너 | 1건 | 박선임 | L-2026-0051 | 진행 중 |\n| 2026-06-18 | 코스메디(주) | 선쿠션 SPF50 | 선쿠션 SPF50 | 3건 | – | L-2026-0033 | 출시 완료 |\n| 2026-06-25 | 아우라코스(주) | 립밤 틴트 | 립밤 틴트 | – | 이책임 | – | 드롭 |',
+  }
+}
+
+function devStatusFence(intent: unknown): string {
+  return '개발현황 카드입니다.\n\n```cardintent\n' + JSON.stringify(intent) + '\n```'
+}
+
+describe('devStatus validation', () => {
+  test('accepts the golden intent', () => {
+    expect(validateDevStatus(goldenDevStatusIntent()).ok).toBe(true)
+  })
+  test('rejects the wrong kind', () => {
+    expect(validateDevStatus({ ...goldenDevStatusIntent(), kind: 'quoteResult' }).ok).toBe(false)
+  })
+  test('rejects a non-string row value (unformatted cost leak shape)', () => {
+    const bad = goldenDevStatusIntent()
+    ;(bad.sections[0].rows[4] as unknown as Record<string, unknown>).value = 2
+    expect(validateDevStatus(bad).ok).toBe(false)
+  })
+  test('rejects a non-enum valueState (fail-closed)', () => {
+    const bad = goldenDevStatusIntent()
+    ;(bad.sections[0].rows[0] as unknown as Record<string, unknown>).valueState = ['value']
+    expect(validateDevStatus(bad).ok).toBe(false)
+  })
+  test('rejects empty sections', () => {
+    expect(validateDevStatus({ ...goldenDevStatusIntent(), sections: [] }).ok).toBe(false)
+  })
+  test('rejects an unknown action id (fail-closed)', () => {
+    const bad = goldenDevStatusIntent()
+    ;(bad.actions![0] as unknown as Record<string, unknown>).actionId = 'deleteEverything'
+    expect(validateDevStatus(bad).ok).toBe(false)
+  })
+  test('rejects a non-string action id (array smuggle)', () => {
+    const bad = goldenDevStatusIntent()
+    ;(bad.actions![0] as unknown as Record<string, unknown>).actionId = ['openDevStatusDetail']
+    expect(validateDevStatus(bad).ok).toBe(false)
+  })
+})
+
+describe('devStatus status-badge color mapping', () => {
+  test('진행 중 / 단가확정 → Accent', () => {
+    expect(devStatusBadgeColor('진행 중')).toBe('Accent')
+    expect(devStatusBadgeColor('단가확정')).toBe('Accent')
+  })
+  test('보류 → Warning', () => {
+    expect(devStatusBadgeColor('보류')).toBe('Warning')
+  })
+  test('출시 완료 → Good', () => {
+    expect(devStatusBadgeColor('출시 완료')).toBe('Good')
+  })
+  test('드롭 → Attention', () => {
+    expect(devStatusBadgeColor('드롭')).toBe('Attention')
+  })
+  test('unknown / empty status → Default (never throws)', () => {
+    expect(devStatusBadgeColor('알수없는상태')).toBe('Default')
+    expect(devStatusBadgeColor('')).toBe('Default')
+    expect(devStatusBadgeColor('  보류  ')).toBe('Warning') // trimmed compare
+  })
+})
+
+describe('devStatus render shape (one Container per dev-product)', () => {
+  test('the golden renders 4 product Containers + a title TextBlock', () => {
+    const card = buildDevStatusCard(goldenDevStatusIntent()) as Record<string, unknown>
+    const body = card.body as Array<Record<string, unknown>>
+    expect((body[0].text as string)).toBe('🧪 개발현황 — 개발제품 4건')
+    const containers = body.filter(el => el.type === 'Container')
+    expect(containers.length).toBe(4)
+    const head = (c: Record<string, unknown>) => ((c.items as Array<Record<string, unknown>>)[0].text as string)
+    expect(head(containers[0])).toBe('케이프 요철크림 · 보류')
+    expect(head(containers[3])).toBe('립밤 틴트 · 드롭')
+    // each Container ends with the 8-field FactSet
+    for (const c of containers) {
+      const items = c.items as Array<Record<string, unknown>>
+      const factSet = items.find(el => el.type === 'FactSet') as Record<string, unknown>
+      expect(factSet).toBeDefined()
+      expect((factSet.facts as unknown[]).length).toBe(8)
+    }
+  })
+
+  test('the status badge is colored by the 상태 row value', () => {
+    const card = buildDevStatusCard(goldenDevStatusIntent()) as Record<string, unknown>
+    const body = card.body as Array<Record<string, unknown>>
+    const containers = body.filter(el => el.type === 'Container')
+    // For each product, the SECOND item (after the Accent header) is the status badge.
+    const badge = (c: Record<string, unknown>) => (c.items as Array<Record<string, unknown>>)[1]
+    expect(badge(containers[0])).toMatchObject({ type: 'TextBlock', text: '보류', color: 'Warning' })
+    expect(badge(containers[1])).toMatchObject({ type: 'TextBlock', text: '진행 중', color: 'Accent' })
+    expect(badge(containers[2])).toMatchObject({ type: 'TextBlock', text: '출시 완료', color: 'Good' })
+    expect(badge(containers[3])).toMatchObject({ type: 'TextBlock', text: '드롭', color: 'Attention' })
+  })
+
+  test("a literal '—' value renders VERBATIM (no empty/session fallback)", () => {
+    const card = buildDevStatusCard(goldenDevStatusIntent()) as Record<string, unknown>
+    const body = card.body as Array<Record<string, unknown>>
+    const containers = body.filter(el => el.type === 'Container')
+    // 선쿠션 (index 2): 연구원 = '—'; 립밤 (index 3): 벌크 = '—' 랩넘버 = '—'.
+    const factsOf = (c: Record<string, unknown>) => {
+      const items = c.items as Array<Record<string, unknown>>
+      const fs = items.find(el => el.type === 'FactSet') as Record<string, unknown>
+      return fs.facts as Array<{ title: string; value: string }>
+    }
+    const f2 = factsOf(containers[2])
+    expect(f2.find(f => f.title === '연구원')!.value).toBe('—')
+    const f3 = factsOf(containers[3])
+    expect(f3.find(f => f.title === '벌크')!.value).toBe('—')
+    expect(f3.find(f => f.title === '랩넘버')!.value).toBe('—')
+  })
+
+  test('AC v1.2 only — no Table / targetWidth / Action.Submit / ToggleVisibility', () => {
+    const card = buildDevStatusCard(goldenDevStatusIntent())
+    const types = collectTypes(card)
+    expect(types).not.toContain('Table')
+    expect(types).not.toContain('Action.Submit')
+    expect(types).not.toContain('Action.ToggleVisibility')
+    const bytes = JSON.stringify(card)
+    expect(bytes).not.toContain('targetWidth')
+    expect((card as Record<string, unknown>).version).toBe('1.2')
+  })
+
+  test('openDevStatusDetail → renderer-supplied domain-pinned OpenUrl (single action)', () => {
+    const card = buildDevStatusCard(goldenDevStatusIntent()) as Record<string, unknown>
+    const actions = card.actions as Array<Record<string, unknown>>
+    expect(actions.length).toBe(1)
+    expect(actions[0].type).toBe('Action.OpenUrl')
+    expect(actions[0].url).toBe(devStatusDeeplink())
+    expect(actions[0].title).toBe('전체 개발현황 보기')
+  })
+
+  test('the devStatus deeplink is the dev-status screen on the first allowed host', () => {
+    expect(devStatusDeeplink({})).toBe('https://crm-qa.cosmax.com/d/?screen=dev-status')
+    // env-overridable host
+    expect(devStatusDeeplink({ BRIDGE_TEAMS_DEEPLINK_HOSTS: 'crm.cosmax.com' })).toBe(
+      'https://crm.cosmax.com/d/?screen=dev-status',
+    )
+    // env-overridable slug (constrained charset; a junk slug falls back to default)
+    expect(devStatusDeeplink({ BRIDGE_TEAMS_DEVSTATUS_SCREEN: 'dev-status-v2' })).toBe(
+      'https://crm-qa.cosmax.com/d/?screen=dev-status-v2',
+    )
+    expect(devStatusDeeplink({ BRIDGE_TEAMS_DEVSTATUS_SCREEN: 'evil?x=1&y=2' })).toBe(
+      'https://crm-qa.cosmax.com/d/?screen=dev-status',
+    )
+  })
+
+  test('a cardintent-supplied payload.url is IGNORED — renderer pins the destination (no open redirect)', () => {
+    for (const smuggled of [
+      'https://evil.example.com/x',
+      'https://crm-qa.cosmax.com/d/?screen=admin-export',
+      'javascript:alert(1)',
+    ]) {
+      const intent = goldenDevStatusIntent()
+      intent.actions = [
+        { actionId: 'openDevStatusDetail', label: '전체 개발현황 보기', payload: { url: smuggled } },
+      ]
+      const card = buildDevStatusCard(intent) as Record<string, unknown>
+      const actions = card.actions as Array<Record<string, unknown>>
+      expect(actions.length).toBe(1)
+      expect(actions[0].url).toBe('https://crm-qa.cosmax.com/d/?screen=dev-status')
+      const cardStr = JSON.stringify(card)
+      expect(cardStr).not.toContain('evil.example')
+      expect(cardStr).not.toContain('admin-export')
+      expect(cardStr).not.toContain('javascript:')
+    }
+  })
+
+  test('a non-view actionId is DROPPED (no actions key)', () => {
+    const intent = goldenDevStatusIntent()
+    // smuggle a different (validation-rejected) id only via cast — buildDevStatusCard
+    // is the last line of defense even past validation.
+    ;(intent.actions![0] as unknown as Record<string, unknown>).actionId = 'createQuoteDoc'
+    const card = buildDevStatusCard(intent) as Record<string, unknown>
+    expect('actions' in card).toBe(false)
+    expect(JSON.stringify(card)).not.toContain('Action.OpenUrl')
+  })
+
+  test('no actions key when nothing maps', () => {
+    const intent = goldenDevStatusIntent()
+    intent.actions = []
+    const card = buildDevStatusCard(intent) as Record<string, unknown>
+    expect('actions' in card).toBe(false)
+  })
+})
+
+describe('devStatus via renderOutbound (seam + §10 + suppression)', () => {
+  test('golden round-trip: fence → 4 product Containers + deeplink + NO Submit + suppressed text', () => {
+    const out = renderOutbound(devStatusFence(goldenDevStatusIntent()))
+    expect(out.attachments.length).toBe(1)
+    expect(out.text).toBe('')
+    expect(out.warning).toBeUndefined()
+    const card = out.attachments[0].content as Record<string, unknown>
+    expect(card.type).toBe('AdaptiveCard')
+    const containers = (card.body as Array<Record<string, unknown>>).filter(el => el.type === 'Container')
+    expect(containers.length).toBe(4)
+    const actions = card.actions as Array<Record<string, unknown>>
+    expect(actions.map(a => a.type)).toEqual(['Action.OpenUrl'])
+    expect(JSON.stringify(card)).not.toContain('Action.Submit')
+    // all four status badges present + correctly colored (the 2nd item of each
+    // Container is the badge TextBlock)
+    const badge = (c: Record<string, unknown>) => (c.items as Array<Record<string, unknown>>)[1]
+    expect(badge(containers[0])).toMatchObject({ text: '보류', color: 'Warning' })
+    expect(badge(containers[1])).toMatchObject({ text: '진행 중', color: 'Accent' })
+    expect(badge(containers[2])).toMatchObject({ text: '출시 완료', color: 'Good' })
+    expect(badge(containers[3])).toMatchObject({ text: '드롭', color: 'Attention' })
+  })
+
+  // MUTATION-PROOF: a §10 forbidden cost key anywhere in the devStatus card bytes
+  // (here smuggled into a row value) must reject the WHOLE card → text-only. If
+  // the §10 byte-scan is reverted, this test fails.
+  test('§10 forbidden cost key in a devStatus row → text-only fallback', () => {
+    const bad = goldenDevStatusIntent()
+    bad.sections[0].rows.push({ label: '비고', value: '원가 12000', valueState: 'value' })
+    const out = renderOutbound(devStatusFence(bad))
+    expect(out.attachments.length).toBe(0)
+    expect(out.warning).toContain('§10')
+    expect(out.text).not.toContain('원가')
+  })
+
+  test('an invalid devStatus intent degrades to text-only, never throws', () => {
+    const bad = { ...goldenDevStatusIntent(), title: 123 }
+    expect(() => renderOutbound(devStatusFence(bad))).not.toThrow()
+    const out = renderOutbound(devStatusFence(bad))
+    expect(out.attachments.length).toBe(0)
+    expect(out.warning).toContain('validation failed')
+  })
+})
+
+describe('quoteResult + devReqAutofill paths are unchanged by the devStatus addition (regression)', () => {
+  test('a valid quoteResult intent still renders with only its OpenUrl deeplink', () => {
+    const out = renderOutbound(fence(validListIntent()))
+    expect(out.attachments.length).toBe(1)
+    const card = out.attachments[0].content as Record<string, unknown>
+    const actions = (card.actions as Array<Record<string, unknown>>) ?? []
+    expect(actions.map(a => a.type)).toEqual(['Action.OpenUrl'])
+    expect(actions[0].url).toBe(quoteResultDeeplink())
+  })
+
+  test('a valid devReqAutofill intent still renders its emphasis Containers + deeplinks', () => {
+    const out = renderOutbound(devReqFence(validDevReqIntent()))
+    expect(out.attachments.length).toBe(1)
+    const card = out.attachments[0].content as Record<string, unknown>
+    const body = card.body as Array<Record<string, unknown>>
+    expect(body.filter(el => el.type === 'Container' && el.style === 'emphasis').length).toBe(2)
+    const actions = (card.actions as Array<Record<string, unknown>>) ?? []
+    expect(actions.map(a => a.url)).toEqual([devReqDeeplink(), devReqDeeplink()])
   })
 })

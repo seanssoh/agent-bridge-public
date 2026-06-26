@@ -1,7 +1,7 @@
 {
   "name": "teams",
   "description": "Microsoft Teams channel for Claude Code. Receives Azure Bot Service activities over HTTP and exposes reply/fetch tools through MCP.",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "author": {
     "name": "Agent Bridge",
     "email": "maintainers@agent-bridge.local"
