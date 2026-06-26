@@ -10,12 +10,30 @@
   },
   "plugins": [
     {
+      "name": "discord",
+      "source": "./plugins/discord",
+      "description": "Discord channel for Claude Code with Agent Bridge access control, reply-reference surfacing, and per-agent thread-as-session support.",
+      "version": "0.1.0",
+      "category": "messaging",
+      "tags": [
+        "discord",
+        "messaging",
+        "channel",
+        "mcp"
+      ]
+    },
+    {
       "name": "teams",
       "source": "./plugins/teams",
       "description": "Microsoft Teams channel for Claude Code with Agent Bridge access control and setup integration.",
-      "version": "0.1.1",
+      "version": "0.1.8",
       "category": "messaging",
-      "tags": ["teams", "messaging", "channel", "mcp"]
+      "tags": [
+        "teams",
+        "messaging",
+        "channel",
+        "mcp"
+      ]
     },
     {
       "name": "ms365",
@@ -23,7 +41,15 @@
       "description": "Microsoft 365 / Graph API tools for Claude Code with Agent Bridge channel state and disclosure policy integration.",
       "version": "0.1.1",
       "category": "productivity",
-      "tags": ["microsoft", "m365", "graph", "mail", "calendar", "teams", "mcp"]
+      "tags": [
+        "microsoft",
+        "m365",
+        "graph",
+        "mail",
+        "calendar",
+        "teams",
+        "mcp"
+      ]
     },
     {
       "name": "mattermost",
@@ -31,7 +57,12 @@
       "description": "Mattermost channel for Claude Code with Agent Bridge access control via Outgoing Webhooks and Bot API.",
       "version": "0.1.0",
       "category": "messaging",
-      "tags": ["mattermost", "messaging", "channel", "mcp"]
+      "tags": [
+        "mattermost",
+        "messaging",
+        "channel",
+        "mcp"
+      ]
     }
   ]
 }

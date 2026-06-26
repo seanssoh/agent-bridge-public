@@ -4,6 +4,110 @@ All notable changes to Agent Bridge are documented here. This project adheres
 loosely to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and tracks
 version bumps via the `VERSION` file.
 
+## [0.17.0-beta5] — Unreleased (mainline · main→v0.17 transition)
+
+**`main` is now the v0.17 feature line.** As part of the operator's LTS transition, the official **`v0.16.16` LTS** was cut as the endpoint of the v0.16.x line (pinned on the `lts` channel), and the v0.17 integration line (`release/v0.17.0-rc1-integration`, beta1–beta4 — the bridge-official Discord plugin, Teams Adaptive Cards, and the v0.17 backports) merged into `main`. Mainline development continues here on `v0.17`, so `main` always carries the latest features while production installs stay pinned to the `lts` channel.
+
+- **teams: `marketplace.json` ↔ `plugin.json` version sync — bump `marketplace.json` teams to `0.1.8` (#18177).** The beta4 packaging slip (`marketplace.json` pinned teams `0.1.1` while `plugin.json` was `0.1.8`) made `agb plugins seed` a no-op; the two now agree at `0.1.8`. A version-sync guard follows.
+- beta5 will additionally bundle the in-flight telegram-poller channel-suppression invariant (#17957 / #2128) and the #17927 P2 statusLine usage feed once they land.
+
+## [0.17.0-beta4] — 2026-06-26 (mainline · beta · devStatus card renderer + claude-token clock-recovery + resolver crash-loop backports)
+
+**v0.17.0-beta4 — the Teams devStatus 개발현황 Adaptive Card renderer, plus the v0.17 backports of the claude-token clock-based recovery (#17927 P0) and the resolver crash-loop fix (#2106), on top of beta3.** Three PRs, each with a codex `implement-ok` on green Linux CI.
+
+### Channels
+
+- **teams: devStatus Adaptive Card renderer — the 개발현황 card (#17992, #2129).** A third `cardintent` kind alongside `quoteResult` + `devReqAutofill`: one Container per dev-product (a `제품 · 상태` Accent header + a status badge colored from the 상태 row value — 진행 중→Accent / 보류→Warning / 출시 완료→Good / 드롭→Attention — + an 8-field FactSet rendered verbatim, literal `—` preserved). The card-level `openDevStatusDetail` action is a renderer-supplied domain-pinned `Action.OpenUrl` (`/d/?screen=dev-status`; the cardintent's `payload.url` is ignored → zero open-redirect); `Action.Submit` is never emitted. §10 is inherited unchanged and the quoteResult + devReqAutofill paths are byte-for-byte unchanged. teams plugin **0.1.7 → 0.1.8**. The card is **dormant** until the bot is reseeded to 0.1.8 (a pre-0.1.8 bot falls back to the `fallbackMarkdown` table — no regression).
+
+### Reliability / credential (v0.17 backports)
+
+- **claude-token: parse the named-tz weekly reset + clock-based recovery (#17927 P0, #2125 → #2127).** v0.17 backport of the operator-mandated fix: `parse_reset_at` now parses the real weekly-429 string `resets Jul 1 at 12pm (Asia/Seoul)` (`at` separator + abbreviated month + named timezone via `zoneinfo`, graceful fallback) and stamps `limited_until`; recovery becomes clock-authoritative (a quota-limited token re-enables once its reset stamp passes, without requiring the unreliable `claude -p` probe; a still-future-capped token stays disabled). Fixes the headless-server weekly-quota tokens that never auto-recovered.
+- **resolver: align resume config-dir with launch for shared agents (#2106, #2122 → #2124).** v0.17 backport of the CRITICAL fleet-host-down fix: a shared admin agent no longer infinite-crash-loops on `claude --resume` (the resume resolver now returns the same per-agent `CLAUDE_CONFIG_DIR` that launch pins, scoped to non-iso shared+agent_home agents; iso agents return earlier and are unaffected) + an honest quarantine log.
+
+## [0.17.0-beta3] — 2026-06-25 (mainline · beta · Teams reply delivery-proof + devReqAutofill renderer + rooms migration)
+
+**v0.17.0-beta3 — a Teams reply reliability fix (a production silent non-delivery), the 개발의뢰 draft Adaptive Card renderer, and the #2079 rooms admin migration robustness, on top of beta2.4.** Three PRs, each with a codex Phase-4 `implement-ok` on green Linux CI.
+
+### Channels
+
+- **teams: the `reply` tool now surfaces the send outcome + emits an audit row (#2112, #2119).** The reply text-only path returned `sent: <chatId>` as soon as `sendActivity` awaited, discarding the Bot Framework `ResourceResponse.id` — so a reply the SDK accepted but never delivered read as success (a production customer agent saw 14 silent non-deliveries). A new pure, unit-tested `outbound-result.ts` classifier turns the send outcome into a three-way result: **confirmed** (non-empty id) → `sent: … message_id=…` (backward-compatible), **unconfirmed** (awaited OK, empty id) → `ok:false` + `teams_reply_unconfirmed:` (never a bare `sent:`), **failed** (threw) → `teams_reply_failed:`. A single-line `teams_outbound_reply` audit row (with newline+length sanitization on every interpolated field) makes outbound delivery observable. teams plugin **0.1.6 → 0.1.7**.
+- **teams: devReqAutofill Adaptive Card renderer — the 개발의뢰 draft card (#17471, #2116).** A second `cardintent` kind alongside `quoteResult`: a per-project grouped draft (an empty-rows section opens a per-project `emphasis` Container, content sections nest, a trailing `⚠ 보완` section becomes a warning Container) with renderer-supplied domain-pinned `Action.OpenUrl` deeplinks for `confirmDevReq` / `editDevReq` (the action payload's entity-id is never placed in the url → zero open-redirect surface). `Action.Submit` is never emitted (Phase-2 trusted-handler gate). §10 is inherited unchanged and the quoteResult path is byte-for-byte unchanged. **Dormant** until crm-dev's `preview_card` emit lands. teams plugin **0.1.5 → 0.1.6**.
+
+### A2A / rooms
+
+- **rooms: robust `room_members.admin` migration + local-admin backfill + leader rebroadcast (#2079, #2113 → #2114).** Backport to the v0.17 line of the rooms admin-migration hardening: `_migrate_schema` PRAGMA-prechecks each column and swallows only the duplicate-column race (a lock / readonly / disk error now re-raises instead of silently leaving the column missing); the reconcile roster-epoch step backfills this node's admin bits from the local configured admin id (local-node rows only, empty config leaves `-1`, never infers a remote admin) and, as the leader, atomically bumps the epoch + enqueues a durable roster rebroadcast.
+
+## [0.17.0-beta2.4] — 2026-06-25 (mainline · beta · Teams quoteResult live-feedback fixes)
+
+**v0.17.0-beta2.4 — two operator live-feedback fixes to the (now lit) Teams `quoteResult` card, on top of beta2.3.** Renderer-only; codex Phase-4 `implement-ok` (findings 0) on green CI.
+
+### Channels
+
+- **teams: add the RFQ FactSet row + suppress the duplicate prose on card success (#2111).** The per-RFQ stack gains an `RFQ` FactSet row (matched from the server's existing `RFQ` row; missing → em dash). On **successful** card render the visible message text is now suppressed (`text: ''`) so the card no longer renders alongside the legacy 10-column markdown table — the card is the content, the prose was a duplicate. This also **strengthens §10**: the success path now carries zero visible text (no leak surface), while the failure path keeps the §10-scanned text fallback and the no-fence path is byte-for-byte unchanged. teams plugin **0.1.4 → 0.1.5**.
+
+## [0.17.0-beta2.3] — 2026-06-25 (mainline · beta · Teams quoteResult light-up-ready)
+
+**v0.17.0-beta2.3 — the Teams `quoteResult` Adaptive Card is light-up-ready: a 6-field per-RFQ layout + a renderer-supplied deeplink, on top of beta2.2.** Still **dark-launched / dormant** (`AC_QUOTE_RESULT_CARD` defaults OFF) — a beta2.3 install sees **zero behavior change** until the operator opts in; light-up is a separate, gated step (renderer reseed + server flag + sign-off). Three renderer PRs redesign the quoteResult card and extend the §10 fail-closed surface to the visible card prose; each carried a full codex Phase-4 pair-review (`implement-ok`, findings 0) on top of green Linux CI.
+
+### Channels
+
+- **teams: §10 fail-closed scan of the visible card prose + Korean/literal forbidden list (#2104).** `renderOutbound` previously scanned only the rendered card bytes — a forbidden cost term in the human-visible prose accompanying a card (outside the `cardintent` fence) was sent unscanned. It now also scans the visible text and **hard-replaces** it with a fixed §10-clean fallback on a hit (both the success and the failure paths), and the forbidden list is extended with the Korean/literal contract terms (`제시가`/원가/마진/공헌이익/영업이익/네고율/회수율/작업장명/임률/고객요청가/manufacturingCostSuggested/standardCost). The no-fence path stays byte-for-byte unchanged.
+- **teams: quoteResult LIST → 6-field per-RFQ stack + Phase-1a contract primitives (#2107).** The quoteResult LIST is redesigned to the operator's #17138 6-field, mobile-safe **per-RFQ stack** (`고객 · 제품` header + `용량` / `랩넘버` + `내용물 견적` / `가공비 견적`), **superseding** the dormant beta2.2 3-col `견적 소계` / `산출상태` layout. Adds the Phase-1a contract primitives: **PriceCell string-only** (raw decimals rejected — zero path for a raw cost number), **`Action.OpenUrl` domain-pinned**, and **`Action.Submit` rejected** in Phase 1a. AC v1.2 only (no `Table` / `targetWidth`, ColumnSet ≤3).
+- **teams: renderer-supplied quoteResult deeplink url (#2108).** The `[전체 견적결과 보기]` deeplink URL is now **supplied by the renderer** (`https://<allowed-host>/d/?screen=rfq-list`, host configurable) and any cardintent-supplied URL is **ignored** — eliminating the open-redirect surface (smuggled / off-domain / `javascript:` URLs all resolve to the pinned destination). The server emits the action id only.
+- teams plugin **0.1.2 → 0.1.4** (version-triggered reseed loads the new renderer).
+
+## [0.17.0-beta2.2] — 2026-06-25 (mainline · beta · Teams Adaptive Card layout)
+
+**v0.17.0-beta2.2 — the Teams `quoteResult` Adaptive Card renders its multi-RFQ LIST as a compact, mobile-safe ColumnSet table, on top of beta2.1.** The card feature stays **dark-launched / dormant** (`AC_QUOTE_RESULT_CARD` defaults OFF) — a beta2.2 install sees zero behavior change until a later opt-in light-up. This cut is renderer/layout only: the additive `renderOutbound` seam, fence parse/strip, fail-closed CardIntent validation, and the §10 forbidden-cost-key golden are unchanged. Carried a full codex pair-review convergence (r1→r3 `implement-ok`) on top of green Linux CI.
+
+### Channels
+
+- **teams: quoteResult LIST → compact AC 1.2 ColumnSet table + col2 = `견적 소계`, bump 0.1.2 → 0.1.3 (#2101).** The multi-RFQ LIST now renders as a scannable ColumnSet "table" — a header row + one row per RFQ (`고객·제품 | 견적 소계 | 상태`, ≤3 columns) — instead of a per-RFQ FactSet stack, so multiple quotes scan record-by-record. AC **1.2** only (no `Table` / `targetWidth`; ColumnSet wraps gracefully at a narrow mobile width per the #15157 mobile-LCD envelope — AC 1.5 `Table` was rejected for mobile). Column 2 matches the **stable `견적 소계`** quote-subtotal label (both spaced + unspaced spellings), not the role-scoped cost labels and not `확정가` (which live RFQs leave unset → an all-em-dash column); column 3 matches the stable `산출상태` only (a generic `상태` row no longer leaks). `valueState`→문구·색 preserved (calculating→`(계산중)`, masked→`●●●`, notRequested→`(해당없음)`, missing→em dash) with no raw-value leak through the new column path; the detail layout (named-section FactSets) is unchanged. The plugin version bump makes a fleet reseed **version-triggered** (clean refresh on restart). **No runtime behavior change** — ships dormant. (The forbidden-key golden remains the contract-derived placeholder pending the vendored `forbidden_cost_keys.gen.json` hash-pin.)
+
+## [0.17.0-beta2.1] — 2026-06-25 (mainline · beta · restart-safety hotfix)
+
+**v0.17.0-beta2.1 — a fleet restart-safety hotfix on top of beta2.** beta2's Teams Adaptive Card renderer added `bun-types` as a type-only `devDependency` for its typecheck. The plugin-cache seed treats every nested `package.json` — including `node_modules/bun-types/package.json` — as a **channel-required** contract file, but the node_modules copy skipped `bun-types`, so the `teams` plugin **failed to link into the cache** (`linked-failed`, criticality=channel-required). The practical blast radius (confirmed in cm-prod soak) is broader than a blocked re-seed: a **channel-required `linked-failed` teams plugin bricks any bot (re)start** — the bot exits immediately after launch. `always_on` bots survive only while never restarted (`--no-restart`); a daemon crash / upgrade / kill would brick them. This release removes the hazard.
+
+### Channels / packaging
+
+- **teams: drop the `bun-types` type-only devDependency + bump 0.1.1 → 0.1.2 (#2097).** `bun-types` is removed from `devDependencies` (bun provides `bun:test` natively at runtime; it was only needed for `tsc`), so `node_modules` no longer carries it and the seed contract has nothing to miss — the channel-required `teams` plugin links clean (`linked-verified`) and bots start normally. A minimal `bun:test` ambient shim keeps `bun run typecheck` passing without the package. The plugin version bump makes a fleet reseed **version-triggered** (clean refresh) rather than force-only — the same-version staleness that masked the regression. **No runtime/renderer change**: the Adaptive Card renderer is byte-unchanged and remains **dark-launched / dormant** (`AC_QUOTE_RESULT_CARD` defaults OFF). The deeper plugin-cache seed contract bug — which can recur for any plugin declaring a type-only or symlinked dependency — is tracked separately ([#2098](https://github.com/seanssoh/agent-bridge-public/issues/2098)).
+
+## [0.17.0-beta2] — 2026-06-24 (mainline · beta)
+
+**v0.17.0-beta2 — a Teams Adaptive Card renderer (dark-launched / dormant) on top of beta1, plus the v0.16.16 stabilization fixes that landed on `main` after beta1, folded into the v0.17 line.** Like beta1 this is a live-test vehicle, not a promotion — the `v0.16.x` LTS line continues independently and is **not** this prerelease. The Adaptive Card feature ships **dormant**: the CRM core defaults its `AC_QUOTE_RESULT_CARD` flag OFF, so the renderer is inert until a later opt-in light-up — a beta2 install sees **zero behavior change** until then. Each PR carried its own internal codex review; this cut adds a full orchestrator Phase-4 pair-review on the new feature (which caught and fixed three fail-closed/spoofing bugs before merge) on top of green Linux CI.
+
+### Channels
+
+- **Teams Adaptive Card `quoteResult` renderer — `cardintent` fenced pass-through, Model B (#2096).** The `@agent-bridge/teams` plugin now extracts a `cardintent` fenced block from the agent's outbound reply text and renders it as a Microsoft Adaptive Card v1.2 attachment (FactSet / ColumnSet ≤3 columns, no `Table`/`targetWidth`, `valueState`→문구·색 mapping) alongside the text. **Additive + fail-closed**: with no fence the existing reply is byte-for-byte unchanged; any parse / validation / §10 / render failure degrades to graceful text-only (never throws into the send); and the raw fenced JSON is always stripped from what the user sees. CardIntent validation is fully fail-closed — string-typed closed enums for `actionId` / `valueState`, and a payload may not override the validated `actionId` — and a §10 forbidden-cost-key golden scans the rendered card bytes. Ships **dark-launched / dormant**. (The forbidden-key list is a contract-derived placeholder pending the vendored `forbidden_cost_keys.gen.json` hash-pin.)
+
+### Folded v0.16.16 stabilization (from `main`, post-beta1)
+
+The seven v0.16.16-line fixes that landed on `main` after the beta1 cut, folded into the v0.17 line (each merged to `main` with its own green CI + codex / patch review; the `ci-select` required-set was union-merged exactly, with zero dangling smoke tokens):
+
+- **#2091 (#1990)** — hooks: per-writer unique temp for the concurrent settings-render race (ends the `plugin_mcp_liveness_restart_failed` flap).
+- **#2089 (#1653)** — upgrade: clear a spurious conflict sidecar that holds no recovery.
+- **#2088 (#1789)** — daemon: pool-level cooldown for saturated claude-token rotation.
+- **#2086 (#1650)** — ms365: always send `offline_access` on the refresh-token grant.
+- **#2083 (#16309)** — config: allowlist `BRIDGE_QUEUE_GATEWAY_TIMEOUT_SECONDS` as a tunable env knob.
+- **#2092** — ci: restore green after #2089 (raw-pathlib noqa + heredoc baseline row).
+- **#2094** — docs: the LTS branch is protected; force-pushes are CI-gated.
+
+## [0.17.0-beta1] — 2026-06-22 (mainline · beta)
+
+**v0.17.0-beta1 — the first cut of the v0.17 feature line (beta — features still landing).** This forks the mainline from `v0.16.16-rc2` and carries the `v0.16.16-rc3` hardening already on `main`; the **v0.16.x LTS line continues independently** (the `lts` / Latest head is unchanged and is NOT this prerelease). As a beta it is a live-test vehicle, not a promotion — expect further v0.17 features to land on top before a stable v0.17.0. First-batch features (each carried its own internal codex review at park time; this cut is the integration gate — full Linux CI + codex integration review):
+
+### Channels
+
+- **bridge-official Discord plugin — vendored, generalized thread-as-session (#2060).** A first-party Discord channel plugin under `plugins/discord/` (server + thread-session dispatcher/guard/egress, access + configure skills, docs). A Discord thread maps to an agent sub-session with workdir binding; the `thread_session_guard` is a PreToolUse guard that fails-closed on reads of the channel transport credentials (`.discord/.env` / `.telegram/.env`), with a self-test proving the deny survives tmp carve-outs and path-normalization evasion. Generalizes the thread-as-session pattern so the same machinery serves other thread-capable channels.
+
+### Reliability / fallback
+
+- **Provider-health outage oracle — Anthropic-outage detection for Codex fallback (P1a, #2066; master-gated OFF).** A daemon-owned 1-prober/N-readers oracle (`bridge-provider-health.py` + `lib/bridge-provider-health.sh` accessors + a gated `cmd_sync_cycle` tick + the `bridge-usage-probe.py` outage classifier) that detects a real Anthropic outage — scoped-on-first-report, DNS-guarded (never blame Anthropic for a local network failure), N-of-M static-agent fleet quorum, recovery hysteresis, and 429/auth explicitly NOT outage-class. **Steady state = zero probes**: the whole tick is a hard NO-OP unless `BRIDGE_FALLBACK_ENABLED` is on AND the oracle has pending work, so a production install pays nothing. Nothing consumes the DOWN state yet — this is the detection foundation for the Anthropic-outage → Codex fallback that P1b (cron) and P3 (live) will build on. Daemon-state writes are O_EXCL-serialized; the stale-lock break is meta-lock-serialized so it is race-free even on the portable no-fcntl path (no lost report under concurrent eviction).
+
+### A2A
+
+- **agent→node discovery (whois) + `send --peer auto` + a `known_agents` roster column (#2025).** `agb a2a whois <agent>` resolves which node(s) an agent lives on by consulting the rooms registry; ambiguity (the same agent name on >1 node) is never collapsed — every candidate is listed, never guessed. `agb a2a send` with `--peer auto` (or omitted) auto-resolves the node from `--to` via the same whois lookup and fails closed (with the candidate list) on an ambiguous target or an incomplete room roster; an explicit `--peer` is still honored verbatim with no whois. `a2a peers list` (plain + `--json`) gains a `known_agents` node→agents column so an operator can see the node↔agent mapping at a glance. No secret material leaks into `whois` / `peers` output.
+
 ## [0.16.16] — 2026-06-26 (LTS)
 
 **v0.16.16 — promotion of the v0.16.16 LTS line (rc1–rc4, soaked 2026-06-17 → 2026-06-25) to an official LTS release, and the LTS endpoint of the v0.16.x line.** Marquee is a **Teams reply silent-non-delivery fix (#2112)** — a production customer agent reported replies that the SDK accepted but never delivered while the reply tool reported success — bundled with the full rc1–rc4 reliability/hardening set below. This **supersedes `v0.16.15` as the `lts` / Latest head**; conservative / production installs tracking the `lts` channel advance here. With this LTS endpoint cut, **mainline development moves to `v0.17`**: the v0.17 feature line (bridge-official Discord plugin, Teams Adaptive Cards, and more) merges to `main`, so `main` now carries the latest features while the `lts` channel stays pinned to this line. Each bundled PR carried its own codex / Phase-4 review; the full Linux CI gate is green.

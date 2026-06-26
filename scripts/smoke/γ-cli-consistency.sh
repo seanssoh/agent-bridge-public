@@ -277,12 +277,40 @@ assert any("add-dev-channel plugin:mattermost@agent-bridge" in a for a in action
 }
 
 assert_official_channel_not_added_to_launch() {
-  # `plugin:discord@claude-plugins-official` is an OFFICIAL channel —
+  # `plugin:telegram@claude-plugins-official` is an OFFICIAL channel —
   # it is loaded by the marketplace at start time, NOT via
   # --dangerously-load-development-channels. The reconciler must not
   # add it to launch_cmd just because the operator added it to
   # BRIDGE_AGENT_CHANNELS. `bridge_filter_development_channels_csv`
   # gates this — verify the gate holds at the update-side.
+  #
+  # Task #12033: telegram is now the lone built-in still sourced from
+  # claude-plugins-official (discord was vendored to @agent-bridge), so the
+  # official-channel contract is asserted with telegram. Discord is exercised
+  # separately by assert_discord_resolves_to_agent_bridge_dev_channel below.
+  write_roster_fixture
+  run_update --channels-set "plugin:ms365@agent-bridge" >/dev/null
+
+  local output
+  output="$(run_update --channels-add "plugin:telegram")"
+  python3 -c '
+import json, sys
+payload = json.loads(sys.argv[1])
+after_launch = payload["after"]["launch_cmd"]
+after_channels = payload["after"]["channels"]
+assert "plugin:telegram@claude-plugins-official" in after_channels, after_channels
+# Official channel must NOT be loaded via --dangerously-load-development-channels.
+assert "plugin:telegram@claude-plugins-official" not in after_launch, \
+  f"official channel was wrongly injected as dev-channel: {after_launch}"
+' "$output"
+}
+
+assert_discord_resolves_to_agent_bridge_dev_channel() {
+  # Task #12033: discord is now a vendored bridge-official plugin resolving to
+  # the @agent-bridge marketplace (mirrors teams/ms365/mattermost), NOT
+  # claude-plugins-official. A bare `plugin:discord` add must qualify to
+  # `plugin:discord@agent-bridge` and — being a non-official (development)
+  # marketplace — be injected into launch_cmd as a dev-channel.
   write_roster_fixture
   run_update --channels-set "plugin:ms365@agent-bridge" >/dev/null
 
@@ -293,10 +321,36 @@ import json, sys
 payload = json.loads(sys.argv[1])
 after_launch = payload["after"]["launch_cmd"]
 after_channels = payload["after"]["channels"]
-assert "plugin:discord@claude-plugins-official" in after_channels, after_channels
-# Official channel must NOT be loaded via --dangerously-load-development-channels.
-assert "plugin:discord@claude-plugins-official" not in after_launch, \
-  f"official channel was wrongly injected as dev-channel: {after_launch}"
+assert "plugin:discord@agent-bridge" in after_channels, after_channels
+assert "plugin:discord@claude-plugins-official" not in after_channels, after_channels
+assert "plugin:discord@agent-bridge" in after_launch, \
+  f"vendored discord dev-channel not injected: {after_launch}"
+actions = payload["actions"]
+assert any("add-dev-channel plugin:discord@agent-bridge" in a for a in actions), actions
+' "$output"
+}
+
+assert_stale_discord_official_pin_migrated() {
+  # Task #12033: an already-provisioned agent that still carries the legacy
+  # explicit pin `plugin:discord@claude-plugins-official` must be migrated to
+  # `plugin:discord@agent-bridge` on the next channel mutation — REPLACED, not
+  # appended (no double-registration). Idempotent across reruns.
+  write_roster_fixture
+  run_update --channels-set "plugin:discord@claude-plugins-official,plugin:ms365@agent-bridge" >/dev/null
+
+  local output
+  output="$(run_update --channels-add "plugin:discord")"
+  python3 -c '
+import json, sys
+payload = json.loads(sys.argv[1])
+after_channels = payload["after"]["channels"]
+toks = [t for t in after_channels.split(",") if t]
+discord_toks = [t for t in toks if t.startswith("plugin:discord")]
+assert discord_toks == ["plugin:discord@agent-bridge"], \
+  f"discord not migrated/replaced cleanly: {discord_toks} (full={after_channels})"
+assert "plugin:discord@claude-plugins-official" not in after_channels, after_channels
+# No double-registration: exactly one discord token total.
+assert len(discord_toks) == 1, f"double-registered discord: {discord_toks}"
 ' "$output"
 }
 
@@ -333,6 +387,10 @@ main() {
     assert_launch_cmd_reconcile_add_new
   smoke_run "#1235 launch_cmd reconcile skips OFFICIAL (non-development) channels" \
     assert_official_channel_not_added_to_launch
+  smoke_run "#12033 vendored discord resolves to @agent-bridge dev-channel" \
+    assert_discord_resolves_to_agent_bridge_dev_channel
+  smoke_run "#12033 stale discord @claude-plugins-official pin migrated (no double-register)" \
+    assert_stale_discord_official_pin_migrated
 
   smoke_run "#1236 agent update --help short-circuits to usage" \
     assert_agent_update_help_short_circuits

@@ -276,17 +276,39 @@ fi
 # (codex PR-7 r1): a bare `BRIDGE_DAEMON_LAST_STEP=` assignment does NOT pulse
 # the parent-visible progress file — only _bridge_daemon_mark_progress does —
 # so H3 requires the mark_progress form specifically, not the bare LAST_STEP.
+# Pure-bash CHARACTER-OFFSET ordering over the body (NO pipe, NO `<<<`
+# here-string, NO process-substitution): for each marker we compute the byte
+# offset of its FIRST occurrence in SYNC_BODY via `${SYNC_BODY%%marker*}` prefix
+# length. Offset ordering is equivalent to line ordering for "appears before".
+# Avoids the SIGPIPE/pipefail interaction of `printf | grep` on the large body
+# AND the heredoc-ban H3 ratchet that flags `mapfile <<<` / `< <(...)`.
+_first_offset() { # $1=marker-substring → first 0-based char offset, or "" if absent
+  local _m="$1" _prefix
+  [[ "$SYNC_BODY" == *"$_m"* ]] || { printf ''; return 0; }
+  _prefix="${SYNC_BODY%%"$_m"*}"
+  printf '%s' "${#_prefix}"
+}
+_due_offset() { # $1=pass → first offset of its `bridge_daemon_pass_due <pass>` site, or ""
+  local _p="$1" _marker _prefix
+  # The pass token is always followed by a space in the daemon source
+  # (`bridge_daemon_pass_due <pass> <interval>`), so anchor on the exact
+  # "bridge_daemon_pass_due <pass> " literal — no glob class needed (SC1087-safe).
+  _marker="bridge_daemon_pass_due ${_p} "
+  [[ "$SYNC_BODY" == *"$_marker"* ]] || { printf ''; return 0; }
+  _prefix="${SYNC_BODY%%"$_marker"*}"
+  printf '%s' "${#_prefix}"
+}
 H3_FAIL=0
 for p in $GATED_PASSES; do
-  mark_line="$(printf '%s\n' "$SYNC_BODY" | grep -nE "_bridge_daemon_mark_progress \"${p}\"" | head -n1 | cut -d: -f1)"
-  due_line="$(printf '%s\n' "$SYNC_BODY" | grep -nE "bridge_daemon_pass_due ${p}\b" | head -n1 | cut -d: -f1)"
+  mark_line="$(_first_offset "_bridge_daemon_mark_progress \"${p}\"")"
+  due_line="$(_due_offset "$p")"
   if [[ -z "$mark_line" || -z "$due_line" ]]; then
     printf '[FAIL] H3: gated pass "%s" missing a _bridge_daemon_mark_progress heartbeat pulse before its due-check (mark=%s due=%s) — a bare LAST_STEP= does NOT refresh the parent-visible progress file\n' "$p" "${mark_line:-?}" "${due_line:-?}" >&2
     H3_FAIL=1
     continue
   fi
   if (( mark_line >= due_line )); then
-    printf '[FAIL] H3: pass "%s" mark_progress pulse (line %s) is NOT before its due-check (line %s) — a skipped tick would not refresh the PR-2 heartbeat\n' "$p" "$mark_line" "$due_line" >&2
+    printf '[FAIL] H3: pass "%s" mark_progress pulse (offset %s) is NOT before its due-check (offset %s) — a skipped tick would not refresh the PR-2 heartbeat\n' "$p" "$mark_line" "$due_line" >&2
     H3_FAIL=1
   fi
 done
