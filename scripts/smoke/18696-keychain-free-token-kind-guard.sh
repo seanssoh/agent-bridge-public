@@ -256,6 +256,34 @@ test_oat_backfill_removes_stale_managed_helper() {
       --config-dir "$(cfg_dir_for "$USER_AGENT")" --agent "$USER_AGENT" --json 2>&1)"
   smoke_assert_contains "$out" '"helper_removed": false' "B2b re-run is a no-op (already coherent)"
   smoke_assert_eq "" "$(helper_in "$USER_AGENT")" "B2b re-run keeps the helper absent"
+
+  # managed-but-not-current (override) case (#18696 r3 / patch-dev #18731): a
+  # stale in-repo DEFAULT managed helper while BRIDGE_CLAUDE_API_KEY_HELPER points
+  # elsewhere. settings_apikeyhelper_coherent() would MISS it (value != current
+  # override path), but apikeyhelper_value_is_bridge_managed() treats the default
+  # as ours — so the cleanup MUST still remove it (was the r2 gap).
+  seed_managed_helper_settings "$USER_AGENT"   # seeds the in-repo DEFAULT helper path
+  smoke_assert_eq "$EXPECTED_HELPER" "$(helper_in "$USER_AGENT")" \
+    "B2b(override) precondition: the default managed helper is present"
+  out="$(BRIDGE_HOST_PLATFORM_OVERRIDE=Darwin BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH=1 \
+    BRIDGE_CLAUDE_API_KEY_HELPER="$SMOKE_TMP_ROOT/custom-operator-helper.sh" \
+    python3 "$AUTH_PY" --registry "$REGISTRY" backfill-settings \
+      --config-dir "$(cfg_dir_for "$USER_AGENT")" --agent "$USER_AGENT" --json 2>&1)"
+  smoke_assert_contains "$out" '"helper_removed": true' \
+    "B2b(override) removes a stale managed-DEFAULT helper even under a custom override"
+  smoke_assert_eq "" "$(helper_in "$USER_AGENT")" \
+    "B2b(override) the default managed helper is gone (broad managed predicate)"
+
+  # And `--check` reports drift for the same managed-but-not-current case.
+  seed_managed_helper_settings "$USER_AGENT"
+  out="$(BRIDGE_HOST_PLATFORM_OVERRIDE=Darwin BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH=1 \
+    BRIDGE_CLAUDE_API_KEY_HELPER="$SMOKE_TMP_ROOT/custom-operator-helper.sh" \
+    python3 "$AUTH_PY" --registry "$REGISTRY" backfill-settings \
+      --config-dir "$(cfg_dir_for "$USER_AGENT")" --agent "$USER_AGENT" --check --json 2>&1)"
+  smoke_assert_contains "$out" '"drift": true' \
+    "B2b(override) --check reports drift for a managed-default helper under override"
+  smoke_assert_eq "$EXPECTED_HELPER" "$(helper_in "$USER_AGENT")" \
+    "B2b(override) --check stays read-only (helper not removed)"
 }
 
 # ===========================================================================

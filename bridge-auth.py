@@ -3013,6 +3013,35 @@ def settings_apikeyhelper_coherent(config_dir: Path) -> bool:
     return str(actual_path.resolve(strict=False)) == claude_api_key_helper_path()
 
 
+def settings_apikeyhelper_is_bridge_managed(config_dir: Path) -> bool:
+    """True when ``settings.json``'s ``apiKeyHelper`` is a bridge-managed value
+    that ``ensure_claude_settings_file`` would REMOVE on cleanup — i.e. the
+    current managed path OR the in-repo default helper, per
+    ``apikeyhelper_value_is_bridge_managed`` (independent of a
+    ``BRIDGE_CLAUDE_API_KEY_HELPER`` override).
+
+    Broader than ``settings_apikeyhelper_coherent`` (current-path only): the
+    #18696 r3 OAT/unknown backfill cleanup MUST gate on THIS predicate so a stale
+    managed-DEFAULT helper left under a custom override is still removed instead
+    of being falsely reported coherent (patch-dev review #18731). Mirrors the
+    writer's removal branch exactly. Never raises: unreadable/malformed reads as
+    not-managed.
+    """
+    try:
+        path = claude_settings_write_path(config_dir)
+    except Exception:  # noqa: BLE001 - symlink-escape etc. → not managed
+        return False
+    if not path.exists():  # noqa: raw-pathlib-controller-only - controller managed-helper probe on the resolved write path
+        return False
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - malformed → not a clean managed value
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    return apikeyhelper_value_is_bridge_managed(parsed.get("apiKeyHelper"))
+
+
 def cmd_backfill_settings(args: argparse.Namespace) -> int:
     """Issue #1855: create-if-absent backfill of the keychain-free apiKeyHelper
     contract for a single pre-#1520 shared Claude agent.
@@ -3077,7 +3106,12 @@ def cmd_backfill_settings(args: argparse.Namespace) -> int:
         # removal branch fires for any non-api_key kind), so the launch falls back
         # to native .credentials.json. `--check` stays read-only. `coherent` is
         # reported against the true desired state for this kind: NO managed helper.
-        managed_present = settings_apikeyhelper_coherent(config_dir)
+        # #18696 r3 (patch-dev #18731): gate cleanup on the WRITER's removal
+        # predicate (current managed path OR in-repo default), not the
+        # current-path-only coherence check — else a stale managed-default helper
+        # under a BRIDGE_CLAUDE_API_KEY_HELPER override survives while we report
+        # coherent:true.
+        managed_present = settings_apikeyhelper_is_bridge_managed(config_dir)
         action_required = (
             "The active Claude token authenticates via the native "
             ".credentials.json sync (Bearer), not the x-api-key apiKeyHelper. "
