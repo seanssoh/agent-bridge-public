@@ -3353,6 +3353,12 @@ select_for_path() {
       # a cron child from reading channel creds, direct-sending to a human, or
       # mutating out-of-run queue tasks.
       add_required cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner cron-runner-schema-openai-strict cron-path-augmentation-874 queue beta5-2-eta-cron-iso-uid-preflight 1359-cron-create-iso-staging 1379-iso-cron-staging-group 1383-iso-cron-result-json-group 8807-cron-backfill-coalesce 1459-cron-dispatch-recovery 1659-cron-status-walk-perf 1677-cron-summary-short-derive 1792-cron-scope-fence 1875-cron-prod-mutation-guard 1843-cron-consecutive-failure-escalation 1826-cron-at-naive-tz 1842-cron-tamper-iso-groupwrite 1880-cron-explicit-model 1943-cron-unmodeled-warn-on-upgrade 2029-cron-child-relay-guard
+      # Issue #18696: bridge-cron-runner.py's validate_claude_keychain_free_auth
+      # now FAILS CLOSED on token KIND — an OAuth/OAT active token (api-key-helper
+      # exit 3) falls back to native .credentials.json instead of forcing the OAT
+      # onto the x-api-key apiKeyHelper. 18696-keychain-free-token-kind-guard B8
+      # pins that cron native-fallback so a refactor can't reintroduce the 401.
+      add_required 18696-keychain-free-token-kind-guard
       add_integration integration-minimal
       ;;
 
@@ -5397,6 +5403,14 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # scope-guard pins all of those so a refactor cannot silently re-open the
       # admin-hijack / --help-mutates path.
       add_required 2137-keychain-free-scope-guard
+      # Issue #18696 (follow-up to #2137): bridge-auth.py/.sh now FAIL-CLOSED gate
+      # the keychain-free apiKeyHelper on token KIND — the helper is wired only
+      # for a confirmed api_key token (x-api-key contract); OAT/unknown route
+      # through the native .credentials.json sync. 18696-keychain-free-token-kind-
+      # guard pins the classifier, the chokepoint, the api-key-helper OAT-never-
+      # to-stdout floor, the verb refusals, and the #2137/#1444 invariants so a
+      # refactor cannot re-wire an OAT as x-api-key (the 401 incident).
+      add_required 18696-keychain-free-token-kind-guard
       # Issue #1899: bridge-auth.sh's bridge_auth_codex_selected_agents +
       # codex sync loop now EXCLUDE dynamic vanilla Codex from the codex-cred
       # fleet sync (it inherits the operator-global ~/.codex/auth.json). Pull

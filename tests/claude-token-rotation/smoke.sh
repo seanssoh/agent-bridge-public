@@ -49,9 +49,15 @@ export BRIDGE_LAYOUT=v2
 # A dedicated non-Darwin block below flips this OFF to assert the Linux gate.
 export BRIDGE_HOST_PLATFORM_OVERRIDE=Darwin
 
-TOKEN_A="fake-claude-oauth-token-a"
-TOKEN_B="fake-claude-oauth-token-b"
-TOKEN_C="fake-claude-oauth-token-c"
+# #18696: the keychain-free apiKeyHelper is now wired only for a confirmed
+# api_key-kind active token (x-api-key contract). This harness exercises the
+# apiKeyHelper render / rotate / disable-re-enable / cron / bridge-run preflight
+# mechanics, so its rotation pool uses api-key tokens — the kind for which the
+# helper path legitimately engages. (OAT-refusal / native-fallback semantics are
+# pinned in scripts/smoke/18696-keychain-free-token-kind-guard.sh.)
+TOKEN_A="sk-ant-api03-MOCK-not-a-real-token-rotation-a"
+TOKEN_B="sk-ant-api03-MOCK-not-a-real-token-rotation-b"
+TOKEN_C="sk-ant-api03-MOCK-not-a-real-token-rotation-c"
 AGENT="patch"
 CREDENTIAL_FILE="$BRIDGE_DATA_ROOT/agents/$AGENT/home/.claude/.credentials.json"
 CLAUDE_CONFIG_FILE="$BRIDGE_DATA_ROOT/agents/$AGENT/home/.claude/.claude.json"

@@ -30,6 +30,14 @@ Usage:
   bash $SCRIPT_DIR/bridge-auth.sh codex-cred source [--json]
   bash $SCRIPT_DIR/bridge-auth.sh codex-cred sync [--agents static|all|csv] [--json]
   bash $SCRIPT_DIR/bridge-auth.sh codex-cred verify --file <path> [--json]
+
+Notes:
+  keychain-free / backfill-settings wire the managed apiKeyHelper (Claude Code's
+  x-api-key contract) ONLY for a confirmed API-key (sk-ant-api...) active token.
+  An OAuth/OAT (sk-ant-oat...) token is a Bearer credential — it authenticates
+  via the native .credentials.json sync, not the apiKeyHelper — so for an
+  OAuth/OAT pool these verbs fail closed (refuse / skip) and 'sync' delivers the
+  native credential instead (#18696).
 EOF
 }
 
