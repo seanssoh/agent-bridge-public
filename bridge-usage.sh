@@ -347,16 +347,33 @@ bridge_usage_select_claude_agents() {
 # bridge_usage_resolve_claude_cache_path <agent>
 #   Stdout: absolute path the agent's claude-hud usage cache would live at.
 #   Isolated agents (linux-user mode) → under $BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT/<os_user>.
-#   Non-isolated agents → controller's $HOME (the existing single-tenant path).
+#   Non-isolated agents that launch Claude with a per-agent CLAUDE_CONFIG_DIR →
+#     under <agent-home>/.claude (the SAME dir launch/resume write to).
+#   Everything else (dynamic-vanilla / operator-global passthrough / unregistered)
+#     → controller's $HOME (the existing single-tenant path).
 bridge_usage_resolve_claude_cache_path() {
   local agent="$1"
-  local os_user="" agent_home=""
+  local os_user="" agent_home="" config_dir=""
 
   if bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
     os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || printf '')"
     if [[ -n "$os_user" ]]; then
       agent_home="$(bridge_agent_linux_user_home "$os_user")"
       printf '%s/.claude/plugins/claude-hud/.usage-cache.json' "$agent_home"
+      return 0
+    fi
+  fi
+
+  # E5 (#17927 P2): non-isolated agents that launch Claude with a per-agent
+  # CLAUDE_CONFIG_DIR (<agent-home>/.claude) write their statusLine usage cache
+  # THERE, not under the controller $HOME. Resolve via the SAME launch resolver
+  # so daemon-read == launch-write. The resolver returns empty for
+  # dynamic-vanilla / operator-global-passthrough / unregistered / stale-#1316-
+  # scaffold agents, where the controller $HOME IS the correct location.
+  if command -v bridge_resolve_agent_claude_config_dir >/dev/null 2>&1; then
+    config_dir="$(bridge_resolve_agent_claude_config_dir "$agent" 2>/dev/null || true)"
+    if [[ -n "$config_dir" ]]; then
+      printf '%s/plugins/claude-hud/.usage-cache.json' "$config_dir"
       return 0
     fi
   fi
@@ -520,6 +537,14 @@ PY
 # ---------------------------------------------------------------------------
 agents_spec=""
 agents_explicit=0
+# #17927 P2 (E6/E8): the daemon passes `--rotation-agents <spec>` to scope which
+# agents' usage may DRIVE a token rotation (managed pool), distinct from
+# `--agents` which scopes read-only monitoring/alerting. We resolve the spec to a
+# CSV of eligible agent ids and forward it to the python monitor as
+# `--rotation-eligible-agents` so eligibility is gated BEFORE the candidate is
+# emitted/latched — a post-hoc daemon skip cannot un-latch.
+rotation_agents_spec=""
+rotation_agents_explicit=0
 forward_args=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -533,6 +558,16 @@ while [[ $# -gt 0 ]]; do
       agents_explicit=1
       shift
       ;;
+    --rotation-agents)
+      rotation_agents_spec="${2:-}"
+      rotation_agents_explicit=1
+      shift 2
+      ;;
+    --rotation-agents=*)
+      rotation_agents_spec="${1#--rotation-agents=}"
+      rotation_agents_explicit=1
+      shift
+      ;;
     *)
       forward_args+=("$1")
       shift
@@ -542,6 +577,12 @@ done
 
 per_agent_cache_json=""
 legacy_single_path=""
+# #17927 P2 (E6/E8): CSV of agents whose usage may DRIVE a rotation. Empty until
+# the monitor branch resolves `--rotation-agents`. A non-empty value (even when
+# it resolves to zero agents → `__ROTATION_NONE__` sentinel) ENABLES the python
+# eligibility gate; the flag staying unset preserves legacy ungated behavior.
+rotation_eligible_csv=""
+rotation_eligible_set=0
 # Cleanup any per-agent tempfile we create.
 trap '[[ -n "${per_agent_cache_json:-}" ]] && rm -f -- "$per_agent_cache_json"' EXIT
 
@@ -561,6 +602,12 @@ run_python() {
   fi
   if [[ -n "$legacy_single_path" ]]; then
     base_args+=(--legacy-single-path "$legacy_single_path")
+  fi
+  # #17927 P2 (E6/E8): pass the resolved rotation-eligible CSV (possibly empty —
+  # an empty value still ENABLES the gate so only controller-managed sentinels
+  # rotate). Absent flag ⇒ python leaves rotation ungated (legacy behavior).
+  if [[ "$subcmd" == "monitor" && "$rotation_eligible_set" == "1" ]]; then
+    base_args+=(--rotation-eligible-agents "$rotation_eligible_csv")
   fi
   # Issue #1437 PRIMARY: pass the native-probe controller cache so the monitor
   # reads it ADDITIVELY in per-agent mode (the default daemon path builds a
@@ -795,6 +842,26 @@ case "$command" in
         # legacy field unchanged.
         legacy_single_path="$claude_usage_cache"
       fi
+    fi
+    # #17927 P2 (E6/E8): resolve the rotation-eligible scope (managed-token pool)
+    # to a CSV the python monitor uses to gate rotation candidates. Resolved with
+    # the SAME selector as `--agents` so the set matches the bridge-auth sync
+    # fanout. monitor-only — `status` never rotates.
+    if [[ "$command" == "monitor" && "$rotation_agents_explicit" -eq 1 ]]; then
+      rotation_stream=""
+      # #17927 P2 (codex r2 — Bug 1): an EXPLICIT-EMPTY rotation scope
+      # (BRIDGE_USAGE_ROTATION_AGENTS="") means "only controller-managed
+      # sentinels are rotation-eligible", NOT the static pool. The selector maps
+      # an empty spec to its static --agents default, so special-case empty to an
+      # empty eligible CSV here (the monitor then rotates only __native__/legacy
+      # sentinels, never a named statusLine agent).
+      if [[ -z "$rotation_agents_spec" ]]; then
+        rotation_eligible_csv=""
+      else
+        rotation_stream="$(bridge_usage_select_claude_agents "$rotation_agents_spec")" || exit 1
+        rotation_eligible_csv="$(printf '%s' "$rotation_stream" | tr '\n' ',' | sed 's/,*$//')"
+      fi
+      rotation_eligible_set=1
     fi
     run_python "$command" "${forward_args[@]+"${forward_args[@]}"}"
     rc=$?

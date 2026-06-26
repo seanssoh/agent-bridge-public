@@ -2280,6 +2280,18 @@ process_usage_monitor() {
   local source=""
   local body_file=""
   local rotation_agent_scope="${BRIDGE_CLAUDE_TOKEN_SYNC_AGENTS:-static}"
+  # #17927 P2 (E6/E8): which agents' usage may DRIVE a rotation (the managed
+  # pool), distinct from BRIDGE_USAGE_MONITOR_AGENTS (read-only alert scope).
+  # Defaults to the sync/managed pool. A monitored-but-non-managed agent's
+  # high-usage cache must NOT rotate the pool — gated inside bridge-usage.py
+  # BEFORE the candidate is emitted/latched (a post-hoc daemon skip cannot
+  # un-latch), so we pass this scope down to the monitor invocation.
+  # #17927 P2 (codex r2 — Bug 1): use `-` not `:-` so an EXPLICIT-EMPTY
+  # BRIDGE_USAGE_ROTATION_AGENTS="" (operator restricts rotation to controller-
+  # managed sentinels only) is preserved as empty, NOT replaced by the sync/
+  # static default. Only an UNSET var falls back to the sync pool.
+  local rotation_eligible_scope="${BRIDGE_USAGE_ROTATION_AGENTS-${BRIDGE_CLAUDE_TOKEN_SYNC_AGENTS:-static}}"
+  local rotation_trigger=""
   local rotate_json=""
   local rotation_status_row=""
   local rotation_status=""
@@ -2320,7 +2332,7 @@ process_usage_monitor() {
   # controller's $HOME. Default scope mirrors bridge-auth.sh sync (static
   # Claude roster). Operators can broaden via BRIDGE_USAGE_MONITOR_AGENTS.
   local usage_monitor_agents_scope="${BRIDGE_USAGE_MONITOR_AGENTS:-static}"
-  if ! monitor_json="$(bridge_with_timeout 30 daemon_usage_monitor "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-usage.sh" monitor --json --agents "$usage_monitor_agents_scope" 2>/dev/null)"; then
+  if ! monitor_json="$(bridge_with_timeout 30 daemon_usage_monitor "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-usage.sh" monitor --json --agents "$usage_monitor_agents_scope" --rotation-agents "$rotation_eligible_scope" 2>/dev/null)"; then
     bridge_note_usage_poll
     return 1
   fi
@@ -2377,7 +2389,19 @@ process_usage_monitor() {
   done < "$_alert_tmp"
 
   local worst_case_agent=""
-  while IFS=$'\t' read -r provider account window used_percent reset_at source worst_case_agent body; do
+  while IFS=$'\t' read -r provider account window used_percent reset_at source worst_case_agent rotation_trigger body; do
+    # #17927 P2 (E10 Obs#2): the candidates parser emits `-` for EMPTY columns
+    # (bash collapses adjacent tabs, which would otherwise shift every later
+    # field). Decode the sentinel back to empty before use.
+    [[ "$provider" == "-" ]] && provider=""
+    [[ "$account" == "-" ]] && account=""
+    [[ "$window" == "-" ]] && window=""
+    [[ "$used_percent" == "-" ]] && used_percent=""
+    [[ "$reset_at" == "-" ]] && reset_at=""
+    [[ "$source" == "-" ]] && source=""
+    [[ "$worst_case_agent" == "-" ]] && worst_case_agent=""
+    [[ "$rotation_trigger" == "-" ]] && rotation_trigger=""
+    [[ "$body" == "-" ]] && body=""
     [[ -z "$provider" || "$provider" != "claude" || -z "$window" ]] && continue
     # Rotate only once per monitor pass; bridge-usage.py already latches each
     # provider/account/window candidate once per usage reset cycle.
@@ -2445,6 +2469,7 @@ process_usage_monitor() {
       --detail sync_status="$rotation_sync_status" \
       --detail agent_scope="$rotation_agent_scope" \
       --detail worst_case_agent="$worst_case_agent" \
+      --detail rotation_trigger="${rotation_trigger:-preemptive}" \
       --detail soonest_reset="$rotation_soonest_reset"
     case "$rotation_status:$rotation_reason" in
       rotated:*)

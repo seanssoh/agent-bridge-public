@@ -2699,6 +2699,13 @@ select_for_path() {
       # decode (re-collapsing empty columns and shifting soonest_reset
       # into rotation_from) is caught by the encode/decode roundtrip case.
       add_required 1789-rotation-limited-until
+      # #17927 P2 (Option C daemon-core): process_usage_monitor now scopes
+      # rotation eligibility to the managed pool (--rotation-agents → gated in
+      # bridge-usage.py BEFORE candidate emit/latch, E6/E8) and decodes the new
+      # rotation_trigger column for the rotation audit row (E10 Obs#2). Pull the
+      # daemon-core smoke on every bridge-daemon.sh move so a future edit cannot
+      # drop the rotation scope, the sentinel decode, or the trigger audit.
+      add_required 17927-p2-statusline-usage-feed
       # v0.15.0-beta5-2 Lane η (#1314, CRITICAL/security):
       # bridge-daemon.sh's `cmd_run_cron_worker` now gates shell-cron
       # dispatch on `bridge_cron_uid_drop_preflight`. The new gate emits
@@ -5447,6 +5454,11 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # empty TSV columns (`-`) so the daemon's IFS=$'\t' read cannot
       # collapse them. The rotation suite pins the encode/decode roundtrip.
       add_required 1789-rotation-limited-until
+      # #17927 P2: usage-rotation-candidates-parse now sentinel-encodes empty
+      # columns AND emits a rotation_trigger (preemptive|reactive) column the
+      # daemon records on its rotation audit row (E10 Obs#2). Pull the daemon-core
+      # smoke so a helper refactor cannot regress the column contract.
+      add_required 17927-p2-statusline-usage-feed
       # Issue #1732 (Lane B): bridge-daemon-helpers.py's ``a2a-stuck-decide`` is
       # now class-aware — it suppresses the [A2A] outbox stuck admin alarm for
       # transient peers (alarm_on_unreachable=False) and honors a per-peer longer
@@ -5566,6 +5578,14 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # safety, the 429-signal contract, the per-window idempotence (no
       # pool-loop), or the rotation-candidate flow without CI catching it.
       add_required 1437-native-usage-probe 1468-usage-429-positive-signal
+      # #17927 P2 (Option C daemon-core): bridge-usage.sh resolves the daemon
+      # cache-read path to the per-agent CLAUDE_CONFIG_DIR (E5), and bridge-usage.py
+      # gates rotation eligibility BEFORE candidate emit/latch (E6/E8) + applies
+      # the `_written_at` staleness-guard and rotation-path (preemptive/reactive)
+      # audit tag (E10). Pull the daemon-core smoke on any usage-file move so a
+      # refactor cannot regress the read-path fix, the eligibility gate, or the
+      # staleness/observability contracts.
+      add_required 17927-p2-statusline-usage-feed
       # Issue #1824: bridge-usage-probe.py classifies a CDN-edge block (CF 429/403
       # with no anthropic origin headers) as `edge-blocked` and refuses to fabricate
       # a synthetic 100% near-limit cache from it (vs a genuine origin

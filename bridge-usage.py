@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -185,6 +186,12 @@ def _claude_snapshots_from_payload(
     # only, exactly as before (no behavior change off the 429-signal path).
     signal_token = payload.get("_signal_token")
     signal_token = str(signal_token) if isinstance(signal_token, str) and signal_token else None
+    # #17927 P2 (E10 Obs#1): the cache's self-reported write time. Carried into
+    # each snapshot so cmd_monitor can suppress a stale reading from driving a
+    # rotation decision (a stale cache = "no signal", never 0% usage). Absent on
+    # a hand-seeded cache → the freshness gate fails open (treats as fresh).
+    written_at = payload.get("_written_at")
+    written_at = str(written_at) if isinstance(written_at, str) and written_at else None
     windows = [
         ("5h", data.get("fiveHour"), data.get("fiveHourResetAt")),
         ("weekly", data.get("sevenDay"), data.get("sevenDayResetAt")),
@@ -209,6 +216,8 @@ def _claude_snapshots_from_payload(
             entry["signal_token"] = signal_token
         if signal_marker is not None:
             entry["signal"] = signal_marker
+        if written_at is not None:
+            entry["written_at"] = written_at
         snapshots.append(entry)
     return snapshots
 
@@ -633,6 +642,71 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_rotation_eligible(args: argparse.Namespace) -> set[str] | None:
+    """#17927 P2 (E6/E8): the rotation-eligible agent set, or None when ungated.
+
+    None  → the flag was not passed (legacy / non-daemon caller): rotation is
+            ungated, every candidate is eligible (pre-#17927 behavior).
+    set   → the flag was passed (the daemon always passes it). Only agents in
+            this set may DRIVE a rotation; an empty set means "no per-agent
+            agent is eligible" (only the controller-managed sentinels rotate).
+    """
+    raw = getattr(args, "rotation_eligible_agents", None)
+    if raw is None:
+        return None
+    return {a.strip() for a in str(raw).split(",") if a.strip()}
+
+
+def _agent_rotation_eligible(snapshot_agent: str, eligible: set[str] | None) -> bool:
+    """True when ``snapshot_agent`` may drive a managed-token rotation.
+
+    ``eligible is None`` ⇒ ungated (legacy). Otherwise the controller-managed
+    sentinels — the native-probe source (``__native__``) and the legacy
+    empty-agent single-controller cache — are ALWAYS eligible (they represent
+    the controller's own managed token, which IS the rotation target). A real
+    per-agent id is eligible only when it is in the managed pool. statusLine
+    caches carry no token/account identity, so a non-managed agent's high-usage
+    reading must never re-point the managed pool (multi-account mis-attribution
+    + the P3 global-login-respect invariant).
+    """
+    if eligible is None:
+        return True
+    if snapshot_agent == "" or snapshot_agent == NATIVE_PROBE_AGENT:
+        return True
+    return snapshot_agent in eligible
+
+
+def _cache_is_fresh(
+    written_at: str | None,
+    max_age_seconds: float,
+    now: datetime | None = None,
+) -> bool:
+    """#17927 P2 (E10 Obs#1): conservative staleness-guard.
+
+    Returns True (fresh / usable) UNLESS ``written_at`` is present, parseable,
+    and older than ``max_age_seconds``. A missing/unparseable timestamp fails
+    OPEN (treated as fresh) so a hand-seeded cache or a future producer variant
+    is never silently dropped — the gate only suppresses a reading when its
+    staleness is PROVABLE. A non-positive ``max_age_seconds`` disables the gate.
+    """
+    if max_age_seconds <= 0:
+        return True
+    if not written_at:
+        return True
+    try:
+        written_dt = parse_iso(written_at)
+    except Exception:
+        return True
+    if written_dt is None:
+        return True
+    if now is None:
+        now = datetime.now(timezone.utc)
+    if written_dt.tzinfo is None:
+        written_dt = written_dt.replace(tzinfo=timezone.utc)
+    age = (now - written_dt).total_seconds()
+    return age <= max_age_seconds
+
+
 def cmd_monitor(args: argparse.Namespace) -> int:
     snapshots = collect_snapshots(args)
     state_path = Path(args.state_file).expanduser()
@@ -648,6 +722,10 @@ def cmd_monitor(args: argparse.Namespace) -> int:
     # proactive threshold so the daemon can rotate or escalate before the
     # account hard-limits.
     weekly_warn_threshold = float(getattr(args, "weekly_warn_threshold", 95.0))
+    # #17927 P2 (E6/E8) rotation-eligibility gate + (E10 Obs#1) staleness gate.
+    rotation_eligible = _parse_rotation_eligible(args)
+    cache_max_age_seconds = float(getattr(args, "cache_max_age_seconds", 21600) or 0)
+    now_dt = datetime.now(timezone.utc)
     # Track the worst-case agent so the aggregate rotation row tells the
     # operator which agent triggered. Per #831 patch-dev r2 §4: a 99% on
     # agent-A must NOT be masked by a 60% on agent-B sharing the same plan.
@@ -693,13 +771,31 @@ def cmd_monitor(args: argparse.Namespace) -> int:
         # (token-free one-way digest). None on a real reading.
         signal_token = snapshot.get("signal_token")
 
+        # #17927 P2 (E10 Obs#1): freshness of THIS reading, computed BEFORE any
+        # reset-cycle latch mutation. A 429-signal (#1468) is a live rotation
+        # instruction and a non-claude provider has no statusLine cache, so both
+        # count as fresh; a claude REAL reading is fresh only when its cache
+        # `written_at` is within the max-age window. Reused by the claude
+        # rotation staleness-guard below.
+        cache_fresh = (
+            snapshot.get("provider") != "claude"
+            or bool(snapshot.get("signal"))
+            or _cache_is_fresh(snapshot.get("written_at"), cache_max_age_seconds, now=now_dt)
+        )
+
         # Cycle rollover: if reset_at has moved forward by more than the grace
         # window, this is a new cycle — clear the latch so alerts can fire again.
         # Equal or wobbling reset_at values are intentionally treated as noise
         # (see RESET_FORWARD_GRACE_SECONDS). This was the #215 noise source.
         if reset_cycle_advanced(previous_reset, reset_at):
             previous_latch = None
-        if reset_cycle_advanced(rotation_triggered_reset_at, reset_at):
+        # #17927 P2 (E10 Obs#1 — codex r2): gate the ROTATION-latch reset-cycle
+        # clear on freshness. A provably stale real reading can carry an advanced
+        # reset_at; clearing the rotation latch on it would let the NEXT fresh
+        # reading at that same reset re-emit a duplicate preemptive candidate (the
+        # exact double-rotation the staleness-guard must prevent). Only a fresh
+        # reading or a 429-signal may advance the rotation cycle here.
+        if cache_fresh and reset_cycle_advanced(rotation_triggered_reset_at, reset_at):
             rotation_triggered_at = None
             rotation_triggered_reset_at = None
         # Issue #1468 (codex r3+r4): a native 429-signal whose token DIFFERS from
@@ -750,41 +846,64 @@ def cmd_monitor(args: argparse.Namespace) -> int:
             next_latch = bucket
             alerted_at = now_iso()
 
-        if (
-            snapshot.get("provider") == "claude"
-            and isinstance(used_percent, (int, float))
-            and used_percent >= candidate_threshold
-        ):
-            # Track worst-case across this monitor pass — used for aggregate
-            # attribution in the output envelope.
-            if used_percent > worst_case_percent:
-                worst_case_percent = float(used_percent)
-                worst_case_agent = snapshot_agent or None
-            if not rotation_triggered_at:
-                candidate = {
-                    **snapshot,
-                    "rotation_threshold": candidate_threshold,
-                    "rotation_threshold_name": candidate_threshold_name,
-                    "worst_case_agent": snapshot_agent or None,
-                    "message": (
-                        f"Claude usage rotation candidate: {snapshot.get('window') or 'unknown'} "
-                        f"window at {used_percent:.0f}% "
-                        f"({candidate_threshold_name} {candidate_threshold:.0f}%)"
-                        + (f" on agent {snapshot_agent}" if snapshot_agent else "")
-                        + "."
-                    ),
-                }
-                rotation_candidates.append(candidate)
-                rotation_triggered_at = now_iso()
-                rotation_triggered_reset_at = reset_at
-                # #1468: remember which token's signal this rotation was for, so
-                # a later DIFFERENT-token 429-signal clears the latch (rotate the
-                # new token once) even at the same reset_at.
-                rotation_triggered_signal_token = signal_token
-        elif snapshot.get("provider") == "claude":
-            rotation_triggered_at = None
-            rotation_triggered_reset_at = None
-            rotation_triggered_signal_token = None
+        if snapshot.get("provider") == "claude":
+            # #17927 P2 (E10 Obs#1): `cache_fresh` was computed above (BEFORE the
+            # reset-cycle latch clear) so a stale reading's advanced reset_at can
+            # never clear the rotation latch. A synthetic 429-signal (#1468)
+            # bypasses the staleness-guard; only REAL readings are subject to it.
+            if not isinstance(used_percent, (int, float)) or not cache_fresh:
+                # No usable signal this tick (absent/null reading OR a provably
+                # stale cache). Leave the rotation latch EXACTLY as-is — do not
+                # advance it and do not clear it. A stale/absent cache must never
+                # be read as 0% usage (which would re-arm rotation) nor as a
+                # threshold crossing (which would rotate on a dead reading).
+                pass
+            elif used_percent >= candidate_threshold:
+                # Track worst-case across this monitor pass — used for aggregate
+                # attribution in the output envelope.
+                if used_percent > worst_case_percent:
+                    worst_case_percent = float(used_percent)
+                    worst_case_agent = snapshot_agent or None
+                if not _agent_rotation_eligible(snapshot_agent, rotation_eligible):
+                    # #17927 P2 (E6/E8): a monitored but non-managed agent
+                    # (global-login / dynamic) crossing threshold drives an ALERT
+                    # only — never a rotation candidate and never the latch. Its
+                    # statusLine cache carries no token/account identity, so
+                    # rotating the managed pool on it would mis-attribute across
+                    # accounts. Latch stays untouched (alert-only).
+                    pass
+                elif not rotation_triggered_at:
+                    candidate = {
+                        **snapshot,
+                        "rotation_threshold": candidate_threshold,
+                        "rotation_threshold_name": candidate_threshold_name,
+                        "worst_case_agent": snapshot_agent or None,
+                        # #17927 P2 (E10 Obs#2): rotation-path provenance so the
+                        # daemon audit can distinguish Option-C preemptive (a
+                        # fresh statusLine/native reading crossing threshold) from
+                        # P2-B reactive (a 429/limited-response signal cache).
+                        "rotation_trigger": "reactive" if snapshot.get("signal") else "preemptive",
+                        "message": (
+                            f"Claude usage rotation candidate: {snapshot.get('window') or 'unknown'} "
+                            f"window at {used_percent:.0f}% "
+                            f"({candidate_threshold_name} {candidate_threshold:.0f}%)"
+                            + (f" on agent {snapshot_agent}" if snapshot_agent else "")
+                            + "."
+                        ),
+                    }
+                    rotation_candidates.append(candidate)
+                    rotation_triggered_at = now_iso()
+                    rotation_triggered_reset_at = reset_at
+                    # #1468: remember which token's signal this rotation was for,
+                    # so a later DIFFERENT-token 429-signal clears the latch
+                    # (rotate the new token once) even at the same reset_at.
+                    rotation_triggered_signal_token = signal_token
+            else:
+                # Fresh, parseable, below threshold → operator has room; clear
+                # the latch so a future climb re-arms once (#215/#831 contract).
+                rotation_triggered_at = None
+                rotation_triggered_reset_at = None
+                rotation_triggered_signal_token = None
 
         entries[key] = {
             "last_alert_bucket": next_latch,
@@ -905,6 +1024,22 @@ def build_parser() -> argparse.ArgumentParser:
     # 7d proactive threshold. Separate from rotation_threshold so the 5h
     # window keeps its 99% behavior while weekly usage can trigger earlier.
     monitor_parser.add_argument("--weekly-warn-threshold", type=float, default=95.0)
+    # #17927 P2 (E6/E8): CSV of agents whose usage may DRIVE a token rotation
+    # (the managed-token pool). Default None = ungated (legacy behavior — every
+    # candidate is rotation-eligible). An empty string ENABLES the gate with an
+    # empty set so only the controller-managed sentinels (__native__ / legacy
+    # empty-agent cache) rotate. A monitored but non-managed agent's high-usage
+    # statusLine cache then drives an ALERT only — never a rotation/latch.
+    monitor_parser.add_argument("--rotation-eligible-agents", default=None)
+    # #17927 P2 (E10 Obs#1): a cache whose `_written_at` is older than this many
+    # seconds is "no signal → defer to reactive", never read as a fresh reading.
+    # Fail-open: a cache with no/unparseable `_written_at` is treated as fresh
+    # (the gate only suppresses when staleness is PROVABLE).
+    monitor_parser.add_argument(
+        "--cache-max-age-seconds",
+        type=float,
+        default=float(os.environ.get("BRIDGE_USAGE_CACHE_MAX_AGE_SECONDS") or 21600),
+    )
     monitor_parser.add_argument("--json", action="store_true")
     monitor_parser.set_defaults(handler=cmd_monitor)
 
