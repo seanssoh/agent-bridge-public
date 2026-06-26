@@ -2402,6 +2402,287 @@ def write_private_file_atomic_dirfd(
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Operator-global credential sync (#18849 Part 1) — seamless file-based
+# rotation for dynamic-vanilla Claude agents.
+#
+# A dynamic vanilla Claude agent (#1890: engine=claude, source=dynamic, NOT
+# linux-user-isolated) runs with HOME = the operator's home and NO private
+# CLAUDE_CONFIG_DIR, so it reads the operator-global
+# ``~/.claude/.credentials.json``. The per-agent rotation sync never touches
+# that file, so dynamic agents stay pinned to whatever (often quota-exhausted)
+# token the operator was logged in under. This module writes the active token
+# into that operator-global file so a running dynamic agent picks it up
+# seamlessly on its next prompt boundary (the same file-reread Claude already
+# does for static per-agent credentials).
+#
+# This is a HIGH-RISK surface: the target is the operator's PERSONAL login
+# state. Every write therefore:
+#   * is double-gated default-OFF (registry ``auto_rotate_enabled`` AND the
+#     persisted ``BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC`` opt-in) — an existing
+#     auto-rotate install never starts touching ``~/.claude`` after upgrade;
+#   * PATCHes rather than overwrites: it reads the existing payload and
+#     replaces ONLY ``claudeAiOauth.accessToken`` (+ ``expiresAt``), preserving
+#     ``refreshToken`` and every unknown field (a fresh login carries more than
+#     the synthetic minimal writer emits — clobbering it would break /login);
+#   * takes a per-write rollback preimage and restores it on any failure;
+#   * FAILS CLOSED when the effective writer is root (``geteuid()==0``) — the
+#     operator file must be written by the operator UID, never root;
+#   * holds a real ``~/.claude/.credentials.json.lock`` flock for the whole
+#     read-patch-write so it cannot race an operator ``claude /login``.
+#
+# Account identity (``oauthAccount`` email) is NOT synced here — the registry
+# carries no identity field (Part 1 = token-sync + identity DETECTION only;
+# identity-sync is the #18849 Part 2 follow-up). The detection surface WARNS
+# when the displayed identity may not match the freshly-synced credential.
+GLOBAL_AUTH_SYNC_OPT_IN_ENV = "BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC"
+# Test-only seam: force the root guard's "is root" branch ON regardless of the
+# real euid. It can only ever make the guard STRICTER (it never relaxes the
+# real ``os.geteuid()==0`` check), so it cannot be used to bypass the
+# fail-closed-as-root contract — only to exercise the fail path from a
+# non-root test runner.
+GLOBAL_AUTH_SYNC_FORCE_ROOT_ENV = "BRIDGE_AUTH_GLOBAL_SYNC_FORCE_ROOT"
+
+
+def global_auth_sync_opt_in_enabled() -> bool:
+    """True iff the persisted ``BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC`` opt-in is ON.
+
+    Default OFF. This is the SECOND gate of the default-OFF double-gate (the
+    first being the registry's ``auto_rotate_enabled``). It is a separate
+    persisted knob precisely so an install that already enabled auto-rotate
+    does NOT begin writing the operator's personal credential file after an
+    upgrade — the operator must explicitly opt in
+    (``agent-bridge config set-env BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC=1``).
+    """
+    raw = os.environ.get(GLOBAL_AUTH_SYNC_OPT_IN_ENV, "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _global_credential_writer_is_root() -> bool:
+    """True when the global credential write must FAIL CLOSED on root.
+
+    Real root (``os.geteuid()==0``) always returns True. The test seam can only
+    ADD a forced-root result — it can never report non-root while actually
+    root — so it cannot be abused to defeat the guard.
+    """
+    if os.geteuid() == 0:
+        return True
+    return os.environ.get(GLOBAL_AUTH_SYNC_FORCE_ROOT_ENV, "").strip() == "1"
+
+
+@contextmanager
+def claude_global_credentials_lock(
+    credentials_path: Path,
+    *,
+    timeout_seconds: int = REGISTRY_LOCK_DEFAULT_TIMEOUT_SECONDS,
+) -> Iterator[None]:
+    """Exclusive flock around the operator-global credential read-patch-write.
+
+    The operator may run ``claude /login`` against the same
+    ``~/.claude/.credentials.json`` at any moment. A real ``.credentials.json.lock``
+    flock (gate 4) guards the whole load->patch->atomic-write critical section so
+    a concurrent login and a daemon-driven token sync cannot interleave into a
+    torn write. Mirrors ``registry_lock``: a sibling ``<path>.lock`` file,
+    non-blocking poll until ``timeout_seconds``, 0600 so it stays operator-only.
+    """
+    credentials_path = Path(credentials_path).expanduser()
+    lock_path = credentials_path.with_suffix(
+        credentials_path.suffix + REGISTRY_LOCK_SUFFIX
+    )
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    acquired = False
+    try:
+        deadline = time.monotonic() + max(1, int(timeout_seconds))
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError:
+                pass
+            except OSError as exc:
+                if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
+                    raise
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"claude_global_credentials_lock timeout after "
+                    f"{timeout_seconds}s on {lock_path}"
+                )
+            time.sleep(0.1)
+        yield
+    finally:
+        if acquired:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def resolve_operator_claude_config_path(credentials_path: Path) -> Path:
+    """Resolve the operator's ``~/.claude.json`` sibling of the credential file.
+
+    ``oauthAccount.emailAddress`` (the DISPLAYED Claude identity) lives in
+    ``<home>/.claude.json``, NOT in ``.credentials.json``. Given the global
+    credentials path ``<home>/.claude/.credentials.json`` the config is
+    ``<home>/.claude.json`` (parent of the ``.claude`` dir).
+    """
+    return Path(credentials_path).expanduser().parent.parent / ".claude.json"
+
+
+def read_oauth_account_email(config_path: Path) -> str:
+    """Best-effort read of ``oauthAccount.emailAddress`` from ``~/.claude.json``.
+
+    DETECTION ONLY (#18849 Part 1, gate 7). Returns the displayed account email
+    or ``""`` when the file is absent / unreadable / lacks the field. Never
+    raises and never writes — identity is surfaced, never mutated, in Part 1.
+    """
+    config_path = Path(config_path).expanduser()
+    try:
+        if config_path.is_symlink() or not config_path.is_file():
+            return ""
+        parsed = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - detection must never raise
+        return ""
+    if not isinstance(parsed, dict):
+        return ""
+    account = parsed.get("oauthAccount")
+    if not isinstance(account, dict):
+        return ""
+    email = account.get("emailAddress")
+    return email.strip() if isinstance(email, str) else ""
+
+
+def patch_global_claude_credentials(
+    path: Path,
+    access_token: str,
+    *,
+    expires_at_ms: int | None = None,
+    owner_uid: int | None = None,
+    allowed_root: Path | None = None,
+) -> dict[str, Any]:
+    """PATCH the operator-global credential file with a new access token.
+
+    Read the existing ``~/.claude/.credentials.json`` payload and replace ONLY
+    ``claudeAiOauth.accessToken`` (and ``expiresAt`` when supplied), preserving
+    ``refreshToken`` and every other field. Atomic, fd-pinned/no-follow write at
+    0600 via ``write_private_file_atomic_dirfd``. Fails closed as root, holds the
+    credential flock, takes a per-write preimage and rolls it back on any error.
+
+    Returns a result dict with ``changed`` (False when the file already carried
+    this exact access token — idempotent no-op), ``created`` (the file was
+    absent and a fresh minimal payload was written), and ``fingerprint``.
+    Raises on root, symlinked target, unparseable existing payload, or write
+    failure (after rollback).
+    """
+    if _global_credential_writer_is_root():
+        raise PermissionError(
+            "refusing to write the operator-global credential file as root "
+            "(geteuid==0) — global auth sync must run as the operator UID, not "
+            "root; --owner-uid only chowns the tempfile, it does not change the "
+            "effective writer"
+        )
+    path = Path(path).expanduser()
+    with claude_global_credentials_lock(path):
+        # Symlink target / symlinked-parent are refused — never follow a swapped
+        # path out of the operator home (mirrors the controller-cred reader).
+        if path.is_symlink():
+            raise PermissionError(
+                f"refusing to write symlinked operator-global credentials: {path}"
+            )
+        if path.parent.is_symlink():
+            raise PermissionError(
+                f"refusing to write operator-global credentials under symlinked "
+                f"parent: {path.parent}"
+            )
+        existed = path.is_file()
+        preimage: bytes | None = None
+        if existed:
+            preimage = path.read_bytes()
+            try:
+                payload = json.loads(preimage.decode("utf-8"))
+            except Exception as exc:  # noqa: BLE001 - corrupt → refuse, never clobber
+                raise ValueError(
+                    f"operator-global credentials are not valid JSON; refusing to "
+                    f"overwrite a possibly mid-login file: {path}: {exc}"
+                ) from exc
+            if not isinstance(payload, dict):
+                raise ValueError(
+                    f"operator-global credentials must contain a JSON object: {path}"
+                )
+        else:
+            payload = {}
+
+        existing_oauth = payload.get("claudeAiOauth")
+        # An EXISTING credential file is expected to carry a ``claudeAiOauth``
+        # object (the only shape Claude writes). If it parses as JSON but lacks
+        # one, refuse rather than reshape an unrecognized file (a corrupt or
+        # attacker-planted file) — PATCH only a recognized credential. The
+        # absent-file case below is the sole create path.
+        if existed and not isinstance(existing_oauth, dict):
+            raise ValueError(
+                "existing operator-global credentials lack a 'claudeAiOauth' "
+                f"object; refusing to reshape an unrecognized credential file: {path}"
+            )
+        old_token = (
+            existing_oauth.get("accessToken")
+            if isinstance(existing_oauth, dict)
+            else None
+        )
+        fingerprint = token_fingerprint(access_token)
+        # Idempotent: the file already carries this exact token → no rewrite.
+        if existed and old_token == access_token:
+            return {
+                "changed": False,
+                "created": False,
+                "fingerprint": fingerprint,
+                "path": str(path),
+            }
+
+        oauth = dict(existing_oauth) if isinstance(existing_oauth, dict) else {}
+        oauth["accessToken"] = access_token
+        if expires_at_ms is not None:
+            oauth["expiresAt"] = expires_at_ms
+        # Only seed scopes when creating a fresh payload; never override an
+        # existing login's scopes.
+        if not existed and "scopes" not in oauth:
+            oauth["scopes"] = CLAUDE_OAUTH_SCOPES
+        payload["claudeAiOauth"] = oauth
+
+        text = json.dumps(payload, ensure_ascii=True, indent=2) + "\n"
+        try:
+            write_private_file_atomic_dirfd(
+                path,
+                text,
+                mode=0o600,
+                prefix=".credentials.",
+                owner_uid=owner_uid,
+                allowed_root=allowed_root,
+            )
+        except Exception:
+            # Per-write rollback (gate 3/5): the atomic writer never half-writes
+            # the final path, but restore the preimage as belt-and-suspenders so
+            # a partial state can never strand the operator's login.
+            try:
+                if existed and preimage is not None:
+                    write_private_file_atomic(path, preimage.decode("utf-8"), mode=0o600, prefix=".credentials.")
+                elif not existed and path.exists():
+                    path.unlink()
+            except Exception:  # noqa: BLE001 - rollback best-effort; original error wins
+                pass
+            raise
+        return {
+            "changed": True,
+            "created": not existed,
+            "fingerprint": fingerprint,
+            "path": str(path),
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Credential-generation state (Q4 groundwork, #1469 enabler, #1470 P1).
 #
 # A later #1469 set-scoped re-wake must answer "which agents were running
@@ -3785,6 +4066,237 @@ def cmd_sync_agent(args: argparse.Namespace) -> int:
     return 0
 
 
+def _global_auth_gate_state(registry_path: Path) -> tuple[bool, bool, str, str]:
+    """Read the default-OFF double-gate + active token under the registry lock.
+
+    Returns ``(auto_rotate, opt_in, active_id, active_token)``. Both gate bits
+    are read together so the daemon and the doctor surface agree on WHY a global
+    write is (not) eligible. ``active_id`` / ``active_token`` are ``""`` when no
+    healthy active token is registered. The registry read is the only locked
+    work — the slower credential write happens afterwards (cmd_recover_due
+    pattern), and the opt-in env is process-constant so there is no second file
+    to race.
+    """
+    auto_rotate = False
+    active_id = ""
+    active_token = ""
+    with registry_lock(registry_path):
+        registry = load_registry(registry_path)
+        auto_rotate = bool(registry.get("auto_rotate_enabled", False))
+        try:
+            active_id, active_token = active_registry_token(registry)
+        except ValueError:
+            active_id, active_token = "", ""
+    return auto_rotate, global_auth_sync_opt_in_enabled(), active_id, active_token
+
+
+def cmd_sync_global(args: argparse.Namespace) -> int:
+    """Write the active registry token into the operator-global credential file.
+
+    #18849 Part 1: the seamless dynamic-vanilla rotation step. Double-gated
+    default-OFF (``auto_rotate_enabled`` AND ``BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC``);
+    PATCHes (never overwrites) ``~/.claude/.credentials.json`` so a running
+    dynamic agent re-reads the new token at its next prompt boundary. Identity
+    (``oauthAccount`` email) is DETECTED + WARNED on, never synced (Part 2).
+    """
+    json_mode = bool(args.json)
+    registry_path = Path(args.registry).expanduser()
+    global_path = resolve_controller_claude_credentials_path(
+        getattr(args, "global_credentials", None)
+    )
+    config_path = (
+        Path(args.claude_config).expanduser()
+        if getattr(args, "claude_config", None)
+        else resolve_operator_claude_config_path(global_path)
+    )
+
+    try:
+        auto_rotate, opt_in, active_id, active_token = _global_auth_gate_state(
+            registry_path
+        )
+    except Exception as exc:  # noqa: BLE001 - registry unreadable → fail closed
+        return fail(f"global auth sync: registry read failed: {exc}", json_mode)
+
+    # Default-OFF double gate. A disabled gate is a NO-WRITE skip, never an
+    # error — an install that has not opted in must converge to "nothing
+    # happened" without touching the operator credential file.
+    if not opt_in or not auto_rotate:
+        reason = (
+            "global_auth_sync_opt_in_disabled"
+            if not opt_in
+            else "auto_rotate_disabled"
+        )
+        payload = {
+            "status": "skipped",
+            "reason": reason,
+            "converged": False,
+            "gate": {"auto_rotate_enabled": auto_rotate, "opt_in_enabled": opt_in},
+            "global_path": str(global_path),
+        }
+        if json_mode:
+            print(json.dumps(payload, ensure_ascii=True, indent=2))
+        else:
+            print(f"skipped: {reason}")
+        return 0
+
+    if not active_id or not active_token:
+        return fail(
+            "global auth sync is enabled but no healthy active Claude token is "
+            "registered; refusing to touch the operator credential file",
+            json_mode,
+        )
+
+    # We run as the operator (the bash layer never escalates this path and
+    # patch_global_claude_credentials fails closed on root). Do NOT pass
+    # --owner-uid: a chown to a foreign uid would EPERM, and chowning to our own
+    # uid is a no-op — the writer already lands the file owned by the operator.
+    allowed_root = (
+        Path(args.allowed_root).expanduser()
+        if getattr(args, "allowed_root", None)
+        else None
+    )
+    try:
+        result = patch_global_claude_credentials(
+            global_path,
+            active_token,
+            expires_at_ms=CLAUDE_OAUTH_EXPIRES_AT_MS,
+            allowed_root=allowed_root,
+        )
+    except Exception as exc:  # noqa: BLE001 - any write failure → fail closed
+        # gate 5: on failure the preimage was rolled back inside the writer and
+        # we report NO convergence so the daemon does not claim the dynamic
+        # fleet picked up the new token.
+        return fail(f"global auth sync write failed: {exc}", json_mode)
+
+    # Identity-shadow DETECTION (gate 7): the registry has no account-identity
+    # field, so we cannot SYNC oauthAccount in Part 1. Surface the displayed
+    # email and WARN that it is NOT updated by the token write, so a doctor /
+    # statusLine consumer (and the operator) can see an auth/identity mismatch
+    # rather than silently trusting a stale displayed account.
+    displayed_email = read_oauth_account_email(config_path)
+    identity_shadow = {
+        "displayed_email": displayed_email,
+        "synced": False,
+        "detection_only": True,
+    }
+    if result["changed"] and displayed_email:
+        identity_shadow["warning"] = (
+            "displayed oauthAccount identity is NOT updated by the token sync "
+            "(Part 1 syncs the token only); if the active token belongs to a "
+            "different account the displayed identity will be stale until the "
+            "operator re-logs in or the #18849 Part 2 identity-sync lands"
+        )
+        print(
+            f"warning: global auth token synced (fingerprint={result['fingerprint']}) "
+            f"but displayed identity '{displayed_email}' is unchanged — identity "
+            "is detection-only in Part 1; verify the displayed account matches "
+            "the active token's account.",
+            file=sys.stderr,
+        )
+
+    status = "synced" if result["changed"] else "converged"
+    payload = {
+        "status": status,
+        "reason": "rotated_token" if result["changed"] else "already_current",
+        "converged": True,
+        "changed": bool(result["changed"]),
+        "created": bool(result["created"]),
+        "active_token_id": active_id,
+        "fingerprint": result["fingerprint"],
+        "global_path": str(global_path),
+        "gate": {"auto_rotate_enabled": auto_rotate, "opt_in_enabled": opt_in},
+        "identity_shadow": identity_shadow,
+    }
+    if json_mode:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+    else:
+        print(f"{status}: operator-global <- {active_id} ({result['fingerprint']})")
+    return 0
+
+
+def cmd_global_auth_status(args: argparse.Namespace) -> int:
+    """Read-only doctor/status surface for the operator-global auth sync (#18849).
+
+    Reports the default-OFF double-gate state, whether the operator-global
+    credential currently converges on the active registry token (by
+    fingerprint), and the identity-shadow DETECTION (displayed oauthAccount
+    email vs the synced token). Never writes — this is the gate-7 detection
+    surface for ``agent-bridge auth claude-token global-auth-status`` and any
+    doctor consumer.
+    """
+    json_mode = bool(args.json)
+    registry_path = Path(args.registry).expanduser()
+    global_path = resolve_controller_claude_credentials_path(
+        getattr(args, "global_credentials", None)
+    )
+    config_path = (
+        Path(args.claude_config).expanduser()
+        if getattr(args, "claude_config", None)
+        else resolve_operator_claude_config_path(global_path)
+    )
+
+    try:
+        auto_rotate, opt_in, active_id, active_token = _global_auth_gate_state(
+            registry_path
+        )
+    except Exception as exc:  # noqa: BLE001 - status must surface, never crash
+        return fail(f"global auth status: registry read failed: {exc}", json_mode)
+
+    enabled = bool(opt_in and auto_rotate)
+    active_fp = token_fingerprint(active_token) if active_token else ""
+
+    global_fp = ""
+    global_present = False
+    try:
+        if not global_path.is_symlink() and global_path.is_file():
+            global_present = True
+            parsed = json.loads(global_path.read_text(encoding="utf-8"))
+            if isinstance(parsed, dict):
+                oauth = parsed.get("claudeAiOauth")
+                if isinstance(oauth, dict) and isinstance(oauth.get("accessToken"), str):
+                    global_fp = token_fingerprint(oauth["accessToken"])
+    except Exception:  # noqa: BLE001 - unreadable global file → report absent fp
+        global_fp = ""
+
+    converged = bool(enabled and active_fp and global_fp and active_fp == global_fp)
+    displayed_email = read_oauth_account_email(config_path)
+
+    payload = {
+        "status": "ok",
+        "enabled": enabled,
+        "gate": {"auto_rotate_enabled": auto_rotate, "opt_in_enabled": opt_in},
+        "active_token_id": active_id,
+        "active_fingerprint": active_fp,
+        "global_present": global_present,
+        "global_fingerprint": global_fp,
+        "converged": converged,
+        "identity_shadow": {
+            "displayed_email": displayed_email,
+            "synced": False,
+            "detection_only": True,
+        },
+        "global_path": str(global_path),
+    }
+    # gate 7 detection: an enabled, written-through global credential whose
+    # displayed identity exists but is never synced is a possible shadow.
+    if enabled and converged and displayed_email:
+        payload["identity_shadow"]["warning"] = (
+            "displayed oauthAccount identity is not synced by Part 1 — verify it "
+            "matches the active token's account"
+        )
+    if json_mode:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+    else:
+        state = "enabled" if enabled else "disabled"
+        conv = "converged" if converged else "not-converged"
+        print(
+            f"global auth sync: {state} (auto_rotate={auto_rotate} "
+            f"opt_in={opt_in}); {conv}; displayed_identity="
+            f"{displayed_email or '<none>'}"
+        )
+    return 0
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Codex fleet-sync CLI handlers (#1470 Phase 2). Invoked by bridge-auth.sh
 # `codex-cred {register,sync,verify,source}` after the bash layer has
@@ -4726,6 +5238,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sync_parser.add_argument("--json", action="store_true")
     sync_parser.set_defaults(handler=cmd_sync_agent)
+
+    # ── Operator-global seamless rotation (#18849 Part 1) ─────────────
+    # Double-gated default-OFF PATCH of ~/.claude/.credentials.json so a
+    # dynamic-vanilla Claude agent re-reads the rotated token seamlessly.
+    sync_global_parser = sub.add_parser("sync-global")
+    sync_global_parser.add_argument(
+        "--global-credentials",
+        default=None,
+        help="explicit path to the operator-global ~/.claude/.credentials.json",
+    )
+    sync_global_parser.add_argument(
+        "--claude-config",
+        default=None,
+        help="explicit path to the operator ~/.claude.json (oauthAccount detection)",
+    )
+    sync_global_parser.add_argument(
+        "--allowed-root",
+        default=None,
+        help="require the resolved global credential dir to stay under this real path",
+    )
+    sync_global_parser.add_argument("--json", action="store_true")
+    sync_global_parser.set_defaults(handler=cmd_sync_global)
+
+    global_status_parser = sub.add_parser("global-auth-status")
+    global_status_parser.add_argument("--global-credentials", default=None)
+    global_status_parser.add_argument("--claude-config", default=None)
+    global_status_parser.add_argument("--json", action="store_true")
+    global_status_parser.set_defaults(handler=cmd_global_auth_status)
 
     # ── Codex fleet-sync adapter (#1470 Phase 2) ──────────────────────
     # register/sync/verify/source only — Codex has no rotation/recover/
