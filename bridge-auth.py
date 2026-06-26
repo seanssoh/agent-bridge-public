@@ -107,6 +107,19 @@ TOKEN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 # marker list.
 QUOTA_LIMIT_MARKERS = ("hit your limit", "usage limit")
 AUTH_FAILED_MARKERS = ("invalid api key", "unauthorized")
+# #18849 Part 2 (cascade): the ``last_check_status`` values that mark an INACTIVE
+# candidate token unavailable for rotation. ``quota_limited`` (a read-only
+# ``check`` saw a 429 but ran WITHOUT ``--disable-on-quota``, so the row stayed
+# enabled) and ``auth_failed`` (``check`` never disables on auth errors) are the
+# two HARD signals an enabled candidate can still carry. ``timeout``/``failed``
+# are transient/ambiguous and stay optimistically AVAILABLE (fail-safe — a flaky
+# probe must never strand a token). See ``classify_probe`` for the vocabulary.
+ROTATION_ADVERSE_CHECK_STATUSES = frozenset({"quota_limited", "auth_failed"})
+# Freshness window for the adverse-check cascade signal: a hard-error check older
+# than this is treated as STALE and the candidate becomes optimistically
+# available again, so a refreshed credential is never permanently stranded by a
+# day-old ``auth_failed``. Overridable via env for tests / tuning.
+ROTATION_ADVERSE_CHECK_MAX_AGE_SECONDS = 21600  # 6h
 CLAUDE_OAUTH_EXPIRES_AT_MS = 4102444800000
 CLAUDE_OAUTH_SCOPES = ["user:inference", "user:profile"]
 CLAUDE_CONFIG_MIGRATION_VERSION = 13
@@ -975,6 +988,79 @@ def token_limited_until(row: dict[str, Any]) -> datetime | None:
     return iso_to_utc(str(row.get("limited_until") or ""))
 
 
+def _rotation_adverse_check_max_age_seconds() -> float:
+    """Freshness window (seconds) for the adverse-check cascade signal (#18849).
+
+    Reads ``BRIDGE_CLAUDE_ROTATION_ADVERSE_CHECK_MAX_AGE_SECONDS`` when set to a
+    positive number; otherwise the ``ROTATION_ADVERSE_CHECK_MAX_AGE_SECONDS``
+    default. A non-positive / unparseable override falls back to the default so a
+    bad value can never collapse the window to zero.
+    """
+    raw = os.environ.get("BRIDGE_CLAUDE_ROTATION_ADVERSE_CHECK_MAX_AGE_SECONDS")
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = 0.0
+        if value > 0:
+            return value
+    return float(ROTATION_ADVERSE_CHECK_MAX_AGE_SECONDS)
+
+
+def rotation_candidate_availability(
+    row: dict[str, Any],
+    now: datetime,
+    *,
+    adverse_check_max_age_seconds: float,
+) -> tuple[bool, datetime | None]:
+    """Cascade availability of an enabled candidate token (#18849 Part 2).
+
+    Returns ``(available, reset_at)``. The candidate is UNAVAILABLE when it is
+    inside a known cooldown window — ``limited_until`` (#1789, the 429-derived
+    rotate-away stamp) or ``disabled_until`` (the quota cooldown) still in the
+    future — OR its most-recent ``last_check_status`` is a hard limit/auth error
+    (:data:`ROTATION_ADVERSE_CHECK_STATUSES`) WITHIN the freshness window.
+
+    An INACTIVE token has no live usage %, so cascade judges availability from
+    these light registry signals only — never a per-candidate usage probe in the
+    rotate loop (an API call per token = expensive + rate-limit risk, and the
+    loop runs under the registry lock). Fail-safe: an absent/unparseable stamp, a
+    STALE adverse check, a FUTURE-dated check stamp (clock skew / hand-edit), or a
+    missing/non-adverse ``last_check_status`` is treated as AVAILABLE
+    ("available-but-unverified"). That never strands a token; a
+    genuinely-capped optimistic pick self-corrects on its next real 429 (the
+    reactive path re-stamps ``limited_until`` and the PR-1 ``_token_digest`` gate
+    suppresses the post-rotation ping-pong), so the residual thrash is bounded.
+
+    ``reset_at`` is the soonest cooldown expiry for a WINDOW-based block (drives
+    the daemon's pool-exhausted suppression/notice cadence). It is ``None`` for an
+    adverse-check block (an auth error carries no reset), so an adverse-only
+    exhaustion falls back to the daemon's short floor cooldown.
+    """
+    reset_at: datetime | None = None
+    for stamp in (
+        token_limited_until(row),
+        iso_to_utc(str(row.get("disabled_until") or "")),
+    ):
+        if stamp is not None and stamp > now:
+            if reset_at is None or stamp < reset_at:
+                reset_at = stamp
+    if reset_at is not None:
+        return False, reset_at
+    if str(row.get("last_check_status") or "") in ROTATION_ADVERSE_CHECK_STATUSES:
+        checked_at = iso_to_utc(str(row.get("last_checked_at") or ""))
+        if checked_at is not None:
+            age_seconds = (now - checked_at).total_seconds()
+            # Only a check whose age is within ``[0, max_age]`` blocks the
+            # candidate. A FUTURE stamp (clock skew / hand-edit) yields a
+            # NEGATIVE age — untrusted, so it fails OPEN (available); honoring it
+            # would strand the token until the future time + window, which the
+            # fail-safe model forbids.
+            if 0 <= age_seconds <= adverse_check_max_age_seconds:
+                return False, None
+    return True, None
+
+
 def redact_token(text: str, token: str) -> str:
     if not text or not token:
         return text
@@ -1481,12 +1567,29 @@ def cmd_rotate(args: argparse.Namespace) -> int:
                     now = now_utc()
                     new_id = ""
                     soonest_reset: datetime | None = None
+                    # #18849 Part 2 (cascade): advance past EVERY unavailable
+                    # candidate — inside a known limit window (#1789
+                    # ``limited_until`` / quota ``disabled_until``) OR carrying a
+                    # recent hard limit/auth ``last_check_status`` — to the next
+                    # AVAILABLE token, refusing (``all_tokens_limited``) only when
+                    # the whole ring is exhausted. The ring is traversed at most
+                    # once per call (bounded), and availability comes from light
+                    # registry signals — never a per-candidate usage probe
+                    # (rate-limit + lock-hold safe). Fail-safe: no/stale signal =>
+                    # available, so a fresh / unchecked pool still rotates.
+                    adverse_max_age = _rotation_adverse_check_max_age_seconds()
                     for candidate in ring:
-                        candidate_row = find_token(registry, candidate)
-                        limited = token_limited_until(candidate_row or {})
-                        if limited is not None and limited > now:
-                            if soonest_reset is None or limited < soonest_reset:
-                                soonest_reset = limited
+                        candidate_row = find_token(registry, candidate) or {}
+                        available, reset_at = rotation_candidate_availability(
+                            candidate_row,
+                            now,
+                            adverse_check_max_age_seconds=adverse_max_age,
+                        )
+                        if not available:
+                            if reset_at is not None and (
+                                soonest_reset is None or reset_at < soonest_reset
+                            ):
+                                soonest_reset = reset_at
                             continue
                         new_id = candidate
                         break
