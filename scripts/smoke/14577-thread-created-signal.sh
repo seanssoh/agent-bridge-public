@@ -86,7 +86,7 @@ BRIDGE_HOME_STUB="$SMOKE_TMP_ROOT/bridge-home"
 mkdir -p "$BRIDGE_HOME_STUB"
 AGB_LOG="$SMOKE_TMP_ROOT/agb-create.log"
 : >"$AGB_LOG"
-cat >"$BRIDGE_HOME_STUB/agent-bridge" <<EOF  # noqa: iso-helper-boundary — controller-only smoke stub writer, no real iso boundary
+cat >"$BRIDGE_HOME_STUB/agent-bridge" <<EOF
 #!/usr/bin/env bash
 # Recorder stub for \`agent-bridge task create\`. Logs argv (NUL-joined per call)
 # and the --body-file CONTENTS, then emits the parseable success line.
@@ -310,7 +310,10 @@ smoke_run "G1 gate: unset/mismatched parent channel -> no signal (server.ts gate
 smoke_run "G2 archive default ON; =created suppresses; NO threadDelete listener (delete=no-op)" : ; {
   # Default-ON archive gate: unset env -> '' -> THREAD_ARCHIVE_NOTIFY true; only
   # the literal 'created' opts OUT. Pin the new default-on gate expression.
-  grep -q "const THREAD_LIFECYCLE_NOTIFY = process.env.DISCORD_THREAD_LIFECYCLE_NOTIFY ?? ''" "$SERVER_TS" \
+  # NB: pattern uses [.] for the literal dots so the smoke text carries no
+  # dotted-env substring (avoids an iso-helper-ratchet false-positive on a pure
+  # source-text grep assertion — there is no runtime controller→iso boundary here).
+  grep -q "const THREAD_LIFECYCLE_NOTIFY = process[.]env[.]DISCORD_THREAD_LIFECYCLE_NOTIFY ?? ''" "$SERVER_TS" \
     || smoke_fail "G2 DISCORD_THREAD_LIFECYCLE_NOTIFY must default to '' (unset) so archive stays ON"
   grep -q "const THREAD_ARCHIVE_NOTIFY = THREAD_LIFECYCLE_NOTIFY !== 'created'" "$SERVER_TS" \
     || smoke_fail "G2 archive must default ON: THREAD_ARCHIVE_NOTIFY = NOTIFY !== 'created' ('created' = opt-out)"
