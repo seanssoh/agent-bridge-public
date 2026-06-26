@@ -181,6 +181,14 @@ add_required 1966-orphan-walk-prune
 # field). In the full static suite so any harvest-stub / bridge-memory.py
 # scan-transcripts edit re-runs the run-as-iso + marshal-back contract.
 add_required 1894-iso-transcript-harvest-run-as-iso
+# Issue #17957 (path B): the disposable-`claude -p` GLOBAL invariant enforcer.
+# T4 scans EVERY claude headless `-p` spawn-site repo-wide and fails on a NEW
+# unlisted naked spawn-site (or a removed channel-off path on a known one);
+# T5 fails on bash-helper/create-agent/Python overlay drift. In the full static
+# suite so any spawn-site, helper, or overlay edit anywhere re-runs the
+# structural guard — the only enforcement that can cover an as-yet-unidentified
+# launcher that re-introduces the telegram/discord poller self-theft.
+add_required 17957-disposable-no-poller
 # Issue #1897: the ci-select-smoke sharding self-check. Pins the post-selection
 # --shard-index/--shard-total filter contract (union-of-shards == unsharded,
 # disjoint shards, empty-shard exit 0, --run shard filtering, shard-aware bun
@@ -4252,6 +4260,19 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       add_integration integration-minimal
       ;;
 
+    runtime-templates/scripts/call-shopify.sh|runtime-templates/scripts/call-patch-update.sh|runtime-templates/skills/patch/scripts/call-patch.sh|runtime-templates/skills/agent-factory/scripts/create-agent.sh|runtime-templates/scripts/lib/singleton-channel-suppression.sh)
+      # Issue #17957 (path B): these runtime-template launchers each spawn a
+      # short/disposable `claude` in the agent's inherited config-dir. Each must
+      # carry the singleton-channel-off `--settings` overlay (the shared bash
+      # helper runtime-templates/scripts/lib/singleton-channel-suppression.sh,
+      # kept in sync with lib/bridge_disposable_claude.py) so the child can't
+      # SIGTERM-steal the admin's telegram/discord poller. This dedicated arm
+      # precedes the broad `runtime-templates/*` channel arm so a launcher edit
+      # re-runs the GLOBAL no-poller invariant guard.
+      add_required 17957-disposable-no-poller
+      add_integration integration-minimal
+      ;;
+
     scripts/apply-channel-policy.sh|lib/bridge-channels.sh|lib/bridge-discord.sh|bridge-discord-relay.sh|bridge-notify.sh|bridge-notify.py|runtime-templates/*)
       # Issue #875: bridge-notify.py owns the implicit-default account silent-
       # skip contract — when an agent has no Discord channel and the runner
@@ -4373,6 +4394,25 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # unreadable tree AND a fully-unreadable home; re-run whenever the
       # rebuild/collect read path moves.
       add_required 1947-memory-rebuild-graceful-skip
+      # Issue #17957 (path B): bridge-memory.py's _llm_summarize disposable
+      # `claude -p` now launches with a --settings overlay that suppresses the
+      # singleton channel plugins (telegram/discord) so it can't steal the
+      # admin's live getUpdates poller, while preserving other plugins/MCP.
+      # Re-run the no-poller contract smoke whenever this spawn moves.
+      add_required 17957-disposable-no-poller
+      add_integration integration-minimal
+      ;;
+
+    bridge-knowledge.py|lib/bridge_disposable_claude.py)
+      # Issue #17957 (path B): the disposable `claude -p` spawns in
+      # bridge-knowledge.py (LLM review + related-page suggestion) and the
+      # shared lib/bridge_disposable_claude.py overlay helper must launch
+      # WITHOUT the singleton channel plugins (telegram/discord) so a
+      # disposable child cannot SIGTERM-steal the admin's live poller, while
+      # preserving every other plugin + MCP. The smoke asserts the spawned
+      # argv carries the singleton-only --settings overlay (no
+      # --strict-mcp-config) and that a per-key merge keeps other plugins/MCP.
+      add_required 17957-disposable-no-poller
       add_integration integration-minimal
       ;;
 

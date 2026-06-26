@@ -68,12 +68,19 @@ EOF
   ephemeral-external)
     SCRIPT_DIR="$RUNTIME_ROOT/scripts"
     mkdir -p "$SCRIPT_DIR"
+    # #17957 path B: bake the singleton-channel-off --settings overlay into the
+    # generated runner so this disposable `claude -p` can't SIGTERM-steal the
+    # admin's live telegram/discord poller. The overlay disables ONLY the two
+    # singleton channel plugins and preserves every other plugin + MCP server
+    # (per-key settings merge). KEEP IN SYNC with
+    # lib/bridge_disposable_claude.py:SINGLETON_CHANNEL_PLUGINS (asserted by
+    # scripts/smoke/17957-disposable-no-poller.sh).
     cat >"$SCRIPT_DIR/run-$NAME.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 BRIDGE_HOME="\${BRIDGE_HOME:-\$HOME/.agent-bridge}"
 TASK="\${1:?Usage: run-$NAME.sh \"task\"}"
-claude -p --no-session-persistence --dangerously-skip-permissions --model "$MODEL" --output-format text "\$TASK"
+claude -p --settings '{"enabledPlugins":{"telegram@claude-plugins-official":false,"discord@claude-plugins-official":false}}' --no-session-persistence --dangerously-skip-permissions --model "$MODEL" --output-format text "\$TASK"
 EOF
     chmod +x "$SCRIPT_DIR/run-$NAME.sh"
     echo "Created: $SCRIPT_DIR/run-$NAME.sh"

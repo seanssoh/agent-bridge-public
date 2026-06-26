@@ -19,6 +19,34 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
+# Shared disposable-`claude -p` launch hardening (#17957). `_llm_summarize`
+# below runs in the agent's real config-dir, so without this it would auto-load
+# the singleton telegram/discord plugins and steal the admin's live poller. The
+# overlay suppresses ONLY those singleton channels and preserves all other
+# plugins/MCP.
+_BRIDGE_MEMORY_LIB_DIR = Path(__file__).resolve().parent / "lib"
+if _BRIDGE_MEMORY_LIB_DIR.is_dir() and str(_BRIDGE_MEMORY_LIB_DIR) not in sys.path:  # noqa: raw-pathlib-controller-only — import-time controller-side lib dir probe
+    sys.path.insert(0, str(_BRIDGE_MEMORY_LIB_DIR))
+
+try:
+    from bridge_disposable_claude import singleton_channel_suppression_argv  # noqa: E402
+except ImportError as _exc:
+    # A relocated copy of this script (e.g. #1894's run-as-iso transcript scan,
+    # which copies only this file without the adjacent lib/) must still import —
+    # but it must NOT silently spawn a disposable `claude -p` that could steal
+    # the admin's telegram/discord poller. Bind a fail-closed proxy: code paths
+    # that never spawn (scan-transcripts, harvest-daily, …) import fine; any
+    # path that actually reaches the spawn raises loudly instead of launching
+    # the child unsuppressed.
+    _BRIDGE_DISPOSABLE_IMPORT_ERROR = _exc
+
+    def singleton_channel_suppression_argv() -> list[str]:  # noqa: E402
+        raise RuntimeError(
+            "lib/bridge_disposable_claude.py is required to launch a disposable "
+            "`claude -p` with the singleton channel plugins suppressed (#17957) "
+            f"but was not importable: {_BRIDGE_DISPOSABLE_IMPORT_ERROR}"
+        )
+
 
 USER_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 SEARCH_SCOPES = ("wiki", "all", "user", "daily", "shared", "project", "decision", "raw")
@@ -1712,7 +1740,7 @@ def _llm_summarize(prompt: str, model: str = "") -> str | None:
     claude = shutil.which("claude")
     if not claude:
         return None
-    command = [claude, "-p", "--no-session-persistence", "--dangerously-skip-permissions", "--output-format", "text"]
+    command = [claude, "-p", *singleton_channel_suppression_argv(), "--no-session-persistence", "--dangerously-skip-permissions", "--output-format", "text"]
     if model:
         command.extend(["--model", model])
     command.append(prompt)
