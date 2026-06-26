@@ -288,3 +288,25 @@ BRIDGE_AGENT_ACTION["developer:clear"]="/clear"
 # it to empty to disable seeding entirely. Claude agents only (Codex skipped).
 #
 # export BRIDGE_SEED_PLUGIN_CONFIG_ALLOWLIST="claude-hud"
+
+# --- Operator-global seamless token rotation for dynamic Claude (#18849) -------
+# HIGH-RISK, default-OFF. When ENABLED, a Claude token rotation also PATCHes the
+# operator-global `~/.claude/.credentials.json` (the file a dynamic-vanilla
+# Claude agent reads: HOME=operator-global, no CLAUDE_CONFIG_DIR) with the new
+# active token, so a running dynamic agent picks up the rotation seamlessly
+# without a restart. The write PATCHes (never overwrites) — it preserves
+# `refreshToken` and every other field of the operator's real login — takes a
+# rollback preimage, holds a `.credentials.json.lock` flock, and FAILS CLOSED if
+# the writer is root.
+#
+# This is double-gated: it fires ONLY when token auto-rotation is enabled AND
+# this opt-in is ON. It writes the operator's PERSONAL credential file, so it is
+# OFF by default and an existing auto-rotate install never starts touching
+# `~/.claude` after an upgrade — you must opt in explicitly. Account identity
+# (`oauthAccount` email) is NOT synced in Part 1; `agent-bridge auth claude-token
+# global-auth-status` DETECTS and warns on a displayed-identity mismatch.
+#
+# Prefer the audited, persisted setter so the daemon inherits it:
+#   agent-bridge config set-env BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC=1
+#
+# export BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC=1

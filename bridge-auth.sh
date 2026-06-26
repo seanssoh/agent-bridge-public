@@ -18,6 +18,8 @@ Usage:
   bash $SCRIPT_DIR/bridge-auth.sh claude-token list [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token activate <id> [--sync] [--agents static|all|csv] [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token sync [--agents static|all|csv] [--json]
+  bash $SCRIPT_DIR/bridge-auth.sh claude-token sync-global [--json]   # #18849 Part 1: double-gated operator-global token PATCH for dynamic-vanilla Claude (default OFF)
+  bash $SCRIPT_DIR/bridge-auth.sh claude-token global-auth-status [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token backfill-settings [--agents static|all|csv] [--check] [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token keychain-free <enable|disable|status> [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token rotate [--if-auto-enabled] [--reason <text>] [--sync] [--agents static|all|csv] [--json]
@@ -1398,6 +1400,36 @@ case "$command" in
         bridge_auth_json_requested "$@" && json_mode=1
         agents_spec="$(bridge_auth_agents_arg "$@")"
         bridge_auth_sync_agents "$registry" "$agents_spec" "$json_mode"
+        ;;
+      sync-global|global-auth-status)
+        # #18849 Part 1: the operator-global seamless rotation step + its
+        # read-only doctor surface. `sync-global` PATCHes the operator's
+        # ~/.claude/.credentials.json with the active token so a dynamic-vanilla
+        # Claude agent (HOME=operator-global, no CLAUDE_CONFIG_DIR) re-reads the
+        # rotated token without a restart. Double-gated default-OFF inside
+        # bridge-auth.py (registry auto_rotate_enabled AND the persisted
+        # BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC opt-in); the writer FAILS CLOSED as root.
+        # The bash layer only resolves the operator-global paths/containment root
+        # and runs python3 DIRECTLY as the current (operator) UID — it never
+        # escalates this write, so a root-running daemon hits the python
+        # root-guard and converges to no-write (gate 4/5).
+        bridge_auth_guard_wrapper_flags "claude-token $subcommand" "" "--json" "$@"
+        json_mode=0
+        bridge_auth_json_requested "$@" && json_mode=1
+        global_cred="$(bridge_auth_controller_credentials_path 2>/dev/null || true)"
+        global_args=()
+        if [[ -n "$global_cred" ]]; then
+          global_args+=(--global-credentials "$global_cred")
+          # Containment root for the WRITE path only: the operator home (parent
+          # of the .claude dir). The read-only status verb takes no allowed-root.
+          if [[ "$subcommand" == "sync-global" ]]; then
+            op_home="$(dirname "$(dirname "$global_cred")")"
+            [[ -n "$op_home" && -d "$op_home" ]] && global_args+=(--allowed-root "$op_home")
+          fi
+        fi
+        [[ "$json_mode" == "1" ]] && global_args+=(--json)
+        exec python3 "$SCRIPT_DIR/bridge-auth.py" --registry "$registry" \
+          "$subcommand" "${global_args[@]}"
         ;;
       backfill-settings)
         # Issue #1855: create-if-absent keychain-free apiKeyHelper backfill for
