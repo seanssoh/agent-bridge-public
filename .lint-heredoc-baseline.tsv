@@ -970,3 +970,4 @@ scripts/smoke/2014-auto-memory-absolute-seed.sh	232	C3	fae89becef765e27c0d7ae46b
 scripts/smoke/2020-skills-assoc-declare.sh	180	H3	330beb7a7312596f6225080899f3c6e9c19dc54418c9690257c42edc64446242	here-string/procsub, non-interpreter consumer	agb-dev-claude	v0.16.16-rc2 (rc2-cut baseline regen; smoke/H3, verified non-deadlocking)
 lib/bridge-agents.sh	9423	C3	a31daa9d1b30fbc422b2fb0a113af1f97758bd464f108772d7ebfb41d0c34373	interpreter heredoc, no capture	agb-dev-claude	v0.16.16-rc2 re-cut (#2031 engine-log reader; C3 no-capture)
 scripts/smoke/mcp-liveness-engine-log.sh	62	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	agb-dev-claude	v0.16.16-rc2 re-cut (#2031 engine-log reader; C3 no-capture)
+lib/bridge-agents.sh	7575	H3	d726ebbda810cf66b10311ae7b9b4e6a487629d6b56dc960ca3ebe379b800cd0	here-string/procsub, non-interpreter consumer	claude	2060 discord-plugin channel CSV split (builtin-fed read, footgun-11-safe)

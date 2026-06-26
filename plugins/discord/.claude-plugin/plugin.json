@@ -1,0 +1,17 @@
+{
+  "name": "discord",
+  "description": "Discord channel for Claude Code with Agent Bridge access control. Self-contained MCP server: pairing, allowlists, guild-channel mention-triggering. Surfaces reply references (referenced_message_id / referenced_message_excerpt) on inbound replies plus a reply marker on fetch_messages so agents know exactly which message a Discord reply targets, and supports per-agent Discord thread-as-session (set DISCORD_THREAD_AUTO_SESSION_CHANNEL_ID). Pairing/allowlist/policy via /discord:access.",
+  "version": "0.1.0",
+  "keywords": [
+    "discord",
+    "messaging",
+    "channel",
+    "mcp",
+    "reply",
+    "thread"
+  ],
+  "author": {
+    "name": "Agent Bridge",
+    "email": "maintainers@agent-bridge.local"
+  }
+}

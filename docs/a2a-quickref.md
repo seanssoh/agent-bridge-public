@@ -23,13 +23,17 @@ needs the receiver daemon configured and running (`agb a2a setup`,
 
 ## Send to an agent by id (1:1 cross-bridge)
 
-You need **two** things today: the target agent id (`--to`) **and** the peer
-bridge it lives on (`--peer`). Both are required for a 1:1 send.
+You need the target agent id (`--to`). The peer/node it lives on (`--peer`) is
+now **auto-resolved** from the agent id when you omit it (or pass `--peer auto`):
 
 ```bash
-agb a2a send --peer <peer-bridge-id> --to <agent-id> \
-  --title "<subject>" --body "<text>" \
+# Auto-resolve the node from the agent id (the common case):
+agb a2a send --to <agent-id> --title "<subject>" --body "<text>" \
   [--from <your-agent-id>] [--priority low|normal|high|urgent] [--dry-run]
+
+# Explicit node — always honored verbatim (no whois lookup):
+agb a2a send --peer <peer-bridge-id> --to <agent-id> \
+  --title "<subject>" --body "<text>"
 ```
 
 - `--body-file <path>` instead of `--body` for long / multi-line bodies.
@@ -43,50 +47,55 @@ agb a2a send --peer <peer-bridge-id> --to <agent-id> \
 - Delivery is durable: the send lands in the local outbox and a delivery runner
   retries with backoff. Force a drain with `agb a2a deliver`.
 
-Don't know `<peer-bridge-id>` for that agent? See the next task.
+Don't know `<peer-bridge-id>` for that agent? You usually don't need it — the
+auto-resolver finds it. See the next task to look it up yourself.
 
-> **(coming, #2025)** `--peer` auto-resolve — when the target agent is unique in
-> a room you share, `--to` alone will determine the peer (and prompt you if
-> ambiguous). Until then, `--peer` is required.
+**`--peer` auto-resolve (#2025).** When `--peer` is omitted (or `--peer auto`),
+the node is resolved from `--to` via the same `a2a whois` lookup (the shared
+room roster). It **never guesses**: if the agent is unique it proceeds (and
+prints `--peer auto-resolved: <agent> -> <node>`); if the agent lives on
+**multiple** nodes it **fails with the candidate list** so you re-send with an
+explicit `--peer <node>`. An explicit `--peer <node>` is always used verbatim —
+no whois, no behavior change from before.
 
 ---
 
 ## Find which node / peer an agent is on
 
-There is **no one-shot agent→node lookup yet** (`a2a whois` is **coming,
-#2025**). The current, working way is to read it off a **room roster**, because
-the roster lists every member as `agent@node`:
+One command, from just the agent id (#2025):
 
-1. List the rooms you can see and pick the one the agent should be in:
+```bash
+agb a2a whois <agent-id>
+# crm-dash-wdh -> doohyun-mac
+```
 
-   ```bash
-   agb room list
-   ```
+It aggregates every shared room roster (where each member is recorded as
+`agent@node`) and answers `<agent> -> <node>`. The node it prints is exactly the
+`--peer` you would pass to `agb a2a send` (and what `--peer auto` resolves to).
+Three cases are handled explicitly:
 
-   Each line shows `room_id  epoch=…  leader=<agent>@<node>  …`.
+- **unique** — prints `<agent> -> <node>` (annotated `(self)` if the agent is on
+  this very node); exit 0.
+- **ambiguous** — the same agent id is on **more than one** node. whois lists
+  **every** candidate and exits nonzero — it never picks one. Re-send with an
+  explicit `--peer <node>`.
+- **not-found** — no shared room places the agent; clear error + nonzero exit.
+  (You only see agents in rooms you share — confirm with `agb room list`.)
 
-2. Show that room — the roster prints one `agent@node` line per member:
+Add `--json` for the structured `{agent, status, node, candidates, self}` result
+(nonzero exit on anything but `unique`, so a script can branch on the rc).
 
-   ```bash
-   agb room show <room_id>
-   ```
+```bash
+agb a2a whois <agent-id> --json
+```
 
-   ```
-   room <room_id> (epoch N, leader <agent>@<node>)
-   members:
-     - crm-dash-wdh@doohyun-mac (member)
-     - …@… (leader)
-   ```
-
-   The part after `@` is the **node**; that node's bridge id is the `--peer` you
-   pass to `agb a2a send`.
-
-`agb room list` / `agb room show` are read-only and also work member-side (a room
-you *joined* but do not lead is shown from the local roster cache).
-
-> **(coming, #2025)** `a2a whois <agent>` — aggregate rooms + peers and answer
-> "`crm-dash-wdh → doohyun-mac`" in one command, so you don't have to know a
-> room id first.
+**Where the answer comes from.** whois is read-only over the **room roster** —
+the same `agent@node` membership `agb room show <room_id>` prints, aggregated
+across rooms so you don't have to know a room id first. There is **no new
+registry**: it reuses the leader-authoritative `room_members` data. So whois only
+sees agents you share a room with; for an agent in no shared room, fall back to
+an explicit `--peer <node>`. `agb room list` / `agb room show` remain the
+per-room view (and work member-side from the local roster cache).
 
 ---
 
@@ -94,16 +103,13 @@ you *joined* but do not lead is shown from the local roster cache).
 
 | Question | Command | What it shows today |
 | --- | --- | --- |
-| What peers am I configured to reach? | `agb a2a peers list` | One row per peer: `id  address  secret=yes/NO  inbound_allowlist=[…]`. **Hostnames/addresses only — no per-peer agent list.** |
+| What peers am I configured to reach? | `agb a2a peers list` | One row per peer: `id  address  secret=yes/NO  inbound_allowlist=[…]  known_agents=<a,b,…>`. The `known_agents` column (#2025) lists the agents known to live on that peer node, derived read-only from the shared room roster (`-` when none / no shared room). `--json` adds a `known_agents` array per peer. |
 | What's my transport / receiver state? | `agb a2a net-status` (alias `agb a2a status`) | Configured transport, this node's listen addr, receiver liveness, peers, room count, per-peer UP/SUSPECT/DOWN. |
+| Which node is a single agent on? | `agb a2a whois <agent-id>` | `<agent> -> <node>` from the aggregated room roster (ambiguous → candidate list, never a guess). See *Find which node / peer an agent is on*. |
 | Who is in a given room (the `agent@node` roster)? | `agb room show <room_id>` | Members as `agent@node`, the leader, epoch, and pending join requests. |
 
-`peers list` / `net-status` are **peer (node) level** — they don't enumerate the
-agents on each peer, which is why agent→node discovery goes through `room show`
-(above).
-
-> **(coming, #2025)** a per-peer **agent-roster column** in `peers list` /
-> `net-status`, so a hostname alone isn't all you get.
+The `known_agents` column and `a2a whois` both read the same room-roster source
+(`room_members`) — a hostname alone is no longer all `peers list` gives you.
 
 ---
 

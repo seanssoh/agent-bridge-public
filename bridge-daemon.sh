@@ -2778,6 +2778,70 @@ bridge_daemon_periodic_codex_cred_sync_tick() {
   return 1
 }
 
+# --------------------------------------------------------------------------- #
+# Provider-health outage oracle tick (#2066 v0.17 fallback, P1a)
+# --------------------------------------------------------------------------- #
+# 1 prober, N readers. STEADY STATE = ZERO PROBES: this tick is a hard NO-OP
+# unless the master gate (BRIDGE_FALLBACK_ENABLED) is on AND the oracle's cheap
+# `should-tick` gate reports work pending (state != UP OR an unconfirmed outage
+# report queued). Only then does it run the backoff re-probe / recovery pass.
+# The default is OFF — nothing consumes the DOWN state yet (cron fallback = P1b,
+# live = P3), so a production install pays nothing here. The detector ENTRY is
+# `bridge-provider-health.py report-outage`, called by the real outage-class
+# failure paths (P1b/P3 wire those); P1a ships the oracle + a smoke that proves
+# detection. All calls are file-as-argv (bridge-daemon heredoc ceiling = 0).
+bridge_daemon_provider_health_state_file() {
+  printf '%s/daemon/provider-health' "$BRIDGE_STATE_DIR"
+}
+
+bridge_daemon_provider_health_due() {
+  # Independent of the expensive periodic passes: gate the per-tick ENTRY on a
+  # short cadence so the daemon does not spawn the cheap should-tick gate every
+  # 5s tick. A due check costs nothing when the feature is off (returns 1).
+  [[ "${BRIDGE_FALLBACK_ENABLED:-0}" =~ ^(1|true|yes|on)$ ]] || return 1
+  local interval="${BRIDGE_FALLBACK_TICK_INTERVAL_SECONDS:-15}"
+  [[ "$interval" =~ ^[0-9]+$ ]] || interval=15
+  (( interval > 0 )) || return 1
+  bridge_daemon_pass_due provider_health "$interval"
+}
+
+bridge_daemon_provider_health_tick() {
+  local target="${BRIDGE_ADMIN_AGENT_ID:-daemon}"
+  local gate_json=""
+  local decision=""
+  local probe_json=""
+  local action=""
+
+  bridge_daemon_provider_health_due || return 1
+
+  # Cheap gate FIRST: should-tick is a pure state read (no probe). With the
+  # feature on but UP and no reports, it says skip and we spend nothing else.
+  gate_json="$(bridge_with_timeout 5 provider_health_gate \
+    python3 "$SCRIPT_DIR/bridge-provider-health.py" should-tick 2>/dev/null || printf '')"
+  case "$gate_json" in
+    *'"decision": "tick"'*|*'"decision":"tick"'*) decision="tick" ;;
+    *) decision="skip" ;;
+  esac
+  [[ "$decision" == "tick" ]] || return 1
+
+  # There IS work (state != UP or a pending report) → run the single-prober
+  # backoff re-probe / recovery-hysteresis pass. Bounded; never aborts the tick.
+  probe_json="$(bridge_with_timeout 30 provider_health_probe \
+    python3 "$SCRIPT_DIR/bridge-provider-health.py" probe-tick 2>/dev/null || printf '')"
+  case "$probe_json" in
+    *'"action": "recovered"'*|*'"action":"recovered"'*) action="recovered" ;;
+    *'"action": "still-down"'*|*'"action":"still-down"'*) action="still-down" ;;
+    *'"action": "recovery-pending"'*|*'"action":"recovery-pending"'*) action="recovery-pending" ;;
+    *) action="noop" ;;
+  esac
+  bridge_audit_log daemon provider_health_tick "$target" \
+    --detail action="$action" \
+    --detail trigger=periodic \
+    2>/dev/null || true
+  daemon_info "provider-health tick: action=$action"
+  return 0
+}
+
 process_claude_token_recovery() {
   local target="${BRIDGE_ADMIN_AGENT_ID:-daemon}"
   local recovery_json=""
@@ -15411,6 +15475,14 @@ cmd_sync_cycle() {
   # refresh / operator re-login on the wall-clock interval.
   BRIDGE_DAEMON_LAST_STEP="codex_cred_periodic_sync"
   if bridge_daemon_periodic_codex_cred_sync_tick; then
+    changed=0
+  fi
+  # #2066 (v0.17 fallback, P1a): provider-health outage oracle. A hard NO-OP
+  # unless BRIDGE_FALLBACK_ENABLED is on AND the oracle has work (state != UP or
+  # a pending outage report) — ZERO steady-state probing by construction. The
+  # default is OFF; nothing consumes the DOWN state yet (P1b/P3).
+  BRIDGE_DAEMON_LAST_STEP="provider_health_tick"
+  if bridge_daemon_provider_health_tick; then
     changed=0
   fi
   BRIDGE_DAEMON_LAST_STEP="usage_monitor"

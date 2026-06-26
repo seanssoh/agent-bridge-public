@@ -280,26 +280,33 @@ assert "plugin:teams@agent-bridge" in payload["after"]["channels"], payload
   line="$(read_field "BRIDGE_AGENT_CHANNELS")"
   smoke_assert_contains "$line" "plugin:teams@agent-bridge" "channels line carries added token"
 
-  output="$(run_update --channels-set plugin:discord@claude-plugins-official,plugin:mattermost@claude-plugins-official)"
+  # Task #12033: use migration-STABLE tokens for the set/remove round-trip.
+  # telegram is the lone built-in still on @claude-plugins-official (so the
+  # marketplace-migration leaves it verbatim), paired with a non-built-in
+  # foreign-marketplace token that the migration never touches. (discord +
+  # mattermost would be rewritten to @agent-bridge by the built-in vendoring
+  # migration — covered explicitly in G-channel-spec-resolution T17-T19 and
+  # γ-cli-consistency, so this generic set/remove smoke stays migration-stable.)
+  output="$(run_update --channels-set plugin:telegram@claude-plugins-official,plugin:foo@some-marketplace)"
   python3 -c '
 import json, sys
 payload = json.loads(sys.argv[1])
 assert payload["changed"] is True, payload
-assert payload["after"]["channels"] == "plugin:discord@claude-plugins-official,plugin:mattermost@claude-plugins-official", payload
+assert payload["after"]["channels"] == "plugin:telegram@claude-plugins-official,plugin:foo@some-marketplace", payload
 ' "$output"
   line="$(read_field "BRIDGE_AGENT_CHANNELS")"
-  smoke_assert_contains "$line" "plugin:mattermost@claude-plugins-official" "channels-set replaced csv on disk"
+  smoke_assert_contains "$line" "plugin:foo@some-marketplace" "channels-set replaced csv on disk"
   smoke_assert_not_contains "$line" "plugin:teams@agent-bridge" "channels-set removed previously-added token"
 
-  output="$(run_update --channels-remove plugin:mattermost@claude-plugins-official)"
+  output="$(run_update --channels-remove plugin:foo@some-marketplace)"
   python3 -c '
 import json, sys
 payload = json.loads(sys.argv[1])
 assert payload["changed"] is True, payload
-assert "plugin:mattermost@claude-plugins-official" not in payload["after"]["channels"], payload
+assert "plugin:foo@some-marketplace" not in payload["after"]["channels"], payload
 ' "$output"
   line="$(read_field "BRIDGE_AGENT_CHANNELS")"
-  smoke_assert_not_contains "$line" "plugin:mattermost@claude-plugins-official" "channels-remove dropped token"
+  smoke_assert_not_contains "$line" "plugin:foo@some-marketplace" "channels-remove dropped token"
 }
 
 assert_dry_run_does_not_mutate() {

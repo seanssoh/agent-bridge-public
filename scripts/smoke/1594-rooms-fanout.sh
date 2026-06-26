@@ -246,8 +246,9 @@ test_T6_partial_failure_reported() {
 
 # ---------------------------------------------------------------------------
 # T7: NO regression. `room talk` (no --fanout) stays cross-node only (it skips
-# same-node members), and the 1:1 `a2a send --peer --to` surface still requires
-# its own args (mutual exclusivity holds).
+# same-node members), and the 1:1 `a2a send --peer --to` surface holds its
+# guards: --peer and --room stay mutually exclusive, and a send that cannot
+# resolve a peer (explicit or via #2025 whois auto-resolve) still fails closed.
 # ---------------------------------------------------------------------------
 test_T7_no_regression() {
   : >"$POST_CAPTURE"; : >"$LOCAL_CAPTURE"
@@ -275,13 +276,19 @@ test_T7_no_regression() {
   [[ $rc -ne 0 ]] || smoke_fail "T7: --room + --peer together must be rejected"
   smoke_assert_contains "$out" "only one of --peer" "T7: --peer and --room are mutually exclusive"
 
-  # A 1:1 `a2a send --to` without --peer is still rejected (no silent fan-out).
+  # A 1:1 `a2a send --to` without --peer still fails closed (no silent send).
+  # #2025/#2071 added a whois `--peer` auto-resolve: when --peer is omitted the
+  # CLI tries to resolve --to's node from the shared A2A rooms registry instead
+  # of erroring immediately. Here `bob` has no entry in the (unset) rooms
+  # registry, so the auto-resolve finds no node and the send STILL fails closed —
+  # the no-regression contract (rc != 0, nothing leaves) holds; only the operator
+  # message changed from "--peer is required" to the auto-resolve guidance.
   set +e
   out="$(python3 "$A2A_CLI" send --to bob --title t --body b 2>&1)"
   rc=$?
   set -e
-  [[ $rc -ne 0 ]] || smoke_fail "T7: a 1:1 send with no --peer and no --room must fail"
-  smoke_assert_contains "$out" "--peer is required" "T7: a 1:1 send still requires --peer"
+  [[ $rc -ne 0 ]] || smoke_fail "T7: a 1:1 send with no --peer and no resolvable node must fail closed"
+  smoke_assert_contains "$out" "auto-resolve found no node" "T7: a 1:1 send with an unresolvable --to fails closed (no silent send)"
 }
 
 # ---------------------------------------------------------------------------
