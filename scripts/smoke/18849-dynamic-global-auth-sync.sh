@@ -29,6 +29,7 @@
 #   T11 existing file lacking claudeAiOauth   -> fail-closed, untouched (PATCH-only)
 #   T12 symlinked parent (#18887 finding 1)   -> fail-closed, NO .lock leak outside root
 #   T13 containment reject (#18887 finding 2) -> credential INODE unchanged (no rollback-rewrite)
+#   T14 parent-swap after lock (#18887 r3)    -> write stays in LOCKED dir (lock-dir == write-dir)
 #   T10 ci-select routing                     -> bridge-auth.py + this smoke selected
 #
 # Footgun #11 (heredoc_write deadlock class): this driver and its helper avoid
@@ -307,6 +308,28 @@ test_containment_failure_inode_unchanged() {
     "T13 credential INODE unchanged on containment reject (no rollback-rewrite — finding 2)"
 }
 
+# ── T14 ───────────────────────────────────────────────────────────────
+# #18887 r3 (adversarial): a parent-swap AFTER lock acquisition must not
+# redirect the write to an unlocked directory. The helper monkeypatches
+# fcntl.flock so that the instant the global-credentials lock flocks its fd, the
+# locked .claude is renamed away and a decoy dir is renamed into .claude (both
+# under allowed_root — containment alone cannot catch it). It then asserts the
+# rotated token landed in the LOCKED dir (now .claude-old) and the swapped-in
+# decoy is untouched — i.e. lock-dir == write-dir. Proven discriminator: FAILS
+# against the r2 string-path writer (re-resolves str(path.parent)), PASSES with
+# the single-dir_fd r3 fix (lock yields the fd; read+write are dir_fd-relative).
+test_parent_swap_after_lock_no_redirect() {
+  local swaproot="$SMOKE_TMP_ROOT/race-op"
+  rm -rf "$swaproot"; mkdir -p "$swaproot"
+  # Assert on the dir we create; the helper builds .claude/.claude-decoy under
+  # it (smoke_assert_path_in_temp resolves the parent, which must exist).
+  smoke_assert_path_in_temp "$swaproot" "race op-home root"
+  local out
+  out="$(python3 "$HELPER" race-parent-swap "$REGISTRY" "$swaproot" "ZZZrotated-race-token-ffffffffffff" 2>&1)"
+  smoke_assert_contains "$out" "OK race-parent-swap" \
+    "T14 parent-swap-after-lock: rotated token stays in the LOCKED dir, decoy untouched (lock-dir == write-dir)"
+}
+
 # ── T10 ───────────────────────────────────────────────────────────────
 test_ci_select_routing() {
   [[ -f "$CI_SELECT" ]] || smoke_fail "T10 missing ci-select-smoke.sh: $CI_SELECT"
@@ -331,6 +354,7 @@ smoke_run "T9 bash wrapper plumbing -> sync-global PATCH end-to-end"          te
 smoke_run "T11 existing file lacking claudeAiOauth -> fail-closed, untouched" test_existing_no_claudeoauth_fail_closed
 smoke_run "T12 symlinked parent -> fail-closed, NO .lock leak outside root"   test_symlinked_parent_no_lock_leak
 smoke_run "T13 containment reject -> credential INODE unchanged (no rewrite)" test_containment_failure_inode_unchanged
+smoke_run "T14 parent-swap-after-lock -> write stays in LOCKED dir"           test_parent_swap_after_lock_no_redirect
 smoke_run "T10 ci-select routing -> bridge-auth.py + smoke selected"          test_ci_select_routing
 
 smoke_log "all checks passed"

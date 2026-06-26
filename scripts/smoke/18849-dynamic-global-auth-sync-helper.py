@@ -110,6 +110,101 @@ def access_token(path: str) -> None:
     print(d.get(CRED_KEY, {}).get(ACCESS, ""))
 
 
+def _seed_oauth(path: str, token: str) -> None:
+    payload = {
+        CRED_KEY: {ACCESS: token, REFRESH: "ZZZkeep-" + token[-8:], "expiresAt": 1},
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(payload, indent=2))
+    os.chmod(path, 0o600)
+
+
+def _read_access(path: str) -> str:
+    try:
+        d = json.load(open(path, encoding="utf-8"))
+    except FileNotFoundError:
+        return "<absent>"
+    return d.get(CRED_KEY, {}).get(ACCESS, "<no-access>")
+
+
+def race_parent_swap(reg_path: str, op_home: str, rotated_token: str) -> None:
+    """#18887 r3 regression — parent-swap AFTER lock acquisition.
+
+    Monkeypatch ``fcntl.flock`` so the instant the global-credentials lock
+    flocks its fd (i.e. AFTER the parent was opened+validated and the lock fd
+    created in it), we rename the locked ``.claude`` away and rename a decoy
+    dir into ``.claude`` — BOTH under allowed_root, so containment alone cannot
+    catch it; only "lock-dir == write-dir" does. A correct single-dir_fd
+    implementation writes the rotated token into the LOCKED directory (now
+    ``.claude-old``) and leaves the swapped-in decoy untouched. The r2
+    string-path writer re-resolved ``str(path.parent)`` and would instead write
+    the rotated token into the unlocked decoy — the residual TOCTOU.
+    """
+    import fcntl
+    import importlib.util
+    from pathlib import Path
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.dirname(os.path.dirname(here))
+    spec = importlib.util.spec_from_file_location(
+        "bridge_auth_mod", os.path.join(repo_root, "bridge-auth.py")
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    claude_dir = os.path.join(op_home, ".claude")
+    decoy_dir = os.path.join(op_home, ".claude-decoy")
+    old_dir = os.path.join(op_home, ".claude-old")
+    cred_name = ".credentials.json"
+    locked_token = "ZZZlocked-old-token-dddddddddddd"
+    decoy_token = "ZZZdecoy-untouched-token-eeeeeeee"
+
+    os.makedirs(claude_dir, exist_ok=True)
+    os.makedirs(decoy_dir, exist_ok=True)
+    _seed_oauth(os.path.join(claude_dir, cred_name), locked_token)
+    _seed_oauth(os.path.join(decoy_dir, cred_name), decoy_token)
+
+    real_flock = fcntl.flock
+    state = {"swapped": False}
+
+    def swapping_flock(fd, op):  # noqa: ANN001
+        if not state["swapped"]:
+            state["swapped"] = True
+            os.rename(claude_dir, old_dir)   # locked dir moves out from under .claude
+            os.rename(decoy_dir, claude_dir)  # decoy takes .claude's place (in-root)
+        return real_flock(fd, op)
+
+    fcntl.flock = swapping_flock
+    try:
+        mod.patch_global_claude_credentials(
+            Path(os.path.join(claude_dir, cred_name)),
+            rotated_token,
+            allowed_root=Path(op_home),
+        )
+    finally:
+        fcntl.flock = real_flock
+
+    if not state["swapped"]:
+        _fail("flock monkeypatch never fired — the race was not exercised")
+    locked_after = _read_access(os.path.join(old_dir, cred_name))  # the locked dir
+    decoy_after = _read_access(os.path.join(claude_dir, cred_name))  # swapped-in
+    if decoy_after == rotated_token:
+        _fail(
+            "RACE REPRODUCED: rotated token landed in the SWAPPED-IN (unlocked) "
+            "directory — parent-swap-after-lock TOCTOU is open"
+        )
+    if locked_after != rotated_token:
+        _fail(
+            f"write did not land in the LOCKED directory (.claude-old got "
+            f"{locked_after!r}, expected the rotated token)"
+        )
+    # The lock and the write must be the same directory: the lock file lives in
+    # the locked dir (now .claude-old), NOT in the swapped-in decoy (.claude).
+    if not os.path.exists(os.path.join(old_dir, cred_name + ".lock")):
+        _fail("lock file is not in the locked directory (.claude-old)")
+    print("OK race-parent-swap: lock-dir == write-dir; decoy untouched")
+
+
 def json_field(field: str) -> None:
     d = json.load(sys.stdin)
     cur = d
@@ -140,6 +235,8 @@ def main() -> None:
         assert_created(sys.argv[2], sys.argv[3])
     elif mode == "access-token":
         access_token(sys.argv[2])
+    elif mode == "race-parent-swap":
+        race_parent_swap(sys.argv[2], sys.argv[3], sys.argv[4])
     elif mode == "json-field":
         json_field(sys.argv[2])
     else:

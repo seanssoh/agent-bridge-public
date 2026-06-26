@@ -2291,6 +2291,70 @@ def _dir_fd_real_path(dir_fd: int) -> str:
     )
 
 
+def _write_text_at_dirfd(
+    dir_fd: int,
+    name: str,
+    text: str,
+    *,
+    mode: int = 0o600,
+    prefix: str = ".tmp.",
+    owner_uid: int | None = None,
+    owner_gid: int | None = None,
+) -> None:
+    """Atomic private write of ``name`` relative to an ALREADY-OPEN parent fd.
+
+    #18887 r3 (codex review): the caller owns ``dir_fd``'s lifetime AND its
+    containment proof (it was opened ``O_DIRECTORY|O_NOFOLLOW`` and, for the
+    global-credential path, validated by fd-identity and is held under the
+    credential flock). Every op here — tempfile create, fsync, chmod, chown,
+    rename — is ``dir_fd``-relative, so the directory written IS the directory
+    the caller checked and locked. There is NO second ``os.open(str(parent))``,
+    which is exactly the residual parent-swap-after-lock TOCTOU r2 still had:
+    the lock pinned one fd while the writer re-resolved the parent by string,
+    so a rename of the parent between lock-acquire and write redirected the
+    write to an unlocked directory. Threading the single fd closes that window.
+    Does NOT open or close ``dir_fd``.
+    """
+    fd = -1
+    # mkstemp does not accept dir_fd, so create the tempfile manually relative
+    # to dir_fd with O_CREAT|O_EXCL|O_NOFOLLOW (uuid name avoids a predictable
+    # path).
+    tmp_name = f"{prefix}{uuid.uuid4().hex}.tmp"
+    try:
+        fd = os.open(
+            tmp_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            mode,
+            dir_fd=dir_fd,
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fd = -1
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        # chmod/chown the tempfile by name relative to dir_fd (BEFORE rename),
+        # so the credential is never world-readable or root-owned at its final
+        # path. follow_symlinks=False so a raced symlink at tmp_name is not
+        # followed.
+        os.chmod(tmp_name, mode, dir_fd=dir_fd, follow_symlinks=False)
+        if owner_uid is not None:
+            gid = owner_gid if owner_gid is not None else -1
+            os.chown(
+                tmp_name, owner_uid, gid, dir_fd=dir_fd, follow_symlinks=False
+            )
+        # Atomic rename within the pinned directory.
+        os.replace(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        tmp_name = ""  # replaced; nothing to clean up
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if tmp_name:
+            try:
+                os.unlink(tmp_name, dir_fd=dir_fd)  # noqa: raw-pathlib-controller-only - controller-side dir_fd-relative tempfile cleanup
+            except (FileNotFoundError, OSError):
+                pass
+
+
 def write_private_file_atomic_dirfd(
     path: Path,
     text: str,
@@ -2328,8 +2392,6 @@ def write_private_file_atomic_dirfd(
     parent = path.parent
     name = path.name
     dir_fd = -1
-    fd = -1
-    tmp_name = ""
     try:
         try:
             dir_fd = os.open(
@@ -2360,43 +2422,19 @@ def write_private_file_atomic_dirfd(
                     f"Codex dest parent resolves outside allowed root: "
                     f"{real_parent} not under {allowed}"
                 )
-        # All ops below are relative to the pinned dir_fd — no second path
-        # resolution, so the checked dir IS the used dir. mkstemp does not
-        # accept dir_fd, so create the tempfile manually relative to dir_fd
-        # with O_CREAT|O_EXCL|O_NOFOLLOW (uuid name avoids a predictable path).
-        tmp_name = f"{prefix}{uuid.uuid4().hex}.tmp"
-        fd = os.open(
-            tmp_name,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-            mode,
-            dir_fd=dir_fd,
+        # All ops are relative to the pinned, validated dir_fd — delegated to
+        # the shared fd-relative writer, so the directory we CHECKED is exactly
+        # the directory we WRITE (no second string resolution).
+        _write_text_at_dirfd(
+            dir_fd,
+            name,
+            text,
+            mode=mode,
+            prefix=prefix,
+            owner_uid=owner_uid,
+            owner_gid=owner_gid,
         )
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fd = -1
-            fh.write(text)
-            fh.flush()
-            os.fsync(fh.fileno())
-        # chmod/chown the tempfile by name relative to dir_fd (BEFORE rename),
-        # so the credential is never world-readable or root-owned at its final
-        # path. follow_symlinks=False so a raced symlink at tmp_name is not
-        # followed.
-        os.chmod(tmp_name, mode, dir_fd=dir_fd, follow_symlinks=False)
-        if owner_uid is not None:
-            gid = owner_gid if owner_gid is not None else -1
-            os.chown(
-                tmp_name, owner_uid, gid, dir_fd=dir_fd, follow_symlinks=False
-            )
-        # Atomic rename within the pinned directory.
-        os.replace(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
-        tmp_name = ""  # replaced; nothing to clean up
     finally:
-        if fd >= 0:
-            os.close(fd)
-        if tmp_name:
-            try:
-                os.unlink(tmp_name, dir_fd=dir_fd)  # noqa: raw-pathlib-controller-only - controller-side dir_fd-relative tempfile cleanup
-            except (FileNotFoundError, OSError):
-                pass
         if dir_fd >= 0:
             os.close(dir_fd)
 
@@ -2555,7 +2593,11 @@ def claude_global_credentials_lock(
                     f"{timeout_seconds}s on {parent}/{lock_name}"
                 )
             time.sleep(0.1)
-        yield
+        # #18887 r3: yield the SAME pinned, validated parent fd the lock holds,
+        # so the caller does its whole read->check->write critical section
+        # dir_fd-relative against this exact directory — never a second string
+        # resolution that a parent-swap-after-lock could redirect.
+        yield dir_fd
     finally:
         if acquired:
             try:
@@ -2643,26 +2685,36 @@ def patch_global_claude_credentials(
             "effective writer"
         )
     path = Path(path).expanduser()
-    # #18887 finding 1: the lock now opens the parent O_DIRECTORY|O_NOFOLLOW +
-    # allowed-root-validates BEFORE creating the lock fd-relative, so a symlinked
-    # parent is refused at lock time and no .lock leaks out of the operator home.
-    with claude_global_credentials_lock(path, allowed_root=allowed_root):
-        # Symlink target (final component) is still refused before we read it —
-        # never read a swapped credential file. The symlinked-PARENT case is now
-        # closed at lock time by the O_NOFOLLOW parent open above.
-        if path.is_symlink():
-            raise PermissionError(
-                f"refusing to write symlinked operator-global credentials: {path}"
-            )
-        if path.parent.is_symlink():
-            raise PermissionError(
-                f"refusing to write operator-global credentials under symlinked "
-                f"parent: {path.parent}"
-            )
-        existed = path.is_file()
+    # #18887 finding 1 + r3: the lock opens the parent O_DIRECTORY|O_NOFOLLOW +
+    # allowed-root-validates (by fd identity) BEFORE creating the lock fd-relative
+    # — a symlinked parent is refused at lock time and no .lock leaks out of the
+    # operator home — and it YIELDS that pinned, validated fd so the entire
+    # read->check->write critical section runs dir_fd-relative against the exact
+    # directory the lock holds. A parent-swap after the lock is acquired cannot
+    # redirect the read or the write (the r2 residual TOCTOU).
+    name = path.name
+    with claude_global_credentials_lock(path, allowed_root=allowed_root) as dir_fd:
+        # Read + existence-check FD-RELATIVE against the locked directory.
+        # O_NOFOLLOW refuses a symlinked final component (the old
+        # path.is_symlink() check); the parent symlink/containment case is
+        # already closed by the lock's O_NOFOLLOW parent open + fd-identity
+        # allowed-root validation. No string re-resolution of path/path.parent.
+        existed = False
         preimage: bytes | None = None
+        try:
+            cred_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:  # ELOOP on a symlinked final component → refuse
+            raise PermissionError(
+                f"refusing to read operator-global credentials via a symlinked "
+                f"final component: {path}: {exc}"
+            ) from exc
+        else:
+            existed = True
+            with os.fdopen(cred_fd, "rb") as fh:
+                preimage = fh.read()
         if existed:
-            preimage = path.read_bytes()
             try:
                 payload = json.loads(preimage.decode("utf-8"))
             except Exception as exc:  # noqa: BLE001 - corrupt → refuse, never clobber
@@ -2714,23 +2766,23 @@ def patch_global_claude_credentials(
         payload["claudeAiOauth"] = oauth
 
         text = json.dumps(payload, ensure_ascii=True, indent=2) + "\n"
-        # #18887 finding 2: NO rollback-rewrite. write_private_file_atomic_dirfd
-        # is atomic (dir_fd-relative tempfile + rename) and chowns the tempfile
-        # BEFORE the rename, so ANY pre-rename failure — including an allowed-root
-        # containment rejection or an O_NOFOLLOW refusal — leaves the original
-        # final path BYTE-FOR-BYTE untouched: there is no half-written state to
-        # roll back. The previous belt-and-suspenders rollback re-wrote the
-        # preimage via the OLDER string-path writer, which itself bypassed the
-        # no-follow / allowed-root / fd-pin hardening and CHANGED the credential
-        # inode on a rejected write (a no-write/fail-closed violation). Let the
-        # error propagate; the operator's login file is never touched on failure.
-        write_private_file_atomic_dirfd(
-            path,
+        # #18887 finding 2 + r3: write FD-RELATIVE via the lock's pinned dir_fd —
+        # NO second os.open(str(parent)), which is what let a parent-swap after
+        # the lock redirect the write to an unlocked directory in r2. Containment
+        # was already proven once, at lock time, against this same fd. The atomic
+        # dir_fd writer stages a tempfile and renames within the locked directory,
+        # chowning BEFORE the rename, so ANY pre-rename failure leaves the original
+        # final path byte- AND inode-identical: there is no half-write and no
+        # rollback-rewrite (the r2 rollback used the OLDER string-path writer,
+        # which bypassed the hardening AND changed the inode on a rejected write).
+        # Let the error propagate; the operator's login file is untouched on failure.
+        _write_text_at_dirfd(
+            dir_fd,
+            name,
             text,
             mode=0o600,
             prefix=".credentials.",
             owner_uid=owner_uid,
-            allowed_root=allowed_root,
         )
         return {
             "changed": True,
