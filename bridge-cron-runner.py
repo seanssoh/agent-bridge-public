@@ -370,6 +370,35 @@ def validate_claude_keychain_free_auth(config_dir: Path) -> None:
     if host_platform() != "Darwin" or not claude_keychain_free_auth_enabled():
         return
 
+    # #18696: the keychain-free apiKeyHelper implements Claude's x-api-key
+    # contract, so only a confirmed api_key-kind active token is helper-eligible.
+    # A present OAuth/OAT (or unknown) active token (api-key-helper exit code 3)
+    # is NOT helper-ready — it authenticates via the native .credentials.json
+    # (Bearer) path, so SKIP keychain-free validation and let the cron launch use
+    # the native credential, mirroring bridge-run.sh. A genuinely absent token
+    # (any other nonzero) keeps the fail-closed validation below. The probe env
+    # is scrubbed of ambient credentials (the #1444 BLOCKING 2 contract).
+    kind_probe_env = os.environ.copy()
+    for _cred_var in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+        kind_probe_env.pop(_cred_var, None)
+    kind_probe = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "bridge-auth.py"),
+            "--registry",
+            str(claude_token_registry_path()),
+            "api-key-helper",
+            "--check",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+        env=kind_probe_env,
+    )
+    if kind_probe.returncode == 3:
+        return
+
     helper_path = claude_api_key_helper_path()
     if not helper_path.is_file() or not os.access(helper_path, os.X_OK):  # noqa: raw-pathlib-controller-only - controller helper preflight (in-repo helper path; Darwin-only)
         raise RuntimeError(

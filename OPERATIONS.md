@@ -1758,8 +1758,12 @@ interactive Claude Code sessions require both files to skip first-run login
 prompts. It also preserves `settings.json` while adding Claude's
 `skipDangerousModePermissionPrompt` user setting for bridge-managed agents
 that are launched with `--dangerously-skip-permissions`. When keychain-free
-auth is explicitly enabled, sync also renders an `apiKeyHelper` path into the
-same settings file.
+auth is explicitly enabled, sync renders the managed `apiKeyHelper` path into
+the same settings file **only for a confirmed API-key (`sk-ant-api…`) active
+token** — an OAuth/OAT (`sk-ant-oat…`, the `claudeAiOauth` `.credentials.json`
+root) is a Bearer credential that authenticates through the native
+`.credentials.json` sync, not the x-api-key `apiKeyHelper` (#18696). See the
+two-contract note in *Keychain-free auth* below.
 
 ```bash
 claude setup-token
@@ -1873,39 +1877,63 @@ The verb writes the underlying runtime-config state for you:
 }
 ```
 
+**Two distinct contracts (#18696).** The keychain-free `apiKeyHelper` implements
+Claude Code's **x-api-key** contract, which only an **API-key token**
+(`sk-ant-api…`) satisfies. The Claude.ai **OAuth/OAT** token (`sk-ant-oat…`, the
+`claudeAiOauth` `.credentials.json` root) is a **Bearer** credential — valid via
+the native `.credentials.json` sync (200) but **x-api-key-invalid** (`401 Invalid
+API key`). So the two paths are separate and not interchangeable:
+
+- **native-oauth-sync** — the working path for subscription/OAuth/OAT tokens:
+  sync writes the per-agent `.credentials.json`; Claude authenticates as Bearer.
+  This needs no helper and is unaffected by the keychain-free gate.
+- **keychain-free-helper** — the x-api-key path: the managed `apiKeyHelper` is
+  wired into `settings.json` **only for a confirmed API-key (`sk-ant-api…`)
+  active token**. An OAuth/OAT/unknown active token is **never** wired onto the
+  helper; it fails closed and routes through native-oauth-sync instead.
+
 **Enable-time preflight (fail closed).** `keychain-free enable` runs a preflight
 before flipping the gate — it verifies the host is macOS, the helper
-(`scripts/claude-oat-api-key-helper.sh`) is executable, and the active registry
-OAT is healthy (registered, enabled, structurally valid, not last-probed
-`auth_failed`). If any check fails the gate is **left unchanged and nothing is
-written**, so a broken/expired OAT can never move interactive Claude onto
-`apiKeyHelper` / API-key billing and produce `Invalid API key` (the #2137
-incident). No secret is printed by the preflight.
+(`scripts/claude-oat-api-key-helper.sh`) is executable, the active token is a
+confirmed API-key kind (#18696), and a real **x-api-key probe through the managed
+helper** authenticates (it fails closed on `401 Invalid API key`). The native
+credential health is reported but is **not** authorizing for the helper path. If
+any authorizing check fails the gate is **left unchanged and nothing is
+written**, so a non-API-key or broken token can never move interactive Claude
+onto `apiKeyHelper` and produce `Invalid API key` (the #2137 / #18696 incident).
+No secret is printed by the preflight.
 
 After enabling, run `agent-bridge auth claude-token sync --agents ...` (or the
 explicit backfill below) so each selected agent's `settings.json` includes the
-managed `apiKeyHelper` path. The helper reads the locked OAT registry and prints
-only the active token to stdout for Claude Code; no OAuth token is placed in
-`launch-secrets.env` or `CLAUDE_CODE_OAUTH_TOKEN`.
-`CLAUDE_CODE_API_KEY_HELPER_TTL_MS` is exported as non-secret launch metadata
-and defaults to 60000 ms so active-id rotation is picked up promptly.
+managed `apiKeyHelper` path **when the active token is an API key**. The helper
+reads the locked registry and prints only a confirmed API-key token to stdout for
+Claude Code; it **refuses (writes nothing, exits non-zero) for an OAuth/OAT
+token** (incl. the `--check` path), so an OAT can never reach the x-api-key
+contract. No token is placed in `launch-secrets.env` or `CLAUDE_CODE_OAUTH_TOKEN`.
+`CLAUDE_CODE_API_KEY_HELPER_TTL_MS` is exported as non-secret launch metadata and
+defaults to 60000 ms so active-id rotation is picked up promptly.
 
 **Backfill scope (admin is opt-in only).** `claude-token backfill-settings`
-create-if-absent-wires `apiKeyHelper` into pre-existing agents' `settings.json`.
-Under a **broad scope** (the default, or `--agents static|all|claude`, including
-the daily daemon hygiene pass) the admin / interactive agent is **excluded** — it
-is only backfilled when an explicit `--agents <admin>` names it. This prevents a
-global gate flip from silently moving the interactive admin onto API-key billing
-(#2137). `--check` stays fleet-wide read-only. The verb also rejects unknown
-flags and prints usage for `--help` *before* touching any agent.
+create-if-absent-wires `apiKeyHelper` into pre-existing agents' `settings.json`
+**only for a confirmed API-key active token** — for an OAuth/OAT pool it returns
+`status: skipped` with an actionable reason (use native sync), writing no helper
+(#18696). Under a **broad scope** (the default, or `--agents static|all|claude`,
+including the daily daemon hygiene pass) the admin / interactive agent is
+**excluded** — it is only backfilled when an explicit `--agents <admin>` names it.
+This prevents a global gate flip from silently moving the interactive admin onto
+API-key billing (#2137). `--check` stays fleet-wide read-only. The verb also
+rejects unknown flags and prints usage for `--help` *before* touching any agent.
 
-On Darwin, `bridge-run.sh` and `bridge-cron-runner.py` fail closed before
-launching `claude` when `claude_keychain_free_auth` is enabled but the helper,
-settings entry, or active registry OAT is unavailable. This avoids falling
-through to the operator user's default Keychain on headless rotation hosts.
-The helper remains a same-UID oracle by design: any process running as the
-agent UID can execute it, but the token is no longer readable from a file that
-normal Bash/tool subprocesses inherit by default.
+On Darwin, when `claude_keychain_free_auth` is enabled `bridge-run.sh` first
+checks the active token kind: an OAuth/OAT active token is **not** treated as
+helper-ready — the launch falls back to the native `.credentials.json`
+(Bearer) path instead of forcing the OAT through the helper. For a confirmed
+API-key token, `bridge-run.sh` (and `bridge-cron-runner.py`) still fail closed
+before launching `claude` when the helper, settings entry, or active registry
+token is unavailable, rather than falling through to the operator user's default
+Keychain on headless rotation hosts. The helper remains a same-UID oracle by
+design: any process running as the agent UID can execute it, but the token is no
+longer readable from a file that normal Bash/tool subprocesses inherit by default.
 
 #### claude.ai OAuth fallback (#1075)
 

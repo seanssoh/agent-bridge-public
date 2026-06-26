@@ -73,9 +73,17 @@ AUTH_SH="$REPO_ROOT/bridge-auth.sh"
 [[ -f "$AUTH_PY" ]] || smoke_fail "missing bridge-auth.py: $AUTH_PY"
 [[ -f "$AUTH_SH" ]] || smoke_fail "missing bridge-auth.sh: $AUTH_SH"
 
-# bridge-auth.py requires a top-level --registry; backfill-settings does not
-# read it (it operates on --config-dir), but argparse still demands the flag.
+# bridge-auth.py requires a top-level --registry; #18696 backfill-settings now
+# reads it to resolve the active token's KIND (the keychain-free apiKeyHelper is
+# wired only for a confirmed api_key token). Seed a healthy api_key registry so
+# these create-if-absent / idempotency / byte-identical sub-tests render the
+# managed helper (the OAT-refusal path is pinned in the #18696 smoke).
 REGISTRY="$SMOKE_TMP_ROOT/registry.json"
+printf '{"version":1,"active_token_id":"primary","auto_rotate_enabled":false,"rotation_threshold":99.0,"weekly_warn_threshold":95.0,"tokens":[{"id":"primary","token":"sk-ant-api03-MOCK-not-a-real-token-1855aaaaaaaa","enabled":true,"last_check_status":"available"}],"last_rotation":{}}\n' >"$REGISTRY"
+# The bridge-auth.sh wrapper (T7/T9) resolves its registry via
+# BRIDGE_CLAUDE_TOKEN_REGISTRY; point it at the same seeded api_key registry so
+# the wrapper path resolves the same kind the direct --registry calls do.
+export BRIDGE_CLAUDE_TOKEN_REGISTRY="$REGISTRY"
 
 # The helper path the writer resolves (and that the gate validates) — the
 # in-repo default when no override is set. The smoke asserts the backfilled
@@ -186,7 +194,10 @@ cfg = Path(sys.argv[1])
 spec = importlib.util.spec_from_file_location("bridge_auth", sys.argv[2])
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
-mod.ensure_claude_settings_file(cfg)
+# #18696: the provision-time writer renders the managed helper only for a
+# confirmed api_key token; the backfill above resolved api_key from the seeded
+# registry, so pass the same kind here to reproduce the identical end state.
+mod.ensure_claude_settings_file(cfg, active_token_kind="api_key")
 PY
   provisioned="$(cat "$cfg2/settings.json")"
   # Note: the legacy file also carried skipDangerousModePermissionPrompt, which

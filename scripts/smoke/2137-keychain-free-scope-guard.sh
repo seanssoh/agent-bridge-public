@@ -57,6 +57,18 @@ CONFIG_FILE="$BRIDGE_RUNTIME_CONFIG_FILE"
 
 EXPECTED_HELPER="$(cd -P "$REPO_ROOT" && python3 -c 'import pathlib; print(pathlib.Path("scripts/claude-oat-api-key-helper.sh").resolve())')"
 
+# #18696: the keychain-free apiKeyHelper is now wired only for a confirmed
+# api_key-kind active token (x-api-key contract), so this scope-guard fixture
+# uses an api-key token — the kind for which the helper-write happy paths below
+# (A3/A4/A4b/A7/A7b) legitimately render the managed apiKeyHelper. OAT-refusal is
+# pinned separately in 18696-keychain-free-token-kind-guard.sh.
+# Mock `claude` for the #18696 enable-time x-api-key preflight probe (A6b/c):
+# returns a clean success so the api_key enable preflight passes deterministically.
+FAKE_BIN="$SMOKE_TMP_ROOT/bin"
+mkdir -p "$FAKE_BIN"
+printf '%s\n' '#!/usr/bin/env bash' "printf '%s\\n' '{\"type\":\"result\",\"is_error\":false,\"result\":\"OK\"}'" >"$FAKE_BIN/claude"
+chmod +x "$FAKE_BIN/claude"
+
 # --- roster + per-agent settings fixtures -----------------------------------
 
 seed_agent_lines() {
@@ -110,6 +122,7 @@ run_auth() {
   BRIDGE_HOST_PLATFORM_OVERRIDE="${PLATFORM:-Darwin}" \
   BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH="${GATE:-}" \
   BRIDGE_CLAUDE_TOKEN_REGISTRY="$REGISTRY" \
+  BRIDGE_CLAUDE_TOKEN_CHECK_BIN="$FAKE_BIN/claude" \
     bash "$AUTH_SH" "$@" >"$SMOKE_TMP_ROOT/auth.out" 2>"$SMOKE_TMP_ROOT/auth.err"
   local rc=$?
   set -e
@@ -117,8 +130,9 @@ run_auth() {
 }
 
 # Write a single-line claude-token registry. $1 active_id ("" for none),
-# $2 enabled (true|false), $3 last_check_status.
-TOKEN_40="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+# $2 enabled (true|false), $3 last_check_status. #18696: the token is an
+# api_key-kind value so the helper-write happy paths render the managed helper.
+TOKEN_40="sk-ant-api03-MOCK-not-a-real-token-aaaaaaaaaaaaaaaa"
 write_registry() {
   local active="$1" enabled="$2" status="$3"
   printf '{"version":1,"active_token_id":"%s","auto_rotate_enabled":false,"rotation_threshold":99.0,"weekly_warn_threshold":95.0,"tokens":[{"id":"primary","token":"%s","enabled":%s,"last_check_status":"%s"}],"last_rotation":{}}\n' \
@@ -132,6 +146,11 @@ gate_enabled_in_config() {
   fi
   python3 -c 'import json,sys; print("true" if json.load(open(sys.argv[1])).get("claude_keychain_free_auth") is True else "false")' "$CONFIG_FILE"
 }
+
+# #18696: seed a healthy api_key registry as the default so the backfill happy
+# paths (A3/A4/A4b) resolve an api_key active token and render the managed
+# helper. A6/A6b/A7/A7b/A8 overwrite this with their own registry state.
+write_registry "primary" "true" "available"
 
 # ===========================================================================
 # A1 — `backfill-settings --help` prints usage, rc 0, no per-agent iteration.

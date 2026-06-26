@@ -113,6 +113,22 @@ KEYCHAIN_FREE_CONFIG_KEY = "claude_keychain_free_auth"
 API_KEY_HELPER_CONFIG_KEY = "claude_api_key_helper"
 API_KEY_HELPER_TTL_CONFIG_KEY = "claude_api_key_helper_ttl_ms"
 DEFAULT_API_KEY_HELPER_TTL_MS = 60000
+# #18696 — keychain-free apiKeyHelper token-kind gate. The managed apiKeyHelper
+# feeds Claude Code's x-api-key contract, which ONLY an API-key token satisfies.
+# An OAuth token (OAT) is a Bearer credential: valid via the native
+# .credentials.json sync (200) but x-api-key-invalid (401 "Invalid API key").
+# classify_token_kind() drives a fail-closed eligibility gate so the helper is
+# wired only for a confirmed api_key token; OAT/unknown route through native sync.
+CLAUDE_API_KEY_TOKEN_PREFIX = "sk-ant-api"
+CLAUDE_OAT_TOKEN_PREFIX = "sk-ant-oat"
+TOKEN_KIND_API_KEY = "api_key"
+TOKEN_KIND_OAUTH_OAT = "oauth_oat"
+TOKEN_KIND_UNKNOWN = "unknown"
+# #18696 — distinct exit code from ``api-key-helper`` meaning "a present active
+# token whose kind is ineligible for the x-api-key apiKeyHelper" (OAT/unknown).
+# bridge-run.sh branches on this to fall back to native credentials instead of
+# failing closed (a genuinely absent token keeps the existing rc=1 die path).
+APIKEYHELPER_INELIGIBLE_KIND_RC = 3
 TRUE_STRINGS = {"1", "true", "yes", "on"}
 MONTHS = {
     "january": 1,
@@ -397,14 +413,21 @@ def settings_writer_context() -> str:
         return "bridge-auth.py"
 
 
-def keychain_free_active_token_health(registry_path: Path) -> tuple[bool, str]:
-    """Health of the active OAT the apiKeyHelper would serve, WITHOUT printing a
-    secret (issue #2137 fix #5).
+def native_credential_health(registry_path: Path) -> tuple[bool, str]:
+    """Health of the active token the NATIVE ``.credentials.json`` sync would
+    serve, WITHOUT printing a secret (issue #2137 fix #5).
 
     Healthy = an active token is registered, enabled, and structurally valid
     (``active_registry_token``), and its last recorded probe is not an auth
     failure. Returns ``(ok, reason)`` where ``reason`` is a generic label, never
-    the token value."""
+    the token value.
+
+    #18696: renamed from ``keychain_free_active_token_health`` and made
+    NON-AUTHORIZING for the keychain-free apiKeyHelper path — it speaks to the
+    native Bearer credential, not the x-api-key helper. The keychain-free
+    preflight no longer treats a healthy token here as helper authorization;
+    helper eligibility is decided by the token-kind gate + the x-api-key probe.
+    """
     try:
         registry = load_registry(registry_path)
     except Exception as exc:  # noqa: BLE001 - unreadable registry → unhealthy
@@ -420,13 +443,83 @@ def keychain_free_active_token_health(registry_path: Path) -> tuple[bool, str]:
     return True, "active_token_healthy"
 
 
+def keychain_free_helper_xapikey_probe(
+    registry_path: Path, timeout_seconds: int = 20
+) -> tuple[bool, str]:
+    """Prove the managed apiKeyHelper authenticates as x-api-key (#18696).
+
+    Builds a throwaway ``CLAUDE_CONFIG_DIR`` whose ``settings.json`` points at
+    the managed apiKeyHelper (and carries NO ``.credentials.json``), then runs
+    the real ``claude -p`` probe. Claude invokes the helper, which serves the
+    active token as x-api-key. An OAT served here returns 401 ("Invalid API
+    key") — exactly the live incident — so we FAIL CLOSED on ``auth_failed`` /
+    401. Returns ``(ok, detail)`` with a generic label, never the token value.
+
+    Only meaningful for an api_key-kind active token; callers gate on the kind
+    first. Mockable via ``BRIDGE_CLAUDE_TOKEN_CHECK_BIN`` (the same hook
+    ``probe_claude_token`` uses), so the smokes drive it without a network call.
+    """
+    helper = claude_api_key_helper_path()
+    claude_bin = os.environ.get("BRIDGE_CLAUDE_TOKEN_CHECK_BIN", "claude")
+    prompt = os.environ.get("BRIDGE_CLAUDE_TOKEN_CHECK_PROMPT", "Return exactly OK.")
+    command = [claude_bin, "-p", prompt, "--output-format", "json"]
+    try:
+        with tempfile.TemporaryDirectory(prefix="agb-keychain-free-xapikey.") as config_dir:
+            config_path = Path(config_dir)
+            os.chmod(config_path, 0o700)
+            settings = {
+                "skipDangerousModePermissionPrompt": True,
+                "apiKeyHelper": helper,
+            }
+            (config_path / "settings.json").write_text(
+                json.dumps(settings, ensure_ascii=True, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            ensure_claude_config_file(config_path)
+            env = os.environ.copy()
+            env.pop(TOKEN_ENV_KEY, None)
+            env.pop("ANTHROPIC_API_KEY", None)
+            env.pop("ANTHROPIC_AUTH_TOKEN", None)
+            env["CLAUDE_CONFIG_DIR"] = str(config_path)
+            env["CLAUDE_CODE_API_KEY_HELPER_TTL_MS"] = str(claude_api_key_helper_ttl_ms())
+            # The managed helper resolves the active token from THIS registry +
+            # the keychain-free gate; pin both so the probe exercises the real
+            # x-api-key path end-to-end (the helper itself fail-closes on a
+            # non-api_key token — see cmd_api_key_helper).
+            env["BRIDGE_CLAUDE_TOKEN_REGISTRY"] = str(registry_path)
+            env["BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH"] = "1"
+            proc = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout_seconds,
+                env=env,
+                check=False,
+            )
+    except subprocess.TimeoutExpired:
+        return False, "x_api_key_probe_timeout"
+    except FileNotFoundError:
+        return False, "claude_not_found"
+    status, _detail = classify_probe(proc.stdout or "", proc.stderr or "", proc.returncode)
+    if status == "available":
+        return True, "x_api_key_ok"
+    if status == "auth_failed":
+        return False, "x_api_key_auth_failed_401"
+    return False, f"x_api_key_probe_{status}"
+
+
 def keychain_free_preflight(registry_path: Path) -> dict[str, Any]:
-    """Issue #2137 fix #5: enable-time preflight.
+    """Issue #2137 fix #5 + #18696: enable-time, fail-closed preflight.
 
     Validates that flipping the keychain-free gate ON would NOT immediately break
-    interactive Claude. Three checks — supported platform (macOS), an executable
-    helper, and a healthy active registry OAT — and the aggregate ``ok`` is their
-    conjunction. No secret is read into the result."""
+    interactive Claude. The AUTHORIZING conjunction is supported platform (macOS)
+    AND an executable helper AND a confirmed ``api_key``-kind active token
+    (#18696 — the apiKeyHelper feeds x-api-key, which an OAT cannot satisfy) AND a
+    real x-api-key probe through the managed helper succeeding. The native
+    credential health is reported but NON-AUTHORIZING (it speaks to the Bearer
+    ``.credentials.json`` path, not the helper). No secret is read into the result.
+    """
     helper = claude_api_key_helper_path()
     platform_ok = keychain_free_apikeyhelper_supported()
     helper_exec = False
@@ -437,15 +530,38 @@ def keychain_free_preflight(registry_path: Path) -> dict[str, Any]:
         helper_detail = f"helper_probe_error: {exc}"
     if not helper_exec and helper_detail == helper:
         helper_detail = f"helper_not_executable: {helper}"
-    token_ok, token_detail = keychain_free_active_token_health(registry_path)
+    # #18696: token-kind gate — the apiKeyHelper serves x-api-key, so only a
+    # confirmed api_key-kind active token is eligible. FAIL CLOSED otherwise so
+    # the gate can never move interactive Claude onto an OAT-as-x-api-key 401.
+    token_kind = active_registry_token_kind(registry_path)
+    kind_ok = token_kind == TOKEN_KIND_API_KEY
+    # #18696: real x-api-key probe through the managed helper — only when the
+    # token is kind-eligible AND the platform/helper preconditions hold. Skipped
+    # (fail-closed) otherwise so the conjunction never authorizes on a non-probed
+    # path. For an OAT pool (the live default) the gate refuses here BEFORE any
+    # network call.
+    if kind_ok and platform_ok and helper_exec:
+        xapi_ok, xapi_detail = keychain_free_helper_xapikey_probe(registry_path)
+    else:
+        xapi_ok, xapi_detail = False, f"skipped: not_eligible (kind={token_kind})"
+    # Non-authorizing native-credential health (informational only).
+    native_ok, native_detail = native_credential_health(registry_path)
     checks = [
         {"check": "platform_supported", "ok": platform_ok, "detail": host_platform()},
         {"check": "helper_executable", "ok": helper_exec, "detail": helper_detail},
-        {"check": "active_token_health", "ok": token_ok, "detail": token_detail},
+        {"check": "active_token_kind", "ok": kind_ok, "detail": token_kind},
+        {"check": "x_api_key_probe", "ok": xapi_ok, "detail": xapi_detail},
+        {
+            "check": "native_credential_health",
+            "ok": native_ok,
+            "detail": native_detail,
+            "authorizing": False,
+        },
     ]
     return {
-        "ok": bool(platform_ok and helper_exec and token_ok),
+        "ok": bool(platform_ok and helper_exec and kind_ok and xapi_ok),
         "api_key_helper": helper,
+        "active_token_kind": token_kind,
         "checks": checks,
     }
 
@@ -522,6 +638,30 @@ def validate_token(token: str) -> None:
         raise ValueError("token cannot contain whitespace")
     if any(ord(ch) < 32 or ord(ch) == 127 for ch in token):
         raise ValueError("token cannot contain control characters")
+
+
+def classify_token_kind(token: str) -> str:
+    """Classify a Claude credential by prefix (#18696).
+
+    Returns one of ``api_key`` | ``oauth_oat`` | ``unknown``. This drives the
+    keychain-free apiKeyHelper eligibility gate: the helper implements Claude's
+    x-api-key contract, so it may serve ONLY a confirmed ``api_key`` token.
+
+    FAIL-CLOSED + backward-compatible: an empty, malformed, or unrecognized
+    token classifies as ``unknown`` — NEVER ``api_key``. Eligibility therefore
+    requires a *positively confirmed* api-key prefix; a missing/unknown kind can
+    never be inferred as eligible. Registry rows carry no required kind field
+    (legacy rows have none), so the kind is always derived from the token bytes
+    here, never trusted from a schema field.
+    """
+    if not isinstance(token, str):
+        return TOKEN_KIND_UNKNOWN
+    candidate = token.strip()
+    if candidate.startswith(CLAUDE_API_KEY_TOKEN_PREFIX):
+        return TOKEN_KIND_API_KEY
+    if candidate.startswith(CLAUDE_OAT_TOKEN_PREFIX):
+        return TOKEN_KIND_OAUTH_OAT
+    return TOKEN_KIND_UNKNOWN
 
 
 def validate_threshold(value: float) -> float:
@@ -752,6 +892,22 @@ def active_registry_token(registry: dict[str, Any]) -> tuple[str, str]:
     token = str(row.get("token") or "")
     validate_token(token)
     return active_id, token
+
+
+def active_registry_token_kind(registry_path: Path) -> str:
+    """Kind of the active registry token, FAIL-CLOSED (#18696).
+
+    Returns ``classify_token_kind(active_token)`` — or ``unknown`` when there is
+    no active token, it is disabled/missing/invalid, or the registry is
+    unreadable. Never raises and never infers ``api_key`` from absence, so a
+    caller can safely treat any non-``api_key`` result as helper-ineligible.
+    """
+    try:
+        registry = load_registry(registry_path)
+        _active_id, token = active_registry_token(registry)
+    except Exception:  # noqa: BLE001 - any failure → fail-closed unknown
+        return TOKEN_KIND_UNKNOWN
+    return classify_token_kind(token)
 
 
 def public_token_row(row: dict[str, Any], active_id: str) -> dict[str, Any]:
@@ -2692,6 +2848,7 @@ def ensure_claude_settings_file(
     agent: str = "",
     writer: str = "",
     allow_apikeyhelper: bool = True,
+    active_token_kind: str = TOKEN_KIND_UNKNOWN,
 ) -> Path:
     _ensure_claude_dir_safe(config_dir / "settings.json", allowed_root)
     config_dir.mkdir(parents=True, exist_ok=True)
@@ -2720,6 +2877,17 @@ def ensure_claude_settings_file(
     # write it there. The cleanup branch below still runs on non-Darwin so a
     # stale managed value (e.g. left by a pre-fix sync, or after the gate is
     # turned off) gets removed regardless of platform.
+    # #18696: the keychain-free apiKeyHelper implements Claude Code's x-api-key
+    # contract, so it may be wired ONLY for a confirmed ``api_key``-kind active
+    # token. An OAuth/OAT (or any unknown/unclassifiable) active token is a
+    # Bearer credential — valid via the native ``.credentials.json`` sync but 401
+    # as x-api-key — so it must NEVER be moved onto the helper. FAIL CLOSED: the
+    # default ``active_token_kind`` is ``unknown``, so a caller that does not
+    # positively confirm an api_key token gets no helper (and a previously
+    # managed one is cleaned up via the removal branch below). This is the single
+    # chokepoint every helper-writing caller (sync, backfill, daemon) funnels
+    # through, additive to the #2137 admin-scope gate and the #1444 Darwin gate.
+    helper_kind_eligible = active_token_kind == TOKEN_KIND_API_KEY
     if not allow_apikeyhelper:
         # Issue #2137 fix #3 (sync-path vector): the admin/interactive agent under
         # a BROAD selection scope (default / static / all / claude). Leave the
@@ -2729,7 +2897,11 @@ def ensure_claude_settings_file(
         # removing one. The admin's managed helper is only ever written / removed
         # when an explicit `--agents <admin>` targets it (allow_apikeyhelper=True).
         pass
-    elif claude_keychain_free_auth_enabled() and keychain_free_apikeyhelper_supported():
+    elif (
+        claude_keychain_free_auth_enabled()
+        and keychain_free_apikeyhelper_supported()
+        and helper_kind_eligible
+    ):
         payload["apiKeyHelper"] = claude_api_key_helper_path()
     elif apikeyhelper_value_is_bridge_managed(payload.get("apiKeyHelper")):
         # Disable/rollback/non-Darwin cleanup: the gate is off (or we are not on
@@ -2781,6 +2953,28 @@ def ensure_claude_settings_file(
                 "api_key_helper": after_helper or "",
                 "settings_file": str(path),
                 "gate_enabled": claude_keychain_free_auth_enabled(),
+                "platform": host_platform(),
+            }
+        )
+    # #18696: when the keychain-free gate + platform are satisfied but the active
+    # token is NOT an api_key (so the helper was deliberately withheld / removed),
+    # record the refusal reason for RCA — the forensic signal an operator needs to
+    # see WHY a keychain-free Darwin agent did not receive the managed helper
+    # (the answer: an OAT/unknown token routes through native .credentials.json).
+    if (
+        allow_apikeyhelper
+        and claude_keychain_free_auth_enabled()
+        and keychain_free_apikeyhelper_supported()
+        and not helper_kind_eligible
+    ):
+        auth_write_audit(
+            {
+                "kind": "claude_settings_apikeyhelper_refused",
+                "agent": agent,
+                "writer": writer or settings_writer_context(),
+                "reason": "active_token_not_api_key",
+                "token_kind": active_token_kind,
+                "settings_file": str(path),
                 "platform": host_platform(),
             }
         )
@@ -2866,6 +3060,37 @@ def cmd_backfill_settings(args: argparse.Namespace) -> int:
             print(f"skipped: {agent or config_dir} (keychain-free off or non-Darwin)")
         return 0
 
+    # #18696: the keychain-free apiKeyHelper backfill applies ONLY to a confirmed
+    # api_key-kind active token. An OAuth/OAT (or unknown) active token is the
+    # native-.credentials.json Bearer path — wiring it onto the x-api-key helper
+    # 401s — so refuse with an actionable reason instead of silently writing a
+    # broken helper. Today's live pool is OAT, so this is the whole-pool refusal.
+    active_kind = active_registry_token_kind(Path(args.registry).expanduser())
+    if active_kind != TOKEN_KIND_API_KEY:
+        payload = {
+            "status": "skipped",
+            "agent": agent,
+            "reason": "active_token_not_api_key",
+            "token_kind": active_kind,
+            "changed": False,
+            "coherent": True,
+            "action_required": (
+                "The active Claude token authenticates via the native "
+                ".credentials.json sync (Bearer), not the x-api-key apiKeyHelper. "
+                "Run `agent-bridge auth claude-token activate <id> --sync --agents "
+                f"{agent or '<agent>'}` for native credentials; the keychain-free "
+                "apiKeyHelper backfill applies only to api_key-kind tokens."
+            ),
+        }
+        if json_mode:
+            json_dump(payload)
+        else:
+            print(
+                f"skipped: {agent or config_dir} (active token kind={active_kind}; "
+                "keychain-free apiKeyHelper serves api_key tokens only — use native sync)"
+            )
+        return 0
+
     already = settings_apikeyhelper_coherent(config_dir)
 
     if check_only:
@@ -2927,6 +3152,9 @@ def cmd_backfill_settings(args: argparse.Namespace) -> int:
             allowed_root=allowed_root,
             agent=agent,
             writer="backfill-settings",
+            # #18696: confirmed api_key (refused above otherwise), so the
+            # chokepoint may wire the managed helper.
+            active_token_kind=active_kind,
         )
     except Exception as exc:
         return fail(str(exc), json_mode)
@@ -3091,12 +3319,55 @@ def cmd_api_key_helper(args: argparse.Namespace) -> int:
     except Exception as exc:
         return fail(str(exc), json_mode)
 
+    # #18696 defense-in-depth floor: the apiKeyHelper feeds Claude's x-api-key
+    # contract, so it may serve ONLY a confirmed api_key token. An OAT (Bearer,
+    # 401 as x-api-key) or any unknown kind is REFUSED — write NOTHING to stdout,
+    # error to stderr, exit 3 (the distinct "kind ineligible" code bridge-run.sh
+    # branches on to fall back to native credentials). FAIL CLOSED on BOTH the
+    # secret-emitting path AND the --check path: the OAT must NEVER reach stdout
+    # and --check must never report the helper healthy for a non-api_key token.
+    token_kind = classify_token_kind(token)
+    if token_kind != TOKEN_KIND_API_KEY:
+        auth_write_audit(
+            {
+                "kind": "claude_apikeyhelper_refused",
+                "reason": "active_token_not_api_key",
+                "active_token_id": active_id,
+                "token_kind": token_kind,
+                "check": bool(args.check),
+            }
+        )
+        if json_mode:
+            json_dump(
+                {
+                    "status": "refused",
+                    "active_token_id": active_id,
+                    "token_kind": token_kind,
+                    "helper_eligible": False,
+                    "reason": "active_token_not_api_key",
+                }
+            )
+        else:
+            print(
+                "refused: the active Claude token is not an API-key (x-api-key) "
+                f"token (kind={token_kind}); the keychain-free apiKeyHelper serves "
+                "API-key tokens only. An OAuth/OAT token authenticates via the "
+                "native .credentials.json sync, not the helper.",
+                file=sys.stderr,
+            )
+        return APIKEYHELPER_INELIGIBLE_KIND_RC
+
     if bool(args.check):
-        payload = {"status": "ok", "active_token_id": active_id}
+        payload = {
+            "status": "ok",
+            "active_token_id": active_id,
+            "token_kind": token_kind,
+            "helper_eligible": True,
+        }
         if json_mode:
             json_dump(payload)
         else:
-            print("ok: active Claude OAuth token available")
+            print("ok: active Claude API-key token available")
         return 0
 
     sys.stdout.write(token)
@@ -3285,6 +3556,13 @@ def cmd_sync_agent(args: argparse.Namespace) -> int:
             owner_gid=owner_gid,
             allowed_root=allowed_root,
         )
+        # #18696: classify the credential we just synced. The native
+        # .credentials.json write above is unconditional (Bearer path, the
+        # working delivery for OAT/subscription tokens); the managed apiKeyHelper
+        # is wired by ensure_claude_settings_file ONLY when this kind is api_key.
+        # Both the registry-OAT and controller-credentials sources resolve here:
+        # an OAuth access token classifies as oauth_oat (or unknown) → no helper.
+        active_token_kind = classify_token_kind(synced_material)
         settings_file = ensure_claude_settings_file(
             credential_file.parent,
             owner_uid=owner_uid,
@@ -3299,6 +3577,7 @@ def cmd_sync_agent(args: argparse.Namespace) -> int:
             # apiKeyHelper. The admin's helper is only managed via an explicit
             # `--agents <admin>`.
             allow_apikeyhelper=not bool(getattr(args, "no_apikeyhelper", False)),
+            active_token_kind=active_token_kind,
         )
     except Exception as exc:
         return fail(str(exc), json_mode)
@@ -3358,34 +3637,44 @@ def cmd_sync_agent(args: argparse.Namespace) -> int:
     if claude_keychain_free_auth_enabled():
         payload["api_key_helper"] = claude_api_key_helper_path()
         payload["api_key_helper_ttl_ms"] = claude_api_key_helper_ttl_ms()
-        # Issue #1855 cred-state honesty: on a keychain-free Darwin install the
-        # launched shared agent authenticates via the apiKeyHelper wired into
-        # its per-agent settings.json — NOT the .credentials.json we just wrote.
-        # If settings.json does not point at the managed helper (a pre-#1520
-        # agent the apiKeyHelper backfill never reached), the #1520 gate can
-        # never pass and the launch silently degrades to the operator keychain:
-        # the agent never consumes the rendered per-agent credential even though
-        # we stamped it `synced`. Surface that incoherence as a structured field
-        # (and a stderr warning) instead of asserting a delivery that cannot
-        # happen, so the daemon sync-tick audit and watchdog/doctor can see it.
-        # Best-effort + non-fatal: the credential write itself already succeeded.
+        payload["active_token_kind"] = active_token_kind
         if keychain_free_apikeyhelper_supported():
-            try:
-                coherent = settings_apikeyhelper_coherent(credential_file.parent)
-            except Exception:  # noqa: BLE001 - never turn a good sync into a failure
-                coherent = True
-            payload["keychain_free_settings_coherent"] = coherent
-            if not coherent:
-                payload["status"] = "synced_incoherent"
-                print(
-                    f"warning: {args.agent} synced a per-agent credential its "
-                    "launch path cannot consume — settings.json does not point "
-                    "at the managed apiKeyHelper (pre-#1520 agent). Run "
-                    f"`agent-bridge upgrade` or `agent-bridge auth claude-token "
-                    f"backfill-settings --agents {args.agent}` to wire the "
-                    "keychain-free contract so this agent joins the OAT pool.",
-                    file=sys.stderr,
-                )
+            if active_token_kind != TOKEN_KIND_API_KEY:
+                # #18696: a non-api_key (OAuth/OAT) active token is NOT eligible
+                # for the x-api-key apiKeyHelper. The native .credentials.json we
+                # just wrote IS the working delivery (Bearer 200); the helper is
+                # intentionally NOT wired (helper scan 0). Surface this as an
+                # actionable, non-error field — NOT the #1855 "run backfill"
+                # warning (backfill also refuses for non-api_key tokens, so that
+                # advice would loop). The sync still succeeded.
+                payload["keychain_free_helper_eligible"] = False
+                payload["keychain_free_helper_skipped_reason"] = "active_token_not_api_key"
+            else:
+                # Issue #1855 cred-state honesty: on a keychain-free Darwin
+                # install with an api_key token the launched agent authenticates
+                # via the apiKeyHelper wired into its per-agent settings.json. If
+                # settings.json does not point at the managed helper (a pre-#1520
+                # agent the backfill never reached), the gate can never pass and
+                # the launch silently degrades to the operator keychain. Surface
+                # that incoherence as a structured field + stderr warning.
+                # Best-effort + non-fatal: the credential write already succeeded.
+                try:
+                    coherent = settings_apikeyhelper_coherent(credential_file.parent)
+                except Exception:  # noqa: BLE001 - never turn a good sync into a failure
+                    coherent = True
+                payload["keychain_free_helper_eligible"] = True
+                payload["keychain_free_settings_coherent"] = coherent
+                if not coherent:
+                    payload["status"] = "synced_incoherent"
+                    print(
+                        f"warning: {args.agent} synced a per-agent credential its "
+                        "launch path cannot consume — settings.json does not point "
+                        "at the managed apiKeyHelper (pre-#1520 agent). Run "
+                        f"`agent-bridge upgrade` or `agent-bridge auth claude-token "
+                        f"backfill-settings --agents {args.agent}` to wire the "
+                        "keychain-free contract so this agent joins the api-key pool.",
+                        file=sys.stderr,
+                    )
     if json_mode:
         json_dump(payload)
     else:

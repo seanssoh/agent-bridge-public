@@ -1382,6 +1382,24 @@ bridge_run_claude_keychain_free_preflight() {
   unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
 
   bridge_require_python
+  registry_path="$(bridge_claude_token_registry_path)"
+
+  # #18696 (follow-up to #2137): the keychain-free apiKeyHelper implements
+  # Claude's x-api-key contract, so only an api_key-kind active token is
+  # helper-eligible. The registry OAT (the Bearer credential, valid via the
+  # native .credentials.json but 401 as x-api-key) must NOT be forced onto the
+  # helper. Probe the active token's kind FAIL-CLOSED: exit 3 = "a present token
+  # whose kind is ineligible" (OAT/unknown) → leave VALIDATED=0 and fall back to
+  # the native credential path below. Any OTHER nonzero (no active token, etc.)
+  # keeps the existing fail-closed validation so a truly absent token still dies.
+  local _kind_rc=0
+  python3 "$SCRIPT_DIR/bridge-auth.py" \
+    --registry "$registry_path" \
+    api-key-helper --check >/dev/null 2>&1 || _kind_rc=$?
+  if [[ "$_kind_rc" -eq 3 ]]; then
+    return 0
+  fi
+
   helper_path="$(bridge_claude_api_key_helper_path)"
   [[ -f "$helper_path" && -x "$helper_path" ]] \
     || bridge_die "Claude keychain-free auth is enabled but apiKeyHelper is not executable: $helper_path"
@@ -1396,10 +1414,19 @@ bridge_run_claude_keychain_free_preflight() {
     bridge_die "Claude keychain-free auth is enabled but settings.json does not point at apiKeyHelper: $settings_file"
   fi
 
-  registry_path="$(bridge_claude_token_registry_path)"
-  if ! python3 "$SCRIPT_DIR/bridge-auth.py" \
-      --registry "$registry_path" \
-      api-key-helper --check >/dev/null; then
+  # Re-check the active token right before declaring keychain-free validated. If
+  # the active token rotated from api_key to OAT/unknown between the kind gate
+  # above and here, this returns the #18696 ineligible-kind code (3) — treat it
+  # the same as the early gate: fall back to native credentials, never die.
+  # Any OTHER nonzero (no active token) keeps the existing fail-closed die.
+  local _late_rc=0
+  python3 "$SCRIPT_DIR/bridge-auth.py" \
+    --registry "$registry_path" \
+    api-key-helper --check >/dev/null 2>&1 || _late_rc=$?
+  if [[ "$_late_rc" -eq 3 ]]; then
+    return 0
+  fi
+  if [[ "$_late_rc" -ne 0 ]]; then
     bridge_die "Claude keychain-free auth is enabled but no active registry OAT is available"
   fi
 
