@@ -771,13 +771,31 @@ def cmd_monitor(args: argparse.Namespace) -> int:
         # (token-free one-way digest). None on a real reading.
         signal_token = snapshot.get("signal_token")
 
+        # #17927 P2 (E10 Obs#1): freshness of THIS reading, computed BEFORE any
+        # reset-cycle latch mutation. A 429-signal (#1468) is a live rotation
+        # instruction and a non-claude provider has no statusLine cache, so both
+        # count as fresh; a claude REAL reading is fresh only when its cache
+        # `written_at` is within the max-age window. Reused by the claude
+        # rotation staleness-guard below.
+        cache_fresh = (
+            snapshot.get("provider") != "claude"
+            or bool(snapshot.get("signal"))
+            or _cache_is_fresh(snapshot.get("written_at"), cache_max_age_seconds, now=now_dt)
+        )
+
         # Cycle rollover: if reset_at has moved forward by more than the grace
         # window, this is a new cycle — clear the latch so alerts can fire again.
         # Equal or wobbling reset_at values are intentionally treated as noise
         # (see RESET_FORWARD_GRACE_SECONDS). This was the #215 noise source.
         if reset_cycle_advanced(previous_reset, reset_at):
             previous_latch = None
-        if reset_cycle_advanced(rotation_triggered_reset_at, reset_at):
+        # #17927 P2 (E10 Obs#1 — codex r2): gate the ROTATION-latch reset-cycle
+        # clear on freshness. A provably stale real reading can carry an advanced
+        # reset_at; clearing the rotation latch on it would let the NEXT fresh
+        # reading at that same reset re-emit a duplicate preemptive candidate (the
+        # exact double-rotation the staleness-guard must prevent). Only a fresh
+        # reading or a 429-signal may advance the rotation cycle here.
+        if cache_fresh and reset_cycle_advanced(rotation_triggered_reset_at, reset_at):
             rotation_triggered_at = None
             rotation_triggered_reset_at = None
         # Issue #1468 (codex r3+r4): a native 429-signal whose token DIFFERS from
@@ -829,12 +847,10 @@ def cmd_monitor(args: argparse.Namespace) -> int:
             alerted_at = now_iso()
 
         if snapshot.get("provider") == "claude":
-            # #17927 P2 (E10 Obs#1): a synthetic 429-signal is a deliberate
-            # rotation INSTRUCTION (#1468) and bypasses the staleness-guard;
-            # only REAL readings are subject to it.
-            cache_fresh = bool(snapshot.get("signal")) or _cache_is_fresh(
-                snapshot.get("written_at"), cache_max_age_seconds, now=now_dt
-            )
+            # #17927 P2 (E10 Obs#1): `cache_fresh` was computed above (BEFORE the
+            # reset-cycle latch clear) so a stale reading's advanced reset_at can
+            # never clear the rotation latch. A synthetic 429-signal (#1468)
+            # bypasses the staleness-guard; only REAL readings are subject to it.
             if not isinstance(used_percent, (int, float)) or not cache_fresh:
                 # No usable signal this tick (absent/null reading OR a provably
                 # stale cache). Leave the rotation latch EXACTLY as-is — do not

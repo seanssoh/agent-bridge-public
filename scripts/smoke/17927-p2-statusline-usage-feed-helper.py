@@ -231,6 +231,40 @@ def main() -> int:
         check(pre is not None and latch_for(ss4, "managed-1") == pre,
               "E10 Obs#1: a stale cache does NOT CLEAR a pre-existing latch (no false 0% read)")
 
+        # ---- E10 Obs#1 (codex r2 regression): a STALE cache whose reset_at is
+        # bogusly ADVANCED (> grace) must NOT clear the rotation latch. Otherwise
+        # the next fresh reading at the REAL (unchanged) reset re-emits a
+        # duplicate preemptive candidate for the same incident. The stale
+        # advanced reset_at is not authoritative.
+        sf6 = tmp / "e10-stale-advanced-reset-state.json"
+        # pass1: fresh 96% at reset R1 -> 1 candidate, latch at R1.
+        r1a, _ = run_monitor(
+            tmp,
+            per_agent=[per_agent_entry("managed-1", cache(five_hour=10, seven_day=96, reset_offset=86400)[0])],
+            rotation_eligible="managed-1", state_file=sf6,
+        )
+        check(len(r1a["rotation_candidates"]) == 1,
+              f"E10 Obs#1(adv): pass1 fresh at R1 rotates once (got {len(r1a['rotation_candidates'])})")
+        latch_r1 = latch_for(json.loads(sf6.read_text()), "managed-1")
+        # pass2: STALE cache (48h old) reporting an ADVANCED reset R2 (> R1 + grace).
+        r2a, s2a = run_monitor(
+            tmp,
+            per_agent=[per_agent_entry("managed-1", cache(five_hour=10, seven_day=96, reset_offset=200000, written_offset=-172800)[0])],
+            rotation_eligible="managed-1", cache_max_age=21600, state_file=sf6,
+        )
+        check(len(r2a["rotation_candidates"]) == 0,
+              f"E10 Obs#1(adv): pass2 stale-advanced-reset drives no candidate (got {len(r2a['rotation_candidates'])})")
+        check(latch_r1 is not None and latch_for(s2a, "managed-1") == latch_r1,
+              "E10 Obs#1(adv): a STALE cache's advanced reset_at does NOT clear the rotation latch")
+        # pass3: fresh 96% at the REAL (unchanged) reset R1 -> latch still held -> no duplicate.
+        r3a, _ = run_monitor(
+            tmp,
+            per_agent=[per_agent_entry("managed-1", cache(five_hour=10, seven_day=96, reset_offset=86400)[0])],
+            rotation_eligible="managed-1", state_file=sf6,
+        )
+        check(len(r3a["rotation_candidates"]) == 0,
+              f"E10 Obs#1(adv): next fresh reading at the real reset emits NO duplicate (got {len(r3a['rotation_candidates'])})")
+
         # ---- E10 Obs#2 reactive: a 429-signal cache is tagged reactive and the
         # controller-managed sentinel (empty agent) is eligible despite a
         # non-empty eligible set.
