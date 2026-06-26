@@ -115,6 +115,16 @@ helper_in() {
   python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("apiKeyHelper",""))' "$(cfg_dir_for "$1")/settings.json"
 }
 
+# Simulate a PRIOR provision that already wired our managed apiKeyHelper, so a
+# later OAT-active backfill must clean it up (#18696 r2 / patch-dev #18722).
+seed_managed_helper_settings() {
+  local cfg
+  cfg="$(cfg_dir_for "$1")"
+  mkdir -p "$cfg"
+  python3 -c 'import json,sys; json.dump({"skipDangerousModePermissionPrompt": True, "apiKeyHelper": sys.argv[2]}, open(sys.argv[1],"w"), indent=2)' \
+    "$cfg/settings.json" "$EXPECTED_HELPER"
+}
+
 reseed_all_settings() {
   seed_legacy_settings "$ADMIN_AGENT"
   seed_legacy_settings "$USER_AGENT"
@@ -203,6 +213,49 @@ test_oat_broad_backfill_and_sync_no_helper() {
     "B2 OAT sync does NOT wire the apiKeyHelper for the non-admin agent (helper scan 0)"
   smoke_assert_eq "" "$(helper_in "$ADMIN_AGENT")" \
     "B2 OAT sync does NOT wire the apiKeyHelper for the admin agent"
+}
+
+# ===========================================================================
+# B2b — OAT active + a STALE managed apiKeyHelper already in settings.json:
+#       a mutating backfill must REMOVE it (route through ensure_claude_settings_file
+#       so the launch falls back to native .credentials.json), and `--check` must
+#       stay read-only and report drift. Without this, the helper floor blocks the
+#       token leak but the launched Claude still sees settings.json pointing at the
+#       (now-refusing) helper — the auth-death shape. (#18696 r2 / patch-dev #18722)
+# ===========================================================================
+test_oat_backfill_removes_stale_managed_helper() {
+  write_registry "$OAT_TOKEN"
+
+  # Precondition: a prior provision left our managed helper wired.
+  seed_managed_helper_settings "$USER_AGENT"
+  smoke_assert_eq "$EXPECTED_HELPER" "$(helper_in "$USER_AGENT")" \
+    "B2b precondition: a stale managed apiKeyHelper is present"
+
+  # --check is read-only: reports drift, removes nothing.
+  local out
+  out="$(BRIDGE_HOST_PLATFORM_OVERRIDE=Darwin BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH=1 \
+    python3 "$AUTH_PY" --registry "$REGISTRY" backfill-settings \
+      --config-dir "$(cfg_dir_for "$USER_AGENT")" --agent "$USER_AGENT" --check --json 2>&1)"
+  smoke_assert_contains "$out" '"drift": true' "B2b --check reports drift for a stale helper on an OAT agent"
+  smoke_assert_eq "$EXPECTED_HELPER" "$(helper_in "$USER_AGENT")" \
+    "B2b --check is read-only: the stale helper is NOT removed"
+
+  # Mutating backfill: REMOVES the stale managed helper.
+  out="$(BRIDGE_HOST_PLATFORM_OVERRIDE=Darwin BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH=1 \
+    python3 "$AUTH_PY" --registry "$REGISTRY" backfill-settings \
+      --config-dir "$(cfg_dir_for "$USER_AGENT")" --agent "$USER_AGENT" --json 2>&1)"
+  smoke_assert_contains "$out" '"helper_removed": true' "B2b mutating backfill reports helper_removed"
+  smoke_assert_contains "$out" '"coherent": true' "B2b reports coherent:true after cleanup"
+  smoke_assert_not_contains "$out" "$OAT_TOKEN" "B2b the OAT never reaches stdout"
+  smoke_assert_eq "" "$(helper_in "$USER_AGENT")" \
+    "B2b mutating backfill REMOVED the stale managed apiKeyHelper (launch falls back to native)"
+
+  # Idempotent: a second mutating backfill is a true no-op (nothing to clean).
+  out="$(BRIDGE_HOST_PLATFORM_OVERRIDE=Darwin BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH=1 \
+    python3 "$AUTH_PY" --registry "$REGISTRY" backfill-settings \
+      --config-dir "$(cfg_dir_for "$USER_AGENT")" --agent "$USER_AGENT" --json 2>&1)"
+  smoke_assert_contains "$out" '"helper_removed": false' "B2b re-run is a no-op (already coherent)"
+  smoke_assert_eq "" "$(helper_in "$USER_AGENT")" "B2b re-run keeps the helper absent"
 }
 
 # ===========================================================================
@@ -370,6 +423,7 @@ PY
 
 smoke_run "B1 OAT keychain-free enable is refused (kind gate), gate stays off"  test_oat_enable_refused
 smoke_run "B2 OAT broad backfill/sync wire no helper; native cred delivered"    test_oat_broad_backfill_and_sync_no_helper
+smoke_run "B2b OAT backfill REMOVES a stale managed helper; --check read-only"   test_oat_backfill_removes_stale_managed_helper
 smoke_run "B3 api-key-helper refuses an OAT, emits nothing to stdout"           test_api_key_helper_oat_emits_nothing
 smoke_run "B4 native sync for an OAT writes .credentials.json, helper scan 0"   test_native_sync_oat_writes_credentials
 smoke_run "B5 confirmed api_key token: helper path allowed (mocked preflight)"  test_api_key_helper_path_allowed

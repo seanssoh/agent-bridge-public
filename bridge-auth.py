@@ -3067,27 +3067,90 @@ def cmd_backfill_settings(args: argparse.Namespace) -> int:
     # broken helper. Today's live pool is OAT, so this is the whole-pool refusal.
     active_kind = active_registry_token_kind(Path(args.registry).expanduser())
     if active_kind != TOKEN_KIND_API_KEY:
+        # #18696 r2 (patch-dev review #18722): an OAT/unknown active token must not
+        # wire the x-api-key apiKeyHelper. But returning `skipped` BEFORE the shared
+        # writer left a prior provision's managed helper in settings.json untouched —
+        # so the launched Claude still invokes it (now refused → no api key),
+        # preserving the auth-death shape even though the helper floor blocks the
+        # token leak. This verb is therefore ALSO the cleanup path: on a mutating
+        # run, REMOVE a stale managed helper via the same chokepoint writer (its
+        # removal branch fires for any non-api_key kind), so the launch falls back
+        # to native .credentials.json. `--check` stays read-only. `coherent` is
+        # reported against the true desired state for this kind: NO managed helper.
+        managed_present = settings_apikeyhelper_coherent(config_dir)
+        action_required = (
+            "The active Claude token authenticates via the native "
+            ".credentials.json sync (Bearer), not the x-api-key apiKeyHelper. "
+            "Run `agent-bridge auth claude-token activate <id> --sync --agents "
+            f"{agent or '<agent>'}` for native credentials; the keychain-free "
+            "apiKeyHelper backfill applies only to api_key-kind tokens."
+        )
+        if check_only:
+            payload = {
+                "status": "ok",
+                "agent": agent,
+                "reason": "active_token_not_api_key",
+                "token_kind": active_kind,
+                "coherent": not managed_present,
+                "drift": managed_present,
+                "changed": False,
+                "action_required": action_required,
+            }
+            if json_mode:
+                json_dump(payload)
+            elif managed_present:
+                print(
+                    f"drift: {agent or config_dir} settings.json points at the managed "
+                    f"apiKeyHelper but the active token kind={active_kind} is not api_key "
+                    "(should use native sync)"
+                )
+            else:
+                print(
+                    f"ok: {agent or config_dir} keychain-free coherent (no managed "
+                    f"apiKeyHelper; active token kind={active_kind} uses native sync)"
+                )
+            return 0
+        helper_removed = False
+        settings_file = None
+        if managed_present:
+            try:
+                settings_file = ensure_claude_settings_file(
+                    config_dir,
+                    owner_uid=owner_uid,
+                    owner_gid=owner_gid,
+                    allowed_root=allowed_root,
+                    agent=agent,
+                    writer="backfill-settings",
+                    # NOT api_key → the writer's removal branch strips the stale
+                    # managed helper (never wires it).
+                    active_token_kind=active_kind,
+                )
+            except Exception as exc:
+                return fail(str(exc), json_mode)
+            helper_removed = True
         payload = {
-            "status": "skipped",
+            "status": "ok",
             "agent": agent,
             "reason": "active_token_not_api_key",
             "token_kind": active_kind,
-            "changed": False,
+            "changed": helper_removed,
+            "helper_removed": helper_removed,
             "coherent": True,
-            "action_required": (
-                "The active Claude token authenticates via the native "
-                ".credentials.json sync (Bearer), not the x-api-key apiKeyHelper. "
-                "Run `agent-bridge auth claude-token activate <id> --sync --agents "
-                f"{agent or '<agent>'}` for native credentials; the keychain-free "
-                "apiKeyHelper backfill applies only to api_key-kind tokens."
-            ),
+            "action_required": action_required,
         }
+        if settings_file is not None:
+            payload["settings_file"] = str(settings_file)
         if json_mode:
             json_dump(payload)
+        elif helper_removed:
+            print(
+                f"cleaned: {agent or config_dir} removed the stale managed apiKeyHelper "
+                f"(active token kind={active_kind} uses native .credentials.json sync)"
+            )
         else:
             print(
-                f"skipped: {agent or config_dir} (active token kind={active_kind}; "
-                "keychain-free apiKeyHelper serves api_key tokens only — use native sync)"
+                f"ok: {agent or config_dir} keychain-free coherent (active token "
+                f"kind={active_kind} uses native sync; no managed apiKeyHelper)"
             )
         return 0
 
