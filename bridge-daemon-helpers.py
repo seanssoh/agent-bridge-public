@@ -852,12 +852,22 @@ def cmd_usage_rotation_candidates_parse(args: argparse.Namespace) -> int:
     """Original site: bridge-daemon.sh:1069 (process_usage_monitor).
 
     Extracts ``rotation_candidates`` tuples from the usage-monitor JSON.
-    Output: one tab-separated row per candidate (8 cols):
-      provider \\t account \\t window \\t used_percent \\t reset_at \\t source \\t agent \\t message
+    Output: one tab-separated row per candidate (9 cols):
+      provider \\t account \\t window \\t used_percent \\t reset_at \\t source \\t
+      agent \\t rotation_trigger \\t message
 
-    Issue #831: `agent` is inserted as the 7th column (before message) so the
-    daemon shell loop can surface the triggering agent in its audit row. The
-    bash callsite is updated in lockstep.
+    Issue #831: `agent` is column 7. #17927 P2 (E10 Obs#2): `rotation_trigger`
+    (``preemptive``|``reactive``) is column 8 so the daemon's
+    ``claude_token_rotation`` audit row records whether a rotation was driven by
+    a fresh statusLine reading (Option-C preemptive) or a 429/limited signal
+    (P2-B reactive).
+
+    EMPTY columns are emitted as the ``-`` sentinel (same producer/consumer
+    contract as rotation-status-parse): the consuming bash ``IFS=$'\\t' read``
+    treats tab as IFS whitespace and COLLAPSES adjacent separators, so an empty
+    middle field (e.g. an empty ``reset_at`` or legacy empty ``agent``) would
+    shift every later field left. The daemon decodes ``-`` back to empty.
+
     JSON-parse error exits 1 so the bash callsite's ``|| rotation_rows=""``
     fallback fires and the loop continues with no candidates.
     """
@@ -865,6 +875,10 @@ def cmd_usage_rotation_candidates_parse(args: argparse.Namespace) -> int:
         payload = json.loads(args.monitor_json)
     except Exception:
         return 1
+
+    def _col(value: Any) -> str:
+        text = "" if value is None else str(value)
+        return text if text else "-"
 
     for item in payload.get("rotation_candidates", []) or []:
         # `agent` field on the candidate falls back to `worst_case_agent` for
@@ -874,14 +888,15 @@ def cmd_usage_rotation_candidates_parse(args: argparse.Namespace) -> int:
         print(
             "\t".join(
                 [
-                    str(item.get("provider", "")),
-                    str(item.get("account", "")),
-                    str(item.get("window", "")),
-                    str(item.get("used_percent", "")),
-                    str(item.get("reset_at", "")),
-                    str(item.get("source", "")),
-                    str(agent),
-                    str(item.get("message", "")),
+                    _col(item.get("provider", "")),
+                    _col(item.get("account", "")),
+                    _col(item.get("window", "")),
+                    _col(item.get("used_percent", "")),
+                    _col(item.get("reset_at", "")),
+                    _col(item.get("source", "")),
+                    _col(agent),
+                    _col(item.get("rotation_trigger", "")),
+                    _col(item.get("message", "")),
                 ]
             )
         )

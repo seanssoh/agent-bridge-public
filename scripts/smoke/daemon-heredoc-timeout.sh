@@ -482,9 +482,11 @@ step_pr799_usage_rotation_candidates_wrap() {
   # Real-helper happy path: confirm the subcommand body parses valid input.
   local out
   out="$(python3 "$REAL_HELPER" usage-rotation-candidates-parse \
-    '{"rotation_candidates":[{"provider":"claude","account":"a","window":"5h","used_percent":"95","reset_at":"x","source":"s","message":"m"}]}')"
-  smoke_assert_eq "claude"$'\t'"a"$'\t'"5h"$'\t'"95"$'\t'"x"$'\t'"s"$'\t'"m" "$out" \
-    "usage-rotation-candidates-parse should emit 7-col row from valid JSON"
+    '{"rotation_candidates":[{"provider":"claude","account":"a","window":"5h","used_percent":"95","reset_at":"x","source":"s","worst_case_agent":"agent-a","rotation_trigger":"preemptive","message":"m"}]}')"
+  # #17927 P2 (E10 Obs#2): 9-col output — agent (col 7) + rotation_trigger
+  # (col 8) before message (col 9); empty fields emit the `-` sentinel.
+  smoke_assert_eq "claude"$'\t'"a"$'\t'"5h"$'\t'"95"$'\t'"x"$'\t'"s"$'\t'"agent-a"$'\t'"preemptive"$'\t'"m" "$out" \
+    "usage-rotation-candidates-parse should emit 9-col row (agent+rotation_trigger) from valid JSON"
 }
 
 step_pr799_rotation_status_wrap() {
@@ -494,8 +496,9 @@ step_pr799_rotation_status_wrap() {
   local out
   out="$(python3 "$REAL_HELPER" rotation-status-parse \
     '{"status":"rotated","reason":"ok","old_active_token_id":"a","active_token_id":"b","sync":{"status":"ok"}}')"
-  smoke_assert_eq "rotated"$'\t'"ok"$'\t'"a"$'\t'"b"$'\t'"ok" "$out" \
-    "rotation-status-parse should emit 5-col row from valid JSON"
+  # #1790 added soonest_reset as col 6 (emitted as the `-` sentinel when absent).
+  smoke_assert_eq "rotated"$'\t'"ok"$'\t'"a"$'\t'"b"$'\t'"ok"$'\t'"-" "$out" \
+    "rotation-status-parse should emit 6-col row (with soonest_reset sentinel) from valid JSON"
 }
 
 step_pr799_recovery_status_wrap() {
