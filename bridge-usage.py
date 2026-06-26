@@ -192,6 +192,15 @@ def _claude_snapshots_from_payload(
     # a hand-seeded cache → the freshness gate fails open (treats as fresh).
     written_at = payload.get("_written_at")
     written_at = str(written_at) if isinstance(written_at, str) and written_at else None
+    # #18849 Part 2: the one-way digest of the OAT this cache was written for (NO
+    # token bytes). Carried onto every snapshot so cmd_monitor can extend the
+    # parse-time stale-attribution guard above — which only drops synthetic
+    # 429-signal caches — to REAL preemptive candidates: after an A->B rotation
+    # the probe may still serve A's not-yet-expired cache, and A's >=threshold
+    # reading must not re-rotate the freshly-active B (post-rotation ping-pong).
+    # Absent on a hand-seeded / digest-less cache → the rotation guard fails open.
+    token_digest = payload.get("_token_digest")
+    token_digest = str(token_digest) if isinstance(token_digest, str) and token_digest else None
     windows = [
         ("5h", data.get("fiveHour"), data.get("fiveHourResetAt")),
         ("weekly", data.get("sevenDay"), data.get("sevenDayResetAt")),
@@ -218,6 +227,8 @@ def _claude_snapshots_from_payload(
             entry["signal"] = signal_marker
         if written_at is not None:
             entry["written_at"] = written_at
+        if token_digest is not None:
+            entry["token_digest"] = token_digest
         snapshots.append(entry)
     return snapshots
 
@@ -618,6 +629,10 @@ def save_monitor_state(path: Path, payload: dict[str, Any]) -> None:
 
 def cmd_status(args: argparse.Namespace) -> int:
     snapshots = collect_snapshots(args)
+    # #18849 Part 2: `token_digest` is an internal rotation-attribution gate input
+    # only (consumed by cmd_monitor); never surface it in the status output.
+    for snapshot in snapshots:
+        snapshot.pop("token_digest", None)
     result = {"generated_at": now_iso(), "snapshots": snapshots}
     if args.json:
         print(json.dumps(result, ensure_ascii=True, indent=2))
@@ -725,6 +740,11 @@ def cmd_monitor(args: argparse.Namespace) -> int:
     # #17927 P2 (E6/E8) rotation-eligibility gate + (E10 Obs#1) staleness gate.
     rotation_eligible = _parse_rotation_eligible(args)
     cache_max_age_seconds = float(getattr(args, "cache_max_age_seconds", 21600) or 0)
+    # #18849 Part 2: the one-way digest of the CURRENTLY-active rotation token
+    # (supplied by bridge-usage.sh on registry installs). Used to drop a REAL
+    # native-probe reading still attributed to a PREVIOUSLY-active token from the
+    # rotation lane (post-rotation ping-pong guard). None/empty ⇒ ungated.
+    active_token_digest = getattr(args, "active_token_digest", None) or None
     now_dt = datetime.now(timezone.utc)
     # Track the worst-case agent so the aggregate rotation row tells the
     # operator which agent triggered. Per #831 patch-dev r2 §4: a 99% on
@@ -771,16 +791,39 @@ def cmd_monitor(args: argparse.Namespace) -> int:
         # (token-free one-way digest). None on a real reading.
         signal_token = snapshot.get("signal_token")
 
+        # #18849 Part 2: post-rotation stale-attribution for REAL readings. A
+        # native-probe reading whose one-way `_token_digest` mismatches the live
+        # --active-token-digest was written for a PREVIOUSLY-active token — a
+        # leftover the probe is still serving after an A->B rotation. Folding it
+        # into `cache_fresh` makes the reading INERT for the ENTIRE rotation lane:
+        # it can neither emit a candidate NOR clear/advance the rotation latch (the
+        # latch reset-cycle clear below is gated on cache_fresh). Mirrors the
+        # parse-time signal guard EXACTLY — suppress only when BOTH digests are
+        # present and differ; a 429-signal (its own guard), a digest-less cache, or
+        # a registry-less install (no active digest) all fail open. The digest is
+        # an internal gate input only (the daemon never consumes it, unlike
+        # signal_token), so it is popped here and never reaches the candidate /
+        # monitor JSON output.
+        rotation_attribution_ok = True
+        if active_token_digest and not snapshot.get("signal"):
+            snap_digest = snapshot.get("token_digest")
+            if isinstance(snap_digest, str) and snap_digest and snap_digest != active_token_digest:
+                rotation_attribution_ok = False
+        snapshot.pop("token_digest", None)
+
         # #17927 P2 (E10 Obs#1): freshness of THIS reading, computed BEFORE any
         # reset-cycle latch mutation. A 429-signal (#1468) is a live rotation
         # instruction and a non-claude provider has no statusLine cache, so both
         # count as fresh; a claude REAL reading is fresh only when its cache
-        # `written_at` is within the max-age window. Reused by the claude
-        # rotation staleness-guard below.
+        # `written_at` is within the max-age window AND it is attributed to the
+        # active token (#18849). Reused by the claude rotation staleness-guard below.
         cache_fresh = (
             snapshot.get("provider") != "claude"
             or bool(snapshot.get("signal"))
-            or _cache_is_fresh(snapshot.get("written_at"), cache_max_age_seconds, now=now_dt)
+            or (
+                _cache_is_fresh(snapshot.get("written_at"), cache_max_age_seconds, now=now_dt)
+                and rotation_attribution_ok
+            )
         )
 
         # Cycle rollover: if reset_at has moved forward by more than the grace
@@ -851,6 +894,8 @@ def cmd_monitor(args: argparse.Namespace) -> int:
             # reset-cycle latch clear) so a stale reading's advanced reset_at can
             # never clear the rotation latch. A synthetic 429-signal (#1468)
             # bypasses the staleness-guard; only REAL readings are subject to it.
+            # #18849 Part 2: cache_fresh also folds in token attribution, so a
+            # post-rotation leftover reading (digest mismatch) is inert here too.
             if not isinstance(used_percent, (int, float)) or not cache_fresh:
                 # No usable signal this tick (absent/null reading OR a provably
                 # stale cache). Leave the rotation latch EXACTLY as-is — do not
