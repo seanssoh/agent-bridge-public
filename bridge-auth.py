@@ -319,6 +319,163 @@ def claude_api_key_helper_ttl_ms() -> int:
     return value if value > 0 else DEFAULT_API_KEY_HELPER_TTL_MS
 
 
+# ---------------------------------------------------------------------------
+# Issue #2137 — keychain-free auth hardening (RCA of a live macOS incident
+# where the keychain-free backfill silently moved the interactive admin onto
+# API-key billing → `Invalid API key`).
+#   - fix #4: a sanctioned single-key writer for the runtime-config gate so the
+#     operator never raw-edits bridge-config.json (and is not blocked by the
+#     set-env `KEY`-substring guard).
+#   - fix #5: an enable-time, fail-closed preflight.
+#   - fix #6: best-effort audit rows around settings/gate writes so RCA can
+#     identify which subprocess wrote `apiKeyHelper` into a given agent.
+
+
+def auth_audit_log_path() -> Path | None:
+    """Resolve the bridge audit log for credential-side writes (#2137 fix #6).
+
+    Honors ``BRIDGE_AUDIT_LOG`` (the rest of the audit chain + the smokes use
+    it); else derives ``<runtime-root>/../logs/audit.jsonl`` from
+    ``BRIDGE_RUNTIME_ROOT`` or ``<BRIDGE_HOME>/logs/audit.jsonl``. Returns None
+    when no root resolves, so the audit write degrades to a no-op rather than
+    guessing a path."""
+    explicit = os.environ.get("BRIDGE_AUDIT_LOG", "").strip()  # noqa: iso-helper-boundary - controller audit log
+    if explicit:
+        return Path(explicit).expanduser()
+    runtime_root = os.environ.get("BRIDGE_RUNTIME_ROOT", "").strip()  # noqa: iso-helper-boundary - controller runtime root
+    if runtime_root:
+        return Path(runtime_root).expanduser().parent / "logs" / "audit.jsonl"
+    bridge_home = os.environ.get("BRIDGE_HOME", "").strip()  # noqa: iso-helper-boundary - controller bridge home
+    if bridge_home:
+        return Path(bridge_home).expanduser() / "logs" / "audit.jsonl"
+    return None
+
+
+def auth_write_audit(detail: dict[str, Any]) -> None:
+    """Append a best-effort JSONL audit row for a credential-side mutation.
+
+    Issue #2137 fix #6: future RCA must be able to identify WHICH subprocess
+    wrote ``apiKeyHelper`` into a given agent (and which flipped the
+    keychain-free gate). Records agent/writer/action plus the resolved pid+ppid —
+    never a secret value. Best-effort: an unwritable log must never fail the auth
+    op (the credential write is the source of truth, not the audit row)."""
+    log_path = auth_audit_log_path()
+    if log_path is None:
+        return
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only - controller audit dir
+        record = {
+            "ts": now_iso(),
+            "actor": "bridge-auth",
+            "action": str(detail.get("kind") or "claude_auth_event"),
+            "pid": os.getpid(),
+            "ppid": os.getppid(),
+            "detail": detail,
+        }
+        with log_path.open("a", encoding="utf-8") as fh:  # noqa: raw-pathlib-controller-only - controller audit append
+            fh.write(json.dumps(record, ensure_ascii=True) + "\n")
+    except OSError:
+        return
+
+
+def settings_writer_context() -> str:
+    """Writer-context label for the settings audit row (#2137 fix #6).
+
+    ``BRIDGE_SETTINGS_WRITER`` lets a caller name the originating pass; else the
+    invoking script basename so the audit row is never anonymous."""
+    explicit = os.environ.get("BRIDGE_SETTINGS_WRITER", "").strip()  # noqa: iso-helper-boundary - controller writer context
+    if explicit:
+        return explicit
+    try:
+        return Path(sys.argv[0]).name or "bridge-auth.py"
+    except (IndexError, ValueError):
+        return "bridge-auth.py"
+
+
+def keychain_free_active_token_health(registry_path: Path) -> tuple[bool, str]:
+    """Health of the active OAT the apiKeyHelper would serve, WITHOUT printing a
+    secret (issue #2137 fix #5).
+
+    Healthy = an active token is registered, enabled, and structurally valid
+    (``active_registry_token``), and its last recorded probe is not an auth
+    failure. Returns ``(ok, reason)`` where ``reason`` is a generic label, never
+    the token value."""
+    try:
+        registry = load_registry(registry_path)
+    except Exception as exc:  # noqa: BLE001 - unreadable registry → unhealthy
+        return False, f"registry_unreadable: {exc}"
+    try:
+        active_id, _token = active_registry_token(registry)
+    except ValueError as exc:
+        return False, f"active_token_unhealthy: {exc}"
+    row = find_token(registry, active_id) or {}
+    last_status = str(row.get("last_check_status") or "")
+    if last_status in ("auth_failed", "invalid", "expired"):
+        return False, f"active_token_last_check_status={last_status}"
+    return True, "active_token_healthy"
+
+
+def keychain_free_preflight(registry_path: Path) -> dict[str, Any]:
+    """Issue #2137 fix #5: enable-time preflight.
+
+    Validates that flipping the keychain-free gate ON would NOT immediately break
+    interactive Claude. Three checks — supported platform (macOS), an executable
+    helper, and a healthy active registry OAT — and the aggregate ``ok`` is their
+    conjunction. No secret is read into the result."""
+    helper = claude_api_key_helper_path()
+    platform_ok = keychain_free_apikeyhelper_supported()
+    helper_exec = False
+    helper_detail = helper
+    try:
+        helper_exec = os.path.isfile(helper) and os.access(helper, os.X_OK)  # noqa: raw-pathlib-controller-only - controller helper probe
+    except OSError as exc:
+        helper_detail = f"helper_probe_error: {exc}"
+    if not helper_exec and helper_detail == helper:
+        helper_detail = f"helper_not_executable: {helper}"
+    token_ok, token_detail = keychain_free_active_token_health(registry_path)
+    checks = [
+        {"check": "platform_supported", "ok": platform_ok, "detail": host_platform()},
+        {"check": "helper_executable", "ok": helper_exec, "detail": helper_detail},
+        {"check": "active_token_health", "ok": token_ok, "detail": token_detail},
+    ]
+    return {
+        "ok": bool(platform_ok and helper_exec and token_ok),
+        "api_key_helper": helper,
+        "checks": checks,
+    }
+
+
+def write_keychain_free_gate(enabled: bool) -> tuple[Path | None, str]:
+    """Issue #2137 fix #4: sanctioned single-key writer for the
+    ``claude_keychain_free_auth`` runtime-config boolean.
+
+    The blessed admin path so the operator never raw-edits bridge-config.json
+    (and is not blocked by the set-env ``KEY``-substring guard). Read-modify-write
+    preserves every other config key; only the one boolean is set. Returns
+    ``(path, "ok")`` or ``(None, reason)`` and never clobbers a malformed config."""
+    path = runtime_config_path()
+    if path is None:
+        return None, "no_runtime_config_path (set BRIDGE_RUNTIME_ROOT or BRIDGE_HOME)"
+    config: dict[str, Any] = {}
+    mode = 0o600
+    if path.is_file():  # noqa: raw-pathlib-controller-only - controller runtime config probe
+        try:
+            mode = path.stat().st_mode & 0o777  # noqa: raw-pathlib-controller-only - controller runtime config mode
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001 - malformed config → refuse, do not clobber
+            return None, f"runtime_config_unreadable: {exc}"
+        if not isinstance(parsed, dict):
+            return None, "runtime_config_not_object"
+        config = parsed
+    config[KEYCHAIN_FREE_CONFIG_KEY] = bool(enabled)
+    text = json.dumps(config, ensure_ascii=True, indent=2) + "\n"
+    try:
+        write_private_file_atomic(path, text, mode=mode, prefix=".bridge-config.")
+    except OSError as exc:
+        return None, f"runtime_config_write_failed: {exc}"
+    return path, "ok"
+
+
 def token_fingerprint(token: str) -> str:
     digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
     tail = token[-4:] if len(token) >= 4 else token
@@ -2510,6 +2667,8 @@ def ensure_claude_settings_file(
     owner_uid: int | None = None,
     owner_gid: int | None = None,
     allowed_root: Path | None = None,
+    agent: str = "",
+    writer: str = "",
 ) -> Path:
     _ensure_claude_dir_safe(config_dir / "settings.json", allowed_root)
     config_dir.mkdir(parents=True, exist_ok=True)
@@ -2526,6 +2685,10 @@ def ensure_claude_settings_file(
             raise ValueError(f"Claude settings file must contain a JSON object: {path}")
         payload = parsed
     payload.setdefault("skipDangerousModePermissionPrompt", True)
+    # Issue #2137 fix #6: snapshot the on-disk apiKeyHelper BEFORE the gate logic
+    # so the audit row below fires only when this writer actually adds / removes /
+    # changes the managed helper (not on every settings rewrite).
+    before_helper = payload.get("apiKeyHelper")
     # #1444 BLOCKING 3 (Linux/iso-v2 leak): only RENDER the managed apiKeyHelper
     # when the gate is enabled AND we are on the platform the feature targets
     # (macOS — matching the Darwin-gated cron-runner/bridge-run.sh preflights).
@@ -2546,6 +2709,30 @@ def ensure_claude_settings_file(
         # Idempotent: once removed, the key is absent so this branch is a no-op
         # on the next sync.
         payload.pop("apiKeyHelper", None)
+    # Issue #2137 fix #6: emit a forensic audit row IFF this writer changed the
+    # managed apiKeyHelper. Identifies which subprocess (writer-context label +
+    # pid/ppid) wrote/removed apiKeyHelper into which agent — the missing signal
+    # the live incident RCA needed. Best-effort; never blocks the settings write.
+    after_helper = payload.get("apiKeyHelper")
+    if before_helper != after_helper:
+        if after_helper is None:
+            apikeyhelper_action = "apikeyhelper_removed"
+        elif before_helper is None:
+            apikeyhelper_action = "apikeyhelper_added"
+        else:
+            apikeyhelper_action = "apikeyhelper_changed"
+        auth_write_audit(
+            {
+                "kind": "claude_settings_apikeyhelper_write",
+                "agent": agent,
+                "writer": writer or settings_writer_context(),
+                "apikeyhelper_action": apikeyhelper_action,
+                "api_key_helper": after_helper or "",
+                "settings_file": str(path),
+                "gate_enabled": claude_keychain_free_auth_enabled(),
+                "platform": host_platform(),
+            }
+        )
     # PR #799 r4 codex finding 1 — always route through write_private_file_atomic.
     # The previous "payload == before" fast path returned without atomic rewrite,
     # doing final-path os.chown on a path the agent UID can swap to a symlink
@@ -2704,6 +2891,8 @@ def cmd_backfill_settings(args: argparse.Namespace) -> int:
             owner_uid=owner_uid,
             owner_gid=owner_gid,
             allowed_root=allowed_root,
+            agent=agent,
+            writer="backfill-settings",
         )
     except Exception as exc:
         return fail(str(exc), json_mode)
@@ -2721,6 +2910,119 @@ def cmd_backfill_settings(args: argparse.Namespace) -> int:
         json_dump(payload)
     else:
         print(f"backfilled: {agent or config_dir} <- apiKeyHelper ({settings_file})")
+    return 0
+
+
+def cmd_keychain_free(args: argparse.Namespace) -> int:
+    """Issue #2137 fixes #4 & #5: sanctioned enable/disable/status for the
+    keychain-free apiKeyHelper gate, with a FAIL-CLOSED enable preflight.
+
+    ``enable`` runs ``keychain_free_preflight`` first; if any check fails the gate
+    is left UNCHANGED and nothing is written — so a broken/expired registry OAT
+    (or an unreachable helper) can never silently move interactive Claude onto
+    API-key billing (the live #2137 incident). ``disable`` flips the gate off;
+    the subsequent sync/backfill removes the managed helpers. ``status`` reports
+    the current gate + a (non-mutating) preflight snapshot."""
+    action = args.action
+    json_mode = bool(args.json)
+    registry_path = Path(args.registry).expanduser()
+
+    if action == "status":
+        enabled = claude_keychain_free_auth_enabled()
+        preflight = keychain_free_preflight(registry_path)
+        payload = {
+            "status": "ok",
+            "action": "status",
+            "enabled": enabled,
+            "preflight": preflight,
+        }
+        if json_mode:
+            json_dump(payload)
+        else:
+            gate = "enabled" if enabled else "disabled"
+            pf = "ok" if preflight["ok"] else "would-fail"
+            print(f"keychain-free: {gate} (enable preflight: {pf})")
+        return 0
+
+    if action == "disable":
+        path, reason = write_keychain_free_gate(False)
+        if path is None:
+            return fail(f"keychain-free disable failed: {reason}", json_mode)
+        auth_write_audit(
+            {
+                "kind": "claude_keychain_free_gate",
+                "action": "disable",
+                "config_file": str(path),
+            }
+        )
+        payload = {
+            "status": "ok",
+            "action": "disable",
+            "enabled": False,
+            "config_file": str(path),
+        }
+        if json_mode:
+            json_dump(payload)
+        else:
+            print(
+                f"keychain-free disabled ({path}); run a sync/backfill to "
+                "remove the managed apiKeyHelper from agent settings"
+            )
+        return 0
+
+    # action == "enable" (argparse `choices` guarantees the third value).
+    preflight = keychain_free_preflight(registry_path)
+    if not preflight["ok"]:
+        # FAIL CLOSED — do NOT flip the gate; write nothing. Enabling now would
+        # move interactive Claude onto a broken API key (the #2137 incident).
+        failed = [c["check"] for c in preflight["checks"] if not c["ok"]]
+        auth_write_audit(
+            {
+                "kind": "claude_keychain_free_gate",
+                "action": "enable_refused",
+                "reason": "preflight_failed",
+                "failed_checks": failed,
+            }
+        )
+        payload = {
+            "status": "refused",
+            "action": "enable",
+            "reason": "preflight_failed",
+            "enabled": claude_keychain_free_auth_enabled(),
+            "preflight": preflight,
+        }
+        if json_mode:
+            json_dump(payload)
+        else:
+            print(
+                "refused: keychain-free enable preflight failed "
+                f"({', '.join(failed)}) — gate left unchanged, no managed helper "
+                "written into interactive agents",
+                file=sys.stderr,
+            )
+        return 1
+
+    path, reason = write_keychain_free_gate(True)
+    if path is None:
+        return fail(f"keychain-free enable failed: {reason}", json_mode)
+    auth_write_audit(
+        {
+            "kind": "claude_keychain_free_gate",
+            "action": "enable",
+            "config_file": str(path),
+        }
+    )
+    payload = {
+        "status": "ok",
+        "action": "enable",
+        "enabled": True,
+        "config_file": str(path),
+        "preflight": preflight,
+    }
+    if json_mode:
+        json_dump(payload)
+    else:
+        print(f"keychain-free enabled ({path})")
     return 0
 
 
@@ -2938,6 +3240,8 @@ def cmd_sync_agent(args: argparse.Namespace) -> int:
             owner_uid=owner_uid,
             owner_gid=owner_gid,
             allowed_root=allowed_root,
+            agent=args.agent,
+            writer="sync-agent",
         )
     except Exception as exc:
         return fail(str(exc), json_mode)
@@ -3902,6 +4206,13 @@ def build_parser() -> argparse.ArgumentParser:
     helper_parser.add_argument("--check", action="store_true")
     helper_parser.add_argument("--json", action="store_true")
     helper_parser.set_defaults(handler=cmd_api_key_helper)
+
+    # Issue #2137 fixes #4 & #5: sanctioned enable/disable/status for the
+    # keychain-free apiKeyHelper gate, with a fail-closed enable preflight.
+    keychain_free_parser = sub.add_parser("keychain-free")
+    keychain_free_parser.add_argument("action", choices=("enable", "disable", "status"))
+    keychain_free_parser.add_argument("--json", action="store_true")
+    keychain_free_parser.set_defaults(handler=cmd_keychain_free)
 
     # Issue #1855: create-if-absent keychain-free settings backfill for a single
     # pre-#1520 shared Claude agent (driven per-agent by the upgrade / daemon

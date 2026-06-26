@@ -18,7 +18,8 @@ Usage:
   bash $SCRIPT_DIR/bridge-auth.sh claude-token list [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token activate <id> [--sync] [--agents static|all|csv] [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token sync [--agents static|all|csv] [--json]
-  bash $SCRIPT_DIR/bridge-auth.sh claude-token backfill-settings [--agents static|all|csv] [--json]
+  bash $SCRIPT_DIR/bridge-auth.sh claude-token backfill-settings [--agents static|all|csv] [--check] [--json]
+  bash $SCRIPT_DIR/bridge-auth.sh claude-token keychain-free <enable|disable|status> [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token rotate [--if-auto-enabled] [--reason <text>] [--sync] [--agents static|all|csv] [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token check <id> [--enable-on-ok] [--disable-on-quota] [--timeout <sec>] [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token classify-output [--stdout-file <path>] [--stderr-file <path>] [--returncode <n>]
@@ -730,6 +731,29 @@ bridge_auth_backfill_settings_agents() {
   if [[ -n "$selection_output" ]]; then
     mapfile -t agents <<<"$selection_output"
   fi
+
+  # Issue #2137 (fix #3): never silently flip the admin/interactive agent onto
+  # the managed apiKeyHelper through a BROAD-scope WRITE. The live incident moved
+  # the interactive `patch` admin onto API-key billing via the daemon's
+  # `--agents static` backfill, breaking its session with `Invalid API key`. In
+  # WRITE mode under a broad scope (default / static / all / claude) the admin is
+  # excluded — it is only backfilled when an explicit `--agents <csv>` names it.
+  # `--check` (check_mode=1) stays fleet-wide read-only (it writes nothing), so
+  # the admin still appears in the coherence/drift report.
+  if [[ "$check_mode" != "1" ]] && bridge_auth_scope_is_broad "$spec"; then
+    local admin_agent=""
+    admin_agent="$(bridge_admin_agent_id 2>/dev/null || true)"
+    if [[ -n "$admin_agent" ]] && (( ${#agents[@]} > 0 )); then
+      local -a _scoped=()
+      local _a=""
+      for _a in "${agents[@]}"; do
+        [[ "$_a" == "$admin_agent" ]] && continue
+        _scoped+=("$_a")
+      done
+      agents=("${_scoped[@]+"${_scoped[@]}"}")
+    fi
+  fi
+
   if (( ${#agents[@]} == 0 )); then
     [[ "$json_mode" == "1" ]] && printf '{"status": "skipped", "reason": "no_matching_claude_agents", "backfilled": [], "unchanged": [], "failed": []}\n'
     [[ "$json_mode" == "1" ]] || printf 'skipped: no_matching_claude_agents\n'
@@ -1187,6 +1211,60 @@ bridge_auth_check_requested() {
   return 1
 }
 
+# Issue #2137 (fixes #1 & #2): guard a wrapper-PARSED claude-token verb's flags
+# BEFORE any agent selection or settings write. backfill-settings / sync /
+# keychain-free consume their flags in bash and call the mutating writer
+# directly, so an unrecognized flag used to be silently ignored while the
+# default-scope mutating path still ran — the live #2137 incident had a
+# diagnostic `backfill-settings --help` execute the backfill instead of printing
+# usage, and a `--definitely-not-a-real-flag` returned rc 0. `-h`/`--help`/`help`
+# prints usage and exits 0 here (no agent iteration); any token that is neither
+# an allowed flag nor an allowed value-flag's value fails closed (exit 2, no
+# writes).
+#   $1  verb label (for the error message)
+#   $2  CSV of value-taking flags (each consumes the following token)
+#   $3  CSV of boolean flags
+#   $4… the verb argv
+bridge_auth_guard_wrapper_flags() {
+  local verb="$1" value_flags="$2" bool_flags="$3"
+  shift 3
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help|help)
+        usage
+        exit 0
+        ;;
+    esac
+    if [[ ",$value_flags," == *",$1,"* ]]; then
+      [[ $# -ge 2 ]] || {
+        printf '[error] %s: %s requires a value\n' "$verb" "$1" >&2
+        exit 2
+      }
+      shift 2
+      continue
+    fi
+    if [[ ",$bool_flags," == *",$1,"* ]]; then
+      shift
+      continue
+    fi
+    printf '[error] %s: unknown flag %s\n' "$verb" "$1" >&2
+    usage >&2
+    exit 2
+  done
+}
+
+# Issue #2137 (fix #3): a BROAD selection keyword (default / static / all /
+# claude) vs an explicit per-agent CSV. backfill-settings WRITE mode never
+# silently flips the admin/interactive agent onto the managed apiKeyHelper under
+# a broad scope — the admin is only backfilled when an explicit `--agents <csv>`
+# names it.
+bridge_auth_scope_is_broad() {
+  case "${1:-static}" in
+    ""|static|all|claude) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 bridge_auth_agents_arg() {
   local default="${BRIDGE_CLAUDE_TOKEN_SYNC_AGENTS:-static}"
   while [[ $# -gt 0 ]]; do
@@ -1281,6 +1359,7 @@ case "$command" in
         exec python3 "$SCRIPT_DIR/bridge-auth.py" --registry "$registry" "$subcommand" "$@"
         ;;
       sync)
+        bridge_auth_guard_wrapper_flags "claude-token sync" "--agents" "--json" "$@"
         json_mode=0
         bridge_auth_json_requested "$@" && json_mode=1
         agents_spec="$(bridge_auth_agents_arg "$@")"
@@ -1294,12 +1373,40 @@ case "$command" in
         # forwards read-only coherence-report mode (codex review PR #1858
         # MAJOR 3 — the wrapper must NOT drop the flag and turn a read-only
         # verb into a write).
+        # Issue #2137 (fixes #1 & #2): `--help` prints usage + exits 0 and an
+        # unknown flag fails closed (exit 2) BEFORE any agent selection / writer.
+        bridge_auth_guard_wrapper_flags "claude-token backfill-settings" "--agents" "--json,--check" "$@"
         json_mode=0
         check_mode=0
         bridge_auth_json_requested "$@" && json_mode=1
         bridge_auth_check_requested "$@" && check_mode=1
         agents_spec="$(bridge_auth_agents_arg "$@")"
         bridge_auth_backfill_settings_agents "$agents_spec" "$json_mode" "$check_mode"
+        ;;
+      keychain-free)
+        # Issue #2137 (fixes #4 & #5): sanctioned, preflighted enable/disable/
+        # status for the keychain-free apiKeyHelper gate. The blessed admin path
+        # so the operator never raw-edits runtime/bridge-config.json (which also
+        # dodges the set-env KEY-substring guard). `enable` runs a FAIL-CLOSED
+        # preflight (supported platform + executable helper + active registry OAT
+        # health) BEFORE flipping the gate, so it can never move the interactive
+        # admin onto a broken API key (`Invalid API key`). The write/read happen
+        # in bridge-auth.py keychain-free.
+        action="${1:-}"
+        case "$action" in
+          -h|--help|help)
+            usage
+            exit 0
+            ;;
+          "")
+            usage >&2
+            exit 1
+            ;;
+        esac
+        shift || true
+        bridge_auth_guard_wrapper_flags "claude-token keychain-free" "" "--json" "$@"
+        exec python3 "$SCRIPT_DIR/bridge-auth.py" --registry "$registry" \
+          keychain-free "$action" "$@"
         ;;
       rotate)
         json_mode=0
