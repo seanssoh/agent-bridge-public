@@ -217,6 +217,38 @@ _PICKER_TAIL_RE='^[[:space:]]*Enter to confirm · Esc to cancel[[:space:]]*$'
 # upgrade supervise flow.
 _PICKER_CODEX_CONFIRM_RE='^[[:space:]]*Press enter to continue[[:space:]]*$'
 
+# #2117 — Codex "Update available" picker. Shape:
+#   ✨ Update available! 0.141.0 -> 0.142.1
+#   › 1. Update now (runs `bun install -g @openai/codex`)
+#     2. Skip
+#     3. Skip until next version
+#   Press enter to continue
+# This block ALSO ends with "Press enter to continue", so without an explicit
+# guard it matches _PICKER_CODEX_CONFIRM_RE and gets reported as
+# `cwd-confirm (sent Enter)`. That misclassification is wrong on two counts:
+# the default cursor sits on "Update now", so a blind Enter would trigger an
+# unattended `bun install -g @openai/codex` mid-session; and Enter does not
+# reliably dismiss this picker, so every */10 sweep re-detects it and re-fires
+# a follow-up task, flooding the admin queue. We require BOTH the
+# "Update available!" banner AND the "N. Update now" option line so free-prose
+# that merely mentions an update cannot trip the matcher. The sweeper leaves
+# this picker alone (no keystroke, no unstuck report); the operator resolves
+# it out-of-band (update codex + restart the agent).
+#
+# The option line is line-anchored and only allows the codex/Claude cursor
+# glyphs (› / ❯) before the digit — NOT the ASCII ">", which is a markdown
+# quote marker. That keeps a doc/PR/log that quotes this picker as
+# "> 1. Update now" from tripping the matcher and silently skipping a
+# genuinely-stuck agent (same free-prose defence as the other regexes).
+# Banner is line-anchored: only leading non-alphanumerics (whitespace, the ✨
+# glyph, punctuation) may precede it, so a mid-prose mention ("…codex showed
+# ✨ Update available! …") cannot trip it. The option line REQUIRES the active
+# cursor marker (›/❯), so a quoted/numbered-list "1. Update now" (no cursor)
+# cannot trip it either. Both must match (line 532-533) — together that rejects
+# free-prose/log/PR-body text that merely quotes this picker.
+_PICKER_CODEX_UPDATE_RE='^[^A-Za-z0-9]*Update available!'
+_PICKER_CODEX_UPDATE_OPTION_RE='^[[:space:]]*(›|❯)[[:space:]]*[0-9]+\.[[:space:]]+Update now'
+
 # #948 — Bypass Permissions warning. Claude CLI default cursor is on
 # "No, exit" (option 1), so bare Enter would EXIT Claude on first launch
 # in a fresh install / fresh user account. Must explicitly send "2" + Enter
@@ -494,6 +526,20 @@ while IFS= read -r agent; do
     matched_pattern=""
     explicit_option=""   # #948 — when set, send "N + Enter" instead of bare Enter
     rate_limit_picker=0
+
+    # #2117 — Codex "Update available" picker. Must be classified BEFORE the
+    # cwd-confirm branch below because it ALSO ends in "Press enter to
+    # continue". Leaving it alone (no keystroke, no unstuck report) is the
+    # whole fix: a blind Enter lands on the default "Update now" cursor and
+    # would run an unattended `bun install -g @openai/codex`, and it does not
+    # dismiss the picker — so the old cwd-confirm misclassification re-fired a
+    # follow-up task every sweep, flooding the admin queue. We require both the
+    # banner and the "Update now" option line so free-prose can't trip it.
+    if printf '%s\n' "$cap" | grep -qE "$_PICKER_CODEX_UPDATE_RE" \
+        && printf '%s\n' "$cap" | grep -qE "$_PICKER_CODEX_UPDATE_OPTION_RE"; then
+        _psw_log "codex 'Update available' picker on '$agent' — left alone (default cursor is 'Update now'; not auto-Entered, not reported as cwd-confirm) (#2117)"
+        continue
+    fi
 
     # r4 (codex PR #949 r3) + r5 (codex PR #949 r4) — scope explicit-option
     # detection to the ACTIVE picker block ONLY. capture-pane returns ~25

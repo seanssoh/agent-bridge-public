@@ -628,4 +628,81 @@ run_sweep
 smoke_assert_eq "0" "$(count_lines "$SEND_LOG")" "18 no bare-Enter send"
 smoke_assert_eq "0" "$(count_lines "$SEND_OPTION_LOG")" "18 no option send (unrelated WARNING ≠ bypass-permissions discriminator)"
 
+# ---------------------------------------------------------------------------
+# Test 19 — Codex "Update available" picker (#2117). It ends with "Press
+# enter to continue" so the OLD classifier matched it as codex cwd-confirm
+# and sent a blind Enter onto the default "Update now" cursor (= unattended
+# `bun install -g @openai/codex`), then re-fired a follow-up task every
+# sweep. The fix recognises it as its own state and leaves it ALONE: no
+# keystroke, no unstuck report, no task.
+# ---------------------------------------------------------------------------
+
+smoke_log "19. codex 'Update available' picker → left alone (no Enter, no task) (#2117)"
+reset_fixture
+printf '%s\n' "codex-update-agent" > "$FIXTURE_DIR/sessions"
+cat >"$FIXTURE_DIR/pane-codex-update-agent" <<'PANE'
+✨ Update available! 0.141.0 -> 0.142.1
+› 1. Update now (runs `bun install -g @openai/codex`)
+  2. Skip
+  3. Skip until next version
+Press enter to continue
+PANE
+
+export BRIDGE_PICKER_SWEEP_NOTIFY="admin"
+run_sweep
+smoke_assert_eq "0" "$(count_lines "$SEND_LOG")" "19 no bare-Enter send (would run bun install on 'Update now')"
+smoke_assert_eq "0" "$(count_lines "$SEND_OPTION_LOG")" "19 no option send"
+smoke_assert_eq "0" "$(grep -c "^---$" "$TASK_LOG" || true)" "19 no task (not reported as cwd-confirm)"
+smoke_assert_contains "$(cat "$BRIDGE_PICKER_SWEEP_LOG")" "Update available" "19 left-alone logged"
+
+# ---------------------------------------------------------------------------
+# Test 20 — Free-prose / markdown-quoted "Update available" mention must NOT
+# suppress a real picker. A pane that quotes the update picker in '>' markers
+# above a genuine rate-limit picker must still get unstuck — the update guard
+# requires the line-anchored "N. Update now" option (cursor › / ❯ only, not
+# the ASCII '>' quote marker), so the quoted text does not match and the real
+# picker below is handled normally.
+# ---------------------------------------------------------------------------
+
+smoke_log "20. quoted 'Update available' above a real picker → real picker still handled (#2117 false-positive defence)"
+reset_fixture
+printf '%s\n' "quoted-update-agent" > "$FIXTURE_DIR/sessions"
+cat >"$FIXTURE_DIR/pane-quoted-update-agent" <<'PANE'
+> codex showed: ✨ Update available! 0.141.0 -> 0.142.1
+> › 1. Update now (runs `bun install -g @openai/codex`)
+> but the operator chose Skip.
+❯ 1. Stop and wait for limit to reset
+  2. Switch to extra usage
+Enter to confirm · Esc to cancel
+PANE
+
+run_sweep
+smoke_assert_eq "1" "$(count_lines "$SEND_LOG")" "20 real rate-limit picker still gets Enter (update guard not tripped by quote)"
+smoke_assert_contains "$(cat "$SEND_LOG")" "quoted-update-agent" "20 send target"
+
+# ---------------------------------------------------------------------------
+# Test 21 — codex r2 (#2136 review): a MID-LINE "Update available!" mention
+# plus a plain no-cursor "N. Update now" numbered-list line (no '>' quote AND
+# no cursor glyph) above a real picker must NOT suppress the real picker. The
+# OLD unanchored banner + optional-cursor option both false-matched this prose
+# and skipped the genuine picker. The line-anchored banner (only leading
+# non-alphanumerics) + cursor-REQUIRED option reject it.
+# ---------------------------------------------------------------------------
+
+smoke_log "21. mid-line banner + no-cursor 'Update now' list above a real picker → real picker handled (#2136 false-positive)"
+reset_fixture
+printf '%s\n' "adversarial-real-picker" > "$FIXTURE_DIR/sessions"
+cat >"$FIXTURE_DIR/pane-adversarial-real-picker" <<'PANE'
+Operator note: codex once showed ✨ Update available! 0.141.0 -> 0.142.1 in this PR body.
+1. Update now was quoted as a numbered list item, not an active picker line.
+The actual active picker is below:
+❯ 1. Stop and wait for limit to reset
+  2. Switch to extra usage
+Enter to confirm · Esc to cancel
+PANE
+
+run_sweep
+smoke_assert_eq "1" "$(count_lines "$SEND_LOG")" "21 real picker gets Enter (mid-line banner + no-cursor list does not trip the update guard)"
+smoke_assert_contains "$(cat "$SEND_LOG")" "adversarial-real-picker" "21 send target"
+
 smoke_log "all checks passed"
