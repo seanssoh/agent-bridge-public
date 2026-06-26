@@ -258,7 +258,13 @@ ARGV_MARKER = re.compile(
 # so the spawn argv legitimately carries no overlay) — allowlisted up to a
 # PINNED uncovered-spawn count so a SECOND naked spawn cannot hide behind the
 # isolation. The file must still actually isolate the config dir.
-ISOLATION_ALLOWLIST = {"bridge-auth.py": 1}
+#   bridge-auth.py = 2: probe_claude_token (the native Bearer token probe) AND
+#   keychain_free_helper_xapikey_probe (#18696, the keychain-free enable preflight's
+#   x-api-key probe). Both run `claude -p` inside a fresh tempfile CLAUDE_CONFIG_DIR
+#   with a minimal settings.json (no agent channel plugins) + env scrub
+#   (ANTHROPIC_API_KEY / AUTH_TOKEN / TOKEN_ENV_KEY popped), so neither can inherit
+#   or register the singleton telegram channel.
+ISOLATION_ALLOWLIST = {"bridge-auth.py": 2}
 
 
 def command_span(lines, idx):
