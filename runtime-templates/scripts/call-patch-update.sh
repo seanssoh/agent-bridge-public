@@ -122,11 +122,30 @@ unset CLAUDECODE OPENCLAW_GATEWAY_TOKEN OPENCLAW_GATEWAY_PORT \
   OPENCLAW_SERVICE_KIND OPENCLAW_SERVICE_MARKER OPENCLAW_PATH_BOOTSTRAPPED \
   2>/dev/null || true
 
+# #17957 path B: load the singleton-channel-off overlay before spawning the
+# disposable `claude -p`. Fail closed if the shared helper is unreachable —
+# spawning without it would let this child SIGTERM-steal the admin's live
+# telegram/discord poller.
+_singleton_suppress_lib=""
+for _cand in \
+  "$(dirname -- "${BASH_SOURCE[0]}")/lib/singleton-channel-suppression.sh" \
+  "$(dirname -- "${BASH_SOURCE[0]}")/../../../scripts/lib/singleton-channel-suppression.sh" \
+  "$BRIDGE_HOME/runtime/scripts/lib/singleton-channel-suppression.sh"; do
+  [[ -r "$_cand" ]] && { _singleton_suppress_lib="$_cand"; break; }
+done
+if [[ -z "$_singleton_suppress_lib" ]]; then
+  echo "[call-patch-update][fatal] #17957 singleton-channel-suppression.sh not found; refusing to launch the disposable Claude child (would risk telegram/discord poller theft)" >&2
+  exit 1
+fi
+# shellcheck source=runtime-templates/scripts/lib/singleton-channel-suppression.sh
+source "$_singleton_suppress_lib"
+
 cd "$PATCH_HOME"
 CLI_OUTPUT_FILE="$(mktemp /tmp/patch-update-output.XXXXXX)"
 TIMEOUT_BIN="$(timeout_bin)"
 if [[ -n "$TIMEOUT_BIN" ]]; then
   "$TIMEOUT_BIN" 900 "$CLAUDE_BIN" -p \
+    "${SINGLETON_CHANNEL_SUPPRESSION_ARGS[@]}" \
     --no-session-persistence \
     --append-system-prompt "$CONTEXT" \
     --dangerously-skip-permissions \
@@ -136,6 +155,7 @@ if [[ -n "$TIMEOUT_BIN" ]]; then
     2>&1 | tee -a "$LOG_FILE" | tee "$CLI_OUTPUT_FILE"
 else
   "$CLAUDE_BIN" -p \
+    "${SINGLETON_CHANNEL_SUPPRESSION_ARGS[@]}" \
     --no-session-persistence \
     --append-system-prompt "$CONTEXT" \
     --dangerously-skip-permissions \

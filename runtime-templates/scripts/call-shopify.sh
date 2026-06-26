@@ -160,8 +160,27 @@ AGENT_SESSION_DIR="$AGENT_HOME/sessions/$FROM_AGENT"
 mkdir -p "$AGENT_SESSION_DIR"
 [[ -f "$AGENT_SESSION_DIR/CLAUDE.md" ]] || ln -sf "$AGENT_HOME/CLAUDE.md" "$AGENT_SESSION_DIR/CLAUDE.md" 2>/dev/null || true
 
+# #17957 path B: load the singleton-channel-off overlay before spawning the
+# disposable `claude -c -p`. Fail closed if the shared helper is unreachable —
+# spawning without it would let this child SIGTERM-steal the admin's live
+# telegram/discord poller.
+_singleton_suppress_lib=""
+for _cand in \
+  "$(dirname -- "${BASH_SOURCE[0]}")/lib/singleton-channel-suppression.sh" \
+  "$(dirname -- "${BASH_SOURCE[0]}")/../../../scripts/lib/singleton-channel-suppression.sh" \
+  "$BRIDGE_HOME/runtime/scripts/lib/singleton-channel-suppression.sh"; do
+  [[ -r "$_cand" ]] && { _singleton_suppress_lib="$_cand"; break; }
+done
+if [[ -z "$_singleton_suppress_lib" ]]; then
+  echo "[call-shopify][fatal] #17957 singleton-channel-suppression.sh not found; refusing to launch the disposable Claude child (would risk telegram/discord poller theft)" >&2
+  exit 1
+fi
+# shellcheck source=runtime-templates/scripts/lib/singleton-channel-suppression.sh
+source "$_singleton_suppress_lib"
+
 cd "$AGENT_SESSION_DIR"
 "$CLAUDE_BIN" -c -p \
+  "${SINGLETON_CHANNEL_SUPPRESSION_ARGS[@]}" \
   --append-system-prompt "$CONTEXT" \
   --dangerously-skip-permissions \
   --model opus \

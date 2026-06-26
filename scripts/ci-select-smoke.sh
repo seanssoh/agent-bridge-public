@@ -172,6 +172,14 @@ add_required 1966-orphan-walk-prune
 # field). In the full static suite so any harvest-stub / bridge-memory.py
 # scan-transcripts edit re-runs the run-as-iso + marshal-back contract.
 add_required 1894-iso-transcript-harvest-run-as-iso
+# Issue #17957 (path B): the disposable-`claude -p` GLOBAL invariant enforcer.
+# T4 scans EVERY claude headless `-p` spawn-site repo-wide and fails on a NEW
+# unlisted naked spawn-site (or a removed channel-off path on a known one);
+# T5 fails on bash-helper/create-agent/Python overlay drift. In the full static
+# suite so any spawn-site, helper, or overlay edit anywhere re-runs the
+# structural guard — the only enforcement that can cover an as-yet-unidentified
+# launcher that re-introduces the telegram/discord poller self-theft.
+add_required 17957-disposable-no-poller
 # Issue #1897: the ci-select-smoke sharding self-check. Pins the post-selection
 # --shard-index/--shard-total filter contract (union-of-shards == unsharded,
 # disjoint shards, empty-shard exit 0, --run shard filtering, shard-aware bun
@@ -4188,6 +4196,19 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # of the sync/csv path cannot regress the "configured skill never reaches
       # .claude/skills/" silent-drop class.
       add_required isolated-skills-sync isolation launch 1151-step-a-helper 1151-r2-sudo-escalate 1155-bootstrap-skill-guard beta5-2-nu-daemon-path-quarantine 2020-skills-assoc-declare
+      add_integration integration-minimal
+      ;;
+
+    runtime-templates/scripts/call-shopify.sh|runtime-templates/scripts/call-patch-update.sh|runtime-templates/skills/patch/scripts/call-patch.sh|runtime-templates/skills/agent-factory/scripts/create-agent.sh|runtime-templates/scripts/lib/singleton-channel-suppression.sh)
+      # Issue #17957 (path B): these runtime-template launchers each spawn a
+      # short/disposable `claude` in the agent's inherited config-dir. Each must
+      # carry the singleton-channel-off `--settings` overlay (the shared bash
+      # helper runtime-templates/scripts/lib/singleton-channel-suppression.sh,
+      # kept in sync with lib/bridge_disposable_claude.py) so the child can't
+      # SIGTERM-steal the admin's telegram/discord poller. This dedicated arm
+      # precedes the broad `runtime-templates/*` channel arm so a launcher edit
+      # re-runs the GLOBAL no-poller invariant guard.
+      add_required 17957-disposable-no-poller
       add_integration integration-minimal
       ;;
 
