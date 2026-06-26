@@ -18,6 +18,11 @@ Usage:
   bridge-handoffd.py serve   --config <path>   [--once]
                              [--detach --pidfile <path>]
   bridge-handoffd.py preflight --config <path>   # validate bind, exit
+
+`serve --detach` binds + PROVES the listener synchronously, then re-execs a
+fresh interpreter (carrying internal --already-detached / --inherited-listen-fd)
+for the long-lived serving process, so the reconcile loop's getaddrinfo bind
+re-prove is never run from a fork-polluted image (macOS NAT64 segfault, #2140).
 """
 
 from __future__ import annotations
@@ -2160,8 +2165,54 @@ class HandoffServer(ThreadingHTTPServer):
     allow_reuse_address = True
     timeout = DEFAULT_REQUEST_TIMEOUT_SECONDS
 
-    def __init__(self, addr, handler, cfg: dict[str, Any]) -> None:
-        super().__init__(addr, handler)
+    def __init__(self, addr, handler, cfg: dict[str, Any], *,
+                 inherited_fd: Optional[int] = None) -> None:
+        if inherited_fd is None:
+            super().__init__(addr, handler)
+            bound_addr = addr
+        else:
+            # #2140 fork-safety: adopt the already-bound + listening socket the
+            # pre-detach launcher PROVED and bound, inherited across the detach
+            # re-exec. Skip bind/activate entirely (NO second bind) — and never
+            # fall back to a fresh bind: an unusable inherited fd raises OSError
+            # so the caller fails closed rather than serving on a socket that
+            # skipped the fail-closed proof.
+            super().__init__(addr, handler, bind_and_activate=False)
+            try:
+                self.socket.close()  # discard the fresh, unbound socket
+            except OSError:
+                pass
+            self.socket = socket.socket(self.address_family, self.socket_type,
+                                        fileno=inherited_fd)
+            # getsockname() is the PORTABLE fail-closed validator: a non-socket
+            # / closed fd raises OSError (ENOTSOCK / EBADF) so the caller refuses
+            # to serve. HTTPServer.server_bind (skipped here) normally records
+            # these from the real bound address; do it from the inherited socket
+            # so the reconcile drift compare sees the ACTUAL bound address.
+            bound_addr = self.socket.getsockname()
+            # Additionally reject a valid-but-NOT-listening socket where the
+            # platform can answer it. Linux's getsockopt(SO_ACCEPTCONN) returns
+            # 1 for a listening socket / 0 otherwise; macOS & the BSDs cannot
+            # query it (getsockopt -> ENOPROTOOPT / EOPNOTSUPP), so ONLY that
+            # "unqueryable" case is treated as non-fatal — getsockname above
+            # already proved it is the launcher's socket. Any OTHER OSError means
+            # the fd is unusable -> FAIL CLOSED (do not adopt an unverified fd).
+            try:
+                acceptconn = self.socket.getsockopt(socket.SOL_SOCKET,
+                                                    socket.SO_ACCEPTCONN)
+            except AttributeError:
+                acceptconn = None  # SO_ACCEPTCONN constant absent on this build
+            except OSError as exc:
+                if exc.errno not in (errno.ENOPROTOOPT, errno.EOPNOTSUPP):
+                    raise
+                acceptconn = None  # platform cannot query the listen flag
+            if acceptconn == 0:
+                raise OSError(
+                    f"inherited listen fd {inherited_fd} is not a "
+                    "listening socket")
+            self.server_address = bound_addr
+            self.server_name = socket.getfqdn(bound_addr[0])
+            self.server_port = bound_addr[1]
         # `cfg` is read per request by do_POST via `self.server.cfg`. The
         # reconcile path swaps it atomically (a single attribute rebind is
         # atomic under CPython, so an in-flight do_POST always sees either the
@@ -2172,9 +2223,10 @@ class HandoffServer(ThreadingHTTPServer):
         self._cfg_lock = threading.Lock()
         # The address/port this socket is actually bound to. The reconcile
         # compares the freshly-resolved+proven bind against this to detect a
-        # local-IP drift; set from the real bound address by cmd_serve.
-        self.bound_address: str = addr[0]
-        self.bound_port: int = addr[1]
+        # local-IP drift; set from the real bound address (the inherited
+        # socket's getsockname when adopting a re-exec'd listener, #2140).
+        self.bound_address: str = bound_addr[0]
+        self.bound_port: int = bound_addr[1]
         # The config file path the peer-identity-update apply re-loads +
         # rewrites (None = the default resolution). Set by cmd_serve so the
         # control-message handler mutates the SAME file the daemon loaded.
@@ -5402,47 +5454,115 @@ def cmd_serve(args: argparse.Namespace) -> int:
     if a2a._allow_insecure_no_secret():
         audit("insecure_secret_bypass", side="receiver", phase="serve",
               security=True)
-    try:
-        bind, port = resolve_bind(cfg)
-    except a2a.A2AError as exc:
-        # BIND phase: resolve_bind failed AFTER config+secret validation
-        # PASSED. The classifier decides whether the specific code is a
-        # transient availability error (tailnet not yet up / IP drift ->
-        # bind_unresolved / bind_not_tailnet / tailscale_unavailable /
-        # resolve_*) or a structural config error (bind_wildcard /
-        # bind_loopback / bind_not_ip). The fail-closed proof itself is
-        # UNCHANGED — the receiver still refuses to serve.
-        log(f"FATAL: {exc} ({exc.code})")
-        audit("startup_fail", code=exc.code, detail=str(exc)[:300],
-              phase="bind")
-        return 1
+    already_detached = bool(getattr(args, "already_detached", False))
+    inherited_fd = getattr(args, "inherited_listen_fd", None)
 
     a2a.ensure_handoff_dirs()
     config_path = Path(args.config) if args.config else None
-    try:
-        server = HandoffServer((bind, port), HandoffHandler, cfg)
-    except OSError as exc:
-        # The socket bind itself failed (EADDRNOTAVAIL on IP drift,
-        # EADDRINUSE on a stale listener) AFTER both config validation and the
-        # fail-closed bind proof passed. phase=bind: a transient availability
-        # error the supervisor should back off, not thrash.
-        log(f"FATAL: cannot bind {bind}:{port}: {exc}")
-        audit("bind_fail", address=bind, port=port, detail=str(exc),
-              phase="bind")
-        return 1
+
+    if already_detached:
+        # #2140 fork-safety: this is the re-exec'd, FRESH-interpreter serving
+        # process. The pre-detach launcher already ran resolve_bind() + bound +
+        # PROVED this listener synchronously (surfacing any bind error to the
+        # launcher), then handed us its fd. We ADOPT that already-proven listener
+        # instead of re-binding — no second bind, and we never fall back to a
+        # fresh (unproven) bind. The reconcile loop STILL re-proves the bind via
+        # resolve_bind() on every tick (the #16247 hostname-keyed security
+        # oracle), now fork-safely: this interpreter never double-forked without
+        # an exec, so its getaddrinfo / macOS Network.framework state is clean.
+        if inherited_fd is None or inherited_fd < 0:
+            log("FATAL: --already-detached requires a valid --inherited-listen-fd")
+            audit("startup_fail", code="inherited_fd_missing",
+                  phase="config", security=True)
+            return 1
+        try:
+            server = HandoffServer(("", 0), HandoffHandler, cfg,
+                                   inherited_fd=inherited_fd)
+        except OSError as exc:
+            # The inherited fd was missing / closed / not a listening socket.
+            # FAIL CLOSED — never silently re-bind a fresh socket that skipped
+            # the launcher's fail-closed proof.
+            log(f"FATAL: cannot adopt inherited listen fd {inherited_fd}: {exc}")
+            audit("startup_fail", code="inherited_fd_invalid",
+                  detail=str(exc)[:300], phase="bind", security=True)
+            return 1
+        bind, port = server.bound_address, server.bound_port
+    else:
+        try:
+            bind, port = resolve_bind(cfg)
+        except a2a.A2AError as exc:
+            # BIND phase: resolve_bind failed AFTER config+secret validation
+            # PASSED. The classifier decides whether the specific code is a
+            # transient availability error (tailnet not yet up / IP drift ->
+            # bind_unresolved / bind_not_tailnet / tailscale_unavailable /
+            # resolve_*) or a structural config error (bind_wildcard /
+            # bind_loopback / bind_not_ip). The fail-closed proof itself is
+            # UNCHANGED — the receiver still refuses to serve.
+            log(f"FATAL: {exc} ({exc.code})")
+            audit("startup_fail", code=exc.code, detail=str(exc)[:300],
+                  phase="bind")
+            return 1
+        try:
+            server = HandoffServer((bind, port), HandoffHandler, cfg)
+        except OSError as exc:
+            # The socket bind itself failed (EADDRNOTAVAIL on IP drift,
+            # EADDRINUSE on a stale listener) AFTER both config validation and
+            # the fail-closed bind proof passed. phase=bind: a transient
+            # availability error the supervisor should back off, not thrash.
+            log(f"FATAL: cannot bind {bind}:{port}: {exc}")
+            audit("bind_fail", address=bind, port=port, detail=str(exc),
+                  phase="bind")
+            return 1
     # The peer-identity-update apply re-loads + rewrites this same file.
     server.config_path = config_path
 
-    # Bind succeeded — fail-closed preflight is satisfied. Now (optionally)
-    # detach into our own session so the receiver outlives the launching
-    # shell / managed agent tool session. The double-fork happens AFTER the
-    # bind so the launcher still sees a non-zero exit on a bad bind.
-    if getattr(args, "detach", False):
+    # Bind succeeded (or the inherited listener was adopted) — the fail-closed
+    # preflight is satisfied. For --detach (and ONLY on the first, not-yet-
+    # re-exec'd launch) re-exec a FRESH interpreter for the long-lived serving
+    # process (#2140). The socket above is already bound + PROVEN, so the
+    # launcher already saw a non-zero exit on a bad bind; we hand its fd to the
+    # re-exec'd process, which adopts the already-proven listener. This makes
+    # the reconcile loop's getaddrinfo (resolve_bind re-prove) run in a clean
+    # interpreter — macOS Network.framework / getaddrinfo is NOT fork-safe in a
+    # process that double-forked WITHOUT exec, which segfaulted the receiver on
+    # a NAT64 network. The detach + re-exec replaces the old pure double-fork.
+    if getattr(args, "detach", False) and not already_detached:
+        listen_fd = server.fileno()
+        # Clear FD_CLOEXEC so the listener survives the execv into the fresh
+        # interpreter (Python sockets are non-inheritable by default, PEP 446).
+        os.set_inheritable(listen_fd, True)
         _detach_into_own_session()
+        # --- detached grandchild only past this point ---
+        # `--pidfile` is placed FIRST (ahead of the potentially long --config
+        # path) so the per-install key the process gate matches on
+        # (bridge_a2a_receiver_pid_is_receiver, lib/bridge-a2a.sh) appears early
+        # in the cmdline and survives `ps -o command=` truncation — mirroring the
+        # original launcher invocation order in lib/bridge-a2a.sh.
+        reexec_argv = [sys.executable, os.path.realpath(__file__), "serve"]
+        if getattr(args, "pidfile", None):
+            reexec_argv += ["--pidfile", str(args.pidfile)]
+        reexec_argv += ["--already-detached",
+                        "--inherited-listen-fd", str(listen_fd)]
+        if getattr(args, "once", False):
+            reexec_argv.append("--once")
+        # `--config <path>` stays UNCONDITIONALLY last so the (potentially long)
+        # path never pushes an earlier flag past a `ps` comm-width truncation.
+        if getattr(args, "config", None):
+            reexec_argv += ["--config", str(args.config)]
+        try:
+            os.execv(sys.executable, reexec_argv)
+        except OSError as exc:
+            # execv should not fail (same interpreter, readable script), but if
+            # it does, FAIL CLOSED — do NOT keep serving from this fork-polluted
+            # image (the exact #2140 hazard).
+            log(f"FATAL: re-exec after detach failed: {exc}")
+            os._exit(127)
+        os._exit(127)  # unreachable: execv replaced the process image
+
     if getattr(args, "pidfile", None):
         # Written by whichever process owns the long-lived server (the
-        # detached grandchild when --detach is set), so the recorded pid is
-        # the durable listener, not a transient launcher pid.
+        # re-exec'd, detached process when --detach is set), so the recorded pid
+        # is the durable listener, not a transient launcher pid.
         try:
             _write_pidfile(args.pidfile)
         except OSError as exc:
@@ -5654,6 +5774,17 @@ def build_parser() -> argparse.ArgumentParser:
                               "the receiver outlives the launching shell")
     p_serve.add_argument("--pidfile", default=None,
                          help="write the durable listener's pid to this path")
+    # #2140 fork-safety (internal, never operator-set): after --detach binds +
+    # proves the listener, the launcher re-execs a FRESH interpreter for the
+    # long-lived serving process so the reconcile loop's getaddrinfo bind
+    # re-prove is not run from a fork-polluted (double-forked-without-exec)
+    # image — that segfaulted on macOS NAT64. The re-exec carries
+    # --already-detached (skip a second detach) + --inherited-listen-fd N (adopt
+    # the already-proven listener instead of re-binding). Suppressed from --help.
+    p_serve.add_argument("--already-detached", action="store_true",
+                         dest="already_detached", help=argparse.SUPPRESS)
+    p_serve.add_argument("--inherited-listen-fd", type=int, default=None,
+                         dest="inherited_listen_fd", help=argparse.SUPPRESS)
     p_serve.set_defaults(func=cmd_serve)
 
     p_pre = sub.add_parser("preflight", help="validate bind + config, then exit")
