@@ -614,7 +614,13 @@ def command_dispatch(args: argparse.Namespace, rt: Runtime) -> int:
             },
         )
         if args.json:
-            print(json.dumps({"ok": True, "response": response, "entry": entry, "compact": compact_info, "seed": seed_info}, ensure_ascii=False, sort_keys=True))
+            # first_dispatch is the lazy first-dispatch loopback signal (#14577):
+            # True only when this dispatch CREATED the thread row (existed_before
+            # was False inside the registry/thread lock). It is intentionally
+            # ABSENT (not False) on both inert early-returns above, which return
+            # before existed_before is meaningful; server.ts only emits the
+            # one-time "thread_created" loopback when first_dispatch === true.
+            print(json.dumps({"ok": True, "response": response, "entry": entry, "compact": compact_info, "seed": seed_info, "first_dispatch": (not existed_before)}, ensure_ascii=False, sort_keys=True))
         else:
             print(response)
         return 0
@@ -1058,8 +1064,14 @@ def command_selftest(_args: argparse.Namespace, _rt: Runtime) -> int:
             dry_run=False,
             json=True,
         )
-        with contextlib.redirect_stdout(io.StringIO()):
+        resumed_buf = io.StringIO()
+        with contextlib.redirect_stdout(resumed_buf):
             command_dispatch(args, rt)
+        # #14577: this thread row was pre-created above (get_or_create_thread),
+        # so existed_before is True → first_dispatch must be False/absent on a
+        # resumed thread (never re-fires the one-time thread_created signal).
+        resumed_payload = json.loads(resumed_buf.getvalue())
+        assert resumed_payload.get("first_dispatch") in (False, None)
 
         with registry_lock(rt):
             registry = read_registry(rt)
@@ -1068,6 +1080,18 @@ def command_selftest(_args: argparse.Namespace, _rt: Runtime) -> int:
         assert out_entry["session_id"] != sid
         assert len(out_entry["archive_chain"]) == 1
         assert Path(out_entry["archive_chain"][0]["archive_path"]).exists()
+
+        # #14577: a FRESH thread on the real (non-dry) path reports
+        # first_dispatch=True exactly once — this is the lazy first-dispatch
+        # loopback trigger server.ts keys the thread_created signal on.
+        fresh_args = argparse.Namespace(
+            **{**vars(args), "thread_id": "fresh-thread-14577", "message_id": "fresh-m1", "mock_response": "mock", "mock_summary": "summary seed"}
+        )
+        fresh_buf = io.StringIO()
+        with contextlib.redirect_stdout(fresh_buf):
+            command_dispatch(fresh_args, rt)
+        fresh_payload = json.loads(fresh_buf.getvalue())
+        assert fresh_payload["first_dispatch"] is True
 
         dry_args = argparse.Namespace(**{**vars(args), "dry_run": True, "mock_response": None})
         with contextlib.redirect_stdout(io.StringIO()):
@@ -1154,6 +1178,10 @@ def command_selftest(_args: argparse.Namespace, _rt: Runtime) -> int:
         disabled_payload = json.loads(buf.getvalue())
         assert disabled_payload["inert"] is True
         assert disabled_payload["reason"] == "registry_capability_gate"
+        # #14577: the registry_capability_gate inert early-return is reached
+        # BEFORE existed_before becomes meaningful for the signal, so
+        # first_dispatch must be ABSENT (key omitted), not False.
+        assert "first_dispatch" not in disabled_payload
         with registry_lock(rt):
             registry = read_registry(rt)
         disabled_cap = registry["threads"][disabled_thread]["capability"]
@@ -1161,6 +1189,29 @@ def command_selftest(_args: argparse.Namespace, _rt: Runtime) -> int:
         assert disabled_cap["transport_supports_threads"] is False
         assert disabled_cap["agent_opt_in"] is False
         assert disabled_cap["thread_registered"] is False
+
+        # #14577: the args-level capability_gate inert early-return (reached when
+        # the inbound args disable thread sessions, before any registry/thread
+        # lock) must ALSO omit first_dispatch entirely.
+        gate_args = argparse.Namespace(
+            **{
+                **vars(args),
+                "thread_id": "capability-gate-thread",
+                "message_id": "gate-m1",
+                "transport_supports_threads": False,
+                "agent_opt_in": False,
+                "dry_run": True,
+                "mock_response": None,
+                "mock_summary": None,
+            }
+        )
+        gate_buf = io.StringIO()
+        with contextlib.redirect_stdout(gate_buf):
+            command_dispatch(gate_args, rt)
+        gate_payload = json.loads(gate_buf.getvalue())
+        assert gate_payload["inert"] is True
+        assert gate_payload["reason"] == "capability_gate"
+        assert "first_dispatch" not in gate_payload
 
     print(json.dumps({"ok": True, "selftest": "passed"}, sort_keys=True))
     return 0

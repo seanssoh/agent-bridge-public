@@ -30,6 +30,15 @@ SCHEMA_VERSION = 1
 # default — if neither is set the producer shim fails closed rather than guess.
 DEFAULT_TRANSPORT = "discord"
 DEFAULT_KIND = "thread_task"
+# #14577: one-time thread-lifecycle awareness signals delivered to the MAIN leg.
+# These are STATIC awareness metadata only — never the inbound thread message
+# text (no-body-leak). The --kind arg stays free-form (no choices= enforcement)
+# so these flow through create_or_get → run_queue_create → post_fresh_arrival_marker
+# unchanged; this map only gives them a stable, human-legible default title.
+LIFECYCLE_KIND_TITLES = {
+    "thread_created": "[thread-created]",
+    "thread_closed": "[thread-closed]",
+}
 CRED_DIR_NAMES = {".discord", ".telegram", "launch-secrets"}
 CRED_FILE_NAMES = {"access.json"}
 
@@ -189,6 +198,12 @@ def task_title(args: argparse.Namespace) -> str:
     title = args.title.strip() if args.title else ""
     if title:
         return title
+    # #14577: lifecycle signals get a stable, prefixed default title so the main
+    # leg can recognize the one-time awareness row at a glance. The title is
+    # operator metadata only (kind + thread_id), never the thread message body.
+    lifecycle_prefix = LIFECYCLE_KIND_TITLES.get(args.kind)
+    if lifecycle_prefix:
+        return f"{lifecycle_prefix} {args.thread_id}"
     return f"[thread-session] {args.thread_id} {args.kind}"
 
 
@@ -446,6 +461,60 @@ def command_selftest(_args: argparse.Namespace) -> int:
                 raise AssertionError("argparse abbreviation should be rejected")
             except SystemExit as exc:
                 assert int(exc.code or 0) == 2
+
+        # #14577: lifecycle kinds + synthetic-message_id idempotency. Use a fresh
+        # ledger root so the lifecycle rows are isolated from the cases above.
+        life_root = Path(tmp) / ".threads-lifecycle"
+        created_args = argparse.Namespace(
+            **{
+                **vars(args),
+                "root": life_root,
+                "thread_id": "thread-life",
+                "message_id": "lifecycle-create",
+                "kind": "thread_created",
+                "title": "",  # exercise the lifecycle default title
+                "mock_task_id": 401,
+            }
+        )
+        # The two new kinds flow through unchanged (free-form --kind, no choices=).
+        created_first = create_or_get(created_args)
+        assert created_first["task_id"] == 401
+        assert created_first["deduped"] is False
+        # Default title is stable lifecycle metadata, NOT the thread message body.
+        assert task_title(created_args) == "[thread-created] thread-life"
+
+        # I1: a second identical thread_created (same synthetic message_id) dedupes
+        # to ONE task — re-delivery (Discord/listener retry) cannot mint a dup row.
+        created_second = create_or_get(created_args)
+        assert created_second["deduped"] is True
+        assert created_second["task_id"] == 401
+
+        # L1: thread_closed with its OWN stable synthetic message_id is a DISTINCT
+        # ledger row (create vs close stay separate), and re-running it dedupes.
+        closed_args = argparse.Namespace(
+            **{
+                **vars(created_args),
+                "message_id": "lifecycle-archive",
+                "kind": "thread_closed",
+                "mock_task_id": 402,
+            }
+        )
+        closed_first = create_or_get(closed_args)
+        assert closed_first["task_id"] == 402
+        assert closed_first["deduped"] is False
+        assert task_title(closed_args) == "[thread-closed] thread-life"
+        closed_second = create_or_get(closed_args)
+        assert closed_second["deduped"] is True
+        assert closed_second["task_id"] == 402
+
+        life_ledger = load_ledger(life_root)
+        # Two distinct rows: one for create, one for close (kind is part of the key).
+        assert len(life_ledger["events"]) == 2
+        created_event_id = event_id_for(key_parts(created_args))
+        closed_event_id = event_id_for(key_parts(closed_args))
+        assert created_event_id != closed_event_id
+        assert life_ledger["events"][created_event_id]["task_id"] == 401
+        assert life_ledger["events"][closed_event_id]["task_id"] == 402
     print(json.dumps({"ok": True, "selftest": "passed"}, sort_keys=True))
     return 0
 
