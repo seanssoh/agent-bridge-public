@@ -4,9 +4,9 @@ All notable changes to Agent Bridge are documented here. This project adheres
 loosely to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and tracks
 version bumps via the `VERSION` file.
 
-## [0.16.16-rc4] — 2026-06-25 (LTS · release candidate)
+## [0.16.16] — 2026-06-26 (LTS)
 
-**v0.16.16-rc4 — the fourth release candidate on the v0.16.16 LTS line: everything in rc3 plus nine post-rc3 fixes, bundled for a fleet-wide update.** Marquee is a **Teams reply silent-non-delivery fix (#2112)** — a production customer agent reported replies that the SDK accepted but never delivered while the reply tool reported success. Like rc1-rc3 this is a soak vehicle, not a promotion — `v0.16.15` stays the `lts` / Latest head and this prerelease is **not** marked Latest. Each PR carried its own codex / Phase-4 review; the rc4 cut is the integration gate (full Linux CI green). Promotion to `v0.16.16` follows the soak.
+**v0.16.16 — promotion of the v0.16.16 LTS line (rc1–rc4, soaked 2026-06-17 → 2026-06-25) to an official LTS release, and the LTS endpoint of the v0.16.x line.** Marquee is a **Teams reply silent-non-delivery fix (#2112)** — a production customer agent reported replies that the SDK accepted but never delivered while the reply tool reported success — bundled with the full rc1–rc4 reliability/hardening set below. This **supersedes `v0.16.15` as the `lts` / Latest head**; conservative / production installs tracking the `lts` channel advance here. With this LTS endpoint cut, **mainline development moves to `v0.17`**: the v0.17 feature line (bridge-official Discord plugin, Teams Adaptive Cards, and more) merges to `main`, so `main` now carries the latest features while the `lts` channel stays pinned to this line. Each bundled PR carried its own codex / Phase-4 review; the full Linux CI gate is green.
 
 ### Channels
 
