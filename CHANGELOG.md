@@ -4,6 +4,19 @@ All notable changes to Agent Bridge are documented here. This project adheres
 loosely to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and tracks
 version bumps via the `VERSION` file.
 
+## [0.17.0-beta4] — 2026-06-26 (mainline · beta · devStatus card renderer + claude-token clock-recovery + resolver crash-loop backports)
+
+**v0.17.0-beta4 — the Teams devStatus 개발현황 Adaptive Card renderer, plus the v0.17 backports of the claude-token clock-based recovery (#17927 P0) and the resolver crash-loop fix (#2106), on top of beta3.** Three PRs, each with a codex `implement-ok` on green Linux CI.
+
+### Channels
+
+- **teams: devStatus Adaptive Card renderer — the 개발현황 card (#17992, #2129).** A third `cardintent` kind alongside `quoteResult` + `devReqAutofill`: one Container per dev-product (a `제품 · 상태` Accent header + a status badge colored from the 상태 row value — 진행 중→Accent / 보류→Warning / 출시 완료→Good / 드롭→Attention — + an 8-field FactSet rendered verbatim, literal `—` preserved). The card-level `openDevStatusDetail` action is a renderer-supplied domain-pinned `Action.OpenUrl` (`/d/?screen=dev-status`; the cardintent's `payload.url` is ignored → zero open-redirect); `Action.Submit` is never emitted. §10 is inherited unchanged and the quoteResult + devReqAutofill paths are byte-for-byte unchanged. teams plugin **0.1.7 → 0.1.8**. The card is **dormant** until the bot is reseeded to 0.1.8 (a pre-0.1.8 bot falls back to the `fallbackMarkdown` table — no regression).
+
+### Reliability / credential (v0.17 backports)
+
+- **claude-token: parse the named-tz weekly reset + clock-based recovery (#17927 P0, #2125 → #2127).** v0.17 backport of the operator-mandated fix: `parse_reset_at` now parses the real weekly-429 string `resets Jul 1 at 12pm (Asia/Seoul)` (`at` separator + abbreviated month + named timezone via `zoneinfo`, graceful fallback) and stamps `limited_until`; recovery becomes clock-authoritative (a quota-limited token re-enables once its reset stamp passes, without requiring the unreliable `claude -p` probe; a still-future-capped token stays disabled). Fixes the headless-server weekly-quota tokens that never auto-recovered.
+- **resolver: align resume config-dir with launch for shared agents (#2106, #2122 → #2124).** v0.17 backport of the CRITICAL fleet-host-down fix: a shared admin agent no longer infinite-crash-loops on `claude --resume` (the resume resolver now returns the same per-agent `CLAUDE_CONFIG_DIR` that launch pins, scoped to non-iso shared+agent_home agents; iso agents return earlier and are unaffected) + an honest quarantine log.
+
 ## [0.17.0-beta3] — 2026-06-25 (mainline · beta · Teams reply delivery-proof + devReqAutofill renderer + rooms migration)
 
 **v0.17.0-beta3 — a Teams reply reliability fix (a production silent non-delivery), the 개발의뢰 draft Adaptive Card renderer, and the #2079 rooms admin migration robustness, on top of beta2.4.** Three PRs, each with a codex Phase-4 `implement-ok` on green Linux CI.
