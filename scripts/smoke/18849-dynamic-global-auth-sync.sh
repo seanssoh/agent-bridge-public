@@ -30,6 +30,16 @@
 #   T12 symlinked parent (#18887 finding 1)   -> fail-closed, NO .lock leak outside root
 #   T13 containment reject (#18887 finding 2) -> credential INODE unchanged (no rollback-rewrite)
 #   T14 parent-swap after lock (#18887 r3)    -> write stays in LOCKED dir (lock-dir == write-dir)
+#   --- #18849 Part 1b (identity-sync) ---
+#   T15 verified probe (displayed != account) -> ~/.claude.json PATCHed, projects/
+#       mcpServers/unknown/mode preserved, registry records verified identity
+#   T16 probe fail (transport/429)            -> NO write, displayed unchanged, row stale (gate: probe-verified)
+#   T17 probe no user:profile scope (403)     -> unknown, NO write
+#   T18 probe 200 but no account email        -> unknown, NO write
+#   T19 keychain-exists guard                 -> identity sync skipped + warn (no JSON/keychain divergence)
+#   T20 .claude.json parent-swap after lock   -> write stays in LOCKED dir (single-dir_fd discriminator)
+#   T21 token-replace race during probe       -> recheck skips registry record + .claude.json write (no stale identity)
+#   T22 post-persist write under registry lock -> verified .claude.json write holds the registry lock (window closed)
 #   T10 ci-select routing                     -> bridge-auth.py + this smoke selected
 #
 # Footgun #11 (heredoc_write deadlock class): this driver and its helper avoid
@@ -65,9 +75,15 @@ DISPLAY_EMAIL="olduser@example.com"
 # Benign, non-credential-shaped token (validate_token only requires len>=20 and
 # no whitespace/quotes) so nothing here resembles a real Anthropic credential.
 ACTIVE_TOKEN="ZZZactive-token-aaaaaaaaaaaaaaaaaaaa"
+# #18849 Part 1b: a default `user:profile` probe fixture so identity-sync is
+# DETERMINISTIC and NEVER touches the network. The default verifies the SAME
+# account the config already displays, so the existing token-sync cases converge
+# with NO identity write (the steady state). Per-test overrides set $PROFILE_FIX.
+DEFAULT_FIX="$SMOKE_TMP_ROOT/profile-default.json"
 
 mkdir -p "$OP_HOME/.claude" "$SMOKE_TMP_ROOT/elsewhere"
 smoke_assert_path_in_temp "$OP_CRED" "fake operator credential path"
+python3 "$HELPER" write-fixture "$DEFAULT_FIX" verified "$DISPLAY_EMAIL"
 
 reset_state() {
   python3 "$HELPER" seed-registry "$REGISTRY" "$ACTIVE_TOKEN" true
@@ -76,14 +92,17 @@ reset_state() {
 }
 
 # Run bridge-auth.py sync-global / global-auth-status directly. $1=opt_in(0|1),
-# remaining args appended. Honors a FORCE_ROOT override via the FORCE_ROOT env.
+# remaining args appended. Honors a FORCE_ROOT override (FORCE_ROOT env), a
+# per-test profile fixture ($PROFILE_FIX, defaults to the converged fixture), and
+# a forced keychain-present detection ($KEYCHAIN=1).
 run_py() {
   local optin="$1"; shift
   # `pre` always carries at least `env`, so its expansion is never an empty
   # array under `set -u` (the bash 3.2 empty-array footgun).
-  local -a pre=(env)
+  local -a pre=(env "BRIDGE_CLAUDE_PROFILE_PROBE_FIXTURE=${PROFILE_FIX:-$DEFAULT_FIX}")
   [[ "$optin" == "1" ]] && pre+=("BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC=1")
   [[ "${FORCE_ROOT:-0}" == "1" ]] && pre+=("BRIDGE_AUTH_GLOBAL_SYNC_FORCE_ROOT=1")
+  [[ "${KEYCHAIN:-0}" == "1" ]] && pre+=("BRIDGE_AUTH_FORCE_KEYCHAIN_PRESENT=1")
   "${pre[@]}" python3 "$AUTH_PY" --registry "$REGISTRY" "$@"
 }
 
@@ -121,6 +140,9 @@ test_gate_off_auto_rotate_false() {
 }
 
 # ── T3 ────────────────────────────────────────────────────────────────
+# Credential PATCH unchanged from Part 1a; Part 1b: the probe verifies the SAME
+# account the config already displays, so identity CONVERGES with no write and
+# the Part 1a stale WARNING is flipped to the quiet converged state.
 test_gate_on_patches_and_preserves() {
   reset_state
   local out err
@@ -131,8 +153,10 @@ test_gate_on_patches_and_preserves() {
   smoke_assert_eq "True" "$(printf '%s' "$out" | field converged)" "T3 converged=True"
   python3 "$HELPER" assert-patched "$OP_CRED" "$ACTIVE_TOKEN" >/dev/null \
     || smoke_fail "T3 PATCH did not preserve refreshToken/unknown fields or wrong mode"
-  smoke_assert_contains "$(cat "$err")" "displayed identity" "T3 identity-shadow warning emitted (detection)"
-  smoke_assert_contains "$(cat "$err")" "$DISPLAY_EMAIL" "T3 warning names the stale displayed identity"
+  smoke_assert_eq "True" "$(printf '%s' "$out" | field identity_shadow.converged)" \
+    "T3 identity CONVERGED (displayed == verified account)"
+  smoke_assert_not_contains "$(cat "$err")" "does not match" \
+    "T3 NO stale-identity warning when displayed already matches the verified account"
 }
 
 # ── T4 ────────────────────────────────────────────────────────────────
@@ -196,7 +220,12 @@ test_status_surface_detects_identity() {
   smoke_assert_eq "True" "$(printf '%s' "$out" | field enabled)" "T8 status enabled=True"
   smoke_assert_eq "True" "$(printf '%s' "$out" | field converged)" "T8 status converged=True"
   smoke_assert_eq "$DISPLAY_EMAIL" "$(printf '%s' "$out" | field identity_shadow.displayed_email)" \
-    "T8 status DETECTS the displayed oauthAccount identity (not synced)"
+    "T8 status reports the displayed oauthAccount identity"
+  # Part 1b: T8's sync verified DISPLAY_EMAIL → identity converged + recorded.
+  smoke_assert_eq "True" "$(printf '%s' "$out" | field identity_converged)" \
+    "T8 status reports identity_converged=True after a verified sync"
+  smoke_assert_eq "$DISPLAY_EMAIL" "$(printf '%s' "$out" | field identity_shadow.verified_email)" \
+    "T8 status reports the verified account email from the registry row"
   # status is read-only when disabled: opt-in OFF => enabled False, no write
   local out2 before
   before="$(cred_cksum)"
@@ -226,6 +255,7 @@ test_bash_wrapper_plumbing() {
   out="$(BRIDGE_CONTROLLER_HOME="$OP_HOME" \
         BRIDGE_CLAUDE_TOKEN_REGISTRY="$REGISTRY" \
         BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC=1 \
+        BRIDGE_CLAUDE_PROFILE_PROBE_FIXTURE="$DEFAULT_FIX" \
         bash "$AUTH_SH" claude-token sync-global --json)"
   smoke_assert_contains "$out" '"status": "synced"' "T9 wrapper: bash->python PATCH synced"
   python3 "$HELPER" assert-patched "$OP_CRED" "$ACTIVE_TOKEN" >/dev/null \
@@ -330,6 +360,170 @@ test_parent_swap_after_lock_no_redirect() {
     "T14 parent-swap-after-lock: rotated token stays in the LOCKED dir, decoy untouched (lock-dir == write-dir)"
 }
 
+# ── T15 (Part 1b) ─────────────────────────────────────────────────────
+# A verified probe whose account differs from the displayed identity PATCHes
+# ~/.claude.json's emailAddress (+ accountUuid) and PRESERVES projects /
+# mcpServers / unknown keys / mode (PATCH-not-overwrite).
+test_identity_sync_patches_and_preserves() {
+  reset_state
+  python3 "$HELPER" seed-config-full "$OP_CFG" "$DISPLAY_EMAIL"
+  local fix="$SMOKE_TMP_ROOT/verified-new.json"
+  python3 "$HELPER" write-fixture "$fix" verified "newuser@example.com"
+  local out
+  out="$(PROFILE_FIX="$fix" run_py 1 sync-global --global-credentials "$OP_CRED" \
+        --claude-config "$OP_CFG" --allowed-root "$OP_HOME" --json)"
+  smoke_assert_eq "synced" "$(printf '%s' "$out" | field identity_shadow.status)" \
+    "T15 identity_shadow.status=synced (displayed != verified)"
+  smoke_assert_eq "True" "$(printf '%s' "$out" | field identity_shadow.converged)" \
+    "T15 identity_shadow.converged=True"
+  python3 "$HELPER" assert-identity-patched "$OP_CFG" "newuser@example.com" >/dev/null \
+    || smoke_fail "T15 identity PATCH lost projects/mcpServers/unknown or wrong mode"
+  smoke_assert_eq "newuser@example.com" "$(python3 "$HELPER" reg-identity "$REGISTRY" account_email)" \
+    "T15 registry row records the verified account_email"
+  smoke_assert_eq "verified" "$(python3 "$HELPER" reg-identity "$REGISTRY" account_email_probe_status)" \
+    "T15 registry probe_status=verified"
+}
+
+# ── T16 (Part 1b) ─────────────────────────────────────────────────────
+# Probe FAILS (transport error) -> NO ~/.claude.json write, displayed identity
+# unchanged, registry row marked stale (last-verified kept, never guessed).
+test_identity_probe_fail_stale_not_guess() {
+  reset_state
+  python3 "$HELPER" seed-config-full "$OP_CFG" "$DISPLAY_EMAIL"
+  local fix="$SMOKE_TMP_ROOT/transport.json"
+  python3 "$HELPER" write-fixture "$fix" transport_error
+  local out
+  out="$(PROFILE_FIX="$fix" run_py 1 sync-global --global-credentials "$OP_CRED" \
+        --claude-config "$OP_CFG" --allowed-root "$OP_HOME" --json)"
+  smoke_assert_eq "synced" "$(printf '%s' "$out" | field status)" "T16 token sync still succeeds"
+  smoke_assert_eq "unverified" "$(printf '%s' "$out" | field identity_shadow.status)" \
+    "T16 identity_shadow.status=unverified on probe failure"
+  smoke_assert_eq "stale" "$(printf '%s' "$out" | field identity_shadow.probe_status)" \
+    "T16 probe_status=stale (network/429) — NOT a guess"
+  python3 "$HELPER" assert-config-email "$OP_CFG" "$DISPLAY_EMAIL" >/dev/null \
+    || smoke_fail "T16 displayed identity was WRITTEN on a failed probe (must stay unchanged)"
+  smoke_assert_eq "stale" "$(python3 "$HELPER" reg-identity "$REGISTRY" account_email_probe_status)" \
+    "T16 registry row marked stale"
+}
+
+# ── T17 (Part 1b) ─────────────────────────────────────────────────────
+# Probe lacks the user:profile scope (403) -> unknown, NO write.
+test_identity_probe_no_scope_unknown() {
+  reset_state
+  python3 "$HELPER" seed-config-full "$OP_CFG" "$DISPLAY_EMAIL"
+  local fix="$SMOKE_TMP_ROOT/noscope.json"
+  python3 "$HELPER" write-fixture "$fix" no_scope
+  local out
+  out="$(PROFILE_FIX="$fix" run_py 1 sync-global --global-credentials "$OP_CRED" \
+        --claude-config "$OP_CFG" --allowed-root "$OP_HOME" --json)"
+  smoke_assert_eq "no_scope" "$(printf '%s' "$out" | field identity_shadow.reason)" \
+    "T17 identity reason=no_scope (token lacks user:profile)"
+  smoke_assert_eq "unknown" "$(printf '%s' "$out" | field identity_shadow.probe_status)" \
+    "T17 probe_status=unknown"
+  python3 "$HELPER" assert-config-email "$OP_CFG" "$DISPLAY_EMAIL" >/dev/null \
+    || smoke_fail "T17 displayed identity was WRITTEN despite missing scope"
+  # Part 1b r2: the read-only doctor surface must REPORT the granular reason so
+  # an operator can see WHY identity never converges (the coarse status alone
+  # only said "unknown"). JSON identity_shadow.probe_reason + the human line.
+  local sout stext
+  sout="$(run_py 1 global-auth-status --global-credentials "$OP_CRED" --claude-config "$OP_CFG" --json)"
+  smoke_assert_eq "no_scope" "$(printf '%s' "$sout" | field identity_shadow.probe_reason)" \
+    "T17 global-auth-status surfaces identity_shadow.probe_reason=no_scope"
+  stext="$(run_py 1 global-auth-status --global-credentials "$OP_CRED" --claude-config "$OP_CFG")"
+  smoke_assert_contains "$stext" "identity probe: no_scope" \
+    "T17 human status line surfaces the no_scope probe reason"
+}
+
+# ── T21 (Part 1b r2) ───────────────────────────────────────────────────
+# Token-replace race: a concurrent cmd_add --replace swaps the active token
+# (same id, new value) WHILE the verified profile probe is in flight. The
+# persist path must recheck the row's CURRENT token fingerprint under the
+# registry lock and skip BOTH the registry identity record AND the
+# ~/.claude.json write — never stamp the OLD token's verified email onto the
+# replacement token. Proven discriminator: FAILS if the fingerprint recheck is
+# removed (stale email recorded onto the new row + written to ~/.claude.json).
+test_identity_token_replace_race() {
+  local raceroot="$SMOKE_TMP_ROOT/race-token-replace"
+  rm -rf "$raceroot"; mkdir -p "$raceroot"
+  smoke_assert_path_in_temp "$raceroot" "token-replace race op-home"
+  local racereg="$raceroot/registry.json"
+  local out
+  out="$(python3 "$HELPER" race-token-replace-during-probe "$racereg" "$raceroot" \
+        "$DISPLAY_EMAIL" "swapped-victim@example.com" 2>&1)"
+  smoke_assert_contains "$out" "OK race-token-replace-during-probe" \
+    "T21 token-replace race: no identity record + no ~/.claude.json write on a mid-probe token swap"
+}
+
+# ── T22 (Part 1b r2) ───────────────────────────────────────────────────
+# Post-persist/pre-patch window (codex r2 Finding 1): the verified-identity
+# ~/.claude.json write must run while the registry lock is HELD, so a concurrent
+# cmd_add --replace (which also needs the registry lock) cannot land between the
+# fingerprint recheck and the displayed-identity write. The helper wraps
+# patch_global_claude_identity and asserts a non-blocking registry_lock grab
+# BLOCKS at write time. Discriminator: FAILS if the write is moved outside the
+# registry lock (the non-blocking grab would then succeed).
+test_identity_post_persist_write_under_lock() {
+  local raceroot="$SMOKE_TMP_ROOT/race-post-persist"
+  rm -rf "$raceroot"; mkdir -p "$raceroot"
+  smoke_assert_path_in_temp "$raceroot" "post-persist race op-home"
+  local racereg="$raceroot/registry.json"
+  local out
+  out="$(python3 "$HELPER" race-post-persist-write-under-lock "$racereg" "$raceroot" \
+        "$DISPLAY_EMAIL" "newverified@example.com" 2>&1)"
+  smoke_assert_contains "$out" "OK race-post-persist" \
+    "T22 verified-identity ~/.claude.json write runs under the registry lock (post-persist window closed)"
+}
+
+# ── T18 (Part 1b) ─────────────────────────────────────────────────────
+# Probe returns 200 but carries NO account email -> unknown, NO write.
+test_identity_probe_no_email_unknown() {
+  reset_state
+  python3 "$HELPER" seed-config-full "$OP_CFG" "$DISPLAY_EMAIL"
+  local fix="$SMOKE_TMP_ROOT/noemail.json"
+  python3 "$HELPER" write-fixture "$fix" no_email
+  local out
+  out="$(PROFILE_FIX="$fix" run_py 1 sync-global --global-credentials "$OP_CRED" \
+        --claude-config "$OP_CFG" --allowed-root "$OP_HOME" --json)"
+  smoke_assert_eq "no_email" "$(printf '%s' "$out" | field identity_shadow.reason)" \
+    "T18 identity reason=no_email"
+  python3 "$HELPER" assert-config-email "$OP_CFG" "$DISPLAY_EMAIL" >/dev/null \
+    || smoke_fail "T18 displayed identity was WRITTEN with no verified email"
+}
+
+# ── T19 (Part 1b) ─────────────────────────────────────────────────────
+# keychain-exists guard: when the operator auth is keychain-backed, identity
+# sync is SKIPPED + warned (do not diverge the JSON from the keychain identity).
+test_identity_keychain_guard() {
+  reset_state
+  python3 "$HELPER" seed-config-full "$OP_CFG" "$DISPLAY_EMAIL"
+  local fix="$SMOKE_TMP_ROOT/verified-new2.json" err out
+  python3 "$HELPER" write-fixture "$fix" verified "newuser@example.com"
+  err="$SMOKE_TMP_ROOT/t19.err"
+  out="$(PROFILE_FIX="$fix" KEYCHAIN=1 run_py 1 sync-global --global-credentials "$OP_CRED" \
+        --claude-config "$OP_CFG" --allowed-root "$OP_HOME" --json 2>"$err")"
+  smoke_assert_eq "skipped" "$(printf '%s' "$out" | field identity_shadow.status)" \
+    "T19 identity sync skipped under keychain-backed auth"
+  smoke_assert_eq "keychain_present" "$(printf '%s' "$out" | field identity_shadow.reason)" \
+    "T19 reason=keychain_present"
+  smoke_assert_contains "$(cat "$err")" "keychain-backed" "T19 keychain divergence warning emitted"
+  python3 "$HELPER" assert-config-email "$OP_CFG" "$DISPLAY_EMAIL" >/dev/null \
+    || smoke_fail "T19 keychain guard did not prevent the ~/.claude.json identity write"
+}
+
+# ── T20 (Part 1b) ─────────────────────────────────────────────────────
+# T14-style parent-swap-after-lock for the ~/.claude.json identity writer: the
+# write must land in the LOCKED dir, proving lock-dir == write-dir (discriminator
+# against a string-path re-resolution of the parent).
+test_identity_parent_swap_after_lock() {
+  local swaproot="$SMOKE_TMP_ROOT/race-cfg"
+  rm -rf "$swaproot"; mkdir -p "$swaproot"
+  smoke_assert_path_in_temp "$swaproot" "race cfg-home root"
+  local out
+  out="$(python3 "$HELPER" race-parent-swap-config "$REGISTRY" "$swaproot" "race-new@example.com" 2>&1)"
+  smoke_assert_contains "$out" "OK race-parent-swap-config" \
+    "T20 .claude.json parent-swap-after-lock: identity stays in the LOCKED dir"
+}
+
 # ── T10 ───────────────────────────────────────────────────────────────
 test_ci_select_routing() {
   [[ -f "$CI_SELECT" ]] || smoke_fail "T10 missing ci-select-smoke.sh: $CI_SELECT"
@@ -355,6 +549,14 @@ smoke_run "T11 existing file lacking claudeAiOauth -> fail-closed, untouched" te
 smoke_run "T12 symlinked parent -> fail-closed, NO .lock leak outside root"   test_symlinked_parent_no_lock_leak
 smoke_run "T13 containment reject -> credential INODE unchanged (no rewrite)" test_containment_failure_inode_unchanged
 smoke_run "T14 parent-swap-after-lock -> write stays in LOCKED dir"           test_parent_swap_after_lock_no_redirect
+smoke_run "T15 identity sync PATCHes ~/.claude.json + preserves load-bearing"  test_identity_sync_patches_and_preserves
+smoke_run "T16 probe fail -> stale, NO write (never a guess)"                  test_identity_probe_fail_stale_not_guess
+smoke_run "T17 probe no-scope (403) -> unknown, NO write"                      test_identity_probe_no_scope_unknown
+smoke_run "T18 probe no-email (200) -> unknown, NO write"                      test_identity_probe_no_email_unknown
+smoke_run "T19 keychain-exists guard -> identity sync skipped + warn"          test_identity_keychain_guard
+smoke_run "T20 .claude.json parent-swap-after-lock -> write in LOCKED dir"     test_identity_parent_swap_after_lock
+smoke_run "T21 token-replace race -> no record + no ~/.claude.json write"      test_identity_token_replace_race
+smoke_run "T22 post-persist write under registry lock (window closed)"         test_identity_post_persist_write_under_lock
 smoke_run "T10 ci-select routing -> bridge-auth.py + smoke selected"          test_ci_select_routing
 
 smoke_log "all checks passed"
