@@ -2496,6 +2496,14 @@ process_usage_monitor() {
     rotation_count=$((rotation_count + 1))
   done < "$_rotation_tmp"
 
+  # #18849 Part 1: a rotation changed the active token, so converge the
+  # operator-global credential immediately (not just on the next periodic tick)
+  # for the seamless dynamic-vanilla pickup. Double-gated default-OFF + idempotent
+  # inside bridge-auth.py; a no-op early return unless the operator opted in.
+  if (( rotation_count > 0 )); then
+    bridge_daemon_global_auth_sync_tick rotation || true
+  fi
+
   bridge_note_usage_poll
   (( alert_count > 0 || rotation_count > 0 ))
 }
@@ -2672,6 +2680,11 @@ bridge_daemon_periodic_token_sync_tick() {
     # without needing audit.jsonl inspection.
     bridge_daemon_audit_periodic_sync_aliveness "$sync_json" "$target" "periodic" || true
     daemon_info "claude token periodic sync: status=${sync_status:-unknown} agents=$agent_scope interval=${interval}s"
+    # #18849 Part 1: after the per-agent (static) sync converges, also converge
+    # the operator-global credential so dynamic-vanilla Claude agents re-read the
+    # active token seamlessly. Double-gated default-OFF + idempotent inside
+    # bridge-auth.py — a no-op (cheap early return) unless the operator opted in.
+    bridge_daemon_global_auth_sync_tick periodic || true
     return 0
   fi
 
@@ -2687,6 +2700,78 @@ bridge_daemon_periodic_token_sync_tick() {
     --detail interval_seconds="$interval" \
     2>/dev/null || true
   daemon_warn "claude token periodic sync failed (bridge-auth.sh exited non-zero; see audit log)"
+  return 1
+}
+
+# --- Operator-global seamless rotation (#18849 Part 1) ------------------------
+# The per-agent sync above converges STATIC agents' private credential files.
+# A dynamic-vanilla Claude agent (#1890: engine=claude, source=dynamic, NOT
+# linux-user-isolated) instead reads the operator-global
+# ~/.claude/.credentials.json, which the per-agent sync never touches — so it
+# stays pinned to the (often quota-exhausted) token the operator was logged in
+# under. This step PATCHes that operator-global file with the active token so a
+# running dynamic agent re-reads it seamlessly at its next prompt boundary.
+#
+# HARD GATES (every one enforced authoritatively inside bridge-auth.py):
+#   * default-OFF double gate — registry auto_rotate_enabled AND the persisted
+#     BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC opt-in. The bash early-return below is a
+#     cheap skip so a non-opted-in install never even spawns the subprocess.
+#   * PATCH-not-overwrite (preserves refreshToken/unknown), root fail-closed,
+#     per-write rollback preimage, idempotent on fingerprint.
+#
+# Fail-semantics (gate 5): a FAILED global sync emits a status=failed audit row
+# and does NOT log dynamic convergence — the daemon must never claim the dynamic
+# fleet picked up a token it could not write. Parsing reuses the existing
+# sync-status-parse helper (NO heredoc-stdin — bridge-daemon.sh ceiling is 0).
+bridge_daemon_global_auth_sync_tick() {
+  local trigger="${1:-periodic}"
+  local target="${BRIDGE_ADMIN_AGENT_ID:-daemon}"
+  local sync_json=""
+  local status=""
+
+  # Default-OFF opt-in early skip (the python double-gate is authoritative; this
+  # only avoids the subprocess for the common not-opted-in install). Lowercase to
+  # match bridge-auth.py's case-insensitive normalization exactly so the bash
+  # early-skip can never disagree with the python gate (e.g. value "On"/"True").
+  local optin_lc="${BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC:-0}"
+  optin_lc="${optin_lc,,}"
+  case "$optin_lc" in
+    1|true|yes|on) ;;
+    *) return 0 ;;
+  esac
+
+  if sync_json="$(bridge_with_timeout 15 daemon_auth_global_sync "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token sync-global --json 2>/dev/null)"; then
+    status="$(bridge_with_timeout 5 global_sync_status_parse python3 \
+      "$SCRIPT_DIR/bridge-daemon-helpers.py" sync-status-parse "$sync_json" \
+      2>/dev/null || printf '')"
+    bridge_audit_log daemon claude_token_global_auth_sync "$target" \
+      --detail status="${status:-unknown}" \
+      --detail trigger="$trigger" \
+      2>/dev/null || true
+    case "$status" in
+      synced|converged)
+        # Convergence report (gate 5): only on a real success.
+        daemon_info "operator-global auth sync: status=$status trigger=$trigger (dynamic-vanilla Claude converged)"
+        return 0
+        ;;
+      skipped)
+        # Gated off at the python layer (opt-in/auto-rotate state changed under
+        # us) — not an error, no convergence claim.
+        return 0
+        ;;
+      *)
+        # failed / empty / error → NO convergence report (gate 5).
+        daemon_warn "operator-global auth sync did NOT converge (status=${status:-unknown} trigger=$trigger); dynamic-vanilla Claude may still hold the old token — see audit log"
+        return 1
+        ;;
+    esac
+  fi
+
+  bridge_audit_log daemon claude_token_global_auth_sync "$target" \
+    --detail status=failed \
+    --detail trigger="$trigger" \
+    2>/dev/null || true
+  daemon_warn "operator-global auth sync failed (bridge-auth.sh exited non-zero; see audit log)"
   return 1
 }
 
