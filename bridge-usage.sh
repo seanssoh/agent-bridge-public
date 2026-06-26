@@ -849,8 +849,18 @@ case "$command" in
     # fanout. monitor-only — `status` never rotates.
     if [[ "$command" == "monitor" && "$rotation_agents_explicit" -eq 1 ]]; then
       rotation_stream=""
-      rotation_stream="$(bridge_usage_select_claude_agents "$rotation_agents_spec")" || exit 1
-      rotation_eligible_csv="$(printf '%s' "$rotation_stream" | tr '\n' ',' | sed 's/,*$//')"
+      # #17927 P2 (codex r2 — Bug 1): an EXPLICIT-EMPTY rotation scope
+      # (BRIDGE_USAGE_ROTATION_AGENTS="") means "only controller-managed
+      # sentinels are rotation-eligible", NOT the static pool. The selector maps
+      # an empty spec to its static --agents default, so special-case empty to an
+      # empty eligible CSV here (the monitor then rotates only __native__/legacy
+      # sentinels, never a named statusLine agent).
+      if [[ -z "$rotation_agents_spec" ]]; then
+        rotation_eligible_csv=""
+      else
+        rotation_stream="$(bridge_usage_select_claude_agents "$rotation_agents_spec")" || exit 1
+        rotation_eligible_csv="$(printf '%s' "$rotation_stream" | tr '\n' ',' | sed 's/,*$//')"
+      fi
       rotation_eligible_set=1
     fi
     run_python "$command" "${forward_args[@]+"${forward_args[@]}"}"

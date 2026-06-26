@@ -2286,7 +2286,11 @@ process_usage_monitor() {
   # high-usage cache must NOT rotate the pool — gated inside bridge-usage.py
   # BEFORE the candidate is emitted/latched (a post-hoc daemon skip cannot
   # un-latch), so we pass this scope down to the monitor invocation.
-  local rotation_eligible_scope="${BRIDGE_USAGE_ROTATION_AGENTS:-${BRIDGE_CLAUDE_TOKEN_SYNC_AGENTS:-static}}"
+  # #17927 P2 (codex r2 — Bug 1): use `-` not `:-` so an EXPLICIT-EMPTY
+  # BRIDGE_USAGE_ROTATION_AGENTS="" (operator restricts rotation to controller-
+  # managed sentinels only) is preserved as empty, NOT replaced by the sync/
+  # static default. Only an UNSET var falls back to the sync pool.
+  local rotation_eligible_scope="${BRIDGE_USAGE_ROTATION_AGENTS-${BRIDGE_CLAUDE_TOKEN_SYNC_AGENTS:-static}}"
   local rotation_trigger=""
   local rotate_json=""
   local rotation_status_row=""
