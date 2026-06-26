@@ -2636,7 +2636,7 @@ def read_oauth_account_email(config_path: Path) -> str:
     """
     config_path = Path(config_path).expanduser()
     try:
-        if config_path.is_symlink() or not config_path.is_file():
+        if config_path.is_symlink() or not config_path.is_file():  # noqa: raw-pathlib-controller-only - controller-side read of the operator-global ~/.claude.json (never an isolated-agent path); detection-only, never mutates
             return ""
         parsed = json.loads(config_path.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 - detection must never raise
@@ -4358,7 +4358,7 @@ def cmd_global_auth_status(args: argparse.Namespace) -> int:
     global_fp = ""
     global_present = False
     try:
-        if not global_path.is_symlink() and global_path.is_file():
+        if not global_path.is_symlink() and global_path.is_file():  # noqa: raw-pathlib-controller-only - controller-side read of the operator-global credential file for status; read-only, never mutates
             global_present = True
             parsed = json.loads(global_path.read_text(encoding="utf-8"))
             if isinstance(parsed, dict):
