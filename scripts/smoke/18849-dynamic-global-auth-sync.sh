@@ -38,6 +38,8 @@
 #   T18 probe 200 but no account email        -> unknown, NO write
 #   T19 keychain-exists guard                 -> identity sync skipped + warn (no JSON/keychain divergence)
 #   T20 .claude.json parent-swap after lock   -> write stays in LOCKED dir (single-dir_fd discriminator)
+#   T21 token-replace race during probe       -> recheck skips registry record + .claude.json write (no stale identity)
+#   T22 post-persist write under registry lock -> verified .claude.json write holds the registry lock (window closed)
 #   T10 ci-select routing                     -> bridge-auth.py + this smoke selected
 #
 # Footgun #11 (heredoc_write deadlock class): this driver and its helper avoid
@@ -420,6 +422,56 @@ test_identity_probe_no_scope_unknown() {
     "T17 probe_status=unknown"
   python3 "$HELPER" assert-config-email "$OP_CFG" "$DISPLAY_EMAIL" >/dev/null \
     || smoke_fail "T17 displayed identity was WRITTEN despite missing scope"
+  # Part 1b r2: the read-only doctor surface must REPORT the granular reason so
+  # an operator can see WHY identity never converges (the coarse status alone
+  # only said "unknown"). JSON identity_shadow.probe_reason + the human line.
+  local sout stext
+  sout="$(run_py 1 global-auth-status --global-credentials "$OP_CRED" --claude-config "$OP_CFG" --json)"
+  smoke_assert_eq "no_scope" "$(printf '%s' "$sout" | field identity_shadow.probe_reason)" \
+    "T17 global-auth-status surfaces identity_shadow.probe_reason=no_scope"
+  stext="$(run_py 1 global-auth-status --global-credentials "$OP_CRED" --claude-config "$OP_CFG")"
+  smoke_assert_contains "$stext" "identity probe: no_scope" \
+    "T17 human status line surfaces the no_scope probe reason"
+}
+
+# ── T21 (Part 1b r2) ───────────────────────────────────────────────────
+# Token-replace race: a concurrent cmd_add --replace swaps the active token
+# (same id, new value) WHILE the verified profile probe is in flight. The
+# persist path must recheck the row's CURRENT token fingerprint under the
+# registry lock and skip BOTH the registry identity record AND the
+# ~/.claude.json write — never stamp the OLD token's verified email onto the
+# replacement token. Proven discriminator: FAILS if the fingerprint recheck is
+# removed (stale email recorded onto the new row + written to ~/.claude.json).
+test_identity_token_replace_race() {
+  local raceroot="$SMOKE_TMP_ROOT/race-token-replace"
+  rm -rf "$raceroot"; mkdir -p "$raceroot"
+  smoke_assert_path_in_temp "$raceroot" "token-replace race op-home"
+  local racereg="$raceroot/registry.json"
+  local out
+  out="$(python3 "$HELPER" race-token-replace-during-probe "$racereg" "$raceroot" \
+        "$DISPLAY_EMAIL" "swapped-victim@example.com" 2>&1)"
+  smoke_assert_contains "$out" "OK race-token-replace-during-probe" \
+    "T21 token-replace race: no identity record + no ~/.claude.json write on a mid-probe token swap"
+}
+
+# ── T22 (Part 1b r2) ───────────────────────────────────────────────────
+# Post-persist/pre-patch window (codex r2 Finding 1): the verified-identity
+# ~/.claude.json write must run while the registry lock is HELD, so a concurrent
+# cmd_add --replace (which also needs the registry lock) cannot land between the
+# fingerprint recheck and the displayed-identity write. The helper wraps
+# patch_global_claude_identity and asserts a non-blocking registry_lock grab
+# BLOCKS at write time. Discriminator: FAILS if the write is moved outside the
+# registry lock (the non-blocking grab would then succeed).
+test_identity_post_persist_write_under_lock() {
+  local raceroot="$SMOKE_TMP_ROOT/race-post-persist"
+  rm -rf "$raceroot"; mkdir -p "$raceroot"
+  smoke_assert_path_in_temp "$raceroot" "post-persist race op-home"
+  local racereg="$raceroot/registry.json"
+  local out
+  out="$(python3 "$HELPER" race-post-persist-write-under-lock "$racereg" "$raceroot" \
+        "$DISPLAY_EMAIL" "newverified@example.com" 2>&1)"
+  smoke_assert_contains "$out" "OK race-post-persist" \
+    "T22 verified-identity ~/.claude.json write runs under the registry lock (post-persist window closed)"
 }
 
 # ── T18 (Part 1b) ─────────────────────────────────────────────────────
@@ -503,6 +555,8 @@ smoke_run "T17 probe no-scope (403) -> unknown, NO write"                      t
 smoke_run "T18 probe no-email (200) -> unknown, NO write"                      test_identity_probe_no_email_unknown
 smoke_run "T19 keychain-exists guard -> identity sync skipped + warn"          test_identity_keychain_guard
 smoke_run "T20 .claude.json parent-swap-after-lock -> write in LOCKED dir"     test_identity_parent_swap_after_lock
+smoke_run "T21 token-replace race -> no record + no ~/.claude.json write"      test_identity_token_replace_race
+smoke_run "T22 post-persist write under registry lock (window closed)"         test_identity_post_persist_write_under_lock
 smoke_run "T10 ci-select routing -> bridge-auth.py + smoke selected"          test_ci_select_routing
 
 smoke_log "all checks passed"

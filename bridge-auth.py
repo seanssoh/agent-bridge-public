@@ -931,11 +931,15 @@ def public_token_row(row: dict[str, Any], active_id: str) -> dict[str, Any]:
         # #18849 Part 1b — per-token verified account identity (non-secret).
         # ``account_email``/``account_subject`` are the LAST values a
         # ``user:profile`` probe VERIFIED; ``account_email_probe_status`` carries
-        # the explicit stale/unknown semantics for the displayed-identity sync.
+        # the explicit stale/unknown semantics for the displayed-identity sync;
+        # ``account_email_probe_reason`` keeps the GRANULAR last-probe outcome
+        # (verified/no_scope/no_email/probe_failed) so the doctor surface can say
+        # WHY the displayed identity never converged.
         "account_email": row.get("account_email") or "",
         "account_email_verified_at": row.get("account_email_verified_at") or "",
         "account_subject": row.get("account_subject") or "",
         "account_email_probe_status": row.get("account_email_probe_status") or "",
+        "account_email_probe_reason": row.get("account_email_probe_reason") or "",
     }
 
 
@@ -3036,35 +3040,104 @@ def _probe_cooldown_elapsed(row: dict[str, Any]) -> bool:
     return (now_utc() - last).total_seconds() >= _identity_probe_cooldown_seconds()
 
 
+# Human-readable labels for the granular last-probe outcome, surfaced on the
+# read-only ``global-auth-status`` doctor line so an operator can see WHY the
+# displayed identity never converged (e.g. a pool token that lacks
+# ``user:profile`` 403s → ``no_scope`` → identity-sync is a permanent no-op).
+_IDENTITY_PROBE_REASON_LABELS = {
+    "verified": "verified (user:profile)",
+    "no_scope": "no_scope (token lacks user:profile)",
+    "no_email": "no_email (profile carried no account email)",
+    "probe_failed": "probe_failed (network/timeout/429 — last verified kept)",
+    "token_replaced": "token_replaced (active token changed mid-probe)",
+    "row_deleted": "row_deleted (active token removed mid-probe)",
+}
+
+
+def _identity_probe_reason_label(reason: str) -> str:
+    if not reason:
+        return "not_probed"
+    return _IDENTITY_PROBE_REASON_LABELS.get(reason, reason)
+
+
+def _identity_row_token_skip_reason(
+    row: dict[str, Any] | None, probed_fingerprint: str
+) -> str:
+    """Token-replace recheck shared by the registry persist and the config write.
+
+    The profile probe runs on ``active_token`` — snapshotted BEFORE the registry
+    lock was released in ``_global_auth_gate_state`` — so a concurrent
+    ``cmd_add --replace`` / rotation can swap the active row's token value (same
+    id) while the probe is in flight. Returns ``""`` if ``row``'s CURRENT token
+    still matches ``probed_fingerprint``, else the skip reason
+    (``"row_deleted"`` / ``"token_replaced"``). The caller MUST hold the
+    registry lock around this check so the verdict stays valid through the write
+    it guards. The fingerprint compare keeps the raw token off disk / the audit
+    log (mirrors ``cmd_check``'s PR #799 r3 recheck).
+    """
+    if row is None:
+        return "row_deleted"
+    current_token = str(row.get("token") or "")
+    current_fingerprint = token_fingerprint(current_token) if current_token else ""
+    if current_fingerprint != probed_fingerprint:
+        return "token_replaced"
+    return ""
+
+
+def _stamp_identity_probe_outcome(
+    row: dict[str, Any], *, status: str, reason: str, email: str = "", subject: str = ""
+) -> None:
+    """Stamp a probe outcome onto an already-locked, fingerprint-verified row.
+
+    On ``verified`` the email / subject / verified-at are updated. On ``stale`` /
+    ``unknown`` the last-verified ``account_email`` / ``account_subject`` are KEPT
+    untouched (never cleared, never guessed) and only the probe markers + the
+    last-probe stamp (which drives the re-probe cooldown) are refreshed.
+    ``reason`` records the GRANULAR outcome (``verified`` / ``no_scope`` /
+    ``no_email`` / ``probe_failed``) into ``account_email_probe_reason`` for the
+    doctor surface — the coarse ``status`` alone cannot say WHY the displayed
+    identity never converged.
+    """
+    row["account_email_probe_status"] = status
+    row["account_email_probe_reason"] = reason or status
+    row["account_email_last_probe_at"] = now_iso()
+    if status == "verified" and email:
+        row["account_email"] = email
+        row["account_email_verified_at"] = now_iso()
+        if subject:
+            row["account_subject"] = subject
+
+
 def record_token_account_identity(
     registry_path: Path,
     token_id: str,
     *,
     status: str,
+    probed_fingerprint: str,
     email: str = "",
     subject: str = "",
-) -> None:
-    """Persist a `user:profile` probe outcome onto the active token row.
+    reason: str = "",
+) -> str:
+    """Persist a non-verified `user:profile` probe outcome onto the active row.
 
-    ``status`` ∈ ``{verified, stale, unknown}``. On ``verified`` the email /
-    subject / verified-at are updated. On ``stale`` / ``unknown`` the
-    last-verified ``account_email`` / ``account_subject`` are KEPT untouched
-    (never cleared, never guessed) and only the probe-status marker + last-probe
-    stamp are refreshed. The last-probe stamp drives the re-probe cooldown.
+    Used for the ``stale`` / ``unknown`` branches, which have NO downstream
+    ``~/.claude.json`` write, so the recheck-under-lock here fully guards them.
+    The ``verified`` branch does its own recheck + write under a SINGLE held
+    registry lock (see ``run_global_identity_sync``) so the displayed-identity
+    write cannot race a token replace either. Returns ``""`` on persist, or a
+    skip reason (``"row_deleted"`` / ``"token_replaced"``).
     """
     with registry_lock(registry_path):
         registry = load_registry(registry_path)
         row = find_token(registry, token_id)
-        if row is None:
-            return
-        row["account_email_probe_status"] = status
-        row["account_email_last_probe_at"] = now_iso()
-        if status == "verified" and email:
-            row["account_email"] = email
-            row["account_email_verified_at"] = now_iso()
-            if subject:
-                row["account_subject"] = subject
+        skip_reason = _identity_row_token_skip_reason(row, probed_fingerprint)
+        if skip_reason:
+            return skip_reason
+        _stamp_identity_probe_outcome(
+            row, status=status, reason=reason, email=email, subject=subject
+        )
         save_registry(registry_path, registry)
+    return ""
 
 
 def patch_global_claude_identity(
@@ -3179,7 +3252,15 @@ def run_global_identity_sync(
 
     Result ``status`` ∈ ``{synced, converged, unverified, skipped, write_failed}``
     with ``converged`` (displayed == verified) + ``verified_email`` /
-    ``displayed_email`` / ``probe_status`` for the doctor surface.
+    ``displayed_email`` / ``probe_status`` for the doctor surface. ``skipped``
+    with reason ``token_replaced`` / ``row_deleted`` means a concurrent token
+    swap during the in-flight probe was detected and BOTH the registry record
+    and the ~/.claude.json write were skipped.
+
+    Inert-by-design: when the active token lacks the ``user:profile`` scope the
+    probe 403s → ``no_scope`` → no write ever lands (a permanent, fail-safe
+    no-op the operator can see via ``global-auth-status``); identity-sync lights
+    up automatically once a ``user:profile``-scoped token is active.
     """
     displayed_email = read_oauth_account_email(config_path)
     # Keychain-exists guard: when auth is keychain-backed, the keychain owns the
@@ -3207,6 +3288,14 @@ def run_global_identity_sync(
                 "displayed_email": displayed_email, "verified_email": verified_email,
                 "probe_status": str(row.get("account_email_probe_status") or "")}
 
+    # ``active_token`` was snapshotted under the registry lock in
+    # ``_global_auth_gate_state`` and the lock then released, so the probe below
+    # runs unlocked. Carry the probed token's fingerprint into the persist path
+    # so a concurrent token replace (same id, new value) during the in-flight
+    # probe cannot stamp this probe's email onto the replacement token — and, on
+    # a verified probe, so the displayed-identity write is skipped too.
+    probed_fingerprint = token_fingerprint(active_token)
+
     probe = probe_claude_account_identity(
         active_token, timeout_seconds=_identity_probe_timeout_seconds()
     )
@@ -3215,7 +3304,16 @@ def run_global_identity_sync(
         # No write, never a guess: probe_failed → stale (keep last verified);
         # no_scope / no_email → unknown.
         reg_status = "stale" if pstatus == "probe_failed" else "unknown"
-        record_token_account_identity(registry_path, active_id, status=reg_status)
+        skipped = record_token_account_identity(
+            registry_path, active_id, status=reg_status,
+            probed_fingerprint=probed_fingerprint, reason=pstatus,
+        )
+        if skipped:
+            # Row deleted / token replaced mid-probe — do not record onto the
+            # replacement token (there is no write to skip on this branch).
+            return {"status": "skipped", "reason": skipped, "synced": False,
+                    "converged": False, "displayed_email": displayed_email,
+                    "verified_email": verified_email, "probe_status": skipped}
         return {"status": "unverified", "reason": pstatus, "synced": False,
                 "converged": False, "displayed_email": displayed_email,
                 "verified_email": verified_email, "probe_status": reg_status,
@@ -3223,19 +3321,46 @@ def run_global_identity_sync(
 
     email = str(probe.get("email") or "")
     subject = str(probe.get("subject") or "")
-    record_token_account_identity(
-        registry_path, active_id, status="verified", email=email, subject=subject
-    )
+    # Persist the verified identity AND write ~/.claude.json while HOLDING the
+    # registry lock the entire time. A concurrent cmd_add --replace must take
+    # the same registry lock to swap the active token, so it cannot interleave
+    # between the fingerprint recheck and the displayed-identity write — this
+    # closes the post-persist/pre-patch window the per-call recheck alone leaves
+    # open. Lock order is always registry_lock -> claude_global_credentials_lock
+    # (the config writer takes the latter internally); no path takes them in
+    # reverse, and the config write is a fast LOCAL op (not a network call), so
+    # the nesting neither deadlocks nor holds the registry lock across slow I/O.
+    skip_reason = ""
+    write_result: dict[str, Any] | None = None
     try:
-        write_result = patch_global_claude_identity(
-            config_path, email=email, subject=subject, allowed_root=allowed_root
-        )
+        with registry_lock(registry_path):
+            registry = load_registry(registry_path)
+            row = find_token(registry, active_id)
+            skip_reason = _identity_row_token_skip_reason(row, probed_fingerprint)
+            if not skip_reason:
+                _stamp_identity_probe_outcome(
+                    row, status="verified", reason="verified",
+                    email=email, subject=subject,
+                )
+                save_registry(registry_path, registry)
+                write_result = patch_global_claude_identity(
+                    config_path, email=email, subject=subject,
+                    allowed_root=allowed_root,
+                )
     except Exception as exc:  # noqa: BLE001 - identity write is best-effort on top of token sync
         print(f"warning: ~/.claude.json identity sync write failed: {exc}",
               file=sys.stderr)
         return {"status": "write_failed", "reason": str(exc), "synced": False,
                 "converged": False, "displayed_email": displayed_email,
                 "verified_email": email, "probe_status": "verified"}
+    if skip_reason:
+        # Row deleted or its token replaced while the verified probe was in
+        # flight: the verified email belongs to a token that is no longer the
+        # active row. Skipped BOTH the registry record AND the ~/.claude.json
+        # write — never persist a stale identity onto the replacement token.
+        return {"status": "skipped", "reason": skip_reason, "synced": False,
+                "converged": False, "displayed_email": displayed_email,
+                "verified_email": "", "probe_status": skip_reason}
     if write_result.get("skipped"):
         return {"status": "skipped", "reason": write_result.get("reason"),
                 "synced": False, "converged": False,
@@ -4827,11 +4952,17 @@ def cmd_global_auth_status(args: argparse.Namespace) -> int:
         identity_row = {}
     verified_email = str(identity_row.get("account_email") or "")
     identity_converged = bool(verified_email) and displayed_email == verified_email
+    probe_reason = str(identity_row.get("account_email_probe_reason") or "")
     identity_shadow = {
         "displayed_email": displayed_email,
         "verified_email": verified_email,
         "verified_at": str(identity_row.get("account_email_verified_at") or ""),
         "probe_status": str(identity_row.get("account_email_probe_status") or ""),
+        # Granular last-probe outcome (verified/no_scope/no_email/probe_failed)
+        # so the operator can see WHY identity never converged — e.g. a pool
+        # token without user:profile reports ``no_scope`` and identity-sync is a
+        # permanent (fail-safe) no-op.
+        "probe_reason": probe_reason,
         "synced": identity_converged,
         "converged": identity_converged,
     }
@@ -4865,7 +4996,8 @@ def cmd_global_auth_status(args: argparse.Namespace) -> int:
         ident = "identity-converged" if identity_converged else "identity-unsynced"
         print(
             f"global auth sync: {state} (auto_rotate={auto_rotate} "
-            f"opt_in={opt_in}); {conv}; {ident}; displayed_identity="
+            f"opt_in={opt_in}); {conv}; {ident}; identity probe: "
+            f"{_identity_probe_reason_label(probe_reason)}; displayed_identity="
             f"{displayed_email or '<none>'}; verified_identity="
             f"{verified_email or '<none>'}"
         )
@@ -5836,7 +5968,20 @@ def build_parser() -> argparse.ArgumentParser:
     sync_global_parser.add_argument("--json", action="store_true")
     sync_global_parser.set_defaults(handler=cmd_sync_global)
 
-    global_status_parser = sub.add_parser("global-auth-status")
+    global_status_parser = sub.add_parser(
+        "global-auth-status",
+        help="report operator-global auth + displayed-identity convergence",
+        description=(
+            "Read-only doctor surface for the gated operator-global auth sync "
+            "(#18849). Default-OFF: needs BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC AND "
+            "auto_rotate. The Part 1b displayed-identity sync is INERT (a "
+            "permanent, fail-safe no-op) when the active token lacks the "
+            "user:profile scope — the profile probe 403s, the 'identity probe:' "
+            "line / identity_shadow.probe_reason surface 'no_scope', and "
+            "~/.claude.json is never written. It lights up automatically once a "
+            "user:profile-scoped token is the active token."
+        ),
+    )
     global_status_parser.add_argument("--global-credentials", default=None)
     global_status_parser.add_argument("--claude-config", default=None)
     global_status_parser.add_argument("--json", action="store_true")
