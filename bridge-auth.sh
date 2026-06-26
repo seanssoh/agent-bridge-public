@@ -357,6 +357,12 @@ bridge_auth_sync_agent_python() {
   local agent="$1"
   local registry="$2"
   local file="$3"
+  # Issue #2137 fix #3: "1" → pass `--no-apikeyhelper` so the OAT credential is
+  # synced but the managed keychain-free apiKeyHelper is left untouched for this
+  # agent (the admin/interactive agent under a broad selection scope).
+  local no_apikeyhelper="${4:-}"
+  local -a apikeyhelper_args=()
+  [[ "$no_apikeyhelper" == "1" ]] && apikeyhelper_args=(--no-apikeyhelper)
   local workdir=""
   local user_home=""
   local os_user=""
@@ -398,7 +404,8 @@ bridge_auth_sync_agent_python() {
     fi
     bridge_linux_sudo_root python3 "$SCRIPT_DIR/bridge-auth.py" \
       --registry "$registry" sync-agent --agent "$agent" --file "$file" \
-      "${workdir_args[@]}" "${owner_args[@]}" "${controller_cred_args[@]}" --json
+      "${workdir_args[@]}" "${owner_args[@]}" "${controller_cred_args[@]}" \
+      "${apikeyhelper_args[@]}" --json
     return $?
   fi
   # Non-isolated dev install — Python still gets the agent's resolved home as
@@ -410,7 +417,8 @@ bridge_auth_sync_agent_python() {
   fi
   python3 "$SCRIPT_DIR/bridge-auth.py" \
     --registry "$registry" sync-agent --agent "$agent" --file "$file" \
-    "${workdir_args[@]}" "${owner_args[@]}" "${controller_cred_args[@]}" --json
+    "${workdir_args[@]}" "${owner_args[@]}" "${controller_cred_args[@]}" \
+    "${apikeyhelper_args[@]}" --json
 }
 
 bridge_auth_selected_agents() {
@@ -541,7 +549,14 @@ PY
     # ``$agent:error`` row.
     local stderr_tmp=""
     stderr_tmp="$(mktemp "${TMPDIR:-/tmp}/agb-auth-sync.XXXXXX" 2>/dev/null || printf '%s' "/tmp/agb-auth-sync.$$.$RANDOM")"
-    if ! output="$(bridge_auth_sync_agent_python "$agent" "$registry" "$file" 2>"$stderr_tmp")"; then
+    # Issue #2137 fix #3 (sync-path vector): under a broad scope the admin/
+    # interactive agent still gets its OAT credential synced, but NOT the managed
+    # apiKeyHelper — so a broad daemon sync can never move the admin onto API-key
+    # billing. `bridge_auth_apikeyhelper_allowed_for` returns non-zero for the
+    # excluded admin; pass "1" to suppress the helper for it.
+    local no_apikeyhelper=""
+    bridge_auth_apikeyhelper_allowed_for "$agent" "$spec" || no_apikeyhelper="1"
+    if ! output="$(bridge_auth_sync_agent_python "$agent" "$registry" "$file" "$no_apikeyhelper" 2>"$stderr_tmp")"; then
       local stderr_body=""
       stderr_body="$(cat "$stderr_tmp" 2>/dev/null || printf '')"
       rm -f "$stderr_tmp"
@@ -736,22 +751,18 @@ bridge_auth_backfill_settings_agents() {
   # the managed apiKeyHelper through a BROAD-scope WRITE. The live incident moved
   # the interactive `patch` admin onto API-key billing via the daemon's
   # `--agents static` backfill, breaking its session with `Invalid API key`. In
-  # WRITE mode under a broad scope (default / static / all / claude) the admin is
-  # excluded — it is only backfilled when an explicit `--agents <csv>` names it.
-  # `--check` (check_mode=1) stays fleet-wide read-only (it writes nothing), so
-  # the admin still appears in the coherence/drift report.
-  if [[ "$check_mode" != "1" ]] && bridge_auth_scope_is_broad "$spec"; then
-    local admin_agent=""
-    admin_agent="$(bridge_admin_agent_id 2>/dev/null || true)"
-    if [[ -n "$admin_agent" ]] && (( ${#agents[@]} > 0 )); then
-      local -a _scoped=()
-      local _a=""
-      for _a in "${agents[@]}"; do
-        [[ "$_a" == "$admin_agent" ]] && continue
-        _scoped+=("$_a")
-      done
-      agents=("${_scoped[@]+"${_scoped[@]}"}")
-    fi
+  # WRITE mode the admin is excluded under a broad scope — it is only backfilled
+  # when an explicit `--agents <csv>` names it. `--check` (check_mode=1) stays
+  # fleet-wide read-only (it writes nothing), so the admin still appears in the
+  # coherence/drift report.
+  if [[ "$check_mode" != "1" ]] && (( ${#agents[@]} > 0 )); then
+    local -a _scoped=()
+    local _a=""
+    for _a in "${agents[@]}"; do
+      bridge_auth_apikeyhelper_allowed_for "$_a" "$spec" || continue
+      _scoped+=("$_a")
+    done
+    agents=("${_scoped[@]+"${_scoped[@]}"}")
   fi
 
   if (( ${#agents[@]} == 0 )); then
@@ -1263,6 +1274,21 @@ bridge_auth_scope_is_broad() {
     ""|static|all|claude) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# Issue #2137 (fix #3): whether THIS agent may receive the managed apiKeyHelper
+# for a given selection scope. The admin/interactive agent is EXCLUDED under a
+# broad scope (default / static / all / claude) — the broad backfill/sync path
+# must never silently move it onto apiKeyHelper / API-key billing. It is opted in
+# only when an explicit `--agents <csv>` (a non-broad scope) names it. Every
+# non-admin agent is always allowed. Returns 0 (allowed) / 1 (excluded).
+bridge_auth_apikeyhelper_allowed_for() {
+  local agent="$1" spec="$2"
+  local admin_agent=""
+  admin_agent="$(bridge_admin_agent_id 2>/dev/null || true)"
+  [[ -n "$admin_agent" && "$agent" == "$admin_agent" ]] || return 0
+  bridge_auth_scope_is_broad "$spec" && return 1
+  return 0
 }
 
 bridge_auth_agents_arg() {

@@ -476,6 +476,23 @@ def write_keychain_free_gate(enabled: bool) -> tuple[Path | None, str]:
     return path, "ok"
 
 
+def keychain_free_env_override() -> str | None:
+    """Return the set, non-empty ``BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH`` env value, or
+    None (issue #2137 fix #4 hardening).
+
+    ``claude_keychain_free_auth_enabled`` gives a non-empty env override
+    precedence over the runtime config, so a `keychain-free enable/disable` that
+    only writes config would be SHADOWED (silently no-op) when the override is
+    set — the exact "looks applied but isn't" misconfiguration the incident was
+    about. The verb refuses to write under a live override and surfaces it in
+    `status` instead. An unset / empty override (the production default) returns
+    None so the config write is authoritative."""
+    raw = os.environ.get("BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH")  # noqa: iso-helper-boundary - controller feature gate
+    if raw is not None and raw.strip():
+        return raw.strip()
+    return None
+
+
 def token_fingerprint(token: str) -> str:
     digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
     tail = token[-4:] if len(token) >= 4 else token
@@ -2669,6 +2686,7 @@ def ensure_claude_settings_file(
     allowed_root: Path | None = None,
     agent: str = "",
     writer: str = "",
+    allow_apikeyhelper: bool = True,
 ) -> Path:
     _ensure_claude_dir_safe(config_dir / "settings.json", allowed_root)
     config_dir.mkdir(parents=True, exist_ok=True)
@@ -2697,7 +2715,16 @@ def ensure_claude_settings_file(
     # write it there. The cleanup branch below still runs on non-Darwin so a
     # stale managed value (e.g. left by a pre-fix sync, or after the gate is
     # turned off) gets removed regardless of platform.
-    if claude_keychain_free_auth_enabled() and keychain_free_apikeyhelper_supported():
+    if not allow_apikeyhelper:
+        # Issue #2137 fix #3 (sync-path vector): the admin/interactive agent under
+        # a BROAD selection scope (default / static / all / claude). Leave the
+        # apiKeyHelper field EXACTLY as-is — the broad path must neither ADD the
+        # managed helper (the live-incident hijack via the daemon's broad
+        # `--agents static` sync) nor fight an explicit operator opt-in by
+        # removing one. The admin's managed helper is only ever written / removed
+        # when an explicit `--agents <admin>` targets it (allow_apikeyhelper=True).
+        pass
+    elif claude_keychain_free_auth_enabled() and keychain_free_apikeyhelper_supported():
         payload["apiKeyHelper"] = claude_api_key_helper_path()
     elif apikeyhelper_value_is_bridge_managed(payload.get("apiKeyHelper")):
         # Disable/rollback/non-Darwin cleanup: the gate is off (or we are not on
@@ -2709,11 +2736,30 @@ def ensure_claude_settings_file(
         # Idempotent: once removed, the key is absent so this branch is a no-op
         # on the next sync.
         payload.pop("apiKeyHelper", None)
-    # Issue #2137 fix #6: emit a forensic audit row IFF this writer changed the
-    # managed apiKeyHelper. Identifies which subprocess (writer-context label +
-    # pid/ppid) wrote/removed apiKeyHelper into which agent — the missing signal
-    # the live incident RCA needed. Best-effort; never blocks the settings write.
     after_helper = payload.get("apiKeyHelper")
+    # PR #799 r4 codex finding 1 — always route through write_private_file_atomic.
+    # The previous "payload == before" fast path returned without atomic rewrite,
+    # doing final-path os.chown on a path the agent UID can swap to a symlink
+    # between check and op. Same TOCTOU symlink-follow class as the bash helper
+    # r3 removed. Atomic rewrite carries the _ensure_claude_dir_safe parent-symlink
+    # check and the chown-before-replace ordering, so there is no privileged-op-
+    # on-final-path window. Perf hit is negligible — settings.json is small and
+    # sync is infrequent.
+    text = json.dumps(payload, ensure_ascii=True, indent=2) + "\n"
+    write_private_file_atomic(
+        path,
+        text,
+        mode=mode,
+        prefix=".settings.",
+        owner_uid=owner_uid,
+        owner_gid=owner_gid,
+    )
+    # Issue #2137 fix #6: emit the forensic audit row AFTER the atomic write
+    # SUCCEEDS (write_private_file_atomic raises on failure and propagates), so a
+    # failed write never leaves a dangling row describing a change that did not
+    # land. Fires only when this writer actually added / removed / changed the
+    # managed apiKeyHelper — identifies which subprocess (writer-context label +
+    # pid/ppid) touched which agent, the missing signal the live RCA needed.
     if before_helper != after_helper:
         if after_helper is None:
             apikeyhelper_action = "apikeyhelper_removed"
@@ -2733,23 +2779,6 @@ def ensure_claude_settings_file(
                 "platform": host_platform(),
             }
         )
-    # PR #799 r4 codex finding 1 — always route through write_private_file_atomic.
-    # The previous "payload == before" fast path returned without atomic rewrite,
-    # doing final-path os.chown on a path the agent UID can swap to a symlink
-    # between check and op. Same TOCTOU symlink-follow class as the bash helper
-    # r3 removed. Atomic rewrite carries the _ensure_claude_dir_safe parent-symlink
-    # check and the chown-before-replace ordering, so there is no privileged-op-
-    # on-final-path window. Perf hit is negligible — settings.json is small and
-    # sync is infrequent.
-    text = json.dumps(payload, ensure_ascii=True, indent=2) + "\n"
-    write_private_file_atomic(
-        path,
-        text,
-        mode=mode,
-        prefix=".settings.",
-        owner_uid=owner_uid,
-        owner_gid=owner_gid,
-    )
     return path
 
 
@@ -2926,6 +2955,7 @@ def cmd_keychain_free(args: argparse.Namespace) -> int:
     action = args.action
     json_mode = bool(args.json)
     registry_path = Path(args.registry).expanduser()
+    env_override = keychain_free_env_override()
 
     if action == "status":
         enabled = claude_keychain_free_auth_enabled()
@@ -2934,6 +2964,7 @@ def cmd_keychain_free(args: argparse.Namespace) -> int:
             "status": "ok",
             "action": "status",
             "enabled": enabled,
+            "env_override": env_override,
             "preflight": preflight,
         }
         if json_mode:
@@ -2941,8 +2972,22 @@ def cmd_keychain_free(args: argparse.Namespace) -> int:
         else:
             gate = "enabled" if enabled else "disabled"
             pf = "ok" if preflight["ok"] else "would-fail"
-            print(f"keychain-free: {gate} (enable preflight: {pf})")
+            shadow = f" [env override {env_override!r} in effect]" if env_override is not None else ""
+            print(f"keychain-free: {gate} (enable preflight: {pf}){shadow}")
         return 0
+
+    # Mutating actions (enable / disable): a live env override would SHADOW the
+    # config write, so the verb reports success while the effective gate stays
+    # unchanged. Refuse fail-closed and tell the operator to unset it (issue
+    # #2137 fix #4 — never report a silent false-success).
+    if env_override is not None:
+        return fail(
+            "BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH env override is set "
+            f"({env_override!r}) and takes precedence over runtime config; a "
+            f"`keychain-free {action}` would be shadowed and not take effect. "
+            "Unset BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH to manage the gate via config.",
+            json_mode,
+        )
 
     if action == "disable":
         path, reason = write_keychain_free_gate(False)
@@ -3242,6 +3287,13 @@ def cmd_sync_agent(args: argparse.Namespace) -> int:
             allowed_root=allowed_root,
             agent=args.agent,
             writer="sync-agent",
+            # Issue #2137 fix #3 (sync-path vector): the bash sync loop passes
+            # `--no-apikeyhelper` for the admin/interactive agent under a broad
+            # selection scope, so a broad daemon sync distributes the OAT
+            # credential to the admin WITHOUT moving it onto the managed
+            # apiKeyHelper. The admin's helper is only managed via an explicit
+            # `--agents <admin>`.
+            allow_apikeyhelper=not bool(getattr(args, "no_apikeyhelper", False)),
         )
     except Exception as exc:
         return fail(str(exc), json_mode)
@@ -4268,6 +4320,17 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "explicit path to the controller's .claude/.credentials.json — used "
             "for the #1075 fallback when no Claude setup-token is registered"
+        ),
+    )
+    sync_parser.add_argument(
+        "--no-apikeyhelper",
+        action="store_true",
+        help=(
+            "Issue #2137 fix #3: sync the OAT credential but do NOT add/remove "
+            "the managed keychain-free apiKeyHelper for this agent. The bash sync "
+            "loop sets it for the admin/interactive agent under a broad selection "
+            "scope so a broad daemon sync can never move the admin onto API-key "
+            "billing without an explicit --agents <admin>."
         ),
     )
     sync_parser.add_argument("--json", action="store_true")

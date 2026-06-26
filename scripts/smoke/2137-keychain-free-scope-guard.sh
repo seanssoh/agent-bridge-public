@@ -265,6 +265,56 @@ test_keychain_free_enable_disable_cycle() {
   [[ "$rc" != "0" ]] || smoke_fail "A6c keychain-free unknown flag returned rc=0 (expected nonzero)"
 }
 
+# ===========================================================================
+# A7 — the SYNC path (not just backfill) excludes the admin under broad scope:
+#      OAT credential is still distributed, but apiKeyHelper is NOT added. The
+#      daemon's periodic `claude-token sync --agents static` is the equivalent
+#      hijack vector the broad backfill exclusion alone did not close.
+# ===========================================================================
+test_sync_broad_scope_excludes_admin_apikeyhelper() {
+  reseed_all_settings
+  write_registry "primary" "true" "available"
+  local rc
+  rc="$(GATE=1 run_auth claude-token sync --json)"
+  smoke_assert_eq "0" "$rc" "A7 broad sync rc 0"
+  # Admin: OAT credential still synced (auth keeps working), but NO managed helper.
+  smoke_assert_file_exists "$(cfg_dir_for "$ADMIN_AGENT")/.credentials.json" \
+    "A7 admin OAT credential is still synced under broad scope"
+  smoke_assert_eq "" "$(helper_in "$ADMIN_AGENT")" \
+    "A7 broad sync does NOT move the admin onto apiKeyHelper (sync-path vector closed)"
+  # Non-admin: gets the managed apiKeyHelper.
+  smoke_assert_eq "$EXPECTED_HELPER" "$(helper_in "$USER_AGENT")" \
+    "A7 broad sync writes the non-admin agent's managed apiKeyHelper"
+}
+
+# A7b — explicit `--agents <admin>` sync DOES manage the admin's apiKeyHelper.
+test_sync_explicit_admin_gets_apikeyhelper() {
+  reseed_all_settings
+  write_registry "primary" "true" "available"
+  local rc
+  rc="$(GATE=1 run_auth claude-token sync --agents "$ADMIN_AGENT" --json)"
+  smoke_assert_eq "0" "$rc" "A7b explicit-admin sync rc 0"
+  smoke_assert_eq "$EXPECTED_HELPER" "$(helper_in "$ADMIN_AGENT")" \
+    "A7b explicit --agents <admin> sync manages the admin apiKeyHelper (opt-in)"
+}
+
+# ===========================================================================
+# A8 — `keychain-free enable` refuses under a live BRIDGE_CLAUDE_KEYCHAIN_FREE_-
+#      AUTH env override (which would shadow the config write → silent
+#      false-success). Fails closed; the config gate is not written.
+# ===========================================================================
+test_keychain_free_refuses_under_env_override() {
+  reseed_all_settings
+  write_registry "primary" "true" "available"
+  rm -f "$CONFIG_FILE"
+  local rc out
+  rc="$(GATE=1 run_auth claude-token keychain-free enable --json)"
+  out="$(cat "$SMOKE_TMP_ROOT/auth.out")$(cat "$SMOKE_TMP_ROOT/auth.err")"
+  [[ "$rc" != "0" ]] || smoke_fail "A8 enable under env override returned rc=0 (expected refusal)"
+  smoke_assert_contains "$out" "env override" "A8 refusal cites the shadowing env override"
+  smoke_assert_eq "false" "$(gate_enabled_in_config)" "A8 config gate not written under env override"
+}
+
 smoke_run "A1 backfill-settings --help prints usage, no agent iteration"   test_help_prints_usage_no_iteration
 smoke_run "A2 backfill-settings unknown flag fails closed (no writes)"      test_unknown_flag_fails_closed
 smoke_run "A3 broad-scope WRITE excludes the admin/interactive agent"       test_broad_scope_excludes_admin
@@ -273,5 +323,8 @@ smoke_run "A4b explicit --agents <admin> opt-in backfills the admin"        test
 smoke_run "A5 gate-off: no resurrect + writer removes managed helper"       test_gate_off_no_resurrect_and_removes
 smoke_run "A6 keychain-free enable fails closed on an unhealthy OAT"        test_keychain_free_enable_fail_closed
 smoke_run "A6b/c keychain-free enable/disable cycle + unknown-flag guard"   test_keychain_free_enable_disable_cycle
+smoke_run "A7 broad SYNC excludes admin apiKeyHelper (OAT still synced)"    test_sync_broad_scope_excludes_admin_apikeyhelper
+smoke_run "A7b explicit --agents <admin> sync manages the admin helper"     test_sync_explicit_admin_gets_apikeyhelper
+smoke_run "A8 keychain-free enable refuses under a shadowing env override"  test_keychain_free_refuses_under_env_override
 
 smoke_log "all checks passed"
