@@ -86,7 +86,7 @@ BRIDGE_HOME_STUB="$SMOKE_TMP_ROOT/bridge-home"
 mkdir -p "$BRIDGE_HOME_STUB"
 AGB_LOG="$SMOKE_TMP_ROOT/agb-create.log"
 : >"$AGB_LOG"
-cat >"$BRIDGE_HOME_STUB/agent-bridge" <<EOF
+cat >"$BRIDGE_HOME_STUB/agent-bridge" <<EOF  # noqa: iso-helper-boundary — controller-only smoke stub writer, no real iso boundary
 #!/usr/bin/env bash
 # Recorder stub for \`agent-bridge task create\`. Logs argv (NUL-joined per call)
 # and the --body-file CONTENTS, then emits the parseable success line.
