@@ -25,9 +25,12 @@
 #   symlink cwd (start + via cd), cd-primary, var/interpreter obfuscation,
 #   unbalanced quote, command-level BRIDGE_BASH_GIT_GUARD=0, every shared-repo
 #   verb (branch -D/-d/-m, worktree remove|prune, stash drop|clear, reflog
-#   delete|expire, gc --prune), and command-NAME indirection (r2 / #19303):
+#   delete|expire, gc --prune), command-NAME indirection (r2 / #19303):
 #   a `$var` / `"$var"` / `$(command -v git)` / `${GIT_BIN:-git}` leader, or a
-#   function/alias (any name) defined then invoked, that hides a destructive git.
+#   function/alias (any name) defined then invoked, that hides a destructive git;
+#   and DOUBLE indirection (r3 / #19317): an indirected leader whose would-be-verb
+#   is ALSO unresolved (`$g -C primary $v`; `$g $v` from any cwd; `v="-C primary
+#   reset"` hiding the redirect flag inside the token) — denied unconditionally.
 # ALLOW (canonical-safe + over-block-0): worktree bare reset/checkout/clean,
 #   cd real-subdir && checkout, stash push / branch create / worktree list /
 #   read-only status|log|diff (incl. `-C primary log`), add/commit/push;
@@ -216,6 +219,57 @@ def main() -> int:
         "${GIT_BIN:-git} -C " + P + " reset",
         True,
     )
+    # ---- DENY: DOUBLE indirection (r3 / #19317) — the would-be-verb is ALSO an
+    # unresolved `$v`, so the literal-token scan missed the destructive verb. An
+    # indirected leader carrying an unresolved would-be-verb is denied
+    # UNCONDITIONALLY (it can word-split at runtime into any destructive/escape
+    # shape — incl. a redirect flag hidden inside the token), mirroring the
+    # literal `git $v` path. The 3 patch-dev repros + the contained-cwd / embedded
+    # -redirect variants the (a)/(b) cwd-gated reading would have missed:
+    expect(
+        "r3 double-indir -C primary + $v verb",
+        WT,
+        "g=git; v=reset; $g -C " + P + " $v --hard",
+        True,
+    )
+    expect(
+        "r3 double-indir $g $v in symlink START cwd",
+        LINK,
+        "g=git; v=reset; $g $v --hard",
+        True,
+    )
+    expect(
+        "r3 double-indir $g $v after cd symlink-primary",
+        WT,
+        f"cd {LINK} && g=git; v=reset; $g $v --hard",
+        True,
+    )
+    # codex r3 review finding: the redirect flag + verb live INSIDE the unresolved
+    # `$v` token, from a CONTAINED cwd with no literal redirect flag in the stream
+    # — the cwd-gated (a)/(b) reading allowed it; the unconditional rule denies it.
+    expect(
+        "r3 double-indir embedded -C in $v, contained cwd (codex)",
+        WT,
+        f'g=git; v="-C {P} reset"; $g $v --hard',
+        True,
+    )
+    # the equivalent plain `$g $v` from a CONTAINED cwd is also unprovable-safe
+    # (statically identical to the embedded-redirect form) → DENY.
+    expect(
+        "r3 double-indir $g $v contained cwd (unprovable)",
+        WT,
+        "g=git; v=reset; $g $v --hard",
+        True,
+    )
+    # command-sub leader the `(){}` neutralization shreds, with a VISIBLE redirect
+    # flag + an unresolved `$v` verb — reading-3 fallback now treats the unresolved
+    # token as a destructive-verb candidate (the redirect flag gates it).
+    expect(
+        "r3 double-indir $(command -v git) -C primary $v",
+        WT,
+        f"v=reset; $(command -v git) -C {P} $v --hard",
+        True,
+    )
     # shared-repo verbs (denied unconditionally in confined context)
     expect("shared branch -D", WT, "git branch -D main", True)
     expect("shared branch -d", WT, "git branch -d feature/x", True)
@@ -268,6 +322,23 @@ def main() -> int:
         "r2 allow helper echoes git string",
         WT,
         'note(){ echo "$@"; }; note "git reset done"',
+        False,
+    )
+    # r3 over-block-0: the unresolved-verb DENY must NOT fire on a RESOLVED
+    # would-be-verb (`run` is a literal, not `$v`) nor on a literal-leader command
+    # (`make` is not indirection) — even when a git stage is present in the line.
+    expect("r3 allow $TOOL run checkout (resolved verb)", WT, "$TOOL run checkout", False)
+    expect("r3 allow make reset (literal leader)", WT, "make reset", False)
+    expect(
+        "r3 allow status && $TOOL run checkout",
+        WT,
+        "git status && $TOOL run checkout",
+        False,
+    )
+    expect(
+        "r3 allow status && make reset (literal leader, git present)",
+        WT,
+        "git status && make reset",
         False,
     )
 

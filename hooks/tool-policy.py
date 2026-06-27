@@ -7956,6 +7956,14 @@ def _admin_sqlite3_task_db_audit(text: str, agent: str) -> str | None:
 #     defined in the same command and then invoked. Such a leader hides the verb
 #     from per-stage classification, so a destructive arg shape there cannot be
 #     proven safe and is DENIED; a literal `/usr/bin/git` path leader stays safe.
+#     DOUBLE indirection (r3 / #19317): when the would-be-verb is ALSO indirected
+#     (`g=git; v=reset; $g -C <primary> $v --hard`, or `v="-C <primary> reset"`
+#     hiding the redirect flag INSIDE the token) the unresolved verb hid the
+#     destructive shape from the literal scan, so an indirected leader carrying an
+#     unresolved would-be-verb is DENIED unconditionally (it can word-split at
+#     runtime into any destructive/escape shape) — mirroring the literal `git $v`
+#     path. A RESOLVED would-be-verb (`$TOOL run checkout` — `run` is literal)
+#     stays ALLOWED (over-block-0).
 #   - SHARED-repo destructive verbs (branch -d/-D/-m, worktree remove|prune,
 #     stash drop|clear, reflog delete|expire, gc --prune) mutate the shared
 #     object/ref store regardless of cwd, so they are DENIED unconditionally in
@@ -8336,27 +8344,54 @@ def _git_verb_destructive_kind(verb: str, args: list[str]) -> str | None:
 def _foreign_stage_git_destructive_shape(real_tokens: list[str]) -> bool:
     """True iff a command-name-indirection stage (leader is a `$…` expansion or a
     defined function/alias, NOT a literal git) carries a destructive-git arg
-    shape. Two readings, fail-closed:
+    shape. Three readings, fail-closed:
 
       1. PARSE the tokens as if the leader stood in the git-leaf position
          (`_parse_git_invocation` skips global opts incl. `-C`/`--git-dir`) — a
          clean `$g -C <primary> reset` / `g -C <primary> stash pop` resolves to a
          destructive verb. This covers single-token `$var` leaders and
          function/alias-name calls (incl. verb sub-args).
-      2. FALLBACK for `$(…)` / `${…}` leaders that the `(){}` neutralization
-         shredded into a bare `$` + jumbled tokens (so the parse mis-reads the
-         verb): a git REDIRECT flag token (`-C` / `--git-dir` / …, the
-         primary-checkout escape vector) co-occurring with a standalone
-         destructive/shared verb token. Requiring the redirect flag keeps a
-         benign `$NPM run checkout` (no escape vector) ALLOWED."""
+      2. DOUBLE indirection (#19146 r3 / #19317): the would-be-verb position
+         (after stripping global flags) holds an UNRESOLVED token (`$v` / `${…}`
+         / `$(…)`), so reading 1 cannot read the verb as a literal and the
+         literal-token scan in reading 3 misses it. An unresolved would-be-verb
+         can expand at runtime to ANY destructive shape — `$v` → `reset`, or even
+         `$v` → `-C <primary> reset` with the redirect-flag escape vector hidden
+         INSIDE the token (Bash word-splits it after the static hook has run). An
+         indirected leader + an unresolved verb is therefore never provably safe
+         and is DENIED unconditionally — mirroring the literal `git $v` path,
+         which already fails closed regardless of cwd / redirect flag, and r2,
+         which denies an indirected leader carrying a literal destructive verb
+         (`$g reset`) regardless of cwd. A RESOLVED would-be-verb (`$TOOL run
+         checkout` — `run` is a literal) is NOT verb_unresolved, so it stays
+         ALLOWED (over-block-0).
+      3. FALLBACK for `$(…)` / `${…}` leaders that the `(){}` neutralization
+         shredded into a bare `$` + jumbled tokens (so reading 1 mis-reads a
+         resolved verb): a git REDIRECT flag token (`-C` / `--git-dir` / …, the
+         primary-checkout escape vector) co-occurring with a destructive verb in
+         the rest of the stream. The verb may be a LITERAL token, or itself an
+         UNRESOLVED `$v` (the #19146 r3 root cause, here behind a shredded leader
+         that reading 2's verb parse could not flag) — `$(command -v git) -C
+         <primary> $v` word-splits into a primary-checkout reset at runtime.
+         Requiring the redirect flag keeps a benign `$NPM run $sub` (no escape
+         vector) ALLOWED. Residual (#19146 follow-up): an escape vector hidden
+         ENTIRELY inside a variable value (`g="git -C <primary> reset"; $g`,
+         `eval "$cmd"`, `alias g="git -C <primary> reset"`) has no literal
+         redirect/verb token to scan and needs same-command value resolution
+         (const-tracking); these pre-existing indirection shapes stay open here."""
     if not real_tokens:
         return False
-    verb, vargs, _hg, _hr, _unres = _parse_git_invocation(real_tokens)
+    verb, vargs, _hg, _hr, verb_unresolved = _parse_git_invocation(real_tokens)
     if verb is not None and _git_verb_destructive_kind(verb, vargs) is not None:
+        return True
+    if verb_unresolved:
         return True
     rest = real_tokens[1:]
     has_redirect = any(t.split("=", 1)[0] in _GIT_REDIRECT_FLAGS for t in rest)
-    has_destructive = any(t in _BASH_DESTRUCTIVE_GIT_TOKENS for t in rest)
+    has_destructive = any(
+        t in _BASH_DESTRUCTIVE_GIT_TOKENS or _bash_token_has_unresolved_expansion(t)
+        for t in rest
+    )
     return has_redirect and has_destructive
 
 
