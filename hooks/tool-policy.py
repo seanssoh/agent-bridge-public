@@ -7949,6 +7949,13 @@ def _admin_sqlite3_task_db_audit(text: str, agent: str) -> str | None:
 #     `pushd` / `popd`) whose REALPATH (symlink-resolved) target stays inside the
 #     worktree, with no obfuscation / shell-embedding / poisoned-cwd / unbalanced
 #     quote. Function/alias redefinition or any non-cwd prelude → DENY.
+#   - COMMAND-NAME indirection (r2 / #19303): the destructive git verb is also
+#     fail-closed when its command-position leader is NOT a directly-resolvable
+#     literal `git` / path-to-git — i.e. a `$var` / `${…}` / `$(…)` / backtick
+#     expansion, or a function/alias (ANY name, generalizing the `git(){…}` case)
+#     defined in the same command and then invoked. Such a leader hides the verb
+#     from per-stage classification, so a destructive arg shape there cannot be
+#     proven safe and is DENIED; a literal `/usr/bin/git` path leader stays safe.
 #   - SHARED-repo destructive verbs (branch -d/-D/-m, worktree remove|prune,
 #     stash drop|clear, reflog delete|expire, gc --prune) mutate the shared
 #     object/ref store regardless of cwd, so they are DENIED unconditionally in
@@ -8016,6 +8023,29 @@ _BASH_DESTRUCTIVE_GIT_WORD_RE = re.compile(
     r"(?:^|[^A-Za-z0-9_-])"
     r"(reset|checkout|switch|restore|clean|stash|branch|worktree|reflog|gc)"
     r"(?:[^A-Za-z0-9_-]|$)"
+)
+# Issue #19146 r2 (#19303) — a shell function / alias DEFINITION is a non-cwd
+# prelude: a LATER stage can invoke it under a non-git name to run a hidden
+# destructive git (`g(){ git "$@"; }; g -C <primary> reset`, `alias g=git; g …`).
+# Collected NAME-INDEPENDENT so the prior `git(){…}` case generalizes to any
+# forwarding name. The POSIX-func form requires the `{` body opener so a format
+# string like `--format='%h ()'` is NOT mistaken for a definition (over-block-0).
+_BASH_POSIX_FUNC_DEF_RE = re.compile(
+    r"(?:^|[;&|\n(){}])\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)\s*\{"
+)
+_BASH_FUNCTION_KW_DEF_RE = re.compile(
+    r"(?:^|[;&|\n])\s*function\s+([A-Za-z_][A-Za-z0-9_]*)\b"
+)
+_BASH_ALIAS_DEF_RE = re.compile(
+    r"(?:^|[;&|\n])\s*alias\s+(?:-[A-Za-z]+\s+)*([A-Za-z_][A-Za-z0-9_-]*)="
+)
+# Standalone destructive/shared git verb TOKENS — the fallback signal for a
+# command-name-indirection stage whose `$(…)` / `${…}` leader the `(){}`
+# neutralization shredded so `_parse_git_invocation` mis-reads the verb. Matched
+# as EXACT tokens (not a regex-within-token) so a quoted argument like
+# `"git reset done"` is NOT mistaken for a destructive verb (over-block-0).
+_BASH_DESTRUCTIVE_GIT_TOKENS = _GIT_WORKTREE_DESTRUCTIVE | frozenset(
+    {"stash", "branch", "worktree", "reflog", "gc"}
 )
 
 
@@ -8165,7 +8195,14 @@ def _classify_bash_stage(stage: str) -> dict[str, Any]:
     if not real_tokens:
         # Only env-assignments / transparent prefixes, no command word — e.g. a
         # bare `g=reset` assignment stage. Treat as a (non-cwd) foreign prelude.
-        return {"kind": "foreign", "raw": stage, "interpreter": False}
+        return {
+            "kind": "foreign",
+            "raw": stage,
+            "interpreter": False,
+            "real_tokens": [],
+            "real_leaf": "",
+            "leader_indirection": False,
+        }
     real_leaf = real_tokens[0].rsplit("/", 1)[-1]
     if real_leaf == "git":
         return {
@@ -8185,6 +8222,11 @@ def _classify_bash_stage(stage: str) -> dict[str, Any]:
         "kind": "foreign",
         "raw": stage,
         "interpreter": real_leaf in _BASH_GIT_INTERPRETER_LEAVES,
+        # Command-position indirection — the leader is a `$var` / `${…}` / `$(…)`
+        # / backtick expansion that could resolve to git at runtime (#19146 r2).
+        "leader_indirection": "$" in real_tokens[0] or "`" in real_tokens[0],
+        "real_tokens": real_tokens,
+        "real_leaf": real_leaf,
     }
 
 
@@ -8291,6 +8333,33 @@ def _git_verb_destructive_kind(verb: str, args: list[str]) -> str | None:
     return None
 
 
+def _foreign_stage_git_destructive_shape(real_tokens: list[str]) -> bool:
+    """True iff a command-name-indirection stage (leader is a `$…` expansion or a
+    defined function/alias, NOT a literal git) carries a destructive-git arg
+    shape. Two readings, fail-closed:
+
+      1. PARSE the tokens as if the leader stood in the git-leaf position
+         (`_parse_git_invocation` skips global opts incl. `-C`/`--git-dir`) — a
+         clean `$g -C <primary> reset` / `g -C <primary> stash pop` resolves to a
+         destructive verb. This covers single-token `$var` leaders and
+         function/alias-name calls (incl. verb sub-args).
+      2. FALLBACK for `$(…)` / `${…}` leaders that the `(){}` neutralization
+         shredded into a bare `$` + jumbled tokens (so the parse mis-reads the
+         verb): a git REDIRECT flag token (`-C` / `--git-dir` / …, the
+         primary-checkout escape vector) co-occurring with a standalone
+         destructive/shared verb token. Requiring the redirect flag keeps a
+         benign `$NPM run checkout` (no escape vector) ALLOWED."""
+    if not real_tokens:
+        return False
+    verb, vargs, _hg, _hr, _unres = _parse_git_invocation(real_tokens)
+    if verb is not None and _git_verb_destructive_kind(verb, vargs) is not None:
+        return True
+    rest = real_tokens[1:]
+    has_redirect = any(t.split("=", 1)[0] in _GIT_REDIRECT_FLAGS for t in rest)
+    has_destructive = any(t in _BASH_DESTRUCTIVE_GIT_TOKENS for t in rest)
+    return has_redirect and has_destructive
+
+
 def _bash_git_apply_cd(
     info: dict[str, Any], cur_real: str | None, wt_real: str
 ) -> tuple[str | None, bool]:
@@ -8335,6 +8404,27 @@ def _text_mentions_destructive_git(text: str) -> bool:
     if "git" not in flat:
         return False
     return bool(_BASH_DESTRUCTIVE_GIT_WORD_RE.search(flat))
+
+
+def _bash_collect_definition_names(joined: str) -> set[str]:
+    """Names of every shell function / alias DEFINED in *joined* (the paren-
+    INTACT, line-continuation-joined command text — the guard's `(){}` neutral-
+    ization below erases the definition markers, so this must run first).
+
+    A definition is a non-cwd prelude: a later stage whose leader is one of these
+    names can invoke a hidden destructive git, so the git guard treats
+    `<defined-name> … <destructive>` like an indirected git leader and fails it
+    closed. Name-INDEPENDENT — generalizes the `git(){…}` redefinition case to
+    any forwarding name (`g(){ git "$@"; }`, `function g {…}`, `alias g=git`)."""
+    names: set[str] = set()
+    for rx in (
+        _BASH_POSIX_FUNC_DEF_RE,
+        _BASH_FUNCTION_KW_DEF_RE,
+        _BASH_ALIAS_DEF_RE,
+    ):
+        for m in rx.finditer(joined):
+            names.add(m.group(1))
+    return names
 
 
 def _emit_bash_git_guard_denied_audit(
@@ -8412,6 +8502,11 @@ def _bash_git_primary_checkout_guard_reason(
         # first (mirrors `_config_set_env_attempt_present`) or the stage splitter
         # would tear the command on the embedded newline and hide the escape.
         joined = text.replace("\\\r\n", "").replace("\\\n", "")
+        # Function / alias definitions are non-cwd preludes — collect their names
+        # from the paren-INTACT text (the neutralization below erases the `(){}`
+        # markers) so a later stage that invokes one with a destructive shape can
+        # be failed closed as command-name indirection (#19146 r2 / #19303).
+        def_names = _bash_collect_definition_names(joined)
         # Neutralize subshell / brace-group grouping metacharacters so a hidden
         # `(cd <primary> && git reset)` or `{ git -C <primary> reset; }` surfaces
         # as its own stage instead of gluing `(cd` / `{`+`git` into one shlex
@@ -8462,17 +8557,39 @@ def _bash_git_primary_checkout_guard_reason(
                 continue
             if kind == "foreign":
                 foreign_seen = True
+                raw = info["raw"]
                 # Interpreter indirection (`bash -c '… git reset …'`, `eval`,
                 # `xargs git`) hides the destructive git from stage analysis.
-                if info.get("interpreter") and _text_mentions_destructive_git(
-                    info["raw"]
-                ):
+                if info.get("interpreter") and _text_mentions_destructive_git(raw):
                     _emit_bash_git_guard_denied_audit(
                         agent,
                         text=text,
                         tool_input=tool_input,
                         worktree=wt_real,
                         sub_reason="interpreter_indirection",
+                    )
+                    return BASH_GIT_PRIMARY_CHECKOUT_DENY_REASON
+                # Command-NAME indirection: the leader is not a directly-
+                # resolvable literal `git` / path-to-git — it is a `$var` /
+                # `${…}` / `$(…)` / backtick expansion, or a function/alias name
+                # DEFINED in this command — so `_classify_bash_stage` cannot see
+                # the git verb. If such a stage carries a destructive-git arg
+                # shape it cannot be proven safe, so the `foreign` branch must NOT
+                # let it continue → fail closed. (A literal `git` / `/path/git`
+                # leader is `kind == "git"` and never reaches here, so the
+                # path-form invocation stays allowed.)
+                if (
+                    info.get("leader_indirection")
+                    or info.get("real_leaf") in def_names
+                ) and _foreign_stage_git_destructive_shape(
+                    info.get("real_tokens") or []
+                ):
+                    _emit_bash_git_guard_denied_audit(
+                        agent,
+                        text=text,
+                        tool_input=tool_input,
+                        worktree=wt_real,
+                        sub_reason="command_name_indirection",
                     )
                     return BASH_GIT_PRIMARY_CHECKOUT_DENY_REASON
                 continue

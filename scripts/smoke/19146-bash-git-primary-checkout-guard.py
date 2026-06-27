@@ -25,7 +25,9 @@
 #   symlink cwd (start + via cd), cd-primary, var/interpreter obfuscation,
 #   unbalanced quote, command-level BRIDGE_BASH_GIT_GUARD=0, every shared-repo
 #   verb (branch -D/-d/-m, worktree remove|prune, stash drop|clear, reflog
-#   delete|expire, gc --prune).
+#   delete|expire, gc --prune), and command-NAME indirection (r2 / #19303):
+#   a `$var` / `"$var"` / `$(command -v git)` / `${GIT_BIN:-git}` leader, or a
+#   function/alias (any name) defined then invoked, that hides a destructive git.
 # ALLOW (canonical-safe + over-block-0): worktree bare reset/checkout/clean,
 #   cd real-subdir && checkout, stash push / branch create / worktree list /
 #   read-only status|log|diff (incl. `-C primary log`), add/commit/push;
@@ -179,6 +181,41 @@ def main() -> int:
         f"git -c alias.x='!cd {P} && git reset --hard' x",
         True,
     )
+    # ---- DENY: command-name indirection (r2 / #19303) — the leader is not a
+    # directly-resolvable literal git, so the destructive verb was slipping the
+    # `foreign` branch. The 7 patch-dev repro cases:
+    expect("r2 $var leader (g=git)", WT, "g=git; $g -C " + P + " reset --hard", True)
+    expect('r2 "$var" quoted leader', WT, 'g=git; "$g" -C ' + P + " reset", True)
+    expect(
+        "r2 function forwards (non-git name)",
+        WT,
+        'g(){ git "$@"; }; g -C ' + P + " reset --hard",
+        True,
+    )
+    expect(
+        "r2 alias g=git (expand_aliases)",
+        WT,
+        "shopt -s expand_aliases; alias g=git; g -C " + P + " reset",
+        True,
+    )
+    expect(
+        "r2 $var leader (x=/usr/bin/git)",
+        WT,
+        "x=/usr/bin/git; $x -C " + P + " reset",
+        True,
+    )
+    expect(
+        "r2 $(command -v git) leader",
+        WT,
+        "$(command -v git) -C " + P + " reset",
+        True,
+    )
+    expect(
+        "r2 ${GIT_BIN:-git} leader",
+        WT,
+        "${GIT_BIN:-git} -C " + P + " reset",
+        True,
+    )
     # shared-repo verbs (denied unconditionally in confined context)
     expect("shared branch -D", WT, "git branch -D main", True)
     expect("shared branch -d", WT, "git branch -d feature/x", True)
@@ -223,6 +260,16 @@ def main() -> int:
     expect("non-goal reflog show", WT, "git reflog show", False)
     expect("non-goal gc (no --prune)", WT, "git gc", False)
     expect("non-git command", WT, "echo git reset is just text", False)
+    # r2 over-block-0: command-name indirection WITHOUT a git escape vector must
+    # stay ALLOWED — a `$var`-led non-git tool subcommand and a defined helper
+    # that merely echoes a git-shaped STRING are not destructive-git shapes.
+    expect("r2 allow $var non-git subcmd", WT, "git status && $TOOL run checkout", False)
+    expect(
+        "r2 allow helper echoes git string",
+        WT,
+        'note(){ echo "$@"; }; note "git reset done"',
+        False,
+    )
 
     # ---- ALLOW: operator structural exemption (cwd = primary repo root) ------
     expect("operator cd-primary reset", P, f"cd {P} && git reset --hard", False)
@@ -231,6 +278,30 @@ def main() -> int:
     expect("operator branch -D", P, "git branch -D main", False)
     expect("operator function redef", P, 'git(){ command git "$@";}; git reset', False)
     expect("operator gc --prune", P, "git gc --prune=now", False)
+    # r2 command-name-indirection symmetry — every DENY case above is ALLOW for
+    # the operator (cwd = primary root → structural exemption, over-block-0).
+    expect("operator r2 $var leader", P, "g=git; $g -C " + P + " reset --hard", False)
+    expect("operator r2 \"$var\" leader", P, 'g=git; "$g" -C ' + P + " reset", False)
+    expect(
+        "operator r2 function forwards",
+        P,
+        'g(){ git "$@"; }; g -C ' + P + " reset --hard",
+        False,
+    )
+    expect(
+        "operator r2 alias g=git",
+        P,
+        "shopt -s expand_aliases; alias g=git; g -C " + P + " reset",
+        False,
+    )
+    expect("operator r2 $x=/usr/bin/git", P, "x=/usr/bin/git; $x -C " + P + " reset", False)
+    expect(
+        "operator r2 $(command -v git)",
+        P,
+        "$(command -v git) -C " + P + " reset",
+        False,
+    )
+    expect("operator r2 ${GIT_BIN:-git}", P, "${GIT_BIN:-git} -C " + P + " reset", False)
 
     # ---- 2nd cover: bridge --prefer new linked worktree ----------------------
     os.environ["BRIDGE_AGENT_WORKDIR_RESOLVED"] = BWT
