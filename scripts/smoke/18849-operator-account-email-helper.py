@@ -35,14 +35,21 @@ def _load_mod():
 
 
 def seed_registry(path: str, token: str, auto_rotate: bool,
-                  account_email: str = "", source: str = "") -> None:
+                  account_email: str = "", source: str = "",
+                  verified_at: str = "", subject: str = "") -> None:
     """Seed a one-token registry. An optional account_email + source models a
-    legacy/probe-sourced or pre-configured row (the smoke sets source explicitly)."""
+    legacy/probe-sourced or pre-configured row (the smoke sets source explicitly).
+    Optional verified_at/subject model the LEGACY probe-era
+    account_email_verified_at / account_subject keys (#2150 r2)."""
     row = {"id": "t1", "token": token, "enabled": True}
     if account_email:
         row["account_email"] = account_email
     if source:
         row["account_email_source"] = source
+    if verified_at:
+        row["account_email_verified_at"] = verified_at
+    if subject:
+        row["account_subject"] = subject
     reg = {
         "version": 1,
         "active_token_id": "t1",
@@ -101,6 +108,16 @@ def reg_field(path: str, field: str) -> None:
     reg = json.load(open(path, encoding="utf-8"))
     for row in reg.get("tokens", []):
         if row.get("id") == reg.get("active_token_id"):
+            print(row.get(field, ""))
+            return
+    print("")
+
+
+def pubrow_field(token_id: str, field: str) -> None:
+    """Print a field of the public `list --json` row for *token_id* (stdin)."""
+    d = json.load(sys.stdin)
+    for row in d.get("tokens", []):
+        if row.get("id") == token_id:
             print(row.get(field, ""))
             return
     print("")
@@ -165,6 +182,8 @@ def main() -> None:
             sys.argv[2], sys.argv[3], sys.argv[4] == "true",
             sys.argv[5] if len(sys.argv) > 5 else "",
             sys.argv[6] if len(sys.argv) > 6 else "",
+            sys.argv[7] if len(sys.argv) > 7 else "",
+            sys.argv[8] if len(sys.argv) > 8 else "",
         )
     elif mode == "seed-cred":
         seed_cred(sys.argv[2])
@@ -174,6 +193,8 @@ def main() -> None:
         write_fixture(sys.argv[2], sys.argv[3], sys.argv[4] if len(sys.argv) > 4 else "")
     elif mode == "reg-field":
         reg_field(sys.argv[2], sys.argv[3])
+    elif mode == "pubrow-field":
+        pubrow_field(sys.argv[2], sys.argv[3])
     elif mode == "assert-config-email":
         assert_config_email(sys.argv[2], sys.argv[3])
     elif mode == "assert-identity-patched":

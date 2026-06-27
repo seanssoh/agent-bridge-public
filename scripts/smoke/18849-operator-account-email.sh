@@ -30,6 +30,7 @@
 #   C13 global-auth-status           -> reports CONFIGURED-identity convergence (not verified-profile)
 #   C14 generated scopes             -> no longer require user:profile (gate 7)
 #   C15 ci-select routing            -> bridge-auth.py + this smoke selected
+#   C16 set over LEGACY verified row -> strips account_email_verified_at/subject
 
 set -uo pipefail
 
@@ -302,6 +303,38 @@ test_ci_select_routing() {
   smoke_assert_contains "$out_self" "$SMOKE_NAME" "C15 ci-select routes the smoke file -> itself"
 }
 
+# ── C16 ───────────────────────────────────────────────────────────────
+# A LEGACY probe-era row carries account_email_verified_at + account_subject
+# (written by an earlier code version; current code never writes them). An
+# operator `set --account-email` must STRIP that stale "verified" provenance —
+# an operator-source row must NEVER carry probe-verified metadata it does not
+# have, or the public row implies a verification that never happened (#2150 r2).
+# Discriminator: FAILS if the verified_at/subject clear is dropped from cmd_set.
+test_set_clears_legacy_verified_metadata() {
+  rm -f "$REGISTRY"
+  python3 "$HELPER" seed-registry "$REGISTRY" "$ACTIVE_TOKEN" true \
+    "legacy@example.com" "operator" "2024-01-01T00:00:00Z" "acct-subject-legacy"
+  smoke_assert_eq "2024-01-01T00:00:00Z" "$(reg account_email_verified_at)" \
+    "C16 precondition: legacy account_email_verified_at present"
+  smoke_assert_eq "acct-subject-legacy" "$(reg account_subject)" \
+    "C16 precondition: legacy account_subject present"
+  python3 "$AUTH_PY" --registry "$REGISTRY" set --id t1 --account-email "fresh@example.com" --json >/dev/null
+  smoke_assert_eq "operator" "$(reg account_email_source)" "C16 source=operator remains"
+  smoke_assert_eq "fresh@example.com" "$(reg account_email)" "C16 new operator email written"
+  # Legacy "verified" metadata must be GONE from the raw row ...
+  smoke_assert_eq "" "$(reg account_email_verified_at)" \
+    "C16 set CLEARS the legacy account_email_verified_at"
+  smoke_assert_eq "" "$(reg account_subject)" \
+    "C16 set CLEARS the legacy account_subject"
+  # ... and ABSENT from the public list --json row.
+  local listed
+  listed="$(python3 "$AUTH_PY" --registry "$REGISTRY" list --json)"
+  smoke_assert_eq "" "$(printf '%s' "$listed" | python3 "$HELPER" pubrow-field t1 account_email_verified_at)" \
+    "C16 public row exposes NO stale account_email_verified_at"
+  smoke_assert_eq "" "$(printf '%s' "$listed" | python3 "$HELPER" pubrow-field t1 account_subject)" \
+    "C16 public row exposes NO stale account_subject"
+}
+
 smoke_run "C1 add --account-email -> row records source=operator"             test_add_account_email_persists
 smoke_run "C2 add without --account-email -> no source"                       test_add_without_email_no_source
 smoke_run "C3 set --account-email -> source=operator"                         test_set_account_email
@@ -317,5 +350,6 @@ smoke_run "C12 optional probe mismatch -> warn-only, no overwrite"           tes
 smoke_run "C13 global-auth-status reports configured convergence"            test_status_reports_configured_convergence
 smoke_run "C14 generated scopes no longer require user:profile"             test_scopes_drop_user_profile
 smoke_run "C15 ci-select routing -> bridge-auth.py + smoke selected"         test_ci_select_routing
+smoke_run "C16 set strips legacy probe-era verified metadata"                test_set_clears_legacy_verified_metadata
 
 smoke_log "all checks passed"

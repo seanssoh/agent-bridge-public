@@ -1623,8 +1623,15 @@ def cmd_set(args: argparse.Namespace) -> int:
             row["account_email_set_at"] = timestamp
             row["updated_at"] = timestamp
             # An operator (re)configuration invalidates any prior verify-probe
-            # diagnostic (it was cross-checked against the OLD value).
+            # diagnostic (it was cross-checked against the OLD value). This
+            # includes the LEGACY probe-era ``account_email_verified_at`` /
+            # ``account_subject`` keys: an operator-source row must NEVER carry
+            # "verified" metadata, or a freshly configured email inherits a
+            # stale verification it does not have. All "verified" metadata is
+            # reserved for the optional-probe path only.
             for stale in (
+                "account_email_verified_at",
+                "account_subject",
                 "account_email_probe_status",
                 "account_email_probe_reason",
                 "account_email_probe_observed",
