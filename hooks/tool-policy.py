@@ -7927,6 +7927,778 @@ def _admin_sqlite3_task_db_audit(text: str, agent: str) -> str | None:
     return str(resolved_task_db)
 
 
+# ---------------------------------------------------------------------------
+# Issue #19146 — PreToolUse Bash guard: block destructive git mutations in the
+# operator's PRIMARY CHECKOUT from a dispatched-fixer (worktree-confined)
+# session. This is the Bash/git counterpart of the Edit/Write #341 gate.
+#
+# Model (plan-ok #19224, 8-round adversarial convergence):
+#   - CONTEXT detection is cwd-derived, NOT env (a native sub-agent inherits the
+#     operator's env). The guard only fires when the hook's effective cwd is
+#     inside a `.claude/worktrees/<name>` tree (a confined fixer). An operator
+#     session — cwd at the repo root, never under `.claude/worktrees/<name>` —
+#     is therefore STRUCTURALLY exempt. A bridge `--prefer new` worker whose
+#     resolved workdir is a git LINKED worktree (its `.git` is a file, never the
+#     operator's primary checkout whose `.git` is a directory) is a 2nd cover.
+#   - ALLOWLIST model (NOT denylist): once a destructive git verb is detected in
+#     a confined context it is ALLOWED only when the command is the canonical
+#     SAFE SHAPE, else fail-closed DENY. Safe shape = a bare `git <verb>` leader
+#     (no env-wrapper, no `VAR=` env-assignment prefix, no `-C` / `--git-dir` /
+#     `--work-tree` / `--git-common-dir` / `--chdir` redirect flag, no other
+#     global option before the verb), preceded only by cwd-preludes (`cd` /
+#     `pushd` / `popd`) whose REALPATH (symlink-resolved) target stays inside the
+#     worktree, with no obfuscation / shell-embedding / poisoned-cwd / unbalanced
+#     quote. Function/alias redefinition or any non-cwd prelude → DENY.
+#   - COMMAND-NAME indirection (r2 / #19303): the destructive git verb is also
+#     fail-closed when its command-position leader is NOT a directly-resolvable
+#     literal `git` / path-to-git — i.e. a `$var` / `${…}` / `$(…)` / backtick
+#     expansion, or a function/alias (ANY name, generalizing the `git(){…}` case)
+#     defined in the same command and then invoked. Such a leader hides the verb
+#     from per-stage classification, so a destructive arg shape there cannot be
+#     proven safe and is DENIED; a literal `/usr/bin/git` path leader stays safe.
+#     DOUBLE indirection (r3 / #19317): when the would-be-verb is ALSO indirected
+#     (`g=git; v=reset; $g -C <primary> $v --hard`, or `v="-C <primary> reset"`
+#     hiding the redirect flag INSIDE the token) the unresolved verb hid the
+#     destructive shape from the literal scan, so an indirected leader carrying an
+#     unresolved would-be-verb is DENIED unconditionally (it can word-split at
+#     runtime into any destructive/escape shape) — mirroring the literal `git $v`
+#     path. A RESOLVED would-be-verb (`$TOOL run checkout` — `run` is literal)
+#     stays ALLOWED (over-block-0).
+#   - SHARED-repo destructive verbs (branch -d/-D/-m, worktree remove|prune,
+#     stash drop|clear, reflog delete|expire, gc --prune) mutate the shared
+#     object/ref store regardless of cwd, so they are DENIED unconditionally in
+#     a confined context (no safe shape).
+#   - subprocess-0: `os.path.realpath` is an lstat-based libc call, not a git
+#     subprocess — the 3s hook budget is preserved.
+#   - FAIL-OPEN limit: a hook crash/timeout cannot block, so this is
+#     defense-in-depth, not a sandbox; the AGENTS.md / CLAUDE.md advisory rule
+#     stays as the parallel layer. Any unexpected error here fails OPEN.
+#   - Escape hatch `BRIDGE_BASH_GIT_GUARD=0` is PROCESS-level env only; a
+#     command-level `BRIDGE_BASH_GIT_GUARD=0 git reset` is a `VAR=` env-assign
+#     prefix that does NOT disable the guard (and is itself denied).
+#
+# Reuses the config-guard machinery for parity: `_split_command_stages`
+# (quote-aware, fail-closed on unbalanced), `_expand_env_split_string` (`env -S`
+# dissolve), `_skip_transparent_command_prefixes` (env/command/exec/nice/…
+# strip), `_LEADING_ENV_ASSIGN_RE`, `_SAFE_REDIRECT_RE`, `_SHELL_QUOTE_ESCAPE_RE`.
+BASH_GIT_PRIMARY_CHECKOUT_DENY_REASON = (
+    "destructive git in the operator's primary checkout is blocked from a "
+    "dispatched-fixer (worktree-confined) session — run destructive git only "
+    "inside your own assigned worktree as a bare `git <verb>` with no `-C` / "
+    "`--git-dir` / env-wrapper / `VAR=` prefix and no `cd` outside the worktree. "
+    "Operator sessions (cwd at the repo root, not under .claude/worktrees) are "
+    "exempt. (issue #19146)"
+)
+
+# git global options that REDIRECT where git operates — any of these before the
+# verb is an escape vector (`git -C <primary> reset`, `git --git-dir=… reset`).
+_GIT_REDIRECT_FLAGS = frozenset(
+    {"-C", "--git-dir", "--work-tree", "--git-common-dir", "--chdir"}
+)
+# git global options that consume the NEXT token as their value (so the value is
+# not mistaken for the verb). `=`-attached forms carry their value in-token.
+_GIT_GLOBAL_ARG_OPTS = frozenset(
+    {
+        "-C",
+        "--git-dir",
+        "--work-tree",
+        "--git-common-dir",
+        "--chdir",
+        "-c",
+        "--namespace",
+        "--super-prefix",
+        "--config-env",
+    }
+)
+# Working-tree destructive verbs — safe ONLY in the canonical shape (bare git,
+# contained cwd); they mutate the current worktree's files / HEAD.
+_GIT_WORKTREE_DESTRUCTIVE = frozenset(
+    {"reset", "checkout", "switch", "restore", "clean"}
+)
+# branch destructive flags (delete / move). Plain `git branch` (list/create) is
+# a NON-goal and never blocked.
+_GIT_BRANCH_DESTRUCTIVE_FLAGS = frozenset(
+    {"-d", "-D", "--delete", "-m", "-M", "--move"}
+)
+# Shell interpreter leaves that can run a hidden destructive git through a
+# quoted payload (`bash -c '… git reset …'`, `eval`, `xargs git`).
+_BASH_GIT_INTERPRETER_LEAVES = frozenset(
+    {"bash", "sh", "zsh", "ksh", "mksh", "dash", "ash", "fish", "eval", "xargs"}
+)
+# High-signal destructive verb words used by the interpreter-indirection /
+# obfuscation fail-closed check.
+_BASH_DESTRUCTIVE_GIT_WORD_RE = re.compile(
+    r"(?:^|[^A-Za-z0-9_-])"
+    r"(reset|checkout|switch|restore|clean|stash|branch|worktree|reflog|gc)"
+    r"(?:[^A-Za-z0-9_-]|$)"
+)
+# Issue #19146 r2 (#19303) — a shell function / alias DEFINITION is a non-cwd
+# prelude: a LATER stage can invoke it under a non-git name to run a hidden
+# destructive git (`g(){ git "$@"; }; g -C <primary> reset`, `alias g=git; g …`).
+# Collected NAME-INDEPENDENT so the prior `git(){…}` case generalizes to any
+# forwarding name. The POSIX-func form requires the `{` body opener so a format
+# string like `--format='%h ()'` is NOT mistaken for a definition (over-block-0).
+_BASH_POSIX_FUNC_DEF_RE = re.compile(
+    r"(?:^|[;&|\n(){}])\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)\s*\{"
+)
+_BASH_FUNCTION_KW_DEF_RE = re.compile(
+    r"(?:^|[;&|\n])\s*function\s+([A-Za-z_][A-Za-z0-9_]*)\b"
+)
+_BASH_ALIAS_DEF_RE = re.compile(
+    r"(?:^|[;&|\n])\s*alias\s+(?:-[A-Za-z]+\s+)*([A-Za-z_][A-Za-z0-9_-]*)="
+)
+# Standalone destructive/shared git verb TOKENS — the fallback signal for a
+# command-name-indirection stage whose `$(…)` / `${…}` leader the `(){}`
+# neutralization shredded so `_parse_git_invocation` mis-reads the verb. Matched
+# as EXACT tokens (not a regex-within-token) so a quoted argument like
+# `"git reset done"` is NOT mistaken for a destructive verb (over-block-0).
+_BASH_DESTRUCTIVE_GIT_TOKENS = _GIT_WORKTREE_DESTRUCTIVE | frozenset(
+    {"stash", "branch", "worktree", "reflog", "gc"}
+)
+
+
+def _bash_token_has_unresolved_expansion(tok: str) -> bool:
+    """True iff *tok* carries an unresolved shell expansion / glob the static
+    hook cannot resolve to a literal (``$``, backtick, or a glob metachar).
+
+    Used in the git VERB position and on `cd` targets: a `$var` there could
+    expand at runtime to `-C <primary> reset` or to a path outside the
+    worktree, so an unresolved token is fail-closed (cannot prove safe)."""
+    if not tok:
+        return False
+    if "$" in tok or "`" in tok:
+        return True
+    return any(c in tok for c in "*?[")
+
+
+def _bash_realpath_contained(path_real: str | None, root_real: str | None) -> bool:
+    """True iff *path_real* is *root_real* or a descendant of it. Both inputs
+    are expected to be already `os.path.realpath`-normalized."""
+    if not path_real or not root_real:
+        return False
+    if path_real == root_real:
+        return True
+    return path_real.startswith(root_real + os.sep)
+
+
+def _worktree_root_of(path: str | None) -> str | None:
+    """Return the `.claude/worktrees/<name>` confining worktree root that
+    contains *path*, by LEXICAL ancestor inspection (abspath, NOT realpath, so
+    the structural exemption is decided on the path string the session reports),
+    or None when *path* has no such ancestor.
+
+    Realpath is deliberately NOT used here: a poisoned symlink under the
+    worktree must still be DETECTED as confined so the realpath containment
+    check downstream can fail it closed — resolving here could erase the
+    `.claude/worktrees` marker and silently exempt a poisoned cwd."""
+    if not path:
+        return None
+    try:
+        p = os.path.abspath(os.path.expanduser(str(path)))
+    except (ValueError, OSError):
+        return None
+    parts = p.split(os.sep)
+    # Walk from the deepest segment so the INNERMOST worktree wins (nested
+    # `.claude/worktrees` would be pathological, but innermost is the tightest
+    # containment boundary).
+    for i in range(len(parts) - 1, 0, -1):
+        if parts[i] == "worktrees" and parts[i - 1] == ".claude":
+            if i + 1 < len(parts) and parts[i + 1]:
+                return os.sep.join(parts[: i + 2])
+    return None
+
+
+def _bash_linked_worktree_dir(workdir: str | None) -> str | None:
+    """Return *workdir* iff it is a git LINKED worktree (its `.git` is a FILE,
+    the gitdir pointer) — structurally NEVER the operator's primary checkout
+    (whose `.git` is a directory). The 2nd confinement cover for bridge
+    `--prefer new` workers whose workdir is not under `.claude/worktrees`."""
+    if not workdir:
+        return None
+    try:
+        wd = os.path.abspath(os.path.expanduser(str(workdir)))
+    except (ValueError, OSError):
+        return None
+    try:
+        if os.path.isdir(wd) and os.path.isfile(os.path.join(wd, ".git")):
+            return wd
+    except OSError:
+        return None
+    return None
+
+
+def _session_confined_worktree(payload: dict[str, Any]) -> str | None:
+    """Return the confining worktree root if the hook's effective context is a
+    dispatched-fixer (worktree-confined) session, else None.
+
+    cwd-derived (the structural exemption): the operator session's cwd is the
+    repo root, never under `.claude/worktrees/<name>`, so it returns None and is
+    never guarded. Both the payload-reported `cwd` and the hook's `os.getcwd()`
+    are inspected; either under a worktree confines the session. Falls back to
+    the bridge `--prefer new` linked-worktree workdir cover."""
+    candidates: list[str] = []
+    pc = str(payload.get("cwd") or "").strip()
+    if pc:
+        candidates.append(pc)
+    try:
+        candidates.append(os.getcwd())
+    except OSError:
+        pass
+    for c in candidates:
+        wt = _worktree_root_of(c)
+        if wt:
+            return wt
+    # 2nd cover: bridge --prefer new worker workdir that is a linked worktree.
+    wd = os.environ.get("BRIDGE_AGENT_WORKDIR_RESOLVED") or os.environ.get(  # noqa: iso-helper-boundary — feature env read, not an isolated runtime artifact
+        "BRIDGE_AGENT_WORKDIR"
+    )
+    return _bash_linked_worktree_dir(wd)
+
+
+def _bash_confined_start_cwd_real(payload: dict[str, Any]) -> str | None:
+    """Realpath of the hook's effective starting cwd (payload `cwd`, else
+    `os.getcwd()`). Used as the symlink-resolved containment anchor."""
+    raw = str(payload.get("cwd") or "").strip()
+    if not raw:
+        try:
+            raw = os.getcwd()
+        except OSError:
+            return None
+    try:
+        return os.path.realpath(raw)
+    except OSError:
+        return None
+
+
+def _classify_bash_stage(stage: str) -> dict[str, Any]:
+    """Classify a single shell stage for the git guard.
+
+    Returns a dict with ``kind`` one of:
+      - ``"git"``     — leader (after transparent-prefix strip) is git.
+                        Carries ``real_tokens`` and ``bare_leader`` (raw
+                        token[0] leaf == git, i.e. no wrapper / env-assign).
+      - ``"cwd"``     — `cd` / `pushd` / `popd` prelude (carries ``leaf``/``args``).
+      - ``"foreign"`` — any other command, a bare `VAR=value` assignment stage,
+                        or a shell interpreter (``interpreter`` flag set).
+      - ``"unparseable"`` — shlex failure (fail-closed at the caller).
+      - ``"empty"``   — no tokens."""
+    scan = _SAFE_REDIRECT_RE.sub(" ", stage)
+    try:
+        toks = shlex.split(scan, posix=True, comments=False)
+    except ValueError:
+        return {"kind": "unparseable", "raw": stage}
+    # Dissolve `env -S` to a FIXPOINT — a single pass leaves a NESTED
+    # `env -S 'env -S "GIT_DIR=x git" reset'` packing intact, hiding the git
+    # leader behind a second `-S` payload. Bounded to avoid a pathological loop.
+    for _ in range(6):
+        expanded = _expand_env_split_string(toks)
+        if expanded == toks:
+            break
+        toks = expanded
+    if not toks:
+        return {"kind": "empty"}
+    raw_leaf = toks[0].rsplit("/", 1)[-1]
+    idx = _skip_transparent_command_prefixes(toks)
+    real_tokens = toks[idx:]
+    if not real_tokens:
+        # Only env-assignments / transparent prefixes, no command word — e.g. a
+        # bare `g=reset` assignment stage. Treat as a (non-cwd) foreign prelude.
+        return {
+            "kind": "foreign",
+            "raw": stage,
+            "interpreter": False,
+            "real_tokens": [],
+            "real_leaf": "",
+            "leader_indirection": False,
+        }
+    real_leaf = real_tokens[0].rsplit("/", 1)[-1]
+    if real_leaf == "git":
+        return {
+            "kind": "git",
+            "real_tokens": real_tokens,
+            "bare_leader": raw_leaf == "git",
+            "raw": stage,
+        }
+    if real_leaf in {"cd", "pushd", "popd"}:
+        return {
+            "kind": "cwd",
+            "leaf": real_leaf,
+            "args": real_tokens[1:],
+            "raw": stage,
+        }
+    return {
+        "kind": "foreign",
+        "raw": stage,
+        "interpreter": real_leaf in _BASH_GIT_INTERPRETER_LEAVES,
+        # Command-position indirection — the leader is a `$var` / `${…}` / `$(…)`
+        # / backtick expansion that could resolve to git at runtime (#19146 r2).
+        "leader_indirection": "$" in real_tokens[0] or "`" in real_tokens[0],
+        "real_tokens": real_tokens,
+        "real_leaf": real_leaf,
+    }
+
+
+def _parse_git_invocation(
+    real_tokens: list[str],
+) -> tuple[str | None, list[str], bool, bool, bool]:
+    """Parse a git stage (``real_tokens[0]`` is the git leaf). Returns
+    ``(verb, verb_args, has_global_opt, has_redirect_flag, verb_unresolved)``.
+
+    Skips leading global options (consuming a value token for the arg-taking
+    ones) to find the verb. ``verb_unresolved`` is True when the verb position
+    holds an unresolved expansion (`$var` / glob) the hook cannot resolve."""
+    i = 1
+    n = len(real_tokens)
+    has_global = False
+    has_redirect = False
+    while i < n:
+        tok = real_tokens[i]
+        if tok.startswith("-") and tok != "-":
+            has_global = True
+            base = tok.split("=", 1)[0]
+            if base in _GIT_REDIRECT_FLAGS:
+                has_redirect = True
+            if "=" not in tok and base in _GIT_GLOBAL_ARG_OPTS:
+                i += 2
+            else:
+                i += 1
+            continue
+        if _bash_token_has_unresolved_expansion(tok):
+            return None, [], has_global, has_redirect, True
+        return tok, real_tokens[i + 1 :], has_global, has_redirect, False
+    return None, [], has_global, has_redirect, False
+
+
+def _git_stage_has_alias_injection(real_tokens: list[str]) -> bool:
+    """True iff a git stage carries an inline `-c`/`--config-env` config value
+    with a `!` (git's shell-alias escape) — e.g.
+    ``git -c alias.x='!cd <primary> && git reset' x``. The custom verb `x` is
+    not in the destructive set, so without this the alias shell-escape would be
+    ALLOWED; fail-closed DENY any inline config-alias shell injection."""
+    i = 1
+    n = len(real_tokens)
+    while i < n:
+        tok = real_tokens[i]
+        if not tok.startswith("-"):
+            break  # reached the verb; no more global options
+        base = tok.split("=", 1)[0]
+        if base in {"-c", "--config-env"}:
+            if "=" in tok:
+                value = tok.split("=", 1)[1]
+            elif i + 1 < n:
+                value = real_tokens[i + 1]
+                i += 1
+            else:
+                value = ""
+            if "!" in value:
+                return True
+        i += 1
+    return False
+
+
+def _git_verb_destructive_kind(verb: str, args: list[str]) -> str | None:
+    """Return ``"worktree"`` / ``"shared"`` / None for a literal git *verb*.
+
+    Working-tree verbs mutate the current worktree (safe in canonical shape);
+    shared-repo verbs mutate the shared object/ref store (denied unconditionally
+    in a confined context). NON-goals (status/log/diff/add/commit/push/…,
+    `branch` list/create, `worktree list|add`, `stash push`) return None."""
+
+    def _first_subcommand() -> str | None:
+        for a in args:
+            if a.startswith("-"):
+                continue
+            return a
+        return None
+
+    if verb in _GIT_WORKTREE_DESTRUCTIVE:
+        return "worktree"
+    if verb == "stash":
+        sub = _first_subcommand()
+        if sub in {"pop", "apply"}:
+            return "worktree"
+        if sub in {"drop", "clear"}:
+            return "shared"
+        return None  # bare `stash` / `stash push` / list / show — NON-goal
+    if verb == "branch":
+        if any(a in _GIT_BRANCH_DESTRUCTIVE_FLAGS for a in args):
+            return "shared"
+        return None  # list / create — NON-goal
+    if verb == "worktree":
+        sub = _first_subcommand()
+        if sub in {"remove", "prune"}:
+            return "shared"
+        return None  # list / add — NON-goal
+    if verb == "reflog":
+        sub = _first_subcommand()
+        if sub in {"delete", "expire"}:
+            return "shared"
+        return None
+    if verb == "gc":
+        if any(a.split("=", 1)[0] == "--prune" for a in args):
+            return "shared"
+        return None
+    return None
+
+
+def _foreign_stage_git_destructive_shape(real_tokens: list[str]) -> bool:
+    """True iff a command-name-indirection stage (leader is a `$…` expansion or a
+    defined function/alias, NOT a literal git) carries a destructive-git arg
+    shape. Three readings, fail-closed:
+
+      1. PARSE the tokens as if the leader stood in the git-leaf position
+         (`_parse_git_invocation` skips global opts incl. `-C`/`--git-dir`) — a
+         clean `$g -C <primary> reset` / `g -C <primary> stash pop` resolves to a
+         destructive verb. This covers single-token `$var` leaders and
+         function/alias-name calls (incl. verb sub-args).
+      2. DOUBLE indirection (#19146 r3 / #19317): the would-be-verb position
+         (after stripping global flags) holds an UNRESOLVED token (`$v` / `${…}`
+         / `$(…)`), so reading 1 cannot read the verb as a literal and the
+         literal-token scan in reading 3 misses it. An unresolved would-be-verb
+         can expand at runtime to ANY destructive shape — `$v` → `reset`, or even
+         `$v` → `-C <primary> reset` with the redirect-flag escape vector hidden
+         INSIDE the token (Bash word-splits it after the static hook has run). An
+         indirected leader + an unresolved verb is therefore never provably safe
+         and is DENIED unconditionally — mirroring the literal `git $v` path,
+         which already fails closed regardless of cwd / redirect flag, and r2,
+         which denies an indirected leader carrying a literal destructive verb
+         (`$g reset`) regardless of cwd. A RESOLVED would-be-verb (`$TOOL run
+         checkout` — `run` is a literal) is NOT verb_unresolved, so it stays
+         ALLOWED (over-block-0).
+      3. FALLBACK for `$(…)` / `${…}` leaders that the `(){}` neutralization
+         shredded into a bare `$` + jumbled tokens (so reading 1 mis-reads a
+         resolved verb): a git REDIRECT flag token (`-C` / `--git-dir` / …, the
+         primary-checkout escape vector) co-occurring with a destructive verb in
+         the rest of the stream. The verb may be a LITERAL token, or itself an
+         UNRESOLVED `$v` (the #19146 r3 root cause, here behind a shredded leader
+         that reading 2's verb parse could not flag) — `$(command -v git) -C
+         <primary> $v` word-splits into a primary-checkout reset at runtime.
+         Requiring the redirect flag keeps a benign `$NPM run $sub` (no escape
+         vector) ALLOWED. Residual (#19146 follow-up, tracked as #2159): an
+         escape vector hidden ENTIRELY inside a variable value
+         (`g="git -C <primary> reset"; $g`, `eval "$cmd"`,
+         `alias g="git -C <primary> reset"`) has no literal redirect/verb token
+         to scan and needs same-command value resolution (const-tracking); these
+         pre-existing indirection shapes stay open here and are NOT closed by
+         this LTS backport — see #2159."""
+    if not real_tokens:
+        return False
+    verb, vargs, _hg, _hr, verb_unresolved = _parse_git_invocation(real_tokens)
+    if verb is not None and _git_verb_destructive_kind(verb, vargs) is not None:
+        return True
+    if verb_unresolved:
+        return True
+    rest = real_tokens[1:]
+    has_redirect = any(t.split("=", 1)[0] in _GIT_REDIRECT_FLAGS for t in rest)
+    has_destructive = any(
+        t in _BASH_DESTRUCTIVE_GIT_TOKENS or _bash_token_has_unresolved_expansion(t)
+        for t in rest
+    )
+    return has_redirect and has_destructive
+
+
+def _bash_git_apply_cd(
+    info: dict[str, Any], cur_real: str | None, wt_real: str
+) -> tuple[str | None, bool]:
+    """Apply a `cd` / `pushd` / `popd` prelude to the effective cwd. Returns
+    ``(new_cwd_real, contained)``. Fail-closed (``(None, False)``) for `popd`,
+    `cd`/`cd -` (→ $HOME / OLDPWD), unresolved targets, and dangling paths —
+    the symlink-resolved REALPATH is what decides worktree containment."""
+    leaf = info.get("leaf")
+    args = info.get("args") or []
+    if leaf == "popd":
+        return None, False
+    target: str | None = None
+    for a in args:
+        if a == "-":
+            target = "-"
+            break
+        if a.startswith("-"):
+            continue  # `cd -P` / `cd -L` flags
+        target = a
+        break
+    if not target or target == "-":
+        return None, False
+    if _bash_token_has_unresolved_expansion(target):
+        return None, False
+    if os.path.isabs(target):
+        cand = target
+    elif cur_real:
+        cand = os.path.join(cur_real, target)
+    else:
+        return None, False
+    try:
+        rp = os.path.realpath(cand)
+    except OSError:
+        return None, False
+    return rp, _bash_realpath_contained(rp, wt_real)
+
+
+def _text_mentions_destructive_git(text: str) -> bool:
+    """True iff *text* (quote/escape-stripped) names git AND a destructive verb
+    word — the fail-closed signal for interpreter-indirection / obfuscation."""
+    flat = _SHELL_QUOTE_ESCAPE_RE.sub("", text)
+    if "git" not in flat:
+        return False
+    return bool(_BASH_DESTRUCTIVE_GIT_WORD_RE.search(flat))
+
+
+def _bash_collect_definition_names(joined: str) -> set[str]:
+    """Names of every shell function / alias DEFINED in *joined* (the paren-
+    INTACT, line-continuation-joined command text — the guard's `(){}` neutral-
+    ization below erases the definition markers, so this must run first).
+
+    A definition is a non-cwd prelude: a later stage whose leader is one of these
+    names can invoke a hidden destructive git, so the git guard treats
+    `<defined-name> … <destructive>` like an indirected git leader and fails it
+    closed. Name-INDEPENDENT — generalizes the `git(){…}` redefinition case to
+    any forwarding name (`g(){ git "$@"; }`, `function g {…}`, `alias g=git`)."""
+    names: set[str] = set()
+    for rx in (
+        _BASH_POSIX_FUNC_DEF_RE,
+        _BASH_FUNCTION_KW_DEF_RE,
+        _BASH_ALIAS_DEF_RE,
+    ):
+        for m in rx.finditer(joined):
+            names.add(m.group(1))
+    return names
+
+
+def _emit_bash_git_guard_denied_audit(
+    agent: str,
+    *,
+    text: str,
+    tool_input: dict[str, Any] | None,
+    worktree: str,
+    sub_reason: str,
+) -> None:
+    """Audit row for a denied destructive-git-in-primary-checkout attempt so an
+    operator can grep escape attempts and the smoke can pin the shape."""
+    detail: dict[str, Any] = {
+        "tool": "Bash",
+        "guard": "bash_git_primary_checkout",
+        "reason": sub_reason,
+        "confined_worktree": worktree,
+        "sample": truncate_text(text, 240),
+    }
+    if tool_input is not None:
+        detail["summary"] = tool_input_summary("Bash", tool_input)
+    write_audit(
+        "tool_policy_bash_git_primary_checkout_denied",
+        agent or "unknown",
+        detail,
+    )
+
+
+def _bash_git_primary_checkout_guard_reason(
+    text: str,
+    payload: dict[str, Any],
+    agent: str,
+    tool_input: dict[str, Any] | None = None,
+) -> str | None:
+    """Return the deny reason iff a confined (dispatched-fixer) Bash command
+    would run a destructive git mutation outside the canonical safe shape, else
+    None. See the module block above for the full contract. Fails OPEN on any
+    unexpected error (documented hook limitation; advisory rule is the parallel
+    defense-in-depth layer)."""
+    try:
+        # Escape hatch — PROCESS-level env only. A command-level
+        # `BRIDGE_BASH_GIT_GUARD=0 git reset` is a `VAR=` env-assign prefix that
+        # never reaches this process env and stays denied below.
+        if os.environ.get("BRIDGE_BASH_GIT_GUARD", "").strip().lower() in {  # noqa: iso-helper-boundary — feature toggle env read, not an isolated runtime artifact
+            "0",
+            "false",
+            "no",
+            "off",
+        }:
+            return None
+        if not text or not text.strip():
+            return None
+        # Cheap prefilter (quote/escape-aware so `g""it` / `\g\i\t` still hit).
+        if "git" not in _SHELL_QUOTE_ESCAPE_RE.sub("", text):
+            return None
+        # CONTEXT — only a confined fixer is guarded; operator sessions exempt.
+        worktree = _session_confined_worktree(payload)
+        if worktree is None:
+            return None
+        try:
+            wt_real = os.path.realpath(worktree)
+        except OSError:
+            return None
+        # A worktree path whose realpath is a PRIMARY checkout (`.git` is a
+        # directory, not a linked-worktree file) means the worktree root itself
+        # was replaced by a symlink to the primary tree — confinement is
+        # compromised; force every working-tree destructive verb closed.
+        try:
+            worktree_compromised = os.path.isdir(os.path.join(wt_real, ".git"))
+        except OSError:
+            worktree_compromised = True
+
+        # Bash removes `\<newline>` line continuations BEFORE tokenizing, so
+        # `git -C \<NL>/primary reset` runs as `git -C /primary reset`. Join them
+        # first (mirrors `_config_set_env_attempt_present`) or the stage splitter
+        # would tear the command on the embedded newline and hide the escape.
+        joined = text.replace("\\\r\n", "").replace("\\\n", "")
+        # Function / alias definitions are non-cwd preludes — collect their names
+        # from the paren-INTACT text (the neutralization below erases the `(){}`
+        # markers) so a later stage that invokes one with a destructive shape can
+        # be failed closed as command-name indirection (#19146 r2 / #19303).
+        def_names = _bash_collect_definition_names(joined)
+        # Neutralize subshell / brace-group grouping metacharacters so a hidden
+        # `(cd <primary> && git reset)` or `{ git -C <primary> reset; }` surfaces
+        # as its own stage instead of gluing `(cd` / `{`+`git` into one shlex
+        # token (mirrors the config-guard paren neutralization, extended to
+        # braces). Coarse on purpose — it only ADDS word boundaries, so it can
+        # never merge two tokens or hide a stage (fail-closed).
+        for _ch in "(){}":
+            joined = joined.replace(_ch, " ")
+        stages, balanced = _split_command_stages(joined)
+        if not balanced:
+            # An unterminated quote masks every operator after it (could hide a
+            # `&& git -C <primary> reset`). Fail closed since git is referenced.
+            _emit_bash_git_guard_denied_audit(
+                agent,
+                text=text,
+                tool_input=tool_input,
+                worktree=wt_real,
+                sub_reason="unbalanced_quote",
+            )
+            return BASH_GIT_PRIMARY_CHECKOUT_DENY_REASON
+
+        cur_real = _bash_confined_start_cwd_real(payload)
+        contained = _bash_realpath_contained(cur_real, wt_real)
+        foreign_seen = False
+
+        for stage in stages:
+            if not stage.strip():
+                continue
+            info = _classify_bash_stage(stage)
+            kind = info["kind"]
+            if kind == "empty":
+                continue
+            if kind == "cwd":
+                cur_real, contained = _bash_git_apply_cd(info, cur_real, wt_real)
+                continue
+            if kind == "unparseable":
+                # Fail closed if an unparseable stage references destructive git.
+                if _text_mentions_destructive_git(info["raw"]):
+                    _emit_bash_git_guard_denied_audit(
+                        agent,
+                        text=text,
+                        tool_input=tool_input,
+                        worktree=wt_real,
+                        sub_reason="unparseable_git_stage",
+                    )
+                    return BASH_GIT_PRIMARY_CHECKOUT_DENY_REASON
+                foreign_seen = True
+                continue
+            if kind == "foreign":
+                foreign_seen = True
+                raw = info["raw"]
+                # Interpreter indirection (`bash -c '… git reset …'`, `eval`,
+                # `xargs git`) hides the destructive git from stage analysis.
+                if info.get("interpreter") and _text_mentions_destructive_git(raw):
+                    _emit_bash_git_guard_denied_audit(
+                        agent,
+                        text=text,
+                        tool_input=tool_input,
+                        worktree=wt_real,
+                        sub_reason="interpreter_indirection",
+                    )
+                    return BASH_GIT_PRIMARY_CHECKOUT_DENY_REASON
+                # Command-NAME indirection: the leader is not a directly-
+                # resolvable literal `git` / path-to-git — it is a `$var` /
+                # `${…}` / `$(…)` / backtick expansion, or a function/alias name
+                # DEFINED in this command — so `_classify_bash_stage` cannot see
+                # the git verb. If such a stage carries a destructive-git arg
+                # shape it cannot be proven safe, so the `foreign` branch must NOT
+                # let it continue → fail closed. (A literal `git` / `/path/git`
+                # leader is `kind == "git"` and never reaches here, so the
+                # path-form invocation stays allowed.)
+                if (
+                    info.get("leader_indirection")
+                    or info.get("real_leaf") in def_names
+                ) and _foreign_stage_git_destructive_shape(
+                    info.get("real_tokens") or []
+                ):
+                    _emit_bash_git_guard_denied_audit(
+                        agent,
+                        text=text,
+                        tool_input=tool_input,
+                        worktree=wt_real,
+                        sub_reason="command_name_indirection",
+                    )
+                    return BASH_GIT_PRIMARY_CHECKOUT_DENY_REASON
+                continue
+            if kind != "git":
+                continue
+            # A git stage.
+            if _git_stage_has_alias_injection(info["real_tokens"]):
+                # Inline `-c alias.x='!…'` shell-escape — the custom verb hides
+                # arbitrary code (incl. a primary-checkout reset). Fail closed.
+                _emit_bash_git_guard_denied_audit(
+                    agent,
+                    text=text,
+                    tool_input=tool_input,
+                    worktree=wt_real,
+                    sub_reason="config_alias_injection",
+                )
+                return BASH_GIT_PRIMARY_CHECKOUT_DENY_REASON
+            verb, args, has_global, _has_redirect, unresolved = _parse_git_invocation(
+                info["real_tokens"]
+            )
+            if unresolved:
+                # Verb position holds an unresolved expansion that could carry
+                # `-C <primary>` + a destructive verb. Fail closed.
+                _emit_bash_git_guard_denied_audit(
+                    agent,
+                    text=text,
+                    tool_input=tool_input,
+                    worktree=wt_real,
+                    sub_reason="unresolved_git_verb",
+                )
+                return BASH_GIT_PRIMARY_CHECKOUT_DENY_REASON
+            if verb is None:
+                continue  # bare `git` / options-only — harmless / erroring
+            dkind = _git_verb_destructive_kind(verb, args)
+            if dkind is None:
+                continue  # NON-goal (status / log / add / commit / push / …)
+            if dkind == "shared":
+                _emit_bash_git_guard_denied_audit(
+                    agent,
+                    text=text,
+                    tool_input=tool_input,
+                    worktree=wt_real,
+                    sub_reason=f"shared_repo_verb:{verb}",
+                )
+                return BASH_GIT_PRIMARY_CHECKOUT_DENY_REASON
+            # Working-tree destructive verb — ALLOW only in the canonical safe
+            # shape: bare git leader (no wrapper / env-assign), no global option
+            # (incl. redirect flag), no foreign prelude, and the effective cwd
+            # provably contained in the (uncompromised) worktree.
+            if (
+                not info["bare_leader"]
+                or has_global
+                or foreign_seen
+                or worktree_compromised
+                or not contained
+            ):
+                _emit_bash_git_guard_denied_audit(
+                    agent,
+                    text=text,
+                    tool_input=tool_input,
+                    worktree=wt_real,
+                    sub_reason=f"working_tree_escape:{verb}",
+                )
+                return BASH_GIT_PRIMARY_CHECKOUT_DENY_REASON
+            # Canonical safe shape, contained — ALLOW this stage.
+            continue
+        return None
+    except Exception:
+        # FAIL-OPEN: a hook crash must not block the tool (documented limit).
+        return None
+
+
 def protected_alias_reason(
     text: str,
     agent: str,
@@ -8938,6 +9710,17 @@ def handle_pretool(payload: dict[str, Any], agent: str) -> int:
             agent,
             tool_input=tool_input,
         )
+        # Issue #19146 — block destructive git mutations in the operator's
+        # primary checkout from a dispatched-fixer (worktree-confined) session.
+        # Runs after the existing alias gate so the credential / protected-path
+        # denies stay first; only fires when nothing above already denied.
+        if reason is None:
+            reason = _bash_git_primary_checkout_guard_reason(
+                str(tool_input.get("command") or ""),
+                payload,
+                agent,
+                tool_input=tool_input,
+            )
     else:
         # Classify read-intent once for the whole non-Bash branch — both
         # the credential carve-out below and the protected-path gate
