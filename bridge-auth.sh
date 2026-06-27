@@ -28,6 +28,7 @@ Usage:
   bash $SCRIPT_DIR/bridge-auth.sh claude-token check <id> [--enable-on-ok] [--disable-on-quota] [--timeout <sec>] [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token classify-output [--stdout-file <path>] [--stderr-file <path>] [--returncode <n>]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token mark-quota <id> [--reset-at <iso>] [--retry-seconds <sec>] [--json]
+  bash $SCRIPT_DIR/bridge-auth.sh claude-token mark-adverse <id> --status <quota_limited|auth_failed> [--reset-at <iso>] [--fingerprint <fp>] [--api-error-status <s>] [--source <text>] [--retry-seconds <sec>] [--json]   # #19460 Fix 1: deterministic active-dead stamp (no probe) so the cascade skips a known-dead token
   bash $SCRIPT_DIR/bridge-auth.sh claude-token recover-due [--timeout <sec>] [--retry-seconds <sec>] [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token auto-rotate <enable|disable|status> [--threshold 99] [--json]
   bash $SCRIPT_DIR/bridge-auth.sh codex-cred register --source <agent> [--json]
@@ -1385,9 +1386,11 @@ case "$command" in
         done
         exec python3 "$SCRIPT_DIR/bridge-auth.py" --registry "$registry" receive "$@"
         ;;
-      list|auto-rotate|check|recover-due|classify-output|mark-quota|set)
+      list|auto-rotate|check|recover-due|classify-output|mark-quota|mark-adverse|set)
         # `set` (#18849 Part 1b-v2): operator metadata write — `--account-email`
         # is NON-SECRET, so a direct argv passthrough is safe (no sealed-tty path).
+        # `mark-adverse` (#19460 Fix 1): id + status/reset/fingerprint/source are
+        # NON-SECRET (fingerprint, not the raw token) → direct argv passthrough.
         exec python3 "$SCRIPT_DIR/bridge-auth.py" --registry "$registry" "$subcommand" "$@"
         ;;
       sync)
