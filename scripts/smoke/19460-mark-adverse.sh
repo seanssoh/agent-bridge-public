@@ -45,35 +45,25 @@ REGISTRY="$SMOKE_TMP_ROOT/registry.json"
 # whitespace/quotes). A FUTURE reset window keeps the quota block "active".
 FUTURE="2999-01-01T00:00:00+00:00"
 
+# `python3 -c` (NOT heredoc-stdin) so the footgun-#11 audit baseline stays clean.
 seed() {
-  python3 - "$REGISTRY" <<'PY'
-import json, sys
-reg = {
-    "version": 1,
-    "active_token_id": "t1",
-    "auto_rotate_enabled": True,
-    "rotation_threshold": 99.0,
-    "weekly_warn_threshold": 95.0,
-    "tokens": [
-        {"id": "t1", "token": "ZZZmarkadv-tok1-aaaaaaaaaaaa", "enabled": True},
-        {"id": "t2", "token": "ZZZmarkadv-tok2-bbbbbbbbbbbb", "enabled": True},
-        {"id": "t3", "token": "ZZZmarkadv-tok3-cccccccccccc", "enabled": True},
-    ],
-    "last_rotation": {},
-}
-json.dump(reg, open(sys.argv[1], "w"))
-PY
+  python3 -c 'import json, sys
+reg = {"version": 1, "active_token_id": "t1", "auto_rotate_enabled": True,
+       "rotation_threshold": 99.0, "weekly_warn_threshold": 95.0,
+       "tokens": [{"id": "t1", "token": "ZZZmarkadv-tok1-aaaaaaaaaaaa", "enabled": True},
+                  {"id": "t2", "token": "ZZZmarkadv-tok2-bbbbbbbbbbbb", "enabled": True},
+                  {"id": "t3", "token": "ZZZmarkadv-tok3-cccccccccccc", "enabled": True}],
+       "last_rotation": {}}
+json.dump(reg, open(sys.argv[1], "w"))' "$REGISTRY"
 }
 
 # reg_field <id> <field>  — print a token row field ('' if absent)
 reg_field() {
-  python3 - "$REGISTRY" "$1" "$2" <<'PY'
-import json, sys
+  python3 -c 'import json, sys
 reg = json.load(open(sys.argv[1]))
 row = next((t for t in reg["tokens"] if t["id"] == sys.argv[2]), {})
 v = row.get(sys.argv[3], "")
-print("true" if v is True else "false" if v is False else v)
-PY
+print("true" if v is True else "false" if v is False else v)' "$REGISTRY" "$1" "$2"
 }
 reg_active() { python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['active_token_id'])" "$REGISTRY"; }
 out_field() { python3 -c "import json,sys;print(json.load(sys.stdin).get(sys.argv[1],''))" "$1"; }
