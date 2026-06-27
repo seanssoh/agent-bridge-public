@@ -121,7 +121,15 @@ ROTATION_ADVERSE_CHECK_STATUSES = frozenset({"quota_limited", "auth_failed"})
 # day-old ``auth_failed``. Overridable via env for tests / tuning.
 ROTATION_ADVERSE_CHECK_MAX_AGE_SECONDS = 21600  # 6h
 CLAUDE_OAUTH_EXPIRES_AT_MS = 4102444800000
-CLAUDE_OAUTH_SCOPES = ["user:inference", "user:profile"]
+# Declarative scopes seeded into a FRESH credential payload (sync-agent / a
+# created operator-global file). This is the REQUESTED-scope metadata field, not
+# an actual grant — the token's real scopes are fixed at mint time. ``user:profile``
+# was only ever seeded here for the displayed-identity probe; #18849 Part 1b-v2
+# (closes #2145) sources the displayed identity from the operator-provided
+# ``account_email`` instead, so we no longer declare a scope the pool tokens do not
+# actually carry (the profile endpoint 403s on them). The usage probe's real
+# scope requirement is unaffected — it depends on the minted grant, not this field.
+CLAUDE_OAUTH_SCOPES = ["user:inference"]
 CLAUDE_CONFIG_MIGRATION_VERSION = 13
 ROOT = Path(__file__).resolve().parent
 KEYCHAIN_FREE_CONFIG_KEY = "claude_keychain_free_auth"
@@ -539,6 +547,42 @@ def validate_token(token: str) -> None:
         raise ValueError("token cannot contain control characters")
 
 
+# RFC 5321 caps a forward-path (the whole address) at 254 chars; we only need a
+# sane upper bound so an absurd value can never bloat the registry / a log line.
+ACCOUNT_EMAIL_MAX_LEN = 254
+
+
+def validate_account_email(value: str | None) -> str:
+    """Local FORMAT-only validation of an operator-provided account email.
+
+    #18849 Part 1b-v2 (closes #2145): the displayed Claude identity is sourced
+    from the operator-provided account email captured in the token registry, not
+    a ``user:profile`` probe. This is the gate for that value. It TRIMS and
+    rejects empty, control/newline chars, internal whitespace, a missing or
+    multiple ``@``, an empty local-part/domain, and an unreasonable length. It
+    NEVER touches the network and NEVER infers the address from the token id —
+    the whole point is to drop the probe dependency, not relocate the guess.
+    Returns the trimmed, validated address.
+    """
+    email = str(value or "").strip()
+    if not email:
+        raise ValueError("account email is empty")
+    if len(email) > ACCOUNT_EMAIL_MAX_LEN:
+        raise ValueError(
+            f"account email is too long (>{ACCOUNT_EMAIL_MAX_LEN} chars)"
+        )
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in email):
+        raise ValueError("account email cannot contain control characters")
+    if any(ch.isspace() for ch in email):
+        raise ValueError("account email cannot contain whitespace")
+    if email.count("@") != 1:
+        raise ValueError("account email must contain exactly one '@'")
+    local, _, domain = email.partition("@")
+    if not local or not domain:
+        raise ValueError("account email must have a non-empty local part and domain")
+    return email
+
+
 def validate_threshold(value: float) -> float:
     value = float(value)
     if value <= 0 or value > 100:
@@ -785,18 +829,26 @@ def public_token_row(row: dict[str, Any], active_id: str) -> dict[str, Any]:
         "disabled_until": row.get("disabled_until") or "",
         "next_check_at": row.get("next_check_at") or "",
         "note": row.get("note") or "",
-        # #18849 Part 1b — per-token verified account identity (non-secret).
-        # ``account_email``/``account_subject`` are the LAST values a
-        # ``user:profile`` probe VERIFIED; ``account_email_probe_status`` carries
-        # the explicit stale/unknown semantics for the displayed-identity sync;
-        # ``account_email_probe_reason`` keeps the GRANULAR last-probe outcome
-        # (verified/no_scope/no_email/probe_failed) so the doctor surface can say
-        # WHY the displayed identity never converged.
+        # #18849 Part 1b-v2 (closes #2145) — per-token account identity (non-secret).
+        # ``account_email`` is the displayed-identity source ONLY when
+        # ``account_email_source == "operator"`` (the operator provided it at
+        # add/receive/set). ``account_email_set_at`` stamps that capture. A
+        # probe-sourced or unmarked-legacy ``account_email`` is NOT trusted for the
+        # write (see ``operator_account_email``).
+        #
+        # The ``account_email_probe_*`` fields are an OPTIONAL, default-OFF
+        # verify-only DIAGNOSTIC stored SEPARATELY from the operator source: the
+        # probe never sets ``account_email`` and a mismatch only WARNs. ``status`` ∈
+        # {verified, verify_skipped, mismatch, probe_failed}; ``reason`` is the
+        # granular outcome; ``observed`` is the probe-seen email (diagnostic only).
         "account_email": row.get("account_email") or "",
+        "account_email_source": row.get("account_email_source") or "",
+        "account_email_set_at": row.get("account_email_set_at") or "",
         "account_email_verified_at": row.get("account_email_verified_at") or "",
         "account_subject": row.get("account_subject") or "",
         "account_email_probe_status": row.get("account_email_probe_status") or "",
         "account_email_probe_reason": row.get("account_email_probe_reason") or "",
+        "account_email_probe_observed": row.get("account_email_probe_observed") or "",
     }
 
 
@@ -1216,15 +1268,22 @@ def _apply_token_to_registry(
     enable_auto_rotate: bool = False,
     threshold: float | None = None,
     weekly_warn_threshold: float | None = None,
+    account_email: str = "",
 ) -> dict[str, Any]:
     """Write *token* into the locked registry under *token_id*.
 
     Shared core for ``cmd_add`` and ``cmd_receive`` (#1367). The token
     is already in process memory (read from ``--stdin``/``--token-file``
     for ``add``, or echo-off from ``/dev/tty`` for ``receive``); this
-    helper performs the locked read-modify-write only. Token validation
-    is the caller's responsibility (done OUTSIDE the lock so the
+    helper performs the locked read-modify-write only. Token + account_email
+    validation is the caller's responsibility (done OUTSIDE the lock so the
     critical section stays narrow, per PR #799 r2 codex finding 3).
+
+    ``account_email`` (#18849 Part 1b-v2) is the operator-provided, already-
+    validated displayed-identity source. Each call rebuilds the row from
+    scratch, so a ``--replace`` that does NOT carry an explicit account_email
+    DROPS any prior ``account_email`` / source / probe metadata — a replaced
+    token can never silently inherit the old identity (the stale-email gate).
 
     Returns the result payload (``status``/``id``/``active_token_id``/
     ``fingerprint``/``registry``). Raises ``ValueError`` on a duplicate
@@ -1253,6 +1312,15 @@ def _apply_token_to_registry(
             rows[rows.index(existing)] = row
         else:
             rows.append(row)
+
+        # Operator-provided displayed-identity source (non-secret), already
+        # format-validated by the caller. Stamping it onto the freshly-rebuilt
+        # row is what makes a replace WITHOUT an explicit email clear the stale
+        # identity, and a replace WITH one write the new operator identity.
+        if account_email:
+            row["account_email"] = account_email
+            row["account_email_source"] = "operator"
+            row["account_email_set_at"] = timestamp
 
         if activate or not registry.get("active_token_id"):
             registry["active_token_id"] = token_id
@@ -1284,6 +1352,11 @@ def cmd_add(args: argparse.Namespace) -> int:
     try:
         validate_token_id(args.id)
         token = read_token(args)
+        account_email = (
+            validate_account_email(args.account_email)
+            if getattr(args, "account_email", None)
+            else ""
+        )
     except Exception as exc:
         return fail(str(exc), json_mode)
 
@@ -1298,6 +1371,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             enable_auto_rotate=bool(args.enable_auto_rotate),
             threshold=args.threshold,
             weekly_warn_threshold=args.weekly_warn_threshold,
+            account_email=account_email,
         )
     except Exception as exc:
         return fail(str(exc), json_mode)
@@ -1361,6 +1435,67 @@ def cmd_activate(args: argparse.Namespace) -> int:
         json_dump(payload)
     else:
         print(f"activated: {args.id} ({payload['fingerprint']})")
+    return 0
+
+
+def cmd_set(args: argparse.Namespace) -> int:
+    """Set per-token operator metadata (#18849 Part 1b-v2, closes #2145).
+
+    Currently the operator-provided ``--account-email`` — the displayed-identity
+    source. The marker ``account_email_source="operator"`` is what makes the
+    value BINDING for the ~/.claude.json identity write. Setting it supersedes
+    any stale probe diagnostic on the row (the probe is verify-only and its
+    findings are meaningless against a freshly configured value). The address is
+    format-validated OUTSIDE the lock; the row is mutated under ``registry_lock``.
+    """
+    json_mode = bool(args.json)
+    registry_path = Path(args.registry).expanduser()
+    try:
+        validate_token_id(args.id)
+        account_email = validate_account_email(args.account_email)
+    except Exception as exc:
+        return fail(str(exc), json_mode)
+    try:
+        with registry_lock(registry_path):
+            registry = load_registry(registry_path)
+            row = find_token(registry, args.id)
+            if row is None:
+                raise ValueError(f"unknown token id: {args.id}")
+            timestamp = now_iso()
+            row["account_email"] = account_email
+            row["account_email_source"] = "operator"
+            row["account_email_set_at"] = timestamp
+            row["updated_at"] = timestamp
+            # An operator (re)configuration invalidates any prior verify-probe
+            # diagnostic (it was cross-checked against the OLD value). This
+            # includes the LEGACY probe-era ``account_email_verified_at`` /
+            # ``account_subject`` keys: an operator-source row must NEVER carry
+            # "verified" metadata, or a freshly configured email inherits a
+            # stale verification it does not have. All "verified" metadata is
+            # reserved for the optional-probe path only.
+            for stale in (
+                "account_email_verified_at",
+                "account_subject",
+                "account_email_probe_status",
+                "account_email_probe_reason",
+                "account_email_probe_observed",
+                "account_email_last_probe_at",
+            ):
+                row.pop(stale, None)
+            save_registry(registry_path, registry)
+    except Exception as exc:
+        return fail(str(exc), json_mode)
+    payload = {
+        "status": "set",
+        "id": args.id,
+        "account_email": account_email,
+        "account_email_source": "operator",
+        "registry": str(registry_path),
+    }
+    if json_mode:
+        json_dump(payload)
+    else:
+        print(f"set: {args.id} account_email={account_email} (source=operator)")
     return 0
 
 
@@ -2835,30 +2970,40 @@ def patch_global_claude_credentials(
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Identity sync (#18849 Part 1b) — sync the DISPLAYED Claude account to the
-# active token's VERIFIED account on a gated global token sync.
+# Identity sync (#18849 Part 1b-v2, closes #2145) — sync the DISPLAYED Claude
+# account to the active token's OPERATOR-CONFIGURED account on a gated global
+# token sync.
 #
 # Part 1a syncs the active TOKEN into ~/.claude/.credentials.json and only
 # DETECTS the identity shadow (oauthAccount.emailAddress in ~/.claude.json can
 # stay stale → /status / statusLine misreport the account). Part 1b closes that
 # by, after a gated credential PATCH, PATCHing ~/.claude.json's displayed email
-# to the account the active token actually belongs to.
+# to the account the active token belongs to.
 #
-# The email is NEVER trusted metadata — it is the result of a `user:profile`
-# probe against the active token (in-process urllib, token only in the
-# Authorization header, never logged / never env-exported). Edge cases are
-# fail-safe: a token without the scope, a probe that fails (network/429/timeout),
-# or a profile that carries no email all converge to NO WRITE — the last-verified
-# value is kept and marked stale/unknown, never replaced with a guess.
+# SOURCE (Part 1b-v2): the email is the OPERATOR-PROVIDED ``account_email`` from
+# the active token's registry row — captured at ``claude-token add`` / ``receive``
+# / ``set`` and BINDING only when ``account_email_source == "operator"``. The
+# original Part 1b probed a ``user:profile`` endpoint that 403s on the pool's
+# inference-purposed tokens (#2145), so identity-sync shipped permanently inert.
+# v2 drops that dependency: the operator already provides the account email when
+# they hand over a setup token, so we use it directly. Empty / absent /
+# non-operator ``account_email`` ⇒ NO WRITE (never guessed, never id-derived).
+# An OPTIONAL, default-OFF verify-only probe (``_run_identity_verify_probe``)
+# survives purely as a diagnostic — it never sources the write and never blocks.
+#
+# RACE-FIX preserved WITHOUT a probe: the write re-reads the active row under the
+# registry lock, verifies the active token fingerprint is unchanged AND the
+# source is still operator, and holds that SAME lock through the fd-pinned
+# ~/.claude.json PATCH — closing the Part 1b r2 token-replace window.
 #
 # The ~/.claude.json writer reuses the Part 1a r3 single-pinned-dir_fd discipline
 # verbatim (``claude_global_credentials_lock`` yields the validated parent fd;
 # the read + the write run dir_fd-relative on that SAME fd via
 # ``_write_text_at_dirfd`` — no second ``os.open(str(parent))``), so the
 # parent-swap-after-lock TOCTOU stays closed. It PATCHes only
-# ``oauthAccount.emailAddress`` (+ ``accountUuid`` when the subject is verified)
-# and preserves ``projects`` / ``mcpServers`` / every unknown key — ~/.claude.json
-# is large and load-bearing. Same double-gate default-OFF + the SAME
+# ``oauthAccount.emailAddress`` (the operator path supplies no subject) and
+# preserves ``projects`` / ``mcpServers`` / every unknown key — ~/.claude.json is
+# large and load-bearing. Same double-gate default-OFF + the SAME
 # ``BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC`` opt-in; fails closed as root.
 CLAUDE_PROFILE_ENDPOINT = "https://api.anthropic.com/api/oauth/profile"
 CLAUDE_OAUTH_BETA = "oauth-2025-04-20"
@@ -3073,12 +3218,11 @@ def _probe_cooldown_elapsed(row: dict[str, Any]) -> bool:
 # displayed identity never converged (e.g. a pool token that lacks
 # ``user:profile`` 403s → ``no_scope`` → identity-sync is a permanent no-op).
 _IDENTITY_PROBE_REASON_LABELS = {
-    "verified": "verified (user:profile)",
-    "no_scope": "no_scope (token lacks user:profile)",
-    "no_email": "no_email (profile carried no account email)",
-    "probe_failed": "probe_failed (network/timeout/429 — last verified kept)",
-    "token_replaced": "token_replaced (active token changed mid-probe)",
-    "row_deleted": "row_deleted (active token removed mid-probe)",
+    "verified": "verified (optional probe matched the configured email)",
+    "mismatch": "mismatch (probe email != configured — WARN only, kept configured)",
+    "no_scope": "verify_skipped (token lacks user:profile — not a blocker)",
+    "no_email": "verify_skipped (profile carried no account email)",
+    "probe_failed": "probe_failed (network/timeout/429 — diagnostic only)",
 }
 
 
@@ -3088,16 +3232,32 @@ def _identity_probe_reason_label(reason: str) -> str:
     return _IDENTITY_PROBE_REASON_LABELS.get(reason, reason)
 
 
+def operator_account_email(row: dict[str, Any] | None) -> str:
+    """The OPERATOR-CONFIGURED account email, or ``""`` (#18849 Part 1b-v2).
+
+    The ``account_email_source`` marker is BINDING: this returns ``account_email``
+    ONLY when the operator provided it (``source == "operator"``). A probe-sourced
+    or unmarked-legacy ``account_email`` is never returned, so a non-operator
+    value can never drive the displayed-identity write (#2145). Empty/absent ⇒
+    ``""`` ⇒ the caller writes nothing.
+    """
+    if not isinstance(row, dict):
+        return ""
+    if str(row.get("account_email_source") or "") != "operator":
+        return ""
+    return str(row.get("account_email") or "").strip()
+
+
 def _identity_row_token_skip_reason(
     row: dict[str, Any] | None, probed_fingerprint: str
 ) -> str:
-    """Token-replace recheck shared by the registry persist and the config write.
+    """Token-replace recheck guarding the identity persist + the config write.
 
-    The profile probe runs on ``active_token`` — snapshotted BEFORE the registry
-    lock was released in ``_global_auth_gate_state`` — so a concurrent
-    ``cmd_add --replace`` / rotation can swap the active row's token value (same
-    id) while the probe is in flight. Returns ``""`` if ``row``'s CURRENT token
-    still matches ``probed_fingerprint``, else the skip reason
+    The displayed-identity write is based on ``active_token`` — snapshotted
+    BEFORE the registry lock was released in ``_global_auth_gate_state`` — so a
+    concurrent ``cmd_add --replace`` / rotation can swap the active row's token
+    value (same id) before the write lands. Returns ``""`` if ``row``'s CURRENT
+    token still matches ``probed_fingerprint``, else the skip reason
     (``"row_deleted"`` / ``"token_replaced"``). The caller MUST hold the
     registry lock around this check so the verdict stays valid through the write
     it guards. The fingerprint compare keeps the raw token off disk / the audit
@@ -3112,60 +3272,74 @@ def _identity_row_token_skip_reason(
     return ""
 
 
-def _stamp_identity_probe_outcome(
-    row: dict[str, Any], *, status: str, reason: str, email: str = "", subject: str = ""
-) -> None:
-    """Stamp a probe outcome onto an already-locked, fingerprint-verified row.
+IDENTITY_VERIFY_PROBE_ENV = "BRIDGE_CLAUDE_IDENTITY_VERIFY_PROBE"
 
-    On ``verified`` the email / subject / verified-at are updated. On ``stale`` /
-    ``unknown`` the last-verified ``account_email`` / ``account_subject`` are KEPT
-    untouched (never cleared, never guessed) and only the probe markers + the
-    last-probe stamp (which drives the re-probe cooldown) are refreshed.
-    ``reason`` records the GRANULAR outcome (``verified`` / ``no_scope`` /
-    ``no_email`` / ``probe_failed``) into ``account_email_probe_reason`` for the
-    doctor surface — the coarse ``status`` alone cannot say WHY the displayed
-    identity never converged.
+
+def _identity_verify_probe_enabled() -> bool:
+    """True iff the OPTIONAL verify-only identity probe is opted in (default-OFF).
+
+    #18849 Part 1b-v2: the probe is no longer the identity SOURCE (the operator-
+    provided ``account_email`` is). It survives only as an OPTIONAL, default-OFF
+    diagnostic that cross-checks a scoped token's profile against the configured
+    email. Steady state therefore makes NO network call — the whole point of
+    #2145's closure is to drop the probe dependency.
     """
-    row["account_email_probe_status"] = status
-    row["account_email_probe_reason"] = reason or status
-    row["account_email_last_probe_at"] = now_iso()
-    if status == "verified" and email:
-        row["account_email"] = email
-        row["account_email_verified_at"] = now_iso()
-        if subject:
-            row["account_subject"] = subject
+    return env_truthy(os.environ.get(IDENTITY_VERIFY_PROBE_ENV))
 
 
-def record_token_account_identity(
+def _run_identity_verify_probe(
     registry_path: Path,
     token_id: str,
-    *,
-    status: str,
+    active_token: str,
     probed_fingerprint: str,
-    email: str = "",
-    subject: str = "",
-    reason: str = "",
+    configured_email: str,
 ) -> str:
-    """Persist a non-verified `user:profile` probe outcome onto the active row.
+    """OPTIONAL verify-only identity probe (#18849 Part 1b-v2). Diagnostic only.
 
-    Used for the ``stale`` / ``unknown`` branches, which have NO downstream
-    ``~/.claude.json`` write, so the recheck-under-lock here fully guards them.
-    The ``verified`` branch does its own recheck + write under a SINGLE held
-    registry lock (see ``run_global_identity_sync``) so the displayed-identity
-    write cannot race a token replace either. Returns ``""`` on persist, or a
-    skip reason (``"row_deleted"`` / ``"token_replaced"``).
+    NEVER the source and NEVER a blocker: it cross-checks the active token's
+    ``user:profile`` profile against the operator-configured email and records a
+    diagnostic into SEPARATE ``account_email_probe_*`` fields. A 403 / missing
+    scope / no-email is a benign ``verify_skipped``; a verified MISMATCH WARNs
+    only and NEVER overwrites ``account_email`` or rolls back the displayed
+    identity. The diagnostic is dropped if the active token was swapped mid-probe
+    (fingerprint recheck under the registry lock). Returns the recorded probe
+    status (``""`` when dropped) for the result surface.
     """
+    probe = probe_claude_account_identity(
+        active_token, timeout_seconds=_identity_probe_timeout_seconds()
+    )
+    pstatus = str(probe.get("status") or "probe_failed")
+    observed = str(probe.get("email") or "")
+    if pstatus == "verified":
+        if configured_email and observed and observed != configured_email:
+            status, reason = "mismatch", "mismatch"
+            print(
+                "warning: optional identity verify-probe saw an account email "
+                "that does NOT match the operator-configured account email; "
+                "keeping the operator-configured identity (verify-only, no "
+                "overwrite)",
+                file=sys.stderr,
+            )
+        else:
+            status, reason = "verified", "verified"
+    elif pstatus in ("no_scope", "no_email"):
+        status, reason = "verify_skipped", pstatus
+    else:
+        status, reason = "probe_failed", pstatus
     with registry_lock(registry_path):
         registry = load_registry(registry_path)
         row = find_token(registry, token_id)
-        skip_reason = _identity_row_token_skip_reason(row, probed_fingerprint)
-        if skip_reason:
-            return skip_reason
-        _stamp_identity_probe_outcome(
-            row, status=status, reason=reason, email=email, subject=subject
-        )
+        if _identity_row_token_skip_reason(row, probed_fingerprint):
+            return ""  # token swapped mid-probe — drop the stale diagnostic
+        # Record ONLY the separate probe-diagnostic fields. The configured
+        # ``account_email`` / ``account_email_source`` are never touched here.
+        row["account_email_probe_status"] = status
+        row["account_email_probe_reason"] = reason
+        row["account_email_last_probe_at"] = now_iso()
+        if observed:
+            row["account_email_probe_observed"] = observed
         save_registry(registry_path, registry)
-    return ""
+    return status
 
 
 def patch_global_claude_identity(
@@ -3269,26 +3443,26 @@ def run_global_identity_sync(
     credential_changed: bool,
     allowed_root: Path | None,
 ) -> dict[str, Any]:
-    """Sync the displayed identity to the active token's verified account.
+    """Sync the displayed identity to the active token's OPERATOR-CONFIGURED account.
 
     Called from ``cmd_sync_global`` AFTER a gated credential PATCH. Best-effort:
     every failure path returns a structured result and NEVER raises, so an
     identity hiccup can never demote the token-sync convergence the daemon
-    reports. Probes only on a real rotation (``credential_changed``) or until a
-    first verification lands (cooldown-bounded) — steady state makes no network
-    call.
+    reports. #18849 Part 1b-v2 (closes #2145): the source is the operator-provided
+    ``account_email`` (``source == "operator"``), NOT a network probe — steady
+    state makes NO network call.
 
-    Result ``status`` ∈ ``{synced, converged, unverified, skipped, write_failed}``
-    with ``converged`` (displayed == verified) + ``verified_email`` /
-    ``displayed_email`` / ``probe_status`` for the doctor surface. ``skipped``
-    with reason ``token_replaced`` / ``row_deleted`` means a concurrent token
-    swap during the in-flight probe was detected and BOTH the registry record
-    and the ~/.claude.json write were skipped.
+    Result ``status`` ∈ ``{synced, converged, unconfigured, skipped, write_failed}``
+    with ``converged`` (displayed == configured) + ``configured_email`` /
+    ``displayed_email`` / ``probe_status`` for the doctor surface. ``unconfigured``
+    means the active row carries no operator ``account_email`` ⇒ NO WRITE (the
+    fail-safe — never a guess). ``skipped`` with reason ``token_replaced`` /
+    ``row_deleted`` / ``source_changed`` means a concurrent token replace / id
+    drop / source change was detected under the write lock and the ~/.claude.json
+    write was skipped.
 
-    Inert-by-design: when the active token lacks the ``user:profile`` scope the
-    probe 403s → ``no_scope`` → no write ever lands (a permanent, fail-safe
-    no-op the operator can see via ``global-auth-status``); identity-sync lights
-    up automatically once a ``user:profile``-scoped token is active.
+    The OPTIONAL verify-only probe (default-OFF) is a pure diagnostic recorded
+    into separate ``account_email_probe_*`` fields; it never sources the write.
     """
     displayed_email = read_oauth_account_email(config_path)
     # Keychain-exists guard: when auth is keychain-backed, the keychain owns the
@@ -3302,63 +3476,52 @@ def run_global_identity_sync(
         )
         return {"status": "skipped", "reason": "keychain_present", "synced": False,
                 "converged": False, "displayed_email": displayed_email,
-                "verified_email": "", "probe_status": "keychain"}
+                "configured_email": "", "source": "", "probe_status": "keychain"}
 
     registry = load_registry(registry_path)
     row = find_token(registry, active_id) or {}
-    verified_email = str(row.get("account_email") or "")
-    have_verified = bool(verified_email)
-    should_probe = credential_changed or (not have_verified and _probe_cooldown_elapsed(row))
-    if not should_probe:
-        converged = bool(verified_email) and displayed_email == verified_email
-        return {"status": "converged" if converged else "unverified",
-                "reason": "steady_state", "synced": False, "converged": converged,
-                "displayed_email": displayed_email, "verified_email": verified_email,
-                "probe_status": str(row.get("account_email_probe_status") or "")}
-
+    configured_email = operator_account_email(row)
     # ``active_token`` was snapshotted under the registry lock in
-    # ``_global_auth_gate_state`` and the lock then released, so the probe below
-    # runs unlocked. Carry the probed token's fingerprint into the persist path
-    # so a concurrent token replace (same id, new value) during the in-flight
-    # probe cannot stamp this probe's email onto the replacement token — and, on
-    # a verified probe, so the displayed-identity write is skipped too.
+    # ``_global_auth_gate_state`` and the lock then released. Carry its
+    # fingerprint into the write path so a concurrent token replace (same id, new
+    # value) before the write lands skips the displayed-identity write.
     probed_fingerprint = token_fingerprint(active_token)
 
-    probe = probe_claude_account_identity(
-        active_token, timeout_seconds=_identity_probe_timeout_seconds()
-    )
-    pstatus = str(probe.get("status") or "probe_failed")
-    if pstatus != "verified":
-        # No write, never a guess: probe_failed → stale (keep last verified);
-        # no_scope / no_email → unknown.
-        reg_status = "stale" if pstatus == "probe_failed" else "unknown"
-        skipped = record_token_account_identity(
-            registry_path, active_id, status=reg_status,
-            probed_fingerprint=probed_fingerprint, reason=pstatus,
+    # OPTIONAL verify-only probe (default-OFF). Pure diagnostic — never source,
+    # never blocker. Bounded to a real rotation or the re-probe cooldown so an
+    # opted-in install does not probe every tick.
+    probe_status = ""
+    if _identity_verify_probe_enabled() and (
+        credential_changed or _probe_cooldown_elapsed(row)
+    ):
+        probe_status = _run_identity_verify_probe(
+            registry_path, active_id, active_token, probed_fingerprint,
+            configured_email,
         )
-        if skipped:
-            # Row deleted / token replaced mid-probe — do not record onto the
-            # replacement token (there is no write to skip on this branch).
-            return {"status": "skipped", "reason": skipped, "synced": False,
-                    "converged": False, "displayed_email": displayed_email,
-                    "verified_email": verified_email, "probe_status": skipped}
-        return {"status": "unverified", "reason": pstatus, "synced": False,
-                "converged": False, "displayed_email": displayed_email,
-                "verified_email": verified_email, "probe_status": reg_status,
-                "detail": str(probe.get("detail") or "")}
 
-    email = str(probe.get("email") or "")
-    subject = str(probe.get("subject") or "")
-    # Persist the verified identity AND write ~/.claude.json while HOLDING the
-    # registry lock the entire time. A concurrent cmd_add --replace must take
-    # the same registry lock to swap the active token, so it cannot interleave
-    # between the fingerprint recheck and the displayed-identity write — this
-    # closes the post-persist/pre-patch window the per-call recheck alone leaves
-    # open. Lock order is always registry_lock -> claude_global_credentials_lock
-    # (the config writer takes the latter internally); no path takes them in
-    # reverse, and the config write is a fast LOCAL op (not a network call), so
-    # the nesting neither deadlocks nor holds the registry lock across slow I/O.
+    if not configured_email:
+        # No operator-configured identity → fail-safe NO WRITE (never a guess,
+        # never id-derived). A probe-sourced / unmarked-legacy ``account_email``
+        # lands here too: ``operator_account_email`` already rejected it.
+        return {"status": "unconfigured", "reason": "no_operator_account_email",
+                "synced": False, "converged": False,
+                "displayed_email": displayed_email, "configured_email": "",
+                "source": str(row.get("account_email_source") or ""),
+                "probe_status": probe_status
+                or str(row.get("account_email_probe_status") or "")}
+
+    # Re-read the active row under the registry lock, verify the active token
+    # fingerprint is UNCHANGED and the source is STILL operator, and hold that
+    # SAME lock through the fd-pinned ~/.claude.json PATCH. A concurrent
+    # cmd_add --replace must take the same registry lock to swap the active
+    # token, so it cannot interleave between the recheck and the write — this
+    # preserves the Part 1b r2 token-replace-race fix WITHOUT a probe. Lock
+    # order is always registry_lock -> claude_global_credentials_lock (the
+    # config writer takes the latter internally); the config write is a fast
+    # LOCAL op (not a network call), so the nesting neither deadlocks nor holds
+    # the registry lock across slow I/O.
     skip_reason = ""
+    locked_email = ""
     write_result: dict[str, Any] | None = None
     try:
         with registry_lock(registry_path):
@@ -3366,39 +3529,42 @@ def run_global_identity_sync(
             row = find_token(registry, active_id)
             skip_reason = _identity_row_token_skip_reason(row, probed_fingerprint)
             if not skip_reason:
-                _stamp_identity_probe_outcome(
-                    row, status="verified", reason="verified",
-                    email=email, subject=subject,
-                )
-                save_registry(registry_path, registry)
-                write_result = patch_global_claude_identity(
-                    config_path, email=email, subject=subject,
-                    allowed_root=allowed_root,
-                )
+                locked_email = operator_account_email(row)
+                if not locked_email:
+                    # The operator source was cleared (e.g. a replace without an
+                    # account email) between the unlocked read and the lock —
+                    # never write a stale identity.
+                    skip_reason = "source_changed"
+                else:
+                    write_result = patch_global_claude_identity(
+                        config_path, email=locked_email, subject="",
+                        allowed_root=allowed_root,
+                    )
     except Exception as exc:  # noqa: BLE001 - identity write is best-effort on top of token sync
         print(f"warning: ~/.claude.json identity sync write failed: {exc}",
               file=sys.stderr)
         return {"status": "write_failed", "reason": str(exc), "synced": False,
                 "converged": False, "displayed_email": displayed_email,
-                "verified_email": email, "probe_status": "verified"}
+                "configured_email": configured_email, "source": "operator",
+                "probe_status": probe_status}
     if skip_reason:
-        # Row deleted or its token replaced while the verified probe was in
-        # flight: the verified email belongs to a token that is no longer the
-        # active row. Skipped BOTH the registry record AND the ~/.claude.json
-        # write — never persist a stale identity onto the replacement token.
+        # The active row was deleted / its token replaced / its operator source
+        # cleared between the snapshot and the locked write: the configured
+        # email no longer belongs to the active row. NO ~/.claude.json write.
         return {"status": "skipped", "reason": skip_reason, "synced": False,
                 "converged": False, "displayed_email": displayed_email,
-                "verified_email": "", "probe_status": skip_reason}
+                "configured_email": "", "source": "operator",
+                "probe_status": probe_status or skip_reason}
     if write_result.get("skipped"):
         return {"status": "skipped", "reason": write_result.get("reason"),
                 "synced": False, "converged": False,
-                "displayed_email": displayed_email, "verified_email": email,
-                "probe_status": "verified"}
+                "displayed_email": displayed_email, "configured_email": locked_email,
+                "source": "operator", "probe_status": probe_status}
     synced = bool(write_result.get("changed"))
     return {"status": "synced" if synced else "converged",
             "reason": write_result.get("reason"), "synced": synced, "converged": True,
-            "displayed_email": email, "verified_email": email,
-            "probe_status": "verified"}
+            "displayed_email": locked_email, "configured_email": locked_email,
+            "source": "operator", "probe_status": probe_status}
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -4856,38 +5022,44 @@ def cmd_global_auth_status(args: argparse.Namespace) -> int:
     converged = bool(enabled and active_fp and global_fp and active_fp == global_fp)
     displayed_email = read_oauth_account_email(config_path)
 
-    # #18849 Part 1b: report the VERIFIED account identity from the active token
-    # row + whether the displayed identity has CONVERGED on it. Read-only — the
-    # status surface NEVER probes (a network call belongs to sync-global) and
-    # never writes; it reflects the last verification sync-global recorded.
+    # #18849 Part 1b-v2: report the OPERATOR-CONFIGURED account identity from the
+    # active token row + whether the displayed identity has CONVERGED on it.
+    # Read-only — the status surface NEVER probes / never writes; it reflects the
+    # operator-configured ``account_email`` (source==operator) and the last
+    # OPTIONAL verify-probe diagnostic sync-global recorded. ``verified`` is
+    # reserved for that probe diagnostic; CONVERGENCE is configured-identity-based.
     identity_row: dict[str, Any] = {}
     try:
         identity_row = find_token(load_registry(registry_path), active_id) or {}
     except Exception:  # noqa: BLE001 - status must surface even on a bad registry
         identity_row = {}
-    verified_email = str(identity_row.get("account_email") or "")
-    identity_converged = bool(verified_email) and displayed_email == verified_email
+    configured_email = operator_account_email(identity_row)
+    identity_converged = bool(configured_email) and displayed_email == configured_email
     probe_reason = str(identity_row.get("account_email_probe_reason") or "")
     identity_shadow = {
         "displayed_email": displayed_email,
-        "verified_email": verified_email,
-        "verified_at": str(identity_row.get("account_email_verified_at") or ""),
+        "configured_email": configured_email,
+        "source": str(identity_row.get("account_email_source") or ""),
+        "set_at": str(identity_row.get("account_email_set_at") or ""),
+        # OPTIONAL verify-only probe diagnostic (default-OFF), stored SEPARATELY
+        # from the configured source: status ∈ {verified, verify_skipped,
+        # mismatch, probe_failed}; reason is granular; observed is the probe-seen
+        # email. It NEVER drives convergence — a 403/no_scope is a benign
+        # verify_skipped, a mismatch only WARNs.
         "probe_status": str(identity_row.get("account_email_probe_status") or ""),
-        # Granular last-probe outcome (verified/no_scope/no_email/probe_failed)
-        # so the operator can see WHY identity never converged — e.g. a pool
-        # token without user:profile reports ``no_scope`` and identity-sync is a
-        # permanent (fail-safe) no-op.
         "probe_reason": probe_reason,
+        "probe_observed": str(identity_row.get("account_email_probe_observed") or ""),
         "synced": identity_converged,
         "converged": identity_converged,
     }
-    # Part 1a's detection WARNING is now flipped: warn ONLY when the identity is
-    # known to be OUT OF SYNC (displayed != verified), not whenever a displayed
-    # identity merely exists. A converged identity is the quiet success state.
-    if enabled and verified_email and displayed_email and not identity_converged:
+    # Warn ONLY when the displayed identity is OUT OF SYNC with the operator-
+    # configured identity (configured set but displayed != configured). A
+    # converged identity — or one with no operator email configured yet — is the
+    # quiet state, not a warning.
+    if enabled and configured_email and displayed_email and not identity_converged:
         identity_shadow["warning"] = (
-            "displayed oauthAccount identity does not match the verified account "
-            "— re-run sync-global to converge the displayed identity"
+            "displayed oauthAccount identity does not match the operator-configured "
+            "account — re-run sync-global to converge the displayed identity"
         )
 
     payload = {
@@ -4911,10 +5083,10 @@ def cmd_global_auth_status(args: argparse.Namespace) -> int:
         ident = "identity-converged" if identity_converged else "identity-unsynced"
         print(
             f"global auth sync: {state} (auto_rotate={auto_rotate} "
-            f"opt_in={opt_in}); {conv}; {ident}; identity probe: "
+            f"opt_in={opt_in}); {conv}; {ident}; identity verify-probe: "
             f"{_identity_probe_reason_label(probe_reason)}; displayed_identity="
-            f"{displayed_email or '<none>'}; verified_identity="
-            f"{verified_email or '<none>'}"
+            f"{displayed_email or '<none>'}; configured_identity="
+            f"{configured_email or '<none>'}"
         )
     return 0
 
@@ -5469,6 +5641,20 @@ def cmd_receive(args: argparse.Namespace) -> int:
         except Exception as exc:
             return fail(str(exc), json_mode)
 
+    # #18849 Part 1b-v2: the operator-provided displayed-identity source. An
+    # explicit --account-email wins; otherwise a fulfilled request may carry the
+    # (non-secret) email captured by `receive --request --account-email`. Validate
+    # BEFORE the token is read so a bad value fails closed with nothing written.
+    account_email_raw = getattr(args, "account_email", None) or ""
+    if not account_email_raw and request_record is not None:
+        account_email_raw = str(request_record.get("account_email") or "")
+    account_email = ""
+    if account_email_raw:
+        try:
+            account_email = validate_account_email(account_email_raw)
+        except Exception as exc:
+            return fail(str(exc), json_mode)
+
     try:
         token = read_token_from_controlling_tty()
     except RuntimeError as exc:
@@ -5498,6 +5684,7 @@ def cmd_receive(args: argparse.Namespace) -> int:
             replace=bool(args.replace),
             enable_auto_rotate=bool(args.enable_auto_rotate),
             threshold=args.threshold,
+            account_email=account_email,
         )
     except Exception as exc:
         return fail(str(exc), json_mode)
@@ -5586,6 +5773,16 @@ def _cmd_receive_request(
         if agents and not re.match(r"^[A-Za-z0-9_.,-]+$", agents):
             return fail("--agents must be a safe slug/csv", json_mode)
 
+    # #18849 Part 1b-v2: the request record may carry the NON-SECRET operator
+    # account email so the operator's `receive --fulfill` lands the displayed
+    # identity without re-typing it. Format-validated; never a token.
+    account_email = ""
+    if getattr(args, "account_email", None):
+        try:
+            account_email = validate_account_email(args.account_email)
+        except Exception as exc:
+            return fail(str(exc), json_mode)
+
     request_id = uuid.uuid4().hex
     nonce = uuid.uuid4().hex
     record = {
@@ -5596,6 +5793,7 @@ def _cmd_receive_request(
         "activate": bool(args.activate),
         "enable_auto_rotate": bool(args.enable_auto_rotate),
         "replace": bool(args.replace),
+        "account_email": account_email,
         "created_at": now_iso(),
         "status": "pending",
     }
@@ -5627,6 +5825,7 @@ def _cmd_receive_request(
         "activate": bool(args.activate),
         "enable_auto_rotate": bool(args.enable_auto_rotate),
         "replace": bool(args.replace),
+        "account_email": account_email,
         "record": str(path),
         "delivery": "sealed_paste_request",
         "next": (
@@ -5683,6 +5882,9 @@ def build_parser() -> argparse.ArgumentParser:
     add_parser.add_argument("--activate", action="store_true")
     add_parser.add_argument("--replace", action="store_true")
     add_parser.add_argument("--note", default="")
+    # #18849 Part 1b-v2 (closes #2145): operator-provided displayed-identity
+    # source (non-secret). On --replace, omitting it CLEARS any prior identity.
+    add_parser.add_argument("--account-email", dest="account_email", default=None)
     add_parser.add_argument("--enable-auto-rotate", action="store_true")
     add_parser.add_argument("--threshold", type=float)
     add_parser.add_argument("--weekly-warn-threshold", type=float, dest="weekly_warn_threshold")
@@ -5710,6 +5912,11 @@ def build_parser() -> argparse.ArgumentParser:
     receive_parser.add_argument("--activate", action="store_true")
     receive_parser.add_argument("--replace", action="store_true")
     receive_parser.add_argument("--note", default="")
+    # #18849 Part 1b-v2: the non-secret operator account email. On the token-FREE
+    # `--request` shape it is stored in the request record; on the token-accepting
+    # `--fulfill`/direct shape it is captured onto the row (explicit wins over the
+    # fulfilled request's stored value).
+    receive_parser.add_argument("--account-email", dest="account_email", default=None)
     receive_parser.add_argument("--enable-auto-rotate", action="store_true")
     receive_parser.add_argument("--threshold", type=float)
     receive_parser.add_argument("--agents", default=None)
@@ -5719,6 +5926,14 @@ def build_parser() -> argparse.ArgumentParser:
     list_parser = sub.add_parser("list")
     list_parser.add_argument("--json", action="store_true")
     list_parser.set_defaults(handler=cmd_list)
+
+    # #18849 Part 1b-v2 (closes #2145): set per-token operator metadata. Today
+    # the operator-provided account email — the BINDING displayed-identity source.
+    set_parser = sub.add_parser("set")
+    set_parser.add_argument("--id", required=True)
+    set_parser.add_argument("--account-email", dest="account_email", required=True)
+    set_parser.add_argument("--json", action="store_true")
+    set_parser.set_defaults(handler=cmd_set)
 
     activate_parser = sub.add_parser("activate")
     activate_parser.add_argument("id")
@@ -5907,16 +6122,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     global_status_parser = sub.add_parser(
         "global-auth-status",
-        help="report operator-global auth + displayed-identity convergence",
+        help="report operator-global auth + configured-identity convergence",
         description=(
             "Read-only doctor surface for the gated operator-global auth sync "
             "(#18849). Default-OFF: needs BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC AND "
-            "auto_rotate. The Part 1b displayed-identity sync is INERT (a "
-            "permanent, fail-safe no-op) when the active token lacks the "
-            "user:profile scope — the profile probe 403s, the 'identity probe:' "
-            "line / identity_shadow.probe_reason surface 'no_scope', and "
-            "~/.claude.json is never written. It lights up automatically once a "
-            "user:profile-scoped token is the active token."
+            "auto_rotate. The Part 1b-v2 displayed-identity sync (closes #2145) "
+            "converges ~/.claude.json's oauthAccount.emailAddress onto the active "
+            "token's OPERATOR-CONFIGURED account_email (source==operator, set via "
+            "claude-token add/receive/set --account-email). With no operator email "
+            "configured it is a fail-safe no-op (configured_identity=<none>); it "
+            "never guesses or id-derives. The optional verify-only probe is a "
+            "default-OFF diagnostic surfaced as identity_shadow.probe_* — never a "
+            "source and never a blocker (a 403 is a benign verify_skipped)."
         ),
     )
     global_status_parser.add_argument("--global-credentials", default=None)
