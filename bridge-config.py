@@ -46,6 +46,7 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import socket
@@ -240,6 +241,42 @@ def admin_agent_id() -> str:
     path keys on, and the operator-TTY fallback still requires a real TTY.
     """
     return os.environ.get("BRIDGE_ADMIN_AGENT_ID", "").strip()
+
+
+def _host_platform() -> str:
+    """Resolve the host OS name, test-overridable via BRIDGE_HOST_PLATFORM_OVERRIDE.
+
+    Mirrors bridge-auth.py `host_platform()` so the platform-aware deny message
+    can be exercised for either OS from a single test runner."""
+    override = os.environ.get("BRIDGE_HOST_PLATFORM_OVERRIDE", "").strip()
+    if override:
+        return override
+    return platform.system()
+
+
+def _shared_uid_binding_deny_reason() -> str:
+    """Platform-aware deny reason for a shared-UID, caller-writable bindings
+    store (message-ONLY — the authorization decision is unchanged).
+
+    On Linux, linux-user isolation (iso-v2) is a genuine headless escape hatch,
+    so we point at it. Off Linux (e.g. macOS, where iso-v2 does not apply) we
+    drop that suggestion and give only the attended-TTY one-liner, so the
+    operator is not sent down a migration path their host cannot take."""
+    base = (
+        "agent-binding-store-writable: the config-caller bindings store is "
+        "owned by this UID (shared-UID) — the owner can forge/re-chmod an "
+        "agent-pane admin binding, so it is not trusted here. On a headless "
+        "shared-UID host there is no operator TTY: run this mutation from an "
+        "attended operator session (--from <admin> on a real TTY)"
+    )
+    if _host_platform() == "Linux":
+        return base + (
+            ", or migrate this admin to linux-user isolation (iso-v2) for "
+            "unattended headless config — the controller/agent UID boundary "
+            "then makes the binding non-forgeable and authorizes it TTY-free. "
+            'See OPERATIONS.md "Iso v2 agent troubleshooting" (#1946).'
+        )
+    return base + "."
 
 
 # ---------------------------------------------------------------------------
@@ -960,19 +997,7 @@ def resolve_config_caller(args: argparse.Namespace) -> ConfigCaller:
                     source=CALLER_SOURCE_AGENT_DIRECT,
                     context=CONFIG_CALLER_CONTEXT_AGENT_PANE,
                     allowed=False,
-                    reason=(
-                        "agent-binding-store-writable: the config-caller "
-                        "bindings store is owned by this UID (shared-UID) — the "
-                        "owner can forge/re-chmod an agent-pane admin binding, so "
-                        "it is not trusted here. On a headless shared-UID host "
-                        "there is no operator TTY: run this mutation from an "
-                        "attended operator session (--from <admin> on a real "
-                        "TTY), or migrate this admin to linux-user isolation "
-                        "(iso-v2) for unattended headless config — the "
-                        "controller/agent UID boundary then makes the binding "
-                        "non-forgeable and authorizes it TTY-free. See "
-                        'OPERATIONS.md "Iso v2 agent troubleshooting" (#1946).'
-                    ),
+                    reason=_shared_uid_binding_deny_reason(),
                 )
             return ConfigCaller(
                 agent_id=bound_agent,

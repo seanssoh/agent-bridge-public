@@ -22,6 +22,7 @@ Usage:
   bash $SCRIPT_DIR/bridge-auth.sh claude-token global-auth-status [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token backfill-settings [--agents static|all|csv] [--check] [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token keychain-free <enable|disable|status> [--json]
+  bash $SCRIPT_DIR/bridge-auth.sh claude-token global-auth-sync <enable|disable|status> [--check] [--json]   # #18849: operator-global seamless token-sync opt-in (persisted; env override secondary). --check = exit-code-only effective-state probe (daemon early-skip)
   bash $SCRIPT_DIR/bridge-auth.sh claude-token rotate [--if-auto-enabled] [--reason <text>] [--sync] [--agents static|all|csv] [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token check <id> [--enable-on-ok] [--disable-on-quota] [--timeout <sec>] [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token classify-output [--stdout-file <path>] [--stderr-file <path>] [--returncode <n>]
@@ -1465,6 +1466,33 @@ case "$command" in
         bridge_auth_guard_wrapper_flags "claude-token keychain-free" "" "--json" "$@"
         exec python3 "$SCRIPT_DIR/bridge-auth.py" --registry "$registry" \
           keychain-free "$action" "$@"
+        ;;
+      global-auth-sync)
+        # #18849: sanctioned enable/disable/status for the operator-global
+        # seamless token-sync opt-in. The blessed admin path so the operator
+        # never raw-edits runtime/bridge-config.json (which also dodges the
+        # set-env KEY-substring guard). The persisted bool is the primary,
+        # headless-safe gate; the BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC env override is
+        # an independent, precedence-bearing contributor surfaced by `status`.
+        # The write/read happen in bridge-auth.py global-auth-sync.
+        action="${1:-}"
+        case "$action" in
+          -h|--help|help)
+            usage
+            exit 0
+            ;;
+          "")
+            usage >&2
+            exit 1
+            ;;
+        esac
+        shift || true
+        # `--check` (#19260): exit-code-only effective-state probe the daemon
+        # early-skip calls (`status --check`) — must be allowlisted here or the
+        # guard fails closed (exit 2) and the daemon skips the sync forever.
+        bridge_auth_guard_wrapper_flags "claude-token global-auth-sync" "" "--json,--check" "$@"
+        exec python3 "$SCRIPT_DIR/bridge-auth.py" --registry "$registry" \
+          global-auth-sync "$action" "$@"
         ;;
       rotate)
         json_mode=0
