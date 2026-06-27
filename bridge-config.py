@@ -46,6 +46,7 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import socket
@@ -170,6 +171,16 @@ ENV_KEY_ALLOWLIST: dict[str, str] = {
     # os.environ by the gateway client. (Interim relief while #2 decouples the
     # gateway drain from the heavy tick.)
     "BRIDGE_QUEUE_GATEWAY_TIMEOUT_SECONDS": ENV_KEY_TYPE_POS_FLOAT,
+    # Issue #18849: operator-global seamless-token-sync opt-in. The secondary,
+    # precedence-bearing route alongside the primary `agent-bridge auth
+    # claude-token global-auth-sync enable` verb; effective gate is
+    # `persisted OR env=="1"`. Read from os.environ by bridge-auth.py
+    # `global_auth_sync_env_override_enabled` with strict `== "1"` equality, so
+    # the `flag_one` type (literal "1" only) is the exact contract — there is no
+    # `=0` disable form (clear the persisted opt-in via the verb and remove this
+    # key via `config unset-env`). Non-secret feature toggle; name carries no
+    # TOKEN/SECRET/KEY substring so the deny screen lets it through.
+    "BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC": ENV_KEY_TYPE_FLAG_ONE,
 }
 
 # EXPLICIT DENY — keys that must NEVER be settable through set-env even if a
@@ -240,6 +251,42 @@ def admin_agent_id() -> str:
     path keys on, and the operator-TTY fallback still requires a real TTY.
     """
     return os.environ.get("BRIDGE_ADMIN_AGENT_ID", "").strip()
+
+
+def _host_platform() -> str:
+    """Resolve the host OS name, test-overridable via BRIDGE_HOST_PLATFORM_OVERRIDE.
+
+    Mirrors bridge-auth.py `host_platform()` so the platform-aware deny message
+    can be exercised for either OS from a single test runner."""
+    override = os.environ.get("BRIDGE_HOST_PLATFORM_OVERRIDE", "").strip()
+    if override:
+        return override
+    return platform.system()
+
+
+def _shared_uid_binding_deny_reason() -> str:
+    """Platform-aware deny reason for a shared-UID, caller-writable bindings
+    store (message-ONLY — the authorization decision is unchanged).
+
+    On Linux, linux-user isolation (iso-v2) is a genuine headless escape hatch,
+    so we point at it. Off Linux (e.g. macOS, where iso-v2 does not apply) we
+    drop that suggestion and give only the attended-TTY one-liner, so the
+    operator is not sent down a migration path their host cannot take."""
+    base = (
+        "agent-binding-store-writable: the config-caller bindings store is "
+        "owned by this UID (shared-UID) — the owner can forge/re-chmod an "
+        "agent-pane admin binding, so it is not trusted here. On a headless "
+        "shared-UID host there is no operator TTY: run this mutation from an "
+        "attended operator session (--from <admin> on a real TTY)"
+    )
+    if _host_platform() == "Linux":
+        return base + (
+            ", or migrate this admin to linux-user isolation (iso-v2) for "
+            "unattended headless config — the controller/agent UID boundary "
+            "then makes the binding non-forgeable and authorizes it TTY-free. "
+            'See OPERATIONS.md "Iso v2 agent troubleshooting" (#1946).'
+        )
+    return base + "."
 
 
 # ---------------------------------------------------------------------------
@@ -960,19 +1007,7 @@ def resolve_config_caller(args: argparse.Namespace) -> ConfigCaller:
                     source=CALLER_SOURCE_AGENT_DIRECT,
                     context=CONFIG_CALLER_CONTEXT_AGENT_PANE,
                     allowed=False,
-                    reason=(
-                        "agent-binding-store-writable: the config-caller "
-                        "bindings store is owned by this UID (shared-UID) — the "
-                        "owner can forge/re-chmod an agent-pane admin binding, so "
-                        "it is not trusted here. On a headless shared-UID host "
-                        "there is no operator TTY: run this mutation from an "
-                        "attended operator session (--from <admin> on a real "
-                        "TTY), or migrate this admin to linux-user isolation "
-                        "(iso-v2) for unattended headless config — the "
-                        "controller/agent UID boundary then makes the binding "
-                        "non-forgeable and authorizes it TTY-free. See "
-                        'OPERATIONS.md "Iso v2 agent troubleshooting" (#1946).'
-                    ),
+                    reason=_shared_uid_binding_deny_reason(),
                 )
             return ConfigCaller(
                 agent_id=bound_agent,
@@ -1666,6 +1701,133 @@ def cmd_set_env(args: argparse.Namespace) -> int:
     return 0
 
 
+def _emit_unset_env_audit(
+    *,
+    trigger: str,
+    actor_label: str,
+    caller_source: str,
+    path: Path,
+    key: str,
+    before_sha: str,
+    after_sha: str | None,
+    reason: str | None,
+) -> None:
+    """Emit a `system_config_mutation` audit row for an unset-env apply/deny.
+
+    DISTINCT from `_emit_set_env_audit` by design (NOT a reuse): the `trigger`
+    is `unset-env-apply` / `unset-env-deny` and `operation` is `unset-env KEY`,
+    so an operator can grep removals separately from sets. Same hash discipline:
+    `before_sha256` always, `after_sha256` only on apply.
+    """
+    detail: dict[str, Any] = {
+        "kind": "system_config_mutation",
+        "actor": actor_label,
+        "actor_source": caller_source,
+        "trigger": trigger,
+        "path": str(path),
+        "before_sha256": before_sha,
+        "operation": f"unset-env {key}",
+        "matched_pattern": matched_pattern(path) or "",
+    }
+    if after_sha is not None:
+        detail["after_sha256"] = after_sha
+    if reason is not None:
+        detail["reason"] = reason
+    write_audit(detail)
+
+
+def cmd_unset_env(args: argparse.Namespace) -> int:
+    """Remove a durable, allowlisted install env override — the symmetric
+    counterpart of `set-env` (#18849).
+
+    Goes through the SAME `resolve_config_caller` trust gate as `set-env`, and
+    the SAME denylist-first → allowlist-required key screen, so a key that is
+    not a sanctioned operational knob can never be removed through this path
+    (and a non-admin caller is denied before the key is even considered). Every
+    other managed-env entry is preserved (read-modify-write). Removing a key
+    that is not set is idempotent (a no-op, not an error). Every apply and deny
+    emits a distinct `unset-env-*` audit row.
+    """
+    path = agent_env_local_path()
+    caller = resolve_config_caller(args)
+    caller_agent = caller.agent_id
+    caller_source = caller.source
+    actor_label = caller_agent or (
+        "operator" if caller_source == CALLER_SOURCE_OPERATOR_TUI else "unknown"
+    )
+
+    key = args.key.strip()
+    before_sha = file_sha256(path)
+
+    def deny(reason: str, code: int) -> int:
+        _emit_unset_env_audit(
+            trigger="unset-env-deny",
+            actor_label=actor_label,
+            caller_source=caller_source,
+            path=path,
+            key=key,
+            before_sha=before_sha,
+            after_sha=None,
+            reason=reason,
+        )
+        print(f"deny: {reason}", file=sys.stderr)
+        return code
+
+    # Trust gate FIRST (issue #1738), identical to set-env: a non-admin pane
+    # binding, an identity spoof, a stale/ambiguous binding, or a noninteractive
+    # caller with no binding is denied before we consider the key.
+    if not caller.allowed:
+        return deny(caller.reason, 3)
+
+    # Key screen: explicit deny BEFORE allowlist (fail-closed), then allowlist —
+    # the same screen set-env applies, so a removal is confined to the same
+    # narrow non-secret allowlist (a denied/non-allowlisted key cannot be
+    # touched even though removal is destructive-only).
+    forbidden = env_key_deny_reason(key)
+    if forbidden is not None:
+        return deny(forbidden, 4)
+    if key not in ENV_KEY_ALLOWLIST:
+        return deny(
+            f"env key '{key}' is not in the set-env allowlist "
+            "(only narrow non-secret operational knobs are settable)",
+            4,
+        )
+
+    # Apply: load the current managed map, drop the single key (preserving every
+    # sibling), rewrite. A missing key is idempotent — no write, before==after.
+    entries = read_managed_env(path)
+    if key not in entries:
+        _emit_unset_env_audit(
+            trigger="unset-env-apply",
+            actor_label=actor_label,
+            caller_source=caller_source,
+            path=path,
+            key=key,
+            before_sha=before_sha,
+            after_sha=before_sha,
+            reason=None,
+        )
+        print(f"unchanged: {path} ({key} was not set)")
+        return 0
+
+    del entries[key]
+    write_managed_env(path, entries)
+    after_sha = file_sha256(path)
+
+    _emit_unset_env_audit(
+        trigger="unset-env-apply",
+        actor_label=actor_label,
+        caller_source=caller_source,
+        path=path,
+        key=key,
+        before_sha=before_sha,
+        after_sha=after_sha,
+        reason=None,
+    )
+    print(f"removed: {path} (unset {key})")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="agent-bridge config — gated system-config mutations (issue #341)",
@@ -1714,6 +1876,30 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     set_env_parser.set_defaults(handler=cmd_set_env)
+
+    unset_env_parser = sub.add_parser(
+        "unset-env",
+        help="remove a durable install env override (symmetric to set-env, #18849)",
+    )
+    unset_env_parser.add_argument(
+        "key",
+        metavar="KEY",
+        help=(
+            "env override to remove, e.g. BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC. KEY "
+            "must be on the same narrow non-secret allowlist as set-env; "
+            "removing a key that is not set is a no-op."
+        ),
+    )
+    unset_env_parser.add_argument(
+        "--from",
+        dest="from_agent",
+        help=(
+            "caller agent id; required when BRIDGE_AGENT_ID is unset. "
+            "Operator workflows from a raw shell must pass --from <admin-agent> "
+            "explicitly — anonymous callers cannot satisfy the admin check."
+        ),
+    )
+    unset_env_parser.set_defaults(handler=cmd_unset_env)
 
     get_parser = sub.add_parser("get", help="read a protected path")
     get_parser.add_argument("--path", required=True)

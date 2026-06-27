@@ -306,7 +306,16 @@ BRIDGE_AGENT_ACTION["developer:clear"]="/clear"
 # (`oauthAccount` email) is NOT synced in Part 1; `agent-bridge auth claude-token
 # global-auth-status` DETECTS and warns on a displayed-identity mismatch.
 #
-# Prefer the audited, persisted setter so the daemon inherits it:
-#   agent-bridge config set-env BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC=1
+# Prefer the sanctioned, audited verb — it writes a persisted runtime-config
+# opt-in the daemon inherits, is headless-safe, and reports the effective state:
+#   agent-bridge auth claude-token global-auth-sync enable     # turn ON
+#   agent-bridge auth claude-token global-auth-sync status     # show effective state
+#   agent-bridge auth claude-token global-auth-sync disable    # clear the persisted opt-in
+#
+# A live BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC=1 env override is a secondary route that
+# takes PRECEDENCE (effective = persisted OR env=="1"); `status` surfaces it. To
+# turn the gate back OFF, run `... global-auth-sync disable` AND remove any env
+# override — `agent-bridge config unset-env BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC` (or
+# delete the export below). There is no `=0` disable form: only "1" enables.
 #
 # export BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC=1
