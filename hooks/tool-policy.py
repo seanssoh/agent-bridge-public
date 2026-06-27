@@ -7066,11 +7066,18 @@ def _admin_bridge_verb_check(
     verb = tokens[1]
 
     if verb == "auth":
-        # `auth claude-token (add|activate|sync|rotate|receive) ...`
+        # `auth claude-token (add|activate|sync|rotate|receive|global-auth-sync) ...`
         if len(tokens) < 4 or tokens[2] != "claude-token":
             return False, None
         sub = tokens[3]
-        if sub not in {"add", "activate", "sync", "rotate", "receive"}:
+        if sub not in {
+            "add",
+            "activate",
+            "sync",
+            "rotate",
+            "receive",
+            "global-auth-sync",
+        }:
             return False, None
         if not admin:
             return False, (
@@ -7086,6 +7093,16 @@ def _admin_bridge_verb_check(
                 return False, "agent-bridge auth claude-token activate: unsafe id"
             if not _validate_auth_flags(rest[1:]):
                 return False, "agent-bridge auth claude-token activate: unsafe arguments"
+        elif sub == "global-auth-sync":
+            # #18849: NON-token verb (enable|disable|status [--json]). Its own
+            # narrow validator — it does NOT reuse `_validate_auth_*` (those gate
+            # the token-bearing add/activate/sync/rotate/receive surface and stay
+            # byte-unchanged here), so admitting this verb cannot widen them.
+            if not _validate_global_auth_sync_args(rest):
+                return False, (
+                    "agent-bridge auth claude-token global-auth-sync: "
+                    "expected enable|disable|status [--json]"
+                )
         elif sub == "receive":
             # #1367 — sealed-paste. The ONLY agent-runnable shape is the
             # token-FREE request/receipt (`receive --request … --json`).
@@ -7212,6 +7229,24 @@ _AUTH_ISO_TS_RE = re.compile(
 _AUTH_FLAGS_VALUE = (
     _AUTH_FLAGS_PATH | _AUTH_FLAGS_SLUG | _AUTH_FLAGS_REASON | _AUTH_FLAGS_ISO
 )
+
+
+def _validate_global_auth_sync_args(tokens: list[str]) -> bool:
+    """`auth claude-token global-auth-sync` accepts exactly one positional
+    action (``enable`` | ``disable`` | ``status``) optionally followed by
+    ``--json`` and nothing else (#18849).
+
+    Deliberately NARROW and standalone — it shares NO state with the
+    token-bearing ``_validate_auth_*`` family, so admitting this non-token verb
+    to the admin allowlist cannot widen the add/activate/sync/rotate validators.
+    A second positional, an unknown flag, or a value-flag (which this verb never
+    takes) all reject.
+    """
+    if not tokens:
+        return False
+    if tokens[0] not in {"enable", "disable", "status"}:
+        return False
+    return all(tok == "--json" for tok in tokens[1:])
 
 
 def _validate_auth_add_args(tokens: list[str]) -> bool:

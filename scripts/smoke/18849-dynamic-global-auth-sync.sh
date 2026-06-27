@@ -40,6 +40,12 @@
 #   T20 .claude.json parent-swap after lock   -> write stays in LOCKED dir (single-dir_fd discriminator)
 #   T21 token-replace race during probe       -> recheck skips registry record + .claude.json write (no stale identity)
 #   T22 post-persist write under registry lock -> verified .claude.json write holds the registry lock (window closed)
+#   T24 daemon early-skip env path (#19260)   -> bridge_daemon_global_auth_sync_tick reuses
+#       the REAL `global-auth-sync status --check` python gate: loose/unset env skip,
+#       literal "1" proceeds (no bash re-derivation that could drift from python)
+#   T25 daemon early-skip persisted path (#19260) -> a verb-enabled persisted-only opt-in
+#       (runtime-config bool true, env UNSET) PROCEEDS to the sync-global spawn; the prior
+#       env-only bash gate skipped it (feature dead at the daemon). --check is single-source
 #   T10 ci-select routing                     -> bridge-auth.py + this smoke selected
 #
 # Footgun #11 (heredoc_write deadlock class): this driver and its helper avoid
@@ -524,6 +530,137 @@ test_identity_parent_swap_after_lock() {
     "T20 .claude.json parent-swap-after-lock: identity stays in the LOCKED dir"
 }
 
+# ── T24 / T25 shared daemon-tick harness (#19260) ──────────────────────
+# Extract the REAL bridge_daemon_global_auth_sync_tick and drive it. The opt-in
+# CHECK runs the REAL `bridge-auth.sh claude-token global-auth-sync status
+# --check` wrapper (the daemon's live probe), so the early-skip exercises the
+# authoritative python effective gate (persisted runtime-config bool OR strict
+# env=="1") end to end. Only the heavier sync-global spawn is shimmed: touching
+# the sentinel means execution PROCEEDED past the early-skip.
+GLOBAL_SYNC_TICK_FUNCS="$SMOKE_TMP_ROOT/global-sync-tick.sh"
+GLOBAL_SYNC_TICK_SENTINEL="$SMOKE_TMP_ROOT/global-sync-tick-spawned"
+
+extract_global_sync_tick() {
+  awk '/^bridge_daemon_global_auth_sync_tick\(\) \{/,/^}/' \
+    "$REPO_ROOT/bridge-daemon.sh" >"$GLOBAL_SYNC_TICK_FUNCS"
+  grep -q "^bridge_daemon_global_auth_sync_tick() {" "$GLOBAL_SYNC_TICK_FUNCS" \
+    || smoke_fail "could not extract bridge_daemon_global_auth_sync_tick (rename in bridge-daemon.sh?)"
+}
+
+# $1 = runtime-config file (persisted state); $2 = env value, or "__UNSET__" to
+# leave BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC unset. Echoes "proceed" if the tick
+# reached the sync-global spawn, "skip" otherwise.
+run_daemon_gate() {
+  local cfg_file="$1" env_val="$2"
+  rm -f "$GLOBAL_SYNC_TICK_SENTINEL"
+  # `pre` always carries at least `env`, so its expansion is never an empty
+  # array under `set -u`. NOT env -i: the real wrapper needs the harness's
+  # v2-marked BRIDGE_HOME to source bridge-lib.sh without dying.
+  local -a pre=(env)
+  [[ "$env_val" == "__UNSET__" ]] && pre+=(-u BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC)
+  pre+=(
+    "FUNCS=$GLOBAL_SYNC_TICK_FUNCS" "SENTINEL=$GLOBAL_SYNC_TICK_SENTINEL"
+    "BRIDGE_BASH_BIN=bash" "SCRIPT_DIR=$REPO_ROOT"
+    "BRIDGE_ADMIN_AGENT_ID=daemon"
+    "BRIDGE_CLAUDE_TOKEN_REGISTRY=$REGISTRY"
+    "BRIDGE_RUNTIME_CONFIG_FILE=$cfg_file"
+  )
+  [[ "$env_val" != "__UNSET__" ]] && pre+=("BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC=$env_val")
+  "${pre[@]}" bash -c '
+    set -uo pipefail
+    # Shim ONLY the heavier sync-global spawn (touch sentinel = PROCEEDED). The
+    # opt-in CHECK label runs the REAL wrapper command verbatim.
+    bridge_with_timeout() {
+      local _secs="$1" label="$2"; shift 2
+      if [[ "$label" == "global_auth_sync_optin_check" ]]; then
+        "$@"; return $?
+      fi
+      : >"$SENTINEL"; return 1
+    }
+    daemon_info() { :; }
+    daemon_warn() { :; }
+    bridge_audit_log() { :; }
+    # shellcheck disable=SC1090
+    source "$FUNCS"
+    bridge_daemon_global_auth_sync_tick periodic >/dev/null 2>&1 || true
+  '
+  if [[ -e "$GLOBAL_SYNC_TICK_SENTINEL" ]]; then printf 'proceed'; else printf 'skip'; fi
+}
+
+# Raw exit code of the REAL bridge-auth.sh `global-auth-sync status --check` (the
+# daemon's probe). $1 = runtime-config file; $2 = env value or "__UNSET__".
+check_optin_rc() {
+  local cfg_file="$1" env_val="$2" rc=0
+  local -a pre=(env)
+  [[ "$env_val" == "__UNSET__" ]] && pre+=(-u BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC)
+  pre+=("BRIDGE_CLAUDE_TOKEN_REGISTRY=$REGISTRY" "BRIDGE_RUNTIME_CONFIG_FILE=$cfg_file")
+  [[ "$env_val" != "__UNSET__" ]] && pre+=("BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC=$env_val")
+  set +e
+  "${pre[@]}" bash "$AUTH_SH" claude-token global-auth-sync status --check >/dev/null 2>&1
+  rc=$?
+  set -e 2>/dev/null || true
+  printf '%s' "$rc"
+}
+
+# ── T24 (#19260) ────────────────────────────────────────────────────────
+# Daemon early-skip honors the python gate on the ENV path (persisted OFF): a
+# loose env value ("true"/"yes"/"on"/" 1 ") or an unset env early-skips, and
+# only the literal "1" proceeds — the strictness now lives in python's
+# global_auth_sync_env_override_enabled, consumed via `--check`, never
+# re-derived in bash.
+test_daemon_gate_effective_env_path() {
+  extract_global_sync_tick
+  local cfg_off="$SMOKE_TMP_ROOT/t24-config-off.json"
+  printf '{}\n' >"$cfg_off"  # persisted OFF: env override is the only contributor
+
+  local v res
+  for v in " 1 " "1 " " 1" "true" "yes" "on" "On" "True" "0" "" "__UNSET__"; do
+    res="$(run_daemon_gate "$cfg_off" "$v")"
+    [[ "$res" == "skip" ]] \
+      || smoke_fail "T24 daemon PROCEEDED for non-enabling env '$v' (must skip; persisted OFF)"
+  done
+  res="$(run_daemon_gate "$cfg_off" "1")"
+  [[ "$res" == "proceed" ]] \
+    || smoke_fail "T24 daemon did NOT proceed for the literal env '1' (persisted OFF)"
+  smoke_log "ok: daemon early-skip honors the python env gate (loose/unset skip; literal '1' proceeds)"
+}
+
+# ── T25 (#19260 — the fix) ──────────────────────────────────────────────
+# THE regression this round closes: an opt-in enabled via the headless
+# `global-auth-sync enable` verb PERSISTS the runtime-config bool but sets NO
+# env. An env-only bash early-skip skipped it, so the daemon never spawned
+# sync-global and the feature was dead at the daemon level. The tick must now
+# PROCEED for a persisted-only opt-in (env UNSET). The mirror (persisted false +
+# env unset) must still cheap-skip. Direct --check exit codes lock the
+# single-source contract AND prove `--check` is allowlisted (an unknown flag
+# fails closed rc=2 -> the daemon would skip forever).
+test_daemon_gate_persisted_only_proceeds() {
+  extract_global_sync_tick
+  local cfg_on="$SMOKE_TMP_ROOT/t25-config-on.json"
+  local cfg_off="$SMOKE_TMP_ROOT/t25-config-off.json"
+  printf '{"claude_global_auth_sync": true}\n' >"$cfg_on"
+  printf '{}\n' >"$cfg_off"
+
+  local res
+  res="$(run_daemon_gate "$cfg_on" "__UNSET__")"
+  [[ "$res" == "proceed" ]] \
+    || smoke_fail "T25 persisted-only opt-in (env unset) did NOT proceed — daemon still env-only (#19260 regression)"
+  res="$(run_daemon_gate "$cfg_off" "__UNSET__")"
+  [[ "$res" == "skip" ]] \
+    || smoke_fail "T25 not-opted-in (persisted false + env unset) PROCEEDED — must cheap-skip"
+
+  local rc
+  rc="$(check_optin_rc "$cfg_on" "__UNSET__")"
+  [[ "$rc" == "0" ]] || smoke_fail "T25 wrapper --check rc=$rc for persisted-only enabled (want 0)"
+  rc="$(check_optin_rc "$cfg_off" "__UNSET__")"
+  [[ "$rc" == "1" ]] || smoke_fail "T25 wrapper --check rc=$rc for not-opted-in (want 1)"
+  rc="$(check_optin_rc "$cfg_off" "1")"
+  [[ "$rc" == "0" ]] || smoke_fail "T25 wrapper --check rc=$rc for env='1' override (want 0)"
+  rc="$(check_optin_rc "$cfg_off" " 1 ")"
+  [[ "$rc" == "1" ]] || smoke_fail "T25 wrapper --check rc=$rc for loose env ' 1 ' (want 1; no strip)"
+  smoke_log "ok: daemon PROCEEDS for persisted-only opt-in; --check is single-source (persisted OR strict env)"
+}
+
 # ── T10 ───────────────────────────────────────────────────────────────
 test_ci_select_routing() {
   [[ -f "$CI_SELECT" ]] || smoke_fail "T10 missing ci-select-smoke.sh: $CI_SELECT"
@@ -557,6 +694,8 @@ smoke_run "T19 keychain-exists guard -> identity sync skipped + warn"          t
 smoke_run "T20 .claude.json parent-swap-after-lock -> write in LOCKED dir"     test_identity_parent_swap_after_lock
 smoke_run "T21 token-replace race -> no record + no ~/.claude.json write"      test_identity_token_replace_race
 smoke_run "T22 post-persist write under registry lock (window closed)"         test_identity_post_persist_write_under_lock
+smoke_run "T24 daemon early-skip honors python env gate (loose/unset skip)"     test_daemon_gate_effective_env_path
+smoke_run "T25 daemon early-skip PROCEEDS for persisted-only opt-in (#19260)"   test_daemon_gate_persisted_only_proceeds
 smoke_run "T10 ci-select routing -> bridge-auth.py + smoke selected"          test_ci_select_routing
 
 smoke_log "all checks passed"
