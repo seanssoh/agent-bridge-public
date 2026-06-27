@@ -1710,6 +1710,69 @@ def cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _converge_operator_global_inline(registry_path: Path) -> dict[str, Any]:
+    """#2164: converge the operator-global credential on the active registry token
+    synchronously, AT an active-token-mutation source (``cmd_rotate`` /
+    ``cmd_activate``) rather than only on the daemon's post-rotation/periodic
+    ticks. So a manual ``claude-token rotate``/``activate`` (or any caller that
+    passes ``--sync``) makes a dynamic-vanilla Claude agent re-read the new token
+    without waiting up to the ~3600s periodic tick.
+
+    Best-effort + double-gated default-OFF (``auto_rotate_enabled`` AND the
+    ``global-auth-sync`` opt-in) INSIDE: NEVER raises and NEVER touches the
+    operator credential file unless the operator opted in. Returns a small status
+    dict (``status`` ∈ {synced, converged, skipped, error}). Callers attach it to
+    their payload but MUST NOT let it fail/roll back the active-token change that
+    already committed (rotation/activation success > a converge hiccup). Reuses
+    ``cmd_sync_global``'s gated primitives; the daemon's own ticks remain an
+    idempotent (fingerprint-based) backstop, so a double converge is harmless.
+    Steady state makes NO network call (identity source is the operator-configured
+    account, not a probe), so this stays well inside the daemon's rotate timeout.
+    """
+    try:
+        global_path = resolve_controller_claude_credentials_path(None)
+        config_path = resolve_operator_claude_config_path(global_path)
+        auto_rotate, opt_in, active_id, active_token = _global_auth_gate_state(
+            registry_path
+        )
+        if not opt_in or not auto_rotate:
+            return {
+                "status": "skipped",
+                "reason": (
+                    "global_auth_sync_opt_in_disabled"
+                    if not opt_in
+                    else "auto_rotate_disabled"
+                ),
+                "converged": False,
+            }
+        if not active_id or not active_token:
+            return {"status": "skipped", "reason": "no_active_token", "converged": False}
+        result = patch_global_claude_credentials(
+            global_path,
+            active_token,
+            expires_at_ms=CLAUDE_OAUTH_EXPIRES_AT_MS,
+            allowed_root=None,
+        )
+        identity_shadow = run_global_identity_sync(
+            registry_path,
+            active_id,
+            active_token,
+            config_path,
+            credential_changed=bool(result["changed"]),
+            allowed_root=None,
+        )
+        return {
+            "status": "synced" if result["changed"] else "converged",
+            "converged": True,
+            "changed": bool(result["changed"]),
+            "active_token_id": active_id,
+            "fingerprint": result["fingerprint"],
+            "identity_shadow": identity_shadow,
+        }
+    except Exception as exc:  # noqa: BLE001 - best-effort; a converge failure must never fail the active-token change that already committed
+        return {"status": "error", "error": str(exc), "converged": False}
+
+
 def cmd_activate(args: argparse.Namespace) -> int:
     json_mode = bool(args.json)
     registry_path = Path(args.registry).expanduser()
@@ -1737,6 +1800,12 @@ def cmd_activate(args: argparse.Namespace) -> int:
         "active_token_id": args.id,
         "fingerprint": token_fingerprint(str(row.get("token") or "")),
     }
+    # #2164: an explicit activation changed the active token — converge the
+    # operator-global credential synchronously when the caller asked (``--sync``)
+    # so a dynamic-vanilla agent picks up the new token without the periodic-tick
+    # lag. Fail-safe + gated default-OFF inside; never fails the activation above.
+    if getattr(args, "sync", False):
+        payload["global_sync"] = _converge_operator_global_inline(registry_path)
     if json_mode:
         json_dump(payload)
     else:
@@ -2265,6 +2334,13 @@ def cmd_rotate(args: argparse.Namespace) -> int:
         "fingerprint": token_fingerprint(str(row.get("token") or "")),
         "reason": args.reason or "",
     }
+    # #2164: the rotation changed the active token — converge the operator-global
+    # credential synchronously when the caller asked (``--sync``, as the daemon
+    # usage-monitor does) so a dynamic-vanilla agent re-reads the new token at its
+    # next prompt boundary instead of waiting up to the ~3600s periodic tick.
+    # Fail-safe + gated default-OFF inside; never rolls back the committed rotation.
+    if getattr(args, "sync", False):
+        payload["global_sync"] = _converge_operator_global_inline(registry_path)
     if json_mode:
         json_dump(payload)
     else:
