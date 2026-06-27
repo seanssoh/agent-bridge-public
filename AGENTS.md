@@ -63,7 +63,7 @@ Codex agents MUST work inside their own git worktree, not the operator's primary
   done
   ```
   Never `rm -f "$BRIDGE_WORKTREE_META_DIR"/<agent>--*.env` blindly — that deletes every project's entry for the same agent name. And never `rm -rf` the worktree path without `git worktree remove` first — that leaves git's bookkeeping in a stale state and breaks future `--prefer new` spawns for the same name.
-- Never run `git checkout <branch>` or `git commit --amend` inside the operator's primary checkout from a Codex agent's session. Those operations belong in the agent's own worktree or in a short-lived temp clone.
+- Never run `git checkout <branch>` or `git commit --amend` inside the operator's primary checkout from a Codex agent's session. Those operations belong in the agent's own worktree or in a short-lived temp clone. As of #19146 this is **enforced, not just advisory**: a PreToolUse Bash guard in `hooks/tool-policy.py` fail-closed DENIES destructive git (`reset`/`checkout`/`switch`/`restore`/`clean`/`stash pop|apply`/`branch -D`/`worktree remove`/`reflog expire`/`gc --prune`, …) that escapes a dispatched-fixer's own worktree into the primary checkout (via `-C`, `--git-dir`, an env wrapper, a `VAR=` prefix, or a `cd` whose realpath leaves the worktree). It is allowlist-based (only the canonical bare-`git` shape inside your own worktree is allowed) and operator sessions are structurally exempt (their cwd is the repo root, not under `.claude/worktrees`). The hook is fail-OPEN on crash/timeout, so this advisory stays the parallel defense-in-depth layer — do not rely on the hook alone.
 
 ### 2. Pair-review workflow
 
@@ -99,4 +99,4 @@ Even when a Codex agent is attached to a shared worktree for legacy reasons, the
 - `git commit --amend` against a commit you did not author in that same session.
 - `git push --force` or `--force-with-lease` against another agent's branch.
 
-Violations have blocked real operator work at least once (see the v0.6.9 release cut note above) and must be treated as P1 process breakage, not a style issue.
+Violations have blocked real operator work at least once (see the v0.6.9 release cut note above) and must be treated as P1 process breakage, not a style issue. The first three (`git checkout`/`reset`/`clean`/`worktree prune` into the primary checkout from a dispatched-fixer session) are now also **enforced** by the #19146 PreToolUse Bash guard described in §1; the hook is a fail-open backstop, so this section remains the authoritative rule.
