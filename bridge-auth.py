@@ -4746,6 +4746,14 @@ def cmd_global_auth_sync(args: argparse.Namespace) -> int:
     effective = persisted or env_override_enabled
     effective_source = global_auth_sync_effective_source()
 
+    if getattr(args, "check", False):
+        # #19260 — exit-code-only effective-state probe for the daemon early-skip.
+        # NEVER mutates and prints nothing: returns 0 iff EFFECTIVELY enabled so
+        # the bash early-skip reuses THIS persisted-OR-env predicate as the single
+        # source of truth (r2 hardcoded an env-only bash gate, which skipped a
+        # verb-enabled persisted opt-in and killed the feature at the daemon).
+        return 0 if effective else 1
+
     if action == "status":
         # The brief enumerates the status --json schema exactly: the four
         # effective-state fields and no envelope (no status/action wrapper).
@@ -6398,6 +6406,18 @@ def build_parser() -> argparse.ArgumentParser:
         "action", choices=("enable", "disable", "status")
     )
     global_auth_sync_parser.add_argument("--json", action="store_true")
+    global_auth_sync_parser.add_argument(
+        "--check",
+        action="store_true",
+        help=(
+            "exit-code-only effective-state probe (no stdout/mutation): exit 0 "
+            "iff the opt-in is EFFECTIVELY enabled (persisted runtime-config bool "
+            "OR BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC=='1'), exit 1 otherwise. The daemon "
+            "early-skip calls `global-auth-sync status --check` so the cheap bash "
+            "skip reuses THIS single python predicate — never re-deriving the gate "
+            "in bash, which is the source-of-truth drift behind #19260."
+        ),
+    )
     global_auth_sync_parser.set_defaults(handler=cmd_global_auth_sync)
 
     # Issue #1855: create-if-absent keychain-free settings backfill for a single

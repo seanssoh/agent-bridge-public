@@ -23,7 +23,7 @@ Usage:
   bash $SCRIPT_DIR/bridge-auth.sh claude-token global-auth-status [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token backfill-settings [--agents static|all|csv] [--check] [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token keychain-free <enable|disable|status> [--json]
-  bash $SCRIPT_DIR/bridge-auth.sh claude-token global-auth-sync <enable|disable|status> [--json]   # #18849: operator-global seamless token-sync opt-in (persisted; env override secondary)
+  bash $SCRIPT_DIR/bridge-auth.sh claude-token global-auth-sync <enable|disable|status> [--check] [--json]   # #18849: operator-global seamless token-sync opt-in (persisted; env override secondary). --check = exit-code-only effective-state probe (daemon early-skip)
   bash $SCRIPT_DIR/bridge-auth.sh claude-token rotate [--if-auto-enabled] [--reason <text>] [--sync] [--agents static|all|csv] [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token check <id> [--enable-on-ok] [--disable-on-quota] [--timeout <sec>] [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token classify-output [--stdout-file <path>] [--stderr-file <path>] [--returncode <n>]
@@ -1498,7 +1498,10 @@ case "$command" in
             ;;
         esac
         shift || true
-        bridge_auth_guard_wrapper_flags "claude-token global-auth-sync" "" "--json" "$@"
+        # `--check` (#19260): exit-code-only effective-state probe the daemon
+        # early-skip calls (`status --check`) — must be allowlisted here or the
+        # guard fails closed (exit 2) and the daemon skips the sync forever.
+        bridge_auth_guard_wrapper_flags "claude-token global-auth-sync" "" "--json,--check" "$@"
         exec python3 "$SCRIPT_DIR/bridge-auth.py" --registry "$registry" \
           global-auth-sync "$action" "$@"
         ;;
