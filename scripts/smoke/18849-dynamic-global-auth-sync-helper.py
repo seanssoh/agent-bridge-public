@@ -117,8 +117,8 @@ def assert_identity_patched(path: str, email: str) -> None:
     o = d.get("oauthAccount", {})
     if o.get("emailAddress") != email:
         _fail(f"oauthAccount.emailAddress not synced to {email!r}: {o.get('emailAddress')!r}")
-    if o.get("accountUuid") != ACCT_UUID:
-        _fail("verified accountUuid (subject) was not written")
+    # #18849 Part 1b-v2: the operator-source path patches ONLY emailAddress (no
+    # subject), so accountUuid must NOT be invented; an existing one is preserved.
     if o.get("organizationName") != "Acme Org":
         _fail("organizationName (unknown oauthAccount field) was LOST")
     if d.get("projects") != {"/some/workdir": {"hasTrustDialogAccepted": True}}:
@@ -222,28 +222,39 @@ def race_parent_swap_config(reg_path: str, op_home: str, email: str) -> None:
     print("OK race-parent-swap-config: lock-dir == write-dir; decoy untouched")
 
 
-def race_token_replace_during_probe(
+def _set_operator_email(reg_path: str, token_id: str, email: str) -> None:
+    """Stamp an OPERATOR-sourced account_email onto a seeded registry row."""
+    reg = json.load(open(reg_path, encoding="utf-8"))
+    for row in reg.get("tokens", []):
+        if row.get("id") == token_id:
+            row["account_email"] = email
+            row["account_email_source"] = "operator"
+    with open(reg_path, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(reg))
+
+
+def race_token_replace_before_write(
     reg_path: str, op_home: str, displayed_email: str, victim_email: str
 ) -> None:
-    """#18849 Part 1b r2 — token-replace race during the in-flight profile probe.
+    """#18849 Part 1b-v2 — token-replace race BEFORE the operator-identity write.
 
-    The verified profile probe runs on ``active_token`` — a value snapshotted
-    BEFORE the registry lock is released (``_global_auth_gate_state``). A
-    concurrent ``cmd_add --replace`` / rotation can swap the active row's token
-    value (same id) WHILE the probe is in flight. We reproduce that by
-    monkeypatching ``probe_claude_account_identity`` so that, at probe time, it
-    (a) swaps t1's token value on disk and (b) returns a VERIFIED identity for a
-    DIFFERENT account. A correct persist path rechecks the row's CURRENT token
-    fingerprint under the registry lock and SKIPS both the registry identity
-    record AND the ~/.claude.json write. Discriminator: with the fingerprint
-    recheck removed, the stale verified email is stamped onto the replacement
-    token AND written into ~/.claude.json.
+    The displayed-identity write is based on ``active_token`` — snapshotted under
+    an earlier lock by ``_global_auth_gate_state``. A concurrent
+    ``cmd_add --replace`` can swap the active row's token value (same id) before
+    the write lands. We reproduce that by seeding t1 with an OPERATOR-configured
+    ``account_email`` (``victim_email``), then swapping ONLY t1's token value on
+    disk to a replacement, and calling ``run_global_identity_sync`` with the
+    ORIGINAL token. The write path rechecks the row's CURRENT token fingerprint
+    under the registry lock and SKIPS the ~/.claude.json write — the configured
+    email no longer belongs to the token the sync was based on. Discriminator:
+    with the fingerprint recheck removed, the configured email is written even
+    though the active token was replaced mid-sync.
     """
     import importlib.util
     from pathlib import Path
 
     # Force the keychain-exists guard OFF so the (macOS) test host's real
-    # keychain state cannot pre-empt the identity path before the probe runs.
+    # keychain state cannot pre-empt the identity path.
     os.environ["BRIDGE_AUTH_FORCE_KEYCHAIN_PRESENT"] = "0"
 
     here = os.path.dirname(os.path.abspath(__file__))
@@ -260,68 +271,47 @@ def race_token_replace_during_probe(
     replacement_token = "ZZZswapped-in-token-bbbbbbbbbbbb"
 
     seed_registry(reg_path, original_token, True)
+    _set_operator_email(reg_path, "t1", victim_email)
     with open(cfg_path, "w", encoding="utf-8") as fh:
         fh.write(json.dumps({"oauthAccount": {"emailAddress": displayed_email}}))
     os.chmod(cfg_path, 0o600)
 
-    real_probe = mod.probe_claude_account_identity
-    state = {"fired": False}
+    # Concurrent cmd_add --replace: swap ONLY the token value (the operator's
+    # account_email / source stay, so only the FINGERPRINT recheck can catch it).
+    reg = json.load(open(reg_path, encoding="utf-8"))
+    for row in reg.get("tokens", []):
+        if row.get("id") == "t1":
+            row["token"] = replacement_token
+    with open(reg_path, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(reg))
 
-    def replacing_probe(token, *, timeout_seconds):  # noqa: ANN001
-        state["fired"] = True
-        reg = json.load(open(reg_path, encoding="utf-8"))
-        for row in reg.get("tokens", []):
-            if row.get("id") == "t1":
-                row["token"] = replacement_token  # concurrent cmd_add --replace
-        with open(reg_path, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps(reg))
-        return {"status": "verified", "email": victim_email,
-                "subject": ACCT_UUID, "detail": "fixture verified (stale token)"}
+    result = mod.run_global_identity_sync(
+        Path(reg_path), "t1", original_token, Path(cfg_path),
+        credential_changed=True, allowed_root=Path(op_home),
+    )
 
-    mod.probe_claude_account_identity = replacing_probe
-    try:
-        result = mod.run_global_identity_sync(
-            Path(reg_path), "t1", original_token, Path(cfg_path),
-            credential_changed=True, allowed_root=Path(op_home),
-        )
-    finally:
-        mod.probe_claude_account_identity = real_probe
-
-    if not state["fired"]:
-        _fail("probe monkeypatch never fired — the race was not exercised")
     if result.get("status") != "skipped" or result.get("reason") != "token_replaced":
         _fail(f"expected status=skipped reason=token_replaced, got {result!r}")
-
-    reg = json.load(open(reg_path, encoding="utf-8"))
-    row = next((r for r in reg.get("tokens", []) if r.get("id") == "t1"), {})
-    if row.get("token") != replacement_token:
-        _fail("precondition: registry token was not actually replaced mid-probe")
-    if row.get("account_email") == victim_email:
-        _fail("RACE REPRODUCED: stale verified email recorded onto the REPLACED token row")
-    if row.get("account_email_probe_status") == "verified":
-        _fail("RACE REPRODUCED: probe_status=verified persisted onto the replaced token row")
 
     cfg = json.load(open(cfg_path, encoding="utf-8"))
     got = cfg.get("oauthAccount", {}).get("emailAddress")
     if got != displayed_email:
         _fail(f"RACE REPRODUCED: ~/.claude.json identity was WRITTEN to {got!r} on a token-replace race")
-    print("OK race-token-replace-during-probe: no identity record, no ~/.claude.json write")
+    print("OK race-token-replace-before-write: no ~/.claude.json write on a mid-sync token swap")
 
 
 def race_post_persist_write_under_lock(
     reg_path: str, op_home: str, displayed_email: str, new_email: str
 ) -> None:
-    """#18849 Part 1b r2 — the verified-identity WRITE must run while the
-    registry lock is HELD, closing the post-persist/pre-patch token-replace
-    window (codex r2 Finding 1). A concurrent ``cmd_add --replace`` swaps the
-    active token under ``registry_lock``; if the ~/.claude.json write ran AFTER
-    the registry lock was released, a replace landing in that gap would let a
-    stale verified email reach the config writer. We wrap
-    ``patch_global_claude_identity`` so that, at write time, it proves a
-    non-blocking ``registry_lock`` acquisition would BLOCK (i.e. the lock is
-    still held by ``run_global_identity_sync``). Discriminator: if the write
-    were moved OUTSIDE the registry lock, the non-blocking flock would SUCCEED
-    and this fails.
+    """#18849 Part 1b-v2 — the operator-identity WRITE must run while the registry
+    lock is HELD, closing the recheck/pre-patch token-replace window. A concurrent
+    ``cmd_add --replace`` swaps the active token under ``registry_lock``; if the
+    ~/.claude.json write ran AFTER the registry lock was released, a replace
+    landing in that gap would let a stale identity reach the config writer. We
+    wrap ``patch_global_claude_identity`` so that, at write time, it proves a
+    non-blocking ``registry_lock`` acquisition would BLOCK (i.e. the lock is still
+    held by ``run_global_identity_sync``). Discriminator: if the write were moved
+    OUTSIDE the registry lock, the non-blocking flock would SUCCEED and this fails.
     """
     import fcntl
     import importlib.util
@@ -341,6 +331,7 @@ def race_post_persist_write_under_lock(
     cfg_path = os.path.join(op_home, ".claude.json")
     token = "ZZZorig-active-token-aaaaaaaaaaaa"
     seed_registry(reg_path, token, True)
+    _set_operator_email(reg_path, "t1", new_email)
     with open(cfg_path, "w", encoding="utf-8") as fh:
         fh.write(json.dumps({"oauthAccount": {"emailAddress": displayed_email}}))
     os.chmod(cfg_path, 0o600)
@@ -349,13 +340,8 @@ def race_post_persist_write_under_lock(
     reg = Path(reg_path)
     lock_path = str(reg.with_suffix(reg.suffix + mod.REGISTRY_LOCK_SUFFIX))
 
-    real_probe = mod.probe_claude_account_identity
     real_writer = mod.patch_global_claude_identity
     state = {"write_called": False, "lock_held_during_write": None}
-
-    def verified_probe(token, *, timeout_seconds):  # noqa: ANN001
-        return {"status": "verified", "email": new_email,
-                "subject": ACCT_UUID, "detail": "fixture verified"}
 
     def probing_writer(config_path, *, email, subject="", owner_uid=None,
                        allowed_root=None):  # noqa: ANN001
@@ -372,7 +358,6 @@ def race_post_persist_write_under_lock(
         return real_writer(config_path, email=email, subject=subject,
                            owner_uid=owner_uid, allowed_root=allowed_root)
 
-    mod.probe_claude_account_identity = verified_probe
     mod.patch_global_claude_identity = probing_writer
     try:
         result = mod.run_global_identity_sync(
@@ -380,7 +365,6 @@ def race_post_persist_write_under_lock(
             credential_changed=True, allowed_root=Path(op_home),
         )
     finally:
-        mod.probe_claude_account_identity = real_probe
         mod.patch_global_claude_identity = real_writer
 
     if not state["write_called"]:
@@ -565,8 +549,8 @@ def main() -> None:
         reg_identity(sys.argv[2], sys.argv[3])
     elif mode == "race-parent-swap-config":
         race_parent_swap_config(sys.argv[2], sys.argv[3], sys.argv[4])
-    elif mode == "race-token-replace-during-probe":
-        race_token_replace_during_probe(
+    elif mode == "race-token-replace-before-write":
+        race_token_replace_before_write(
             sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
     elif mode == "race-post-persist-write-under-lock":
         race_post_persist_write_under_lock(
