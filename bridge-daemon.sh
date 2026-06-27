@@ -2754,16 +2754,15 @@ bridge_daemon_global_auth_sync_tick() {
   local sync_json=""
   local status=""
 
-  # Default-OFF opt-in early skip (the python double-gate is authoritative; this
-  # only avoids the subprocess for the common not-opted-in install). Lowercase to
-  # match bridge-auth.py's case-insensitive normalization exactly so the bash
-  # early-skip can never disagree with the python gate (e.g. value "On"/"True").
-  local optin_lc="${BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC:-0}"
-  optin_lc="${optin_lc,,}"
-  case "$optin_lc" in
-    1|true|yes|on) ;;
-    *) return 0 ;;
-  esac
+  # Default-OFF opt-in early skip (the python double-gate inside sync-global is
+  # authoritative; this only avoids spawning the subprocess for the common
+  # not-opted-in install). The BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC env override is the
+  # literal "1" ONLY — a strict raw match identical to bridge-auth.py's
+  # global_auth_sync_env_override_enabled — so the bash early-skip is never
+  # LOOSER than the python env gate. A value like "true"/"On"/" 1 " is NOT
+  # enabling and is correctly skipped here too (this guard reads ONLY the env
+  # override; a persisted-only opt-in is honored on the env-bearing tick path).
+  [[ "${BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC:-}" == "1" ]] || return 0
 
   if sync_json="$(bridge_with_timeout 15 daemon_auth_global_sync "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token sync-global --json 2>/dev/null)"; then
     status="$(bridge_with_timeout 5 global_sync_status_parse python3 \

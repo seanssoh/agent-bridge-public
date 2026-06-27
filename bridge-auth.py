@@ -2751,13 +2751,18 @@ def global_auth_sync_env_override_enabled() -> bool:
     """True iff the ``BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC`` env override is the
     canonical enabling literal ``"1"``.
 
-    Deliberately strict equality (``== "1"``), matching the ``flag_one`` config
-    type that screens the same key on the ``set-env`` allowlist: the only value
-    that turns the gate ON is ``"1"``; ``"0"``/``"true"``/empty are NOT enabling.
-    To clear an enabling override the operator removes the key (``config
-    unset-env`` on main, or a manual edit) — there is no ``=0`` disable form.
+    Deliberately strict equality on the RAW value (``== "1"``), matching the
+    ``flag_one`` config type that screens the same key on the ``set-env``
+    allowlist: the only value that turns the gate ON is the exact string
+    ``"1"``; ``"0"``/``"true"``/empty are NOT enabling, and a whitespace-padded
+    form (``" 1 "``/``"1 "``/``" 1"``) is NOT enabling either — the comparison
+    does NOT ``.strip()``, so a padded value falls through to OFF rather than
+    silently activating a personal-credential writer the operator did not type
+    exactly. To clear an enabling override the operator removes the key
+    (``config unset-env`` on main, or a manual edit) — there is no ``=0``
+    disable form.
     """
-    return os.environ.get(GLOBAL_AUTH_SYNC_OPT_IN_ENV, "").strip() == "1"
+    return os.environ.get(GLOBAL_AUTH_SYNC_OPT_IN_ENV, "") == "1"
 
 
 def global_auth_sync_opt_in_enabled() -> bool:

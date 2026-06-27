@@ -513,6 +513,67 @@ def race_parent_swap(reg_path: str, op_home: str, rotated_token: str) -> None:
     print("OK race-parent-swap: lock-dir == write-dir; decoy untouched")
 
 
+def _load_repo_module(filename: str, modname: str):
+    """Import a repo-root module (e.g. bridge-auth.py) by path for in-process probes."""
+    import importlib.util
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.dirname(os.path.dirname(here))
+    spec = importlib.util.spec_from_file_location(
+        modname, os.path.join(repo_root, filename)
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# Whitespace-padded and look-alike values that MUST be rejected (config) / treated
+# as OFF (env override). The flag's contract is literal "1" only — no .strip().
+_FLAG_NON_ENABLING = [" 1 ", "1 ", " 1", " true ", "true", "0", ""]
+_GLOBAL_SYNC_ENV = "BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC"
+_ROOM_AUTOJOIN_KEY = "BRIDGE_A2A_ROOM_AUTOJOIN"
+
+
+def flag_strict_probes() -> None:
+    """#19234 r2 — prove the flag_one validator + env override are LITERAL "1"
+    only (no .strip() normalization), and that tightening the shared flag_one
+    type does NOT regress BRIDGE_A2A_ROOM_AUTOJOIN (exact "1" still accepted)."""
+    auth = _load_repo_module("bridge-auth.py", "bridge_auth_flagprobe")
+    config = _load_repo_module("bridge-config.py", "bridge_config_flagprobe")
+
+    # 1) env override: only the raw literal "1" enables; padded/look-alikes OFF.
+    for val in _FLAG_NON_ENABLING:
+        os.environ[_GLOBAL_SYNC_ENV] = val
+        if auth.global_auth_sync_env_override_enabled():
+            _fail(f"env override ENABLED for non-literal {val!r} (must be OFF)")
+    os.environ[_GLOBAL_SYNC_ENV] = "1"
+    if not auth.global_auth_sync_env_override_enabled():
+        _fail("env override NOT enabled for the literal '1' (must be ON)")
+    os.environ.pop(_GLOBAL_SYNC_ENV, None)
+    if auth.global_auth_sync_env_override_enabled():
+        _fail("env override ENABLED when the key is unset (must be OFF)")
+
+    # 2) config validator: padded/look-alikes REJECT; only literal "1" accepts.
+    for val in _FLAG_NON_ENABLING:
+        canon, reason = config.validate_env_value(_GLOBAL_SYNC_ENV, val)
+        if canon is not None or reason is None:
+            _fail(f"validator ACCEPTED non-literal {val!r} -> {canon!r} (must reject)")
+    canon, reason = config.validate_env_value(_GLOBAL_SYNC_ENV, "1")
+    if canon != "1" or reason is not None:
+        _fail(f"validator did NOT accept the literal '1' -> ({canon!r}, {reason!r})")
+
+    # 3) ROOM_AUTOJOIN zero-regression: shared flag_one type, exact "1" still
+    #    accepted; the whitespace-padded form is rejected the SAME way.
+    canon, reason = config.validate_env_value(_ROOM_AUTOJOIN_KEY, "1")
+    if canon != "1" or reason is not None:
+        _fail(f"ROOM_AUTOJOIN regression: exact '1' rejected -> ({canon!r}, {reason!r})")
+    canon, reason = config.validate_env_value(_ROOM_AUTOJOIN_KEY, " 1 ")
+    if canon is not None or reason is None:
+        _fail(f"ROOM_AUTOJOIN: padded ' 1 ' ACCEPTED -> {canon!r} (must reject)")
+
+    print("OK flag-strict-probes: literal-1-only enforced; ROOM_AUTOJOIN '1' still accepted")
+
+
 def json_field(field: str) -> None:
     d = json.load(sys.stdin)
     cur = d
@@ -563,6 +624,8 @@ def main() -> None:
         access_token(sys.argv[2])
     elif mode == "race-parent-swap":
         race_parent_swap(sys.argv[2], sys.argv[3], sys.argv[4])
+    elif mode == "flag-strict-probes":
+        flag_strict_probes()
     elif mode == "json-field":
         json_field(sys.argv[2])
     else:

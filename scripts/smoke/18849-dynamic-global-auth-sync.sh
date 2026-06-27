@@ -40,6 +40,10 @@
 #   T22 write under registry lock             -> operator-identity .claude.json write holds the registry lock (window closed)
 #   (operator-source capture/validation, optional verify-probe + scope change live in
 #    scripts/smoke/18849-operator-account-email.sh)
+#   T23 flag_one literal-"1"-only (#19234 r2) -> opt-in env override + set-env validator
+#       reject/OFF a whitespace-padded " 1 " (no .strip()); ROOM_AUTOJOIN "1" un-regressed
+#   T24 daemon early-skip literal-"1" (#19234 r2) -> bridge_daemon_global_auth_sync_tick
+#       skips "true"/"yes"/"on"/" 1 " (strict raw == "1"), never spawns sync-global
 #   T10 ci-select routing                     -> bridge-auth.py + this smoke selected
 #
 # Footgun #11 (heredoc_write deadlock class): this driver and its helper avoid
@@ -465,6 +469,65 @@ test_identity_parent_swap_after_lock() {
     "T20 .claude.json parent-swap-after-lock: identity stays in the LOCKED dir"
 }
 
+# ── T23 (#19234 r2) ────────────────────────────────────────────────────
+# The opt-in env override AND the flag_one set-env validator are LITERAL "1"
+# only — neither .strip()s, so a whitespace-padded " 1 " is OFF / rejected, not
+# silently normalized. Also proves the shared flag_one tightening does NOT
+# regress BRIDGE_A2A_ROOM_AUTOJOIN (exact "1" still accepted).
+test_flag_one_literal_strict() {
+  local out
+  out="$(python3 "$HELPER" flag-strict-probes 2>&1)" \
+    || smoke_fail "T23 flag-strict-probes failed: $out"
+  smoke_assert_contains "$out" "OK flag-strict-probes" \
+    "T23 env override + flag_one validator are literal-1-only (no strip); ROOM_AUTOJOIN un-regressed"
+}
+
+# ── T24 (#19234 r2) ─────────────────────────────────────────────────────
+# The daemon's opt-in EARLY-SKIP (bridge_daemon_global_auth_sync_tick) is
+# literal-"1"-only too: a value like "true"/"yes"/"on"/" 1 " must early-skip and
+# NOT spawn sync-global, matching the python env override's strict raw == "1".
+# Unit-tests the real extracted function with shimmed deps; the sentinel is
+# touched ONLY if the guard let execution reach the sync-global spawn.
+test_daemon_gate_literal_strict() {
+  local daemon_src="$REPO_ROOT/bridge-daemon.sh"
+  local funcs="$SMOKE_TMP_ROOT/global-sync-tick.sh"
+  awk '/^bridge_daemon_global_auth_sync_tick\(\) \{/,/^}/' "$daemon_src" >"$funcs"
+  grep -q "^bridge_daemon_global_auth_sync_tick() {" "$funcs" \
+    || smoke_fail "T24 could not extract bridge_daemon_global_auth_sync_tick (rename in bridge-daemon.sh?)"
+
+  local sentinel="$SMOKE_TMP_ROOT/t24-spawned"
+  run_daemon_gate() {
+    rm -f "$sentinel"
+    # env -i so no outer smoke state (set -e, BRIDGE_*) leaks in; the inner shell
+    # sets its own flags. bridge_with_timeout is shimmed to TOUCH the sentinel —
+    # reaching it means the early-skip guard did NOT fire.
+    env -i PATH="$PATH" \
+      FUNCS="$funcs" SENTINEL="$sentinel" \
+      BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC="$1" \
+      BRIDGE_BASH_BIN="bash" SCRIPT_DIR="/nonexistent" \
+      BRIDGE_ADMIN_AGENT_ID="daemon" \
+      bash -c '
+        set -uo pipefail
+        bridge_with_timeout() { : >"$SENTINEL"; return 1; }
+        daemon_info() { :; }
+        daemon_warn() { :; }
+        bridge_audit_log() { :; }
+        # shellcheck disable=SC1090
+        source "$FUNCS"
+        bridge_daemon_global_auth_sync_tick periodic >/dev/null 2>&1 || true
+      '
+  }
+
+  local v
+  for v in " 1 " "1 " " 1" "true" "yes" "on" "On" "True" "0" ""; do
+    run_daemon_gate "$v"
+    [[ -e "$sentinel" ]] && smoke_fail "T24 daemon early-skip SPAWNED sync for non-literal '$v' (must skip)"
+  done
+  run_daemon_gate "1"
+  [[ -e "$sentinel" ]] || smoke_fail "T24 daemon early-skip did NOT proceed for the literal '1'"
+  smoke_log "ok: daemon early-skip is literal-1-only (no true/yes/on/whitespace spawn)"
+}
+
 # ── T10 ───────────────────────────────────────────────────────────────
 test_ci_select_routing() {
   [[ -f "$CI_SELECT" ]] || smoke_fail "T10 missing ci-select-smoke.sh: $CI_SELECT"
@@ -495,6 +558,8 @@ smoke_run "T19 keychain-exists guard -> identity sync skipped + warn"          t
 smoke_run "T20 .claude.json parent-swap-after-lock -> write in LOCKED dir"     test_identity_parent_swap_after_lock
 smoke_run "T21 token-replace race -> no ~/.claude.json write"                  test_identity_token_replace_race
 smoke_run "T22 identity write under registry lock (window closed)"             test_identity_post_persist_write_under_lock
+smoke_run "T23 opt-in env + flag_one validator literal-1-only (no strip)"      test_flag_one_literal_strict
+smoke_run "T24 daemon opt-in early-skip literal-1-only (no true/yes/on)"        test_daemon_gate_literal_strict
 smoke_run "T10 ci-select routing -> bridge-auth.py + smoke selected"          test_ci_select_routing
 
 smoke_log "all checks passed"

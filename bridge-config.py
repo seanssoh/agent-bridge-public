@@ -1291,10 +1291,16 @@ def validate_env_value(key: str, raw: str) -> tuple[str | None, str | None]:
         return str(val), None
     if expected == ENV_KEY_TYPE_FLAG_ONE:
         # The only durable value is the literal "1" (the consuming code uses
-        # strict `!= "1"` equality). Reject everything else — "0"/"true"/"yes"
-        # would be silently treated as OFF by the gate, so accepting them here
-        # would be a confusing no-op. To disable, remove the key + restart.
-        if text == "1":
+        # strict `!= "1"` equality). Compare the RAW value, NOT the stripped
+        # `text`: a whitespace-padded " 1 " must NOT normalize to "1". Accepting
+        # the padded form would persist `export KEY='1'` that the strict runtime
+        # gate honors, even though the operator typed a value the screen never
+        # promised to accept — a silent normalization the flag's literal-only
+        # contract forbids. Reject everything else — "0"/"true"/"yes" and any
+        # whitespace-padded form would be silently treated as OFF by the gate,
+        # so accepting them here would be a confusing no-op. To disable, remove
+        # the key + restart.
+        if raw == "1":
             return "1", None
         return None, (
             f"value for {key} must be the literal \"1\" (the feature gate is "
