@@ -187,6 +187,52 @@ to `release/X.Y-lts` whose resulting HEAD has **not** passed CI is prohibited.
 > trigger** below. So "the v0.16 hardening rides `main`" (pre-fork) and "the v0.16 LTS lives on
 > `release/0.16-lts`" (post-fork) are the *same line at two life stages*, not a contradiction.
 
+### LTS line ancestry invariant — HEAD always descends from the latest stable tag
+
+Branch hygiene above says "don't push an un-CI-green HEAD." The **ancestry invariant** is the
+stronger, structural rule a CI gate now enforces: the LTS branch has exactly **one permitted
+shape**.
+
+- **The base is always the latest stable `vX.Y.z` tag** of the line. `release/0.16-lts` is anchored
+  at the highest *bare* `v0.16.z` tag — never an `-rc`/`-beta` prerelease, never an older tag.
+- **Backports are cherry-picked *onto* that tag-based head**, one fast-forward at a time. After
+  every backport the branch HEAD is still a **fast-forward descendant** of the latest stable tag.
+- **The branch never accumulates a *parallel* cherry-pick line.** A history that re-creates the
+  backports on a divergent base — instead of fast-forwarding from the tag — is drift, even when the
+  *contents* look equivalent.
+
+**Enforcement.** The `lts-line-ancestry-check` CI job (`scripts/ci/lts-line-ancestry-check.sh`) runs
+on every push / PR targeting `release/0.16-*`. It selects the latest stable `vX.Y.z` tag for the
+line (`git tag --list "v<minor>.*" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$'` — bare versions only, so
+`-rc`/`-beta`/`+build` are excluded) and asserts
+`git merge-base --is-ancestor <tag> <branch-HEAD>`. Not an ancestor → the job fails with
+`release/<minor>-* HEAD has drifted from <tag>; reset-to-tag required`. The line glob is anchored on
+the literal `v<minor>.` prefix, so a future `release/0.17-lts` (glob `v0.17.*`) can never match a
+`v0.16.*` tag. If the line has **no** stable tag yet, the gate fails **explicitly** (it never
+green-skips): a line with no tag has no ancestry to assert, and the only way to make it green is to
+cut the line's first stable tag.
+
+> **No bootstrap problem.** Right after a tag cut the branch HEAD *equals* the tag, which is its own
+> ancestor — the gate passes trivially. Before the next cut, every new HEAD must descend from the
+> prior stable tag. There is no chicken-and-egg gap.
+
+**On drift → reset-to-tag, do not patch forward.** When the gate fails (or you otherwise find the
+branch has diverged), reset the line to its tag and re-apply only the qualified backports:
+
+1. `git checkout release/0.16-lts`
+2. `git reset --hard <latest-stable-v0.16.z-tag>`
+3. Cherry-pick **only** the backports that meet the backport criteria (§4), in order — each one
+   fast-forwards the head, so the invariant holds at every step.
+4. Force-push under the three-requirement protocol in
+   [`AGENTS.md` §"Multi-Agent Collaboration"](../AGENTS.md) (candidate-branch CI green → patch-dev
+   codex `implement-ok` → `git ls-remote` re-verify).
+
+**Why this exists.** The drift class has recurred three times; most recently a wholesale force-push
+reset `release/0.16-lts` onto a **48-commit parallel cherry-pick line** instead of fast-forwarding
+the **13** qualified backports onto the latest tag. A parallel line silently re-orders, drops, or
+duplicates backports and makes the branch impossible to reason about against the tag it claims to
+extend. The ancestry gate turns that invisible footgun into a red CI check.
+
 ## 5. Fork trigger + mechanics
 
 - **Trigger = the first real new FEATURE** destined for the next minor. Hardening alone does **not**

@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - main
+      # LTS maintenance line — so the lts-line-ancestry-check gate fires on a
+      # (force-)push to release/0.16-lts, not only on PRs targeting it (#19043).
+      - 'release/0.16-*'
   pull_request:
   workflow_dispatch:
     inputs:
@@ -64,6 +67,7 @@ jobs:
             agb \
             lib/*.sh \
             scripts/*.sh \
+            scripts/ci/*.sh \
             scripts/smoke/*.sh \
             agent-roster.local.example.sh
 
@@ -285,3 +289,38 @@ jobs:
         run: |
           echo "legacy-full-smoke is archived and opt-in only; modular smoke jobs are the deploy/PR signal."
           timeout 12m bash ./scripts/smoke/legacy-full-smoke.sh
+
+  lts-line-ancestry-check:
+    # Recurrence-prevention gate for the LTS-line drift class (#19043,
+    # patch-approved #19116). Fires ONLY when a release/0.16-* maintenance
+    # branch is the push target or PR base — main / feature CI is unaffected.
+    # Asserts the branch HEAD still descends from the latest stable v0.16.z tag
+    # (so a wholesale force-push onto a parallel cherry-pick line goes red
+    # instead of shipping invisibly to the next patch cut). Policy:
+    # docs/release-lines.md §"LTS line ancestry invariant".
+    name: lts-line-ancestry-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: |
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/0.16-')) ||
+      (github.event_name == 'pull_request' && startsWith(github.base_ref, 'release/0.16-'))
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history + all tags: the ancestry assertion needs every stable
+          # tag object and the branch / PR-head commit reachable locally.
+          fetch-depth: 0
+
+      - name: Self-test selector + ancestry logic
+        run: bash ./scripts/smoke/lts-line-ancestry-self.sh
+
+      - name: Assert release/0.16-* HEAD descends from latest stable tag
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            branch="$GITHUB_BASE_REF"
+          else
+            branch="${GITHUB_REF#refs/heads/}"
+          fi
+          bash ./scripts/ci/lts-line-ancestry-check.sh "$branch" "$HEAD_SHA"
