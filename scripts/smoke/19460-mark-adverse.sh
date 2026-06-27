@@ -36,7 +36,9 @@ smoke_setup_bridge_home "$SMOKE_NAME"
 
 REPO_ROOT="$SMOKE_REPO_ROOT"
 AUTH_PY="$REPO_ROOT/bridge-auth.py"
+AUTH_SH="$REPO_ROOT/bridge-auth.sh"
 [[ -f "$AUTH_PY" ]] || smoke_fail "missing bridge-auth.py: $AUTH_PY"
+[[ -f "$AUTH_SH" ]] || smoke_fail "missing bridge-auth.sh: $AUTH_SH"
 
 REGISTRY="$SMOKE_TMP_ROOT/registry.json"
 # Benign, non-credential token strings (validate_token wants len>=20, no
@@ -137,10 +139,27 @@ test_cascade_skips_marked() {
   smoke_assert_eq "t3" "$(reg_active)" "T5 registry active advanced to t3"
 }
 
+# ── T6 ────────────────────────────────────────────────────────────────
+# The daemon + auth automation call `bridge-auth.sh claude-token ...`, never
+# bridge-auth.py directly, so the wrapper MUST route mark-adverse or PR-B (the
+# daemon active-dead recovery) fails at runtime. Prove the bash->python plumbing
+# reaches the new handler end to end (the python-direct cases above cannot).
+test_wrapper_plumbing() {
+  seed
+  local out
+  out="$(BRIDGE_CLAUDE_TOKEN_REGISTRY="$REGISTRY" bash "$AUTH_SH" claude-token mark-adverse t2 --status auth_failed --source nudge --json)"
+  smoke_assert_eq "auth_failed" "$(printf '%s' "$out" | out_field status)" \
+    "T6 wrapper: bash bridge-auth.sh -> python mark-adverse reaches the handler"
+  smoke_assert_eq "auth_failed" "$(reg_field t2 last_check_status)" \
+    "T6 wrapper: the registry row was actually stamped through the wrapper"
+  smoke_assert_eq "true" "$(reg_field t2 enabled)" "T6 wrapper: auth_failed still no permanent disable"
+}
+
 smoke_run "T1 quota_limited -> disabled + reset windows (mark-quota parity)"       test_quota_disables_and_windows
 smoke_run "T2 auth_failed -> stays enabled, adverse-stamp only (no disable)"        test_auth_failed_no_permanent_disable
 smoke_run "T3 stale fingerprint -> SKIP write (token_replaced), row untouched"      test_stale_fingerprint_skips
 smoke_run "T4 no fingerprint -> applies (guard fires only when fp supplied)"        test_no_fingerprint_applies
 smoke_run "T5 cascade skips an auth_failed-fresh candidate, selects available"      test_cascade_skips_marked
+smoke_run "T6 wrapper routes mark-adverse (bash->python handler reached)"           test_wrapper_plumbing
 
 smoke_log "all checks passed"
