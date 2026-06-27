@@ -1959,6 +1959,105 @@ def cmd_mark_quota(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_mark_adverse(args: argparse.Namespace) -> int:
+    """#19460 Fix 1 — deterministically stamp a token's ADVERSE result (a real
+    429/quota or 401/403 auth failure observed on a live run) onto its registry
+    row, WITHOUT a network probe, so the cascade rotation
+    (``rotation_candidate_availability``) skips it BEFORE the next selection
+    instead of blindly re-picking a known-dead token (the M4 fleet-down shape).
+
+    Two shapes, matching how the cascade reads availability:
+
+    * ``quota_limited`` — a 429/quota hit. Mirrors ``mark-quota``: disables the
+      token and stamps the reset window (``limited_until`` / ``disabled_until`` /
+      ``next_check_at``) so ``recover-due`` re-enables it once the limit resets.
+    * ``auth_failed`` — a 401/403. Does NOT permanently disable (an auth error
+      may be transient, and a refreshed credential must be able to recover): it
+      stamps ``last_check_status=auth_failed`` + ``last_checked_at=now`` so the
+      cascade skips it for the bounded adverse-freshness window
+      (:data:`ROTATION_ADVERSE_CHECK_STATUSES` TTL) and then fails OPEN.
+
+    Token-id + fingerprint guarded like ``cmd_check`` / ``cmd_recover_due``: when
+    a ``--fingerprint`` is supplied it must match the row's CURRENT token under
+    the lock, so a capture from a since-replaced token is never persisted onto the
+    new one (skipped, no write). Fingerprint-only — the raw token never leaves the
+    registry.
+    """
+    json_mode = bool(args.json)
+    registry_path = Path(args.registry).expanduser()
+    status = str(args.status)
+    reset_at = str(args.reset_at or "")
+    source = str(getattr(args, "source", "") or "")
+    api_error_status = str(getattr(args, "api_error_status", "") or "")
+    expected_fp = str(getattr(args, "fingerprint", "") or "")
+    retry_seconds = int(args.retry_seconds or 1800)
+    skipped_reason = ""
+    try:
+        with registry_lock(registry_path):
+            registry = load_registry(registry_path)
+            row = find_token(registry, args.id)
+            if row is None:
+                raise ValueError(f"unknown token id: {args.id}")
+            if expected_fp:
+                current_fp = token_fingerprint(str(row.get("token") or ""))
+                if current_fp != expected_fp:
+                    # Token VALUE was replaced (cmd_add --replace / cmd_rotate)
+                    # since the adverse signal was captured — discard rather than
+                    # stamping a stale failure onto a token it never applied to.
+                    skipped_reason = "token_replaced"
+            if not skipped_reason:
+                timestamp = now_iso()
+                row["last_checked_at"] = timestamp
+                row["last_check_status"] = status
+                if source:
+                    row["last_check_source"] = source
+                if api_error_status:
+                    row["last_check_api_error_status"] = api_error_status
+                if status == "quota_limited":
+                    row["enabled"] = False
+                    row["disabled_reason"] = "quota_limited"
+                    if reset_at:
+                        row["disabled_until"] = reset_at
+                        row["next_check_at"] = reset_at
+                        # #17927: stamp the #1789 limit-window field too so the
+                        # clock-authoritative recovery sweep + rotate-selection
+                        # skip read the real reset, not just the disable gate.
+                        row["limited_until"] = reset_at
+                    else:
+                        row["next_check_at"] = (
+                            now_utc() + timedelta(seconds=retry_seconds)
+                        ).isoformat(timespec="seconds")
+                else:
+                    # auth_failed — adverse-stamp ONLY, never permanently disable.
+                    # The fresh last_check_status keeps the cascade off it for the
+                    # adverse-freshness TTL; a bounded next_check_at schedules the
+                    # recovery re-probe; the token stays enabled so it fails open.
+                    row["next_check_at"] = (
+                        now_utc() + timedelta(seconds=retry_seconds)
+                    ).isoformat(timespec="seconds")
+                row["updated_at"] = timestamp
+                save_registry(registry_path, registry)
+    except Exception as exc:
+        return fail(str(exc), json_mode)
+    active_id = str(registry.get("active_token_id") or "")
+    payload = {
+        "status": "skipped" if skipped_reason else status,
+        "id": args.id,
+        "active_token_id": active_id,
+        "reset_at": reset_at,
+    }
+    if skipped_reason:
+        payload["reason"] = skipped_reason
+    if json_mode:
+        json_dump(payload)
+    else:
+        if skipped_reason:
+            print(f"skipped: {args.id} reason={skipped_reason}")
+        else:
+            print(f"{status}: {args.id}")
+    return 0
+
+
 def cmd_recover_due(args: argparse.Namespace) -> int:
     json_mode = bool(args.json)
     registry_path = Path(args.registry).expanduser()
@@ -6371,6 +6470,22 @@ def build_parser() -> argparse.ArgumentParser:
     mark_quota_parser.add_argument("--retry-seconds", type=int, default=1800)
     mark_quota_parser.add_argument("--json", action="store_true")
     mark_quota_parser.set_defaults(handler=cmd_mark_quota)
+
+    # #19460 Fix 1 — deterministic active-dead recovery primitive. Stamps a real
+    # observed 429/quota or 401/403 onto the token row (no network probe) so the
+    # cascade skips a known-dead token before the next selection.
+    mark_adverse_parser = sub.add_parser("mark-adverse")
+    mark_adverse_parser.add_argument("id")
+    mark_adverse_parser.add_argument(
+        "--status", required=True, choices=["quota_limited", "auth_failed"]
+    )
+    mark_adverse_parser.add_argument("--reset-at", default="")
+    mark_adverse_parser.add_argument("--fingerprint", default="")
+    mark_adverse_parser.add_argument("--api-error-status", default="")
+    mark_adverse_parser.add_argument("--source", default="")
+    mark_adverse_parser.add_argument("--retry-seconds", type=int, default=1800)
+    mark_adverse_parser.add_argument("--json", action="store_true")
+    mark_adverse_parser.set_defaults(handler=cmd_mark_adverse)
 
     recover_parser = sub.add_parser("recover-due")
     recover_parser.add_argument("--timeout", type=int, default=45)
