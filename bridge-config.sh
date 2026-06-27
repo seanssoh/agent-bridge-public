@@ -13,6 +13,8 @@ usage() {
   cat <<EOF
 Usage:
   $(basename "$0") set --path <p> --change <expr> [--from <agent>]
+  $(basename "$0") set-env KEY=VALUE [--from <agent>]
+  $(basename "$0") unset-env KEY [--from <agent>]
   $(basename "$0") get --path <p>
   $(basename "$0") list-protected [--json]
 

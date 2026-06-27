@@ -2735,20 +2735,104 @@ GLOBAL_AUTH_SYNC_OPT_IN_ENV = "BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC"
 # fail-closed-as-root contract — only to exercise the fail path from a
 # non-root test runner.
 GLOBAL_AUTH_SYNC_FORCE_ROOT_ENV = "BRIDGE_AUTH_GLOBAL_SYNC_FORCE_ROOT"
+# Persisted runtime-config boolean backing the opt-in, mirroring
+# ``KEYCHAIN_FREE_CONFIG_KEY``. The sanctioned writer is
+# ``global-auth-sync enable|disable``; the env override stays a secondary,
+# precedence-bearing path (see ``global_auth_sync_opt_in_enabled``).
+GLOBAL_AUTH_SYNC_CONFIG_KEY = "claude_global_auth_sync"
+
+
+def global_auth_sync_persisted_enabled() -> bool:
+    """True iff the persisted ``claude_global_auth_sync`` runtime-config bool is ON."""
+    return runtime_config_truthy(GLOBAL_AUTH_SYNC_CONFIG_KEY)
+
+
+def global_auth_sync_env_override_enabled() -> bool:
+    """True iff the ``BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC`` env override is the
+    canonical enabling literal ``"1"``.
+
+    Deliberately strict equality on the RAW value (``== "1"``), matching the
+    ``flag_one`` config type that screens the same key on the ``set-env``
+    allowlist: the only value that turns the gate ON is the exact string
+    ``"1"``; ``"0"``/``"true"``/empty are NOT enabling, and a whitespace-padded
+    form (``" 1 "``/``"1 "``/``" 1"``) is NOT enabling either — the comparison
+    does NOT ``.strip()``, so a padded value falls through to OFF rather than
+    silently activating a personal-credential writer the operator did not type
+    exactly. To clear an enabling override the operator removes the key
+    (``config unset-env`` on main, or a manual edit) — there is no ``=0``
+    disable form.
+    """
+    return os.environ.get(GLOBAL_AUTH_SYNC_OPT_IN_ENV, "") == "1"
 
 
 def global_auth_sync_opt_in_enabled() -> bool:
-    """True iff the persisted ``BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC`` opt-in is ON.
+    """True iff the global-auth-sync opt-in is EFFECTIVELY ON.
 
     Default OFF. This is the SECOND gate of the default-OFF double-gate (the
-    first being the registry's ``auto_rotate_enabled``). It is a separate
-    persisted knob precisely so an install that already enabled auto-rotate
-    does NOT begin writing the operator's personal credential file after an
-    upgrade — the operator must explicitly opt in
-    (``agent-bridge config set-env BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC=1``).
+    first being the registry's ``auto_rotate_enabled``). It is a separate knob
+    precisely so an install that already enabled auto-rotate does NOT begin
+    writing the operator's personal credential file after an upgrade — the
+    operator must explicitly opt in.
+
+    Effective state is ``persisted OR env``: the persisted runtime-config bool
+    (set by ``agent-bridge auth claude-token global-auth-sync enable``) OR a
+    live ``BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC=1`` env override. The verb is the
+    primary, headless-safe path; the env override is a secondary route that
+    takes precedence so a value left in the environment is never silently
+    ignored (and is surfaced by ``global-auth-sync status``).
     """
-    raw = os.environ.get(GLOBAL_AUTH_SYNC_OPT_IN_ENV, "").strip().lower()
-    return raw in ("1", "true", "yes", "on")
+    return (
+        global_auth_sync_persisted_enabled()
+        or global_auth_sync_env_override_enabled()
+    )
+
+
+def write_global_auth_sync_gate(enabled: bool) -> tuple[Path | None, str]:
+    """Sanctioned single-key writer for the ``claude_global_auth_sync``
+    runtime-config boolean (mirrors ``write_keychain_free_gate``).
+
+    The blessed admin path so the operator never raw-edits bridge-config.json
+    (and is not blocked by the set-env ``KEY``-substring guard). Read-modify-write
+    preserves every other config key; only the one boolean is set. Returns
+    ``(path, "ok")`` or ``(None, reason)`` and never clobbers a malformed config."""
+    path = runtime_config_path()
+    if path is None:
+        return None, "no_runtime_config_path (set BRIDGE_RUNTIME_ROOT or BRIDGE_HOME)"
+    config: dict[str, Any] = {}
+    mode = 0o600
+    if path.is_file():  # noqa: raw-pathlib-controller-only - controller runtime config probe
+        try:
+            mode = path.stat().st_mode & 0o777  # noqa: raw-pathlib-controller-only - controller runtime config mode
+            parsed = json.loads(path.read_text(encoding="utf-8"))  # noqa: raw-pathlib-controller-only - controller runtime config read
+        except Exception as exc:  # noqa: BLE001 - malformed config → refuse, do not clobber
+            return None, f"runtime_config_unreadable: {exc}"
+        if not isinstance(parsed, dict):
+            return None, "runtime_config_not_object"
+        config = parsed
+    config[GLOBAL_AUTH_SYNC_CONFIG_KEY] = bool(enabled)
+    text = json.dumps(config, ensure_ascii=True, indent=2) + "\n"
+    try:
+        write_private_file_atomic(path, text, mode=mode, prefix=".bridge-config.")
+    except OSError as exc:
+        return None, f"runtime_config_write_failed: {exc}"
+    return path, "ok"
+
+
+def global_auth_sync_effective_source() -> str:
+    """Classify WHY ``global_auth_sync_opt_in_enabled`` is what it is.
+
+    One of ``runtime-config`` | ``env`` | ``both`` | ``default`` — so ``status``
+    can tell the operator which knob is in force (and whether a ``disable`` will
+    leave a live env override behind)."""
+    persisted = global_auth_sync_persisted_enabled()
+    env = global_auth_sync_env_override_enabled()
+    if persisted and env:
+        return "both"
+    if persisted:
+        return "runtime-config"
+    if env:
+        return "env"
+    return "default"
 
 
 def _global_credential_writer_is_root() -> bool:
@@ -4642,6 +4726,126 @@ def cmd_keychain_free(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_global_auth_sync(args: argparse.Namespace) -> int:
+    """#18849 — sanctioned enable/disable/status for the operator-global
+    seamless-token-sync opt-in (``BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC``).
+
+    Mirrors ``keychain-free``: a persisted runtime-config boolean, written via
+    ``write_global_auth_sync_gate``, so the operator never raw-edits
+    bridge-config.json. The effective gate is ``persisted OR env=="1"`` — the
+    env override is an INDEPENDENT, precedence-bearing contributor, so (unlike
+    ``keychain-free``) a live override does NOT shadow the persisted write and a
+    mutation is never refused under it. ``disable`` clears the persisted bool but
+    can only WARN when a live env override keeps the gate on — it cannot remove
+    an env value (use ``agent-bridge config unset-env`` on main, or unset it
+    manually)."""
+    action = args.action
+    json_mode = bool(args.json)
+    persisted = global_auth_sync_persisted_enabled()
+    env_override_enabled = global_auth_sync_env_override_enabled()
+    effective = persisted or env_override_enabled
+    effective_source = global_auth_sync_effective_source()
+
+    if getattr(args, "check", False):
+        # #19260 — exit-code-only effective-state probe for the daemon early-skip.
+        # NEVER mutates and prints nothing: returns 0 iff EFFECTIVELY enabled so
+        # the bash early-skip reuses THIS persisted-OR-env predicate as the single
+        # source of truth (r2 hardcoded an env-only bash gate, which skipped a
+        # verb-enabled persisted opt-in and killed the feature at the daemon).
+        return 0 if effective else 1
+
+    if action == "status":
+        # The brief enumerates the status --json schema exactly: the four
+        # effective-state fields and no envelope (no status/action wrapper).
+        payload = {
+            "enabled": effective,
+            "persisted_enabled": persisted,
+            "env_override_enabled": env_override_enabled,
+            "effective_source": effective_source,
+        }
+        if json_mode:
+            json_dump(payload)
+        else:
+            gate = "enabled" if effective else "disabled"
+            print(
+                f"global-auth-sync: {gate} "
+                f"(persisted={persisted}, env_override={env_override_enabled}, "
+                f"source={effective_source})"
+            )
+        return 0
+
+    if action == "disable":
+        path, reason = write_global_auth_sync_gate(False)
+        if path is None:
+            return fail(f"global-auth-sync disable failed: {reason}", json_mode)
+        auth_write_audit(
+            {
+                "kind": "claude_global_auth_sync_gate",
+                "action": "disable",
+                "config_file": str(path),
+            }
+        )
+        # The persisted bool is cleared, but the env override is independent and
+        # precedence-bearing — if it is still "1" the gate stays EFFECTIVELY ON,
+        # so we must not claim a full disable (the "looks applied but isn't"
+        # trap). Re-read the override post-write (env is process-stable here).
+        still_on_by_env = global_auth_sync_env_override_enabled()
+        payload = {
+            "status": "ok",
+            "action": "disable",
+            "enabled": still_on_by_env,
+            "persisted_enabled": False,
+            "env_override_enabled": still_on_by_env,
+            "config_file": str(path),
+        }
+        if still_on_by_env:
+            payload["warning"] = (
+                "still enabled by env override: BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC=1 "
+                "is set and takes precedence; remove it to fully disable "
+                "(agent-bridge config unset-env BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC, "
+                "or unset it in the environment)"
+            )
+        if json_mode:
+            json_dump(payload)
+        else:
+            print(f"global-auth-sync persisted opt-in cleared ({path})")
+            if still_on_by_env:
+                print(
+                    "warning: still enabled by env override "
+                    "(BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC=1 takes precedence); remove "
+                    "it to fully disable — `agent-bridge config unset-env "
+                    "BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC` or unset it in the "
+                    "environment",
+                    file=sys.stderr,
+                )
+        return 0
+
+    # action == "enable" (argparse `choices` guarantees the third value).
+    path, reason = write_global_auth_sync_gate(True)
+    if path is None:
+        return fail(f"global-auth-sync enable failed: {reason}", json_mode)
+    auth_write_audit(
+        {
+            "kind": "claude_global_auth_sync_gate",
+            "action": "enable",
+            "config_file": str(path),
+        }
+    )
+    payload = {
+        "status": "ok",
+        "action": "enable",
+        "enabled": True,
+        "persisted_enabled": True,
+        "env_override_enabled": env_override_enabled,
+        "config_file": str(path),
+    }
+    if json_mode:
+        json_dump(payload)
+    else:
+        print(f"global-auth-sync enabled ({path})")
+    return 0
+
+
 def cmd_api_key_helper(args: argparse.Namespace) -> int:
     json_mode = bool(args.json)
     if json_mode and not bool(args.check):
@@ -6193,6 +6397,28 @@ def build_parser() -> argparse.ArgumentParser:
     keychain_free_parser.add_argument("action", choices=("enable", "disable", "status"))
     keychain_free_parser.add_argument("--json", action="store_true")
     keychain_free_parser.set_defaults(handler=cmd_keychain_free)
+
+    # #18849: sanctioned enable/disable/status for the operator-global seamless
+    # token-sync opt-in (persisted runtime-config bool; env override is a
+    # secondary, precedence-bearing path surfaced by `status`).
+    global_auth_sync_parser = sub.add_parser("global-auth-sync")
+    global_auth_sync_parser.add_argument(
+        "action", choices=("enable", "disable", "status")
+    )
+    global_auth_sync_parser.add_argument("--json", action="store_true")
+    global_auth_sync_parser.add_argument(
+        "--check",
+        action="store_true",
+        help=(
+            "exit-code-only effective-state probe (no stdout/mutation): exit 0 "
+            "iff the opt-in is EFFECTIVELY enabled (persisted runtime-config bool "
+            "OR BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC=='1'), exit 1 otherwise. The daemon "
+            "early-skip calls `global-auth-sync status --check` so the cheap bash "
+            "skip reuses THIS single python predicate — never re-deriving the gate "
+            "in bash, which is the source-of-truth drift behind #19260."
+        ),
+    )
+    global_auth_sync_parser.set_defaults(handler=cmd_global_auth_sync)
 
     # Issue #1855: create-if-absent keychain-free settings backfill for a single
     # pre-#1520 shared Claude agent (driven per-agent by the upgrade / daemon

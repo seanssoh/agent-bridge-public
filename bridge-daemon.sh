@@ -2754,16 +2754,23 @@ bridge_daemon_global_auth_sync_tick() {
   local sync_json=""
   local status=""
 
-  # Default-OFF opt-in early skip (the python double-gate is authoritative; this
-  # only avoids the subprocess for the common not-opted-in install). Lowercase to
-  # match bridge-auth.py's case-insensitive normalization exactly so the bash
-  # early-skip can never disagree with the python gate (e.g. value "On"/"True").
-  local optin_lc="${BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC:-0}"
-  optin_lc="${optin_lc,,}"
-  case "$optin_lc" in
-    1|true|yes|on) ;;
-    *) return 0 ;;
-  esac
+  # Default-OFF opt-in early skip. Only the heavier sync-global subprocess (and
+  # its per-tick audit row) is worth spawning once the operator has opted in, so
+  # consult the SINGLE python predicate via a cheap exit-code-only probe:
+  # `global-auth-sync status --check` exits 0 iff the opt-in is EFFECTIVELY
+  # enabled — the authoritative `persisted runtime-config bool OR
+  # BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC == "1"` gate (bridge-auth.py
+  # global_auth_sync_opt_in_enabled). Reusing the python authority is the #19260
+  # fix: r2 hardcoded an env-ONLY bash gate, so an opt-in enabled through the
+  # headless `global-auth-sync enable` verb (which PERSISTS the bool but sets no
+  # env) was silently skipped here and the feature was dead at the daemon level.
+  # The probe reads only the runtime config + env (no registry/token/credential
+  # work, no audit write), so the cheap not-opted-in skip is preserved and the
+  # bash skip can never drift LOOSER or TIGHTER than the python gate. A check
+  # failure/timeout fails safe to skip (the next tick retries).
+  bridge_with_timeout 5 global_auth_sync_optin_check \
+    "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token \
+    global-auth-sync status --check >/dev/null 2>&1 || return 0
 
   if sync_json="$(bridge_with_timeout 15 daemon_auth_global_sync "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token sync-global --json 2>/dev/null)"; then
     status="$(bridge_with_timeout 5 global_sync_status_parse python3 \
