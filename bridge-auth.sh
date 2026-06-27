@@ -12,9 +12,10 @@ bridge_require_python
 usage() {
   cat <<EOF
 Usage:
-  bash $SCRIPT_DIR/bridge-auth.sh claude-token add --id <id> (--stdin|--token-file <path>) [--activate] [--replace] [--sync] [--agents static|all|csv] [--enable-auto-rotate] [--threshold 99] [--json]
-  bash $SCRIPT_DIR/bridge-auth.sh claude-token receive --id <id> [--fulfill <request-id>] [--activate] [--replace] [--enable-auto-rotate] [--threshold 99] [--json]
-  bash $SCRIPT_DIR/bridge-auth.sh claude-token receive --request --id <id> [--agents static|all|csv] [--activate] [--enable-auto-rotate] --json
+  bash $SCRIPT_DIR/bridge-auth.sh claude-token add --id <id> (--stdin|--token-file <path>) [--activate] [--replace] [--account-email <addr>] [--sync] [--agents static|all|csv] [--enable-auto-rotate] [--threshold 99] [--json]
+  bash $SCRIPT_DIR/bridge-auth.sh claude-token receive --id <id> [--fulfill <request-id>] [--activate] [--replace] [--account-email <addr>] [--enable-auto-rotate] [--threshold 99] [--json]
+  bash $SCRIPT_DIR/bridge-auth.sh claude-token receive --request --id <id> [--agents static|all|csv] [--activate] [--account-email <addr>] [--enable-auto-rotate] --json
+  bash $SCRIPT_DIR/bridge-auth.sh claude-token set --id <id> --account-email <addr> [--json]   # #18849 Part 1b-v2: operator-provided displayed-identity source (closes #2145)
   bash $SCRIPT_DIR/bridge-auth.sh claude-token list [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token activate <id> [--sync] [--agents static|all|csv] [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token sync [--agents static|all|csv] [--json]
@@ -1391,7 +1392,9 @@ case "$command" in
         done
         exec python3 "$SCRIPT_DIR/bridge-auth.py" --registry "$registry" receive "$@"
         ;;
-      list|auto-rotate|check|recover-due|classify-output|mark-quota)
+      list|auto-rotate|check|recover-due|classify-output|mark-quota|set)
+        # `set` (#18849 Part 1b-v2): operator metadata write — `--account-email`
+        # is NON-SECRET, so a direct argv passthrough is safe (no sealed-tty path).
         exec python3 "$SCRIPT_DIR/bridge-auth.py" --registry "$registry" "$subcommand" "$@"
         ;;
       sync)
