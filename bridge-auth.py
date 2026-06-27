@@ -1732,6 +1732,14 @@ def _converge_operator_global_inline(registry_path: Path) -> dict[str, Any]:
     try:
         global_path = resolve_controller_claude_credentials_path(None)
         config_path = resolve_operator_claude_config_path(global_path)
+        # patch-dev gap 5: match the bash `sync-global` wrapper's WRITE-containment
+        # root EXACTLY — the operator home (parent of the .claude dir), same
+        # `dirname dirname $global_cred` derivation (bridge-auth.sh), passed only
+        # when it is a real directory. Reusing the wrapper's allowed-root keeps the
+        # inline converge under the same parent-containment proof instead of
+        # weakening it with allowed_root=None.
+        op_home = global_path.parent.parent
+        allowed_root = op_home if op_home.is_dir() else None
         auto_rotate, opt_in, active_id, active_token = _global_auth_gate_state(
             registry_path
         )
@@ -1751,7 +1759,7 @@ def _converge_operator_global_inline(registry_path: Path) -> dict[str, Any]:
             global_path,
             active_token,
             expires_at_ms=CLAUDE_OAUTH_EXPIRES_AT_MS,
-            allowed_root=None,
+            allowed_root=allowed_root,
         )
         identity_shadow = run_global_identity_sync(
             registry_path,
@@ -1759,7 +1767,7 @@ def _converge_operator_global_inline(registry_path: Path) -> dict[str, Any]:
             active_token,
             config_path,
             credential_changed=bool(result["changed"]),
-            allowed_root=None,
+            allowed_root=allowed_root,
         )
         return {
             "status": "synced" if result["changed"] else "converged",
