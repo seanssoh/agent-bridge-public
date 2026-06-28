@@ -91,10 +91,10 @@ fi
 
 # --- S3: lock dance — unlocked probe + revalidate-at-commit -------------------
 echo "[S3] live probe runs OUTSIDE registry_lock; commit gated on fresh-view revalidate"
-if printf '%s\n' "$preflight_fn" | grep -qE 'probe_claude_token\(candidate_token, preflight_timeout\)'; then
+if printf '%s\n' "$preflight_fn" | grep -qE 'probe_claude_token\(candidate_token, (preflight_timeout|probe_timeout)\)'; then
   ok "preflight calls probe_claude_token with the short preflight budget"
 else
-  fail "preflight does not invoke probe_claude_token(candidate_token, preflight_timeout)"
+  fail "preflight does not invoke probe_claude_token(candidate_token, <timeout>)"
 fi
 # The probe must NOT be indented deeper than the `with registry_lock` blocks
 # (which would mean it runs UNDER the lock). It sits at the per-candidate loop

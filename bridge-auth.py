@@ -1275,7 +1275,7 @@ def classify_probe(stdout: str, stderr: str, returncode: int) -> tuple[str, dict
     return "failed", detail
 
 
-def probe_claude_token(token: str, timeout_seconds: int) -> dict[str, Any]:
+def probe_claude_token(token: str, timeout_seconds: float) -> dict[str, Any]:
     claude_bin = os.environ.get("BRIDGE_CLAUDE_TOKEN_CHECK_BIN", "claude")
     prompt = os.environ.get("BRIDGE_CLAUDE_TOKEN_CHECK_PROMPT", "Return exactly OK.")
     command = [claude_bin, "-p", prompt, "--output-format", "json"]
@@ -1685,6 +1685,17 @@ def _cmd_rotate_preflight(
     """
     retry_seconds = 1800
     preflight_timeout = int(getattr(args, "preflight_timeout", 12) or 12)
+    # #2171 PR-B2: optional GLOBAL probe budget (total live-probe seconds across
+    # the whole ring pass). 0 / unset = unbounded — the legacy PR-B1 behavior,
+    # byte-identical. When > 0, each candidate's live probe is capped to
+    # ``min(preflight_timeout, remaining_budget)`` and a spent budget FAILS
+    # CLOSED for the still-unprobed candidates (the per-candidate gate below):
+    # the daemon's reactive rotate can never run the whole ring unbounded, and a
+    # candidate the budget never reached is excluded, never committed from stale
+    # registry availability alone.
+    preflight_budget = int(getattr(args, "preflight_budget", 0) or 0)
+    budget_enabled = preflight_budget > 0
+    budget_remaining = float(preflight_budget)
     adverse_max_age = _rotation_adverse_check_max_age_seconds()
 
     old_id = ""
@@ -1780,10 +1791,37 @@ def _cmd_rotate_preflight(
                     )
                     continue
 
+                # #2171 PR-B2 global-budget gate (fail-CLOSED). Cap THIS
+                # candidate's live probe to whatever of the ``--preflight-budget``
+                # remains (the FRACTIONAL remainder — ``subprocess`` accepts a
+                # float timeout — so a sub-second budget tail is honored, never
+                # floored to 0 and starved). Once the budget is spent the
+                # still-unprobed candidates are excluded with the stable trace
+                # reason ``preflight_budget_exhausted`` and NEVER committed from
+                # stale registry availability — the only commit path stays a
+                # parseable live ``available`` probe. A fully budget-exhausted
+                # pass falls through to the ``all_tokens_limited`` envelope below.
+                probe_timeout: float = preflight_timeout
+                if budget_enabled:
+                    probe_timeout = min(float(preflight_timeout), budget_remaining)
+                    if probe_timeout <= 0:
+                        preflight_trace.append(
+                            {
+                                "id": candidate,
+                                "outcome": "skipped",
+                                "reason": "preflight_budget_exhausted",
+                                "fingerprint": candidate_fp,
+                            }
+                        )
+                        continue
+
                 # Step B (UNLOCKED): live probe. NEVER under registry_lock —
                 # holding the lock across the network op would block the daemon's
                 # rotate loop, operator activate, and the recovery sweep.
-                probe = probe_claude_token(candidate_token, preflight_timeout)
+                probe_started = time.monotonic()
+                probe = probe_claude_token(candidate_token, probe_timeout)
+                if budget_enabled:
+                    budget_remaining -= time.monotonic() - probe_started
                 status = str(probe.get("status") or "failed")
                 # #2171 PR-B1 gate: parse-unknown fails CLOSED. classify_probe's
                 # legacy fallback returns ``available`` for non-JSON stdout with
@@ -6638,6 +6676,20 @@ def _load_and_consume_request(
     return record if isinstance(record, dict) else {}
 
 
+def _nonnegative_int(raw: str) -> int:
+    """argparse ``type`` that rejects negative integers.
+
+    Used for ``--preflight-budget``: a negative value (only reachable via a
+    fat-fingered env override) must NOT silently fall through the
+    ``budget > 0`` gate and disable the budget — that would re-open the
+    unbounded ring the budget exists to close. Fail closed at parse time.
+    """
+    parsed = int(raw)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--registry", required=True)
@@ -6722,8 +6774,16 @@ def build_parser() -> argparse.ArgumentParser:
     # before the active pointer is committed — see cmd_rotate / _cmd_rotate_preflight.
     rotate_parser.add_argument("--preflight", action="store_true")
     # Short probe budget for the preflight so the new network op fits inside the
-    # daemon's 20s rotate timeout (probe_claude_token's own default is 45s).
+    # daemon's rotate timeout (probe_claude_token's own default is 45s).
     rotate_parser.add_argument("--preflight-timeout", type=int, default=12)
+    # #2171 PR-B2: GLOBAL preflight budget (total live-probe seconds across the
+    # whole ring pass). 0 (default) = unbounded — the legacy per-candidate-timeout
+    # behavior. The daemon passes a small positive budget so a multi-candidate
+    # ring can never out-run the rotate timeout, and a spent budget fail-closes
+    # the unprobed candidates (see _cmd_rotate_preflight). Non-negative only: a
+    # negative value would silently disable the budget gate (fail OPEN), so it is
+    # rejected at parse time.
+    rotate_parser.add_argument("--preflight-budget", type=_nonnegative_int, default=0)
     rotate_parser.add_argument("--sync", action="store_true", help=argparse.SUPPRESS)
     rotate_parser.add_argument("--agents", help=argparse.SUPPRESS)
     rotate_parser.add_argument("--json", action="store_true")

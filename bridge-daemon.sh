@@ -2428,8 +2428,22 @@ process_usage_monitor() {
     # candidate row) to the rotator so it can stamp `limited_until` on the
     # old token and stop round-robining into tokens that are themselves
     # still rate-limited.
-    rotate_json="$(bridge_with_timeout 20 daemon_auth_token_rotate "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token rotate \
+    # #2171 PR-B2 (incident #19460 M4 fleet-down): enable `--preflight` for
+    # EVERY daemon rotation (proactive + reactive). The selected candidate is
+    # LIVE-probed before the active pointer is committed, so the daemon can never
+    # sync a stale/limited credential fleet-wide off a fail-open registry flag.
+    # The global `--preflight-budget` caps the summed probe time across the ring
+    # (per-candidate probe = min(--preflight-timeout, remaining budget)); a spent
+    # budget fails closed to `skipped:all_tokens_limited` (the existing #1789 D2
+    # pool-exhausted path), never a partial/invalid rotate envelope. The
+    # `bridge_with_timeout` ceiling is raised to budget + overhead (rotate/lock/
+    # revalidate/write + the `--sync` fanout) so a full multi-candidate budgeted
+    # ring fits inside it instead of being SIGKILLed into `invalid_rotation_output`.
+    rotate_json="$(bridge_with_timeout "${BRIDGE_CLAUDE_ROTATE_TIMEOUT_SECONDS:-30}" daemon_auth_token_rotate "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token rotate \
       --if-auto-enabled \
+      --preflight \
+      --preflight-budget "${BRIDGE_CLAUDE_ROTATE_PREFLIGHT_BUDGET_SECONDS:-15}" \
+      --preflight-timeout "${BRIDGE_CLAUDE_ROTATE_PREFLIGHT_PER_CANDIDATE_SECONDS:-6}" \
       --sync \
       --agents "$rotation_agent_scope" \
       --reason "usage:${window}:${used_percent}" \
