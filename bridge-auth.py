@@ -527,6 +527,22 @@ def token_fingerprint(token: str) -> str:
     return f"sha256:{digest[:12]}...{tail}"
 
 
+def _usage_cache_token_digest(token: str) -> str:
+    """One-way 16-char SHA-256 prefix that keys a token to its usage-cache reading.
+
+    #2171 PR-B3: the measured-usage prefilter matches a rotation candidate against
+    the `.usage-cache.json` `_token_digest` field, which the usage probe writes via
+    ``bridge-usage-probe.py:_token_signal_digest`` — a 16-char SHA-256 hex prefix
+    carrying NO token bytes. This MUST stay byte-for-byte identical to that digest
+    (a single-char drift makes every candidate miss the cache → the prefilter goes
+    silently inert). It is deliberately NOT ``token_fingerprint`` above, whose
+    ``sha256:<12>...<tail>`` display form appends the last 4 raw token chars and
+    would never match a cache key. Empty token → empty digest (no match)."""
+    if not token:
+        return ""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+
+
 def validate_token_id(token_id: str) -> None:
     if not TOKEN_ID_RE.match(token_id):
         raise ValueError("token id must match [A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
@@ -903,15 +919,122 @@ def _rotation_adverse_check_max_age_seconds() -> float:
     return float(ROTATION_ADVERSE_CHECK_MAX_AGE_SECONDS)
 
 
+def _coerce_usage_percent(value: Any) -> float | None:
+    """Coerce a usage-cache window value to a float percent, else None.
+
+    Mirrors the monitor's ``float(used_percent)`` try/except (bridge-usage.py) so
+    a non-numeric / absent window contributes no near-limit signal. ``bool`` is
+    rejected explicitly (``isinstance(True, int)`` is True in Python) so a stray
+    JSON boolean can never be read as 0%/1%."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_measured_usage_index(
+    cache_paths: "list[str | Path]",
+    *,
+    rotation_threshold: float,
+    weekly_warn_threshold: float,
+    cache_max_age_seconds: float,
+    now: datetime,
+) -> dict[str, dict[str, bool]]:
+    """Token-free measured-usage prefilter index, built OUTSIDE ``registry_lock``.
+
+    #2171 PR-B3: ``rotation_candidate_availability`` selects from LIGHT registry
+    stamps and never the candidate's own measured usage, so a near-limit-but-
+    unstamped token can still be chosen (the #19460 M4 fleet-down selection gap).
+    This builder reads each ``.usage-cache.json`` (the shape
+    ``bridge-usage-probe.py:map_payload_to_cache`` writes — ``data.fiveHour`` /
+    ``data.sevenDay`` used %, ``_token_digest``, ``_written_at``) and precomputes,
+    per token digest, whether each window is at/over its threshold:
+
+        {token_digest: {"5h": near_limit_bool, "weekly": near_limit_bool}}
+
+    The near-limit BOOLEANS are precomputed HERE so the eligibility predicate
+    hard-codes no threshold. Freshness + thresholds REUSE the monitor's semantics
+    (no new knobs): ``rotation_threshold`` for 5h, ``weekly_warn_threshold`` for
+    weekly, and the conservative ``_cache_is_fresh`` rule — a reading is dropped
+    ONLY when its ``_written_at`` is present, parseable, and older than
+    ``cache_max_age_seconds`` (a non-positive max-age disables the gate). EVERY
+    error path FAILS OPEN: an absent / unreadable / malformed cache, a non-dict
+    payload, a missing/empty ``_token_digest``, a provably-stale reading, or a
+    non-numeric window contributes nothing, so the candidate falls back to the
+    existing registry-stamp eligibility (additive, no regression; an install with
+    no usage cache is a no-op). NEVER returns token bytes — only digest keys.
+
+    All cache file IO lives here (outside the lock); the predicate reads only the
+    returned in-memory index."""
+    index: dict[str, dict[str, bool]] = {}
+    for raw_path in cache_paths:
+        try:
+            payload = json.loads(Path(str(raw_path)).expanduser().read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        digest = payload.get("_token_digest")
+        if not isinstance(digest, str) or not digest:
+            continue
+        if cache_max_age_seconds > 0:
+            written_at = payload.get("_written_at")
+            if isinstance(written_at, str) and written_at:
+                written_dt = iso_to_utc(written_at)
+                if written_dt is not None and (now - written_dt).total_seconds() > cache_max_age_seconds:
+                    continue
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            data = payload.get("lastGoodData")
+        if not isinstance(data, dict):
+            continue
+        five_hour = _coerce_usage_percent(data.get("fiveHour"))
+        seven_day = _coerce_usage_percent(data.get("sevenDay"))
+        entry = index.setdefault(digest, {"5h": False, "weekly": False})
+        if five_hour is not None and five_hour >= rotation_threshold:
+            entry["5h"] = True
+        if seven_day is not None and seven_day >= weekly_warn_threshold:
+            entry["weekly"] = True
+    return index
+
+
+def _measured_usage_index_from_args(
+    args: argparse.Namespace, now: datetime
+) -> dict[str, dict[str, bool]]:
+    """Build the measured-usage prefilter index from the rotate args (or empty).
+
+    No ``--measured-usage-cache`` paths (the default until PR-B2 wires the daemon)
+    => empty index => the eligibility gate is a no-op (byte-identical to before)."""
+    cache_paths = list(getattr(args, "measured_usage_cache", None) or [])
+    if not cache_paths:
+        return {}
+    return _build_measured_usage_index(
+        cache_paths,
+        rotation_threshold=float(getattr(args, "rotation_threshold", 99.0)),
+        weekly_warn_threshold=float(getattr(args, "weekly_warn_threshold", 95.0)),
+        cache_max_age_seconds=float(getattr(args, "cache_max_age_seconds", 21600)),
+        now=now,
+    )
+
+
 def rotation_candidate_availability(
     row: dict[str, Any],
     now: datetime,
     *,
     adverse_check_max_age_seconds: float,
-) -> tuple[bool, datetime | None]:
+    measured_usage_index: dict[str, dict[str, bool]] | None = None,
+) -> tuple[bool, datetime | None, str]:
     """Cascade availability of an enabled candidate token (#18849 Part 2).
 
-    Returns ``(available, reset_at)``. The candidate is UNAVAILABLE when it is
+    Returns ``(available, reset_at, reason)`` — ``reason`` is ``""`` when
+    available, ``"registry_stamp"`` for a light-signal block (the legacy cascade /
+    preflight Step A trace folds this into its existing ``stale_flag_unavailable``
+    string), or ``"measured_near_limit"`` for the #2171 PR-B3 prefilter block
+    below. The candidate is UNAVAILABLE when it is
     inside a known cooldown window — ``limited_until`` (#1789, the 429-derived
     rotate-away stamp) or ``disabled_until`` (the quota cooldown) still in the
     future — OR its most-recent ``last_check_status`` is a hard limit/auth error
@@ -932,6 +1055,18 @@ def rotation_candidate_availability(
     the daemon's pool-exhausted suppression/notice cadence). It is ``None`` for an
     adverse-check block (an auth error carries no reset), so an adverse-only
     exhaustion falls back to the daemon's short floor cooldown.
+
+    #2171 PR-B3: ``measured_usage_index`` (default empty ⇒ no-op) adds a cheap
+    selection-time prefilter AFTER the registry-stamp checks: a candidate that
+    otherwise looks available is still skipped when its OWN most-recent measured
+    usage is at/over a window threshold (the #19460 M4 gap where a near-limit-but-
+    unstamped token was chosen, then synced fleet-wide). The index is built OUTSIDE
+    the registry lock (``_build_measured_usage_index``) and injected here; this
+    predicate does NO cache IO — it only computes the candidate's one-way digest
+    and reads the precomputed near-limit booleans. Absent / no-digest-match ⇒
+    FAIL OPEN to the registry-stamp verdict (additive; LTS / no-cache installs are
+    a no-op). It does NOT close the stale/missing-cache worst case on its own — the
+    daemon's PR-B1 ``--preflight`` live probe (enabled by PR-B2) is that backstop.
     """
     reset_at: datetime | None = None
     for stamp in (
@@ -942,7 +1077,7 @@ def rotation_candidate_availability(
             if reset_at is None or stamp < reset_at:
                 reset_at = stamp
     if reset_at is not None:
-        return False, reset_at
+        return False, reset_at, "registry_stamp"
     if str(row.get("last_check_status") or "") in ROTATION_ADVERSE_CHECK_STATUSES:
         checked_at = iso_to_utc(str(row.get("last_checked_at") or ""))
         if checked_at is not None:
@@ -953,8 +1088,18 @@ def rotation_candidate_availability(
             # would strand the token until the future time + window, which the
             # fail-safe model forbids.
             if 0 <= age_seconds <= adverse_check_max_age_seconds:
-                return False, None
-    return True, None
+                return False, None, "registry_stamp"
+    # #2171 PR-B3 measured-usage prefilter (additive; fail-open). The candidate
+    # passed the registry-stamp checks; reject it ONLY when its own digest maps to
+    # a precomputed near-limit reading in the injected index. No index / no digest
+    # match ⇒ available, exactly as before.
+    if measured_usage_index:
+        token = str(row.get("token") or "")
+        if token:
+            entry = measured_usage_index.get(_usage_cache_token_digest(token))
+            if entry and (entry.get("5h") or entry.get("weekly")):
+                return False, None, "measured_near_limit"
+    return True, None, ""
 
 
 def redact_token(text: str, token: str) -> str:
@@ -1073,6 +1218,48 @@ def parse_reset_at(text: str, reference: datetime | None = None) -> str:
     return ""
 
 
+# Token-kind classification (#18696 / #2141) — backported to the v0.16 LTS line
+# for the #2171 PR-B1 live-preflight, which gates OAT-native probing on the kind
+# (the classifier shipped on mainline via #2141 but was not on the v0.16 line).
+CLAUDE_API_KEY_TOKEN_PREFIX = "sk-ant-api"
+CLAUDE_OAT_TOKEN_PREFIX = "sk-ant-oat"
+TOKEN_KIND_API_KEY = "api_key"
+TOKEN_KIND_OAUTH_OAT = "oauth_oat"
+TOKEN_KIND_UNKNOWN = "unknown"
+
+
+def classify_token_kind(token: str) -> str:
+    """Classify a Claude credential by prefix (#18696).
+
+    Returns one of ``api_key`` | ``oauth_oat`` | ``unknown``. FAIL-CLOSED: an
+    empty / malformed / unrecognized token classifies as ``unknown`` — NEVER
+    ``api_key``. The kind is always derived from the token bytes, never trusted
+    from a schema field (legacy rows carry no kind).
+    """
+    if not isinstance(token, str):
+        return TOKEN_KIND_UNKNOWN
+    candidate = token.strip()
+    if candidate.startswith(CLAUDE_API_KEY_TOKEN_PREFIX):
+        return TOKEN_KIND_API_KEY
+    if candidate.startswith(CLAUDE_OAT_TOKEN_PREFIX):
+        return TOKEN_KIND_OAUTH_OAT
+    return TOKEN_KIND_UNKNOWN
+
+
+def active_registry_token_kind(registry_path: Path) -> str:
+    """Kind of the active registry token, FAIL-CLOSED (#18696).
+
+    ``classify_token_kind(active_token)`` — or ``unknown`` when there is no
+    active token, it is disabled/missing/invalid, or the registry is unreadable.
+    """
+    try:
+        registry = load_registry(registry_path)
+        _active_id, token = active_registry_token(registry)
+    except Exception:  # noqa: BLE001 - any failure → fail-closed unknown
+        return TOKEN_KIND_UNKNOWN
+    return classify_token_kind(token)
+
+
 def classify_probe(stdout: str, stderr: str, returncode: int) -> tuple[str, dict[str, Any]]:
     raw = "\n".join(part for part in (stdout, stderr) if part)
     payload: Any = None
@@ -1097,6 +1284,11 @@ def classify_probe(stdout: str, stderr: str, returncode: int) -> tuple[str, dict
         "api_error_status": api_status_text,
         "reset_at": reset_at,
         "returncode": returncode,
+        # #2171 PR-B1: whether stdout parsed as JSON. The legacy fallback below
+        # treats unparseable stdout with rc0 as ``available`` (fail-OPEN, kept
+        # for the existing reactive paths); a strict caller (cmd_rotate
+        # live-preflight) must reject that "available" as parse-unknown.
+        "json_ok": payload is not None,
     }
 
     if api_status_text == "429" or any(marker in lower for marker in QUOTA_LIMIT_MARKERS):
@@ -1114,7 +1306,7 @@ def classify_probe(stdout: str, stderr: str, returncode: int) -> tuple[str, dict
     return "failed", detail
 
 
-def probe_claude_token(token: str, timeout_seconds: int) -> dict[str, Any]:
+def probe_claude_token(token: str, timeout_seconds: float) -> dict[str, Any]:
     claude_bin = os.environ.get("BRIDGE_CLAUDE_TOKEN_CHECK_BIN", "claude")
     prompt = os.environ.get("BRIDGE_CLAUDE_TOKEN_CHECK_PROMPT", "Return exactly OK.")
     command = [claude_bin, "-p", prompt, "--output-format", "json"]
@@ -1499,9 +1691,344 @@ def cmd_set(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_rotate_preflight(
+    args: argparse.Namespace, registry_path: Path, json_mode: bool
+) -> int:
+    """#2171 selected-candidate LIVE preflight rotation (opt-in ``--preflight``).
+
+    The default cmd_rotate selects a rotation candidate from STALE registry
+    health flags (``rotation_candidate_availability``, fail-open). On the #19460
+    M4 fleet-down incident that can pick a token that is itself stale/limited —
+    the daemon then syncs a dead credential fleet-wide. With ``--preflight`` the
+    selected candidate is LIVE-probed (``probe_claude_token`` — the exact probe
+    ``cmd_check`` uses) BEFORE the active pointer is committed: authorize ONLY on
+    ``available``; ``quota_limited`` / ``auth_failed`` / ``timeout`` / ``failed``
+    / a 403 / parse-``unknown`` ALL EXCLUDE the candidate (a 403 is an auth
+    error, never healthy evidence).
+
+    Mirrors the ``cmd_check`` lock dance PER candidate — locked snapshot →
+    UNLOCKED probe (NEVER under ``registry_lock``) → locked revalidate + commit
+    — and is bounded to ONE ring pass. Failed-candidate probe evidence is
+    persisted (bounded; an auth failure is recorded as a freshness-windowed
+    ``last_check_status``, NEVER a permanent disable) before the next candidate.
+    With ``--preflight`` OFF the legacy stale-flag cascade runs unchanged
+    (cmd_rotate), so this path is fully additive and backward-compatible.
+    """
+    retry_seconds = 1800
+    preflight_timeout = int(getattr(args, "preflight_timeout", 12) or 12)
+    # #2171 PR-B2: optional GLOBAL probe budget (total live-probe seconds across
+    # the whole ring pass). 0 / unset = unbounded — the legacy PR-B1 behavior,
+    # byte-identical. When > 0, each candidate's live probe is capped to
+    # ``min(preflight_timeout, remaining_budget)`` and a spent budget FAILS
+    # CLOSED for the still-unprobed candidates (the per-candidate gate below):
+    # the daemon's reactive rotate can never run the whole ring unbounded, and a
+    # candidate the budget never reached is excluded, never committed from stale
+    # registry availability alone.
+    preflight_budget = int(getattr(args, "preflight_budget", 0) or 0)
+    budget_enabled = preflight_budget > 0
+    budget_remaining = float(preflight_budget)
+    adverse_max_age = _rotation_adverse_check_max_age_seconds()
+    # #2171 PR-B3: build the token-free measured-usage prefilter index BEFORE any
+    # registry_lock (all cache IO happens here, never under the lock). Empty when
+    # no --measured-usage-cache is supplied ⇒ the eligibility gate is a no-op.
+    measured_index = _measured_usage_index_from_args(args, now_utc())
+
+    old_id = ""
+    new_id = ""
+    committed_row: dict[str, Any] | None = None
+    skipped_payload: dict[str, Any] | None = None
+    soonest_reset: datetime | None = None
+    preflight_trace: list[dict[str, Any]] = []
+    ring: list[str] = []
+
+    def _note_reset(stamp: datetime | None) -> None:
+        nonlocal soonest_reset
+        if stamp is not None and (soonest_reset is None or stamp < soonest_reset):
+            soonest_reset = stamp
+
+    try:
+        # Phase 1 (locked): gate, snapshot the active token, durably stamp the
+        # rotating-away token's known 429 window (#1789), and build the ring.
+        with registry_lock(registry_path):
+            registry = load_registry(registry_path)
+            if args.if_auto_enabled and not bool(registry.get("auto_rotate_enabled", False)):
+                skipped_payload = {"status": "skipped", "reason": "auto_rotate_disabled"}
+            else:
+                ids = enabled_token_ids(registry)
+                if len(ids) < 2:
+                    skipped_payload = {
+                        "status": "skipped",
+                        "reason": "no_alternate_token",
+                        "active_token_id": registry.get("active_token_id") or "",
+                    }
+                else:
+                    old_id = str(registry.get("active_token_id") or "")
+                    if args.limited_until and old_id:
+                        old_row = find_token(registry, old_id)
+                        if old_row is not None and iso_to_utc(args.limited_until) is not None:
+                            old_row["limited_until"] = args.limited_until
+                            save_registry(registry_path, registry)
+                    if old_id in ids:
+                        start = ids.index(old_id) + 1
+                        ring = [ids[(start + i) % len(ids)] for i in range(len(ids) - 1)]
+                    else:
+                        ring = list(ids)
+
+        # Phase 2 (bounded ONE ring pass): per-candidate lock dance. ``ring`` is
+        # populated only on the >=2-enabled branch, so gating on it (not on a
+        # non-empty old_id) keeps parity with the OFF path when the active
+        # pointer is empty (the ring already excludes the active token).
+        if skipped_payload is None and ring:
+            for candidate in ring:
+                # Step A (locked): stale-flag gate + snapshot token/fp/kind.
+                now = now_utc()
+                with registry_lock(registry_path):
+                    registry = load_registry(registry_path)
+                    candidate_row = find_token(registry, candidate)
+                    if candidate_row is None:
+                        preflight_trace.append(
+                            {"id": candidate, "outcome": "skipped", "reason": "row_absent"}
+                        )
+                        continue
+                    available, reset_at, skip_reason = rotation_candidate_availability(
+                        candidate_row,
+                        now,
+                        adverse_check_max_age_seconds=adverse_max_age,
+                        measured_usage_index=measured_index,
+                    )
+                    if not available:
+                        _note_reset(reset_at)
+                        preflight_trace.append(
+                            {
+                                "id": candidate,
+                                "outcome": "skipped",
+                                # A measured-usage prefilter skip carries its own
+                                # stable reason; every registry-stamp block keeps
+                                # the legacy ``stale_flag_unavailable`` string.
+                                "reason": (
+                                    "measured_near_limit"
+                                    if skip_reason == "measured_near_limit"
+                                    else "stale_flag_unavailable"
+                                ),
+                            }
+                        )
+                        continue
+                    candidate_token = str(candidate_row.get("token") or "")
+                    try:
+                        validate_token(candidate_token)
+                    except ValueError:
+                        preflight_trace.append(
+                            {"id": candidate, "outcome": "excluded", "reason": "invalid_token"}
+                        )
+                        continue
+                    candidate_fp = token_fingerprint(candidate_token)
+                    candidate_kind = classify_token_kind(candidate_token)
+
+                # Credential contract: ``probe_claude_token`` is the NATIVE OAuth
+                # (.credentials.json) probe. Probing an api-key / unknown token
+                # through it would be a silent wrong-protocol probe whose result
+                # is meaningless, so FAIL CLOSED for any non-OAT candidate with an
+                # explicit reason rather than committing on misleading evidence.
+                if candidate_kind != TOKEN_KIND_OAUTH_OAT:
+                    preflight_trace.append(
+                        {
+                            "id": candidate,
+                            "outcome": "excluded",
+                            "reason": f"preflight_unsupported_kind:{candidate_kind}",
+                            "fingerprint": candidate_fp,
+                        }
+                    )
+                    continue
+
+                # #2171 PR-B2 global-budget gate (fail-CLOSED). Cap THIS
+                # candidate's live probe to whatever of the ``--preflight-budget``
+                # remains (the FRACTIONAL remainder — ``subprocess`` accepts a
+                # float timeout — so a sub-second budget tail is honored, never
+                # floored to 0 and starved). Once the budget is spent the
+                # still-unprobed candidates are excluded with the stable trace
+                # reason ``preflight_budget_exhausted`` and NEVER committed from
+                # stale registry availability — the only commit path stays a
+                # parseable live ``available`` probe. A fully budget-exhausted
+                # pass falls through to the ``all_tokens_limited`` envelope below.
+                probe_timeout: float = preflight_timeout
+                if budget_enabled:
+                    probe_timeout = min(float(preflight_timeout), budget_remaining)
+                    if probe_timeout <= 0:
+                        preflight_trace.append(
+                            {
+                                "id": candidate,
+                                "outcome": "skipped",
+                                "reason": "preflight_budget_exhausted",
+                                "fingerprint": candidate_fp,
+                            }
+                        )
+                        continue
+
+                # Step B (UNLOCKED): live probe. NEVER under registry_lock —
+                # holding the lock across the network op would block the daemon's
+                # rotate loop, operator activate, and the recovery sweep.
+                probe_started = time.monotonic()
+                probe = probe_claude_token(candidate_token, probe_timeout)
+                if budget_enabled:
+                    budget_remaining -= time.monotonic() - probe_started
+                status = str(probe.get("status") or "failed")
+                # #2171 PR-B1 gate: parse-unknown fails CLOSED. classify_probe's
+                # legacy fallback returns ``available`` for non-JSON stdout with
+                # rc0; that is NOT well-formed healthy evidence for committing a
+                # rotation candidate. Only a parseable JSON success may authorize
+                # — anything else is excluded (selection guard, not a permanent
+                # account verdict). Override the local + the probe dict so the
+                # downstream commit gate, evidence write, and trace all see it.
+                if status == "available" and not bool(probe.get("json_ok")):
+                    status = "failed"
+                    probe["status"] = "failed"
+                probe_reset = str(probe.get("reset_at") or "")
+                probe_api = str(probe.get("api_error_status") or "")
+
+                # Step C (locked): revalidate against a FRESH view + commit on
+                # ``available``; otherwise persist bounded failure evidence and
+                # advance to the next candidate.
+                now2 = now_utc()
+                with registry_lock(registry_path):
+                    registry = load_registry(registry_path)
+                    live_row = find_token(registry, candidate)
+                    active_now = str(registry.get("active_token_id") or "")
+                    live_fp = (
+                        token_fingerprint(str(live_row.get("token") or ""))
+                        if live_row is not None and live_row.get("token")
+                        else ""
+                    )
+                    if status == "available":
+                        # Discard the probe DETERMINISTICALLY if anything moved
+                        # under us during the unlocked window — a concurrent
+                        # rotation (active changed), the candidate row vanished,
+                        # its token value was replaced (fingerprint mismatch), it
+                        # was disabled, or a fresh adverse signal landed. Never
+                        # commit a stale probe onto a moved/replaced row.
+                        revalidate_ok = (
+                            active_now == old_id
+                            and live_row is not None
+                            and live_fp == candidate_fp
+                            and bool(live_row.get("enabled", True))
+                            and rotation_candidate_availability(
+                                live_row,
+                                now2,
+                                adverse_check_max_age_seconds=adverse_max_age,
+                                measured_usage_index=measured_index,
+                            )[0]
+                        )
+                        if revalidate_ok:
+                            live_row.pop("limited_until", None)
+                            timestamp = now_iso()
+                            registry["active_token_id"] = candidate
+                            live_row["last_activated_at"] = timestamp
+                            registry["last_rotation"] = {
+                                "rotated_at": timestamp,
+                                "from": old_id,
+                                "to": candidate,
+                                "reason": args.reason or "",
+                            }
+                            save_registry(registry_path, registry)
+                            new_id = candidate
+                            committed_row = live_row
+                            preflight_trace.append(
+                                {"id": candidate, "outcome": "committed", "fingerprint": candidate_fp}
+                            )
+                            break
+                        preflight_trace.append(
+                            {
+                                "id": candidate,
+                                "outcome": "discarded",
+                                "reason": "revalidation_failed",
+                                "fingerprint": candidate_fp,
+                            }
+                        )
+                        if active_now != old_id:
+                            # Someone else rotated the pool; this pass is moot.
+                            break
+                        continue
+
+                    # Adverse / inconclusive probe → EXCLUDE this candidate.
+                    # Persist bounded evidence ONLY onto the SAME token we probed
+                    # (fingerprint guard mirrors cmd_check): quota / auth →
+                    # last_check_status within the freshness window so a later
+                    # pass skips it; never enabled=False (no permanent disable).
+                    if live_row is not None and live_fp == candidate_fp:
+                        update_row_from_probe(
+                            live_row,
+                            probe,
+                            enable_on_ok=False,
+                            disable_on_quota=False,
+                            retry_seconds=retry_seconds,
+                        )
+                        if status == "quota_limited" and probe_reset and iso_to_utc(probe_reset) is not None:
+                            live_row["limited_until"] = probe_reset
+                        save_registry(registry_path, registry)
+                    if status == "quota_limited" and probe_reset:
+                        _note_reset(iso_to_utc(probe_reset))
+                    preflight_trace.append(
+                        {
+                            "id": candidate,
+                            "outcome": "excluded",
+                            "reason": f"probe_{status}",
+                            "api_error_status": probe_api,
+                            "fingerprint": candidate_fp,
+                        }
+                    )
+    except Exception as exc:
+        return fail(str(exc), json_mode)
+
+    if skipped_payload is None and not new_id:
+        # No candidate cleared the live probe (every alternate is limited,
+        # adverse, un-probeable, or raced). Route to the existing
+        # ``all_tokens_limited`` refusal so the daemon's #1789 D2 pool-exhausted
+        # latch behaves exactly as before.
+        skipped_payload = {
+            "status": "skipped",
+            "reason": "all_tokens_limited",
+            "active_token_id": old_id,
+            "soonest_reset": (
+                soonest_reset.isoformat(timespec="seconds")
+                if soonest_reset is not None
+                else ""
+            ),
+        }
+
+    if skipped_payload is not None:
+        if preflight_trace:
+            skipped_payload["preflight"] = preflight_trace
+        if json_mode:
+            json_dump(skipped_payload)
+        else:
+            print(f"skipped: {skipped_payload['reason']}")
+        return 0
+
+    payload = {
+        "status": "rotated",
+        "old_active_token_id": old_id,
+        "active_token_id": new_id,
+        "fingerprint": token_fingerprint(str((committed_row or {}).get("token") or "")),
+        "reason": args.reason or "",
+        "preflight": preflight_trace,
+    }
+    if json_mode:
+        json_dump(payload)
+    else:
+        print(f"rotated: {old_id or '-'} -> {new_id} ({payload['fingerprint']})")
+    return 0
+
+
 def cmd_rotate(args: argparse.Namespace) -> int:
     json_mode = bool(args.json)
     registry_path = Path(args.registry).expanduser()
+    # #2171: opt-in selected-candidate live preflight. Default OFF preserves the
+    # legacy stale-flag cascade below verbatim (backward-compatible).
+    if bool(getattr(args, "preflight", False)):
+        return _cmd_rotate_preflight(args, registry_path, json_mode)
+    # #2171 PR-B3: build the token-free measured-usage prefilter index BEFORE the
+    # registry_lock (all cache IO out of the lock). Empty without
+    # --measured-usage-cache ⇒ the eligibility gate stays byte-identical.
+    measured_index = _measured_usage_index_from_args(args, now_utc())
     # PR #799 r2 codex finding 3 — registry lock around the load->mutate->save.
     old_id = ""
     new_id = ""
@@ -1559,10 +2086,11 @@ def cmd_rotate(args: argparse.Namespace) -> int:
                     adverse_max_age = _rotation_adverse_check_max_age_seconds()
                     for candidate in ring:
                         candidate_row = find_token(registry, candidate) or {}
-                        available, reset_at = rotation_candidate_availability(
+                        available, reset_at, _skip_reason = rotation_candidate_availability(
                             candidate_row,
                             now,
                             adverse_check_max_age_seconds=adverse_max_age,
+                            measured_usage_index=measured_index,
                         )
                         if not available:
                             if reset_at is not None and (
@@ -3189,21 +3717,172 @@ def operator_keychain_credentials_present() -> bool:
         return False
     if host_platform() != "Darwin":
         return False
-    service = (
-        os.environ.get("BRIDGE_CLAUDE_KEYCHAIN_SERVICE", "").strip()
-        or "Claude Code-credentials"
-    )
+    # Full-enumerate base + hashed ``Claude Code-credentials*`` services. The old
+    # base-only ``find-generic-password -s 'Claude Code-credentials'`` MISSED the
+    # hashed-service variant (``Claude Code-credentials-<hash>``, Claude Code
+    # v2.1.195) — the exact M4 class this guard must catch (#2171 PR-D review F2).
+    # Fail-OPEN-to-absent is preserved: an enumeration error yields no services →
+    # False (a missed detection is not a divergence; the gated write only ever
+    # lands a freshly VERIFIED email — see docstring).
+    services, _enum_error = keychain_claude_service_names(_security_binary())
+    return len(services) > 0
+
+
+# ─────────────────────────────────────────────────────────────────────
+# #2171 (incident #19460 M4 fleet-down) PR-D — Claude Code keychain shadow
+# self-heal. macOS-only. Claude Code (v2.1.195, confirmed on sean-m4) stores its
+# OAuth credential in the login keychain under a HASHED service name
+# (``Claude Code-credentials-<hash>``) alongside / instead of the base
+# ``Claude Code-credentials``. A keychain entry whose access token DIVERGES from
+# the agent's active pool token SHADOWS the per-agent ``.credentials.json`` — the
+# session authenticates with the stale keychain token (e.g. a personal
+# ``Claude Max`` subscription that hit a weekly limit → 429) even though
+# ``.credentials.json`` holds the correct rotating pool token. The base-only
+# ``find-generic-password -s 'Claude Code-credentials'`` MISSES the hashed
+# variant, so reconcile must FULL-ENUMERATE via ``dump-keychain``.
+#
+# Default = FAIL-CLOSED diagnostic (report the stale shadow, delete NOTHING,
+# non-zero exit so a health gate notices). Deletion happens only on the
+# operator-approved ``--apply`` path. Tokens are compared / logged by
+# FINGERPRINT (sha256 prefix) only — the raw secret never reaches stdout, the
+# diff, or the audit log.
+CLAUDE_KEYCHAIN_BASE_SERVICE = "Claude Code-credentials"
+
+
+def _security_binary() -> str:
+    """The ``security(1)`` binary to shell out to.
+
+    Honors the ``BRIDGE_SECURITY_BIN`` test seam (an injected mock keychain
+    tool) so the keychain smokes never touch the real login keychain; defaults
+    to the system ``security``.
+    """
+    return os.environ.get("BRIDGE_SECURITY_BIN", "").strip() or "security"
+
+
+def _extract_oauth_access_token(secret: str) -> str:
+    """The OAuth access token inside a keychain secret blob.
+
+    Claude Code stores ``{"claudeAiOauth": {"accessToken": "..."}}`` (also seen
+    with the token at top level); return that access token. A bare-token secret
+    (not JSON) is returned as-is so an older credential shape still fingerprints.
+    Never logs the secret.
+    """
+    try:
+        parsed = json.loads(secret)
+    except (ValueError, TypeError):
+        return secret
+    if isinstance(parsed, dict):
+        oauth = parsed.get("claudeAiOauth")
+        if isinstance(oauth, dict) and isinstance(oauth.get("accessToken"), str):
+            return oauth["accessToken"]
+        if isinstance(parsed.get("accessToken"), str):
+            return parsed["accessToken"]
+        return ""
+    return secret
+
+
+def keychain_claude_service_names(security_bin: str) -> tuple[list[str], str]:
+    """Full-enumerate every ``Claude Code-credentials*`` keychain service name.
+
+    Returns ``(services, error)``. Claude Code uses a HASHED service name, so a
+    base-only ``find-generic-password -s 'Claude Code-credentials'`` is
+    insufficient — this parses ``dump-keychain``'s ``"svce"<blob>="..."`` lines
+    and returns every service whose name is the base service OR a
+    ``<base>-<suffix>`` hashed variant, de-duplicated and order-preserved.
+
+    ``error`` is ``""`` on a successful enumeration (``services`` may still be
+    empty = genuinely no entries). A ``security(1)`` exception / missing binary /
+    non-zero exit returns ``([], "enumeration_failed:...")`` so the caller can
+    FAIL CLOSED — an enumeration that never ran must NOT look like "no shadow"
+    (#2171 PR-D review F1). The service NAME is not a secret (the operator's
+    working fix prints it); the token it guards never leaves this module
+    un-fingerprinted.
+    """
     try:
         proc = subprocess.run(
-            ["security", "find-generic-password", "-s", service],
+            [security_bin, "dump-keychain"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+            check=False,
+            text=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - enumeration failure is SIGNALED, not swallowed
+        return [], f"enumeration_failed:{type(exc).__name__}"
+    if proc.returncode != 0:
+        # security(1) could not read the keychain (locked / denied / failing or
+        # stub binary). This is NOT "no entries" — signal it so the caller fails
+        # closed rather than reporting a vacuous clean (#2171 PR-D review F1).
+        return [], f"enumeration_failed:rc{proc.returncode}"
+    services: list[str] = []
+    seen: set[str] = set()
+    for line in (proc.stdout or "").splitlines():
+        if '"svce"' not in line:
+            continue
+        match = re.search(r'"svce"<blob>="(.+?)"\s*$', line)
+        if not match:
+            continue
+        value = match.group(1)
+        if value != CLAUDE_KEYCHAIN_BASE_SERVICE and not value.startswith(
+            CLAUDE_KEYCHAIN_BASE_SERVICE + "-"
+        ):
+            continue
+        if value in seen:
+            continue
+        seen.add(value)
+        services.append(value)
+    return services, ""
+
+
+def keychain_entry_fingerprint(security_bin: str, service: str) -> tuple[str, str]:
+    """``(fingerprint, error)`` for a keychain entry's OAuth access token.
+
+    Reads the generic-password secret with ``find-generic-password -s <svc> -w``,
+    extracts the OAuth access token, and returns its ``token_fingerprint`` — never
+    the raw secret. On any failure returns ``("", reason)`` so the caller reports
+    the entry as unreadable without crashing the reconcile.
+    """
+    try:
+        proc = subprocess.run(
+            [security_bin, "find-generic-password", "-s", service, "-w"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+            check=False,
+            text=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - read is best-effort, never fatal
+        return "", f"read_failed:{type(exc).__name__}"
+    if proc.returncode != 0:
+        return "", "read_failed"
+    secret = (proc.stdout or "").strip()
+    if not secret:
+        return "", "empty"
+    token = _extract_oauth_access_token(secret)
+    if not token:
+        return "", "no_access_token"
+    return token_fingerprint(token), ""
+
+
+def keychain_delete_service(security_bin: str, service: str) -> tuple[bool, str]:
+    """Delete a keychain generic-password entry by service name (``--apply`` only).
+
+    Returns ``(deleted, error)``. Never raises; a ``security(1)`` failure is
+    reported so the reconcile can mark the cleanup incomplete (fail-closed).
+    """
+    try:
+        proc = subprocess.run(
+            [security_bin, "delete-generic-password", "-s", service],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=5,
+            timeout=20,
             check=False,
         )
-    except Exception:  # noqa: BLE001 - detection is best-effort, never fatal
-        return False
-    return proc.returncode == 0
+    except Exception as exc:  # noqa: BLE001 - delete is best-effort, never fatal
+        return False, f"delete_failed:{type(exc).__name__}"
+    if proc.returncode != 0:
+        return False, "delete_failed"
+    return True, ""
 
 
 def _probe_cooldown_elapsed(row: dict[str, Any]) -> bool:
@@ -5091,6 +5770,225 @@ def cmd_global_auth_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reconcile_keychain(args: argparse.Namespace) -> int:
+    """Diagnose (and with ``--apply``, clean) a Claude Code keychain shadow (#2171).
+
+    macOS-only. Full-enumerates ``Claude Code-credentials*`` keychain entries
+    (base + hashed-service variants) and compares each entry's OAuth access-token
+    fingerprint with the EXPECTED active pool token. A matching entry is healthy;
+    a MISMATCHING entry is a stale shadow that makes a session ignore its rotating
+    ``.credentials.json`` and authenticate with the wrong (e.g. limit-hit
+    personal) token — the confirmed sean-m4 M4 fleet-down RCA.
+
+    Default = fail-closed diagnostic: report the shadow, delete NOTHING, exit 3
+    on a detected shadow so a health gate notices. ``--apply`` is the
+    operator-approved cleanup path that deletes ONLY the stale entries.
+    Fingerprint-only — the raw secret never reaches stdout / the audit log.
+    """
+    json_mode = bool(args.json)
+    apply_cleanup = bool(getattr(args, "apply", False))
+    registry_path = Path(args.registry).expanduser()
+    security_bin = _security_binary()
+    claude_config_dir = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+
+    # Non-Darwin hosts have no login keychain to shadow — report a clean no-op
+    # without shelling out to security(1).
+    if host_platform() != "Darwin":
+        payload = {
+            "status": "skipped_non_darwin",
+            "platform": host_platform(),
+            "applied": False,
+            "claude_config_dir": claude_config_dir,
+            "expected_fingerprint": "",
+            "expected_source": "",
+            "entries": [],
+            "stale_count": 0,
+            "stale_services": [],
+            "deleted": [],
+            "delete_errors": [],
+        }
+        if json_mode:
+            json_dump(payload)
+        else:
+            print(f"reconcile-keychain: skipped (non-Darwin host: {host_platform()})")
+        return 0
+
+    # The EXPECTED (good) fingerprint: a specific agent's `.credentials.json`
+    # OAuth access token when `--expected-credentials` is given, else the active
+    # registry pool token. With no determinable expected fingerprint every entry
+    # is INDETERMINATE — never classified stale, never deleted (fail-closed).
+    expected_fp = ""
+    expected_source = ""
+    expected_creds = getattr(args, "expected_credentials", None)
+    if expected_creds:
+        creds_path = Path(expected_creds).expanduser()
+        try:
+            secret = creds_path.read_text(encoding="utf-8").strip()
+        except Exception as exc:  # noqa: BLE001 - unreadable expected source is fatal
+            return fail(
+                f"reconcile-keychain: unreadable --expected-credentials: {exc}",
+                json_mode,
+            )
+        token = _extract_oauth_access_token(secret)
+        expected_fp = token_fingerprint(token) if token else ""
+        expected_source = f"credentials:{creds_path}"
+    else:
+        try:
+            registry = load_registry(registry_path)
+            active_id, active_token = active_registry_token(registry)
+            expected_fp = token_fingerprint(active_token)
+            expected_source = f"registry-active:{active_id}"
+        except Exception:  # noqa: BLE001 - no active token → indeterminate, never stale
+            expected_fp = ""
+            expected_source = "registry-active:<none>"
+
+    services, enum_error = keychain_claude_service_names(security_bin)
+    if enum_error:
+        # Fail-CLOSED (#2171 PR-D review F1): enumeration never ran, so we CANNOT
+        # claim "no shadow". Report an explicit failure, delete NOTHING even
+        # under --apply, and exit non-zero so a health gate notices the gap.
+        payload = {
+            "status": "keychain_enumeration_failed",
+            "platform": "Darwin",
+            "applied": False,
+            "claude_config_dir": claude_config_dir,
+            "expected_fingerprint": expected_fp,
+            "expected_source": expected_source,
+            "entries": [],
+            "stale_count": 0,
+            "stale_services": [],
+            "deleted": [],
+            "delete_errors": [],
+            "error": enum_error,
+        }
+        if json_mode:
+            json_dump(payload)
+        else:
+            print(
+                f"reconcile-keychain: keychain_enumeration_failed ({enum_error}); "
+                "deleted nothing (cannot inspect keychain — fail-closed)"
+            )
+        return 2
+    entries: list[dict[str, str]] = []
+    stale_services: list[str] = []
+    unreadable_services: list[str] = []
+    for service in services:
+        fingerprint, err = keychain_entry_fingerprint(security_bin, service)
+        if err:
+            match_state = "unreadable"
+            unreadable_services.append(service)
+        elif not expected_fp:
+            match_state = "indeterminate"
+        elif fingerprint == expected_fp:
+            match_state = "match"
+        else:
+            match_state = "stale"
+            stale_services.append(service)
+        entries.append(
+            {
+                "service": service,
+                "fingerprint": fingerprint,
+                "match": match_state,
+                "error": err,
+            }
+        )
+
+    deleted: list[str] = []
+    delete_errors: list[dict[str, str]] = []
+    # Fail-closed: never MUTATE the keychain while ANY enumerated entry could not
+    # be read (#2171 PR-D review r3). With a mix of confirmed-stale + unreadable
+    # entries we cannot prove the unreadable one is not the active token, so we
+    # delete nothing until every relevant entry is classifiable — the operator
+    # resolves the unreadable entry (e.g. unlock the keychain) and re-runs --apply.
+    if apply_cleanup and stale_services and not unreadable_services:
+        for service in stale_services:
+            ok, derr = keychain_delete_service(security_bin, service)
+            if ok:
+                deleted.append(service)
+            else:
+                delete_errors.append({"service": service, "error": derr})
+
+    stale_count = len(stale_services)
+    unreadable_count = len(unreadable_services)
+    if not services:
+        status = "clean_no_entries"
+    elif not expected_fp:
+        # Entries exist but no active pool token / expected source is readable —
+        # nothing can be CLASSIFIED (let alone deleted). Report honestly rather
+        # than a false "clean"; fail-closed leaves every entry untouched.
+        status = "indeterminate_no_active"
+    elif unreadable_count:
+        # An enumerated Claude Code entry could not be READ, so we cannot tell
+        # whether it is the active token or a stale shadow. Fail-closed REGARDLESS
+        # of stale_count (#2171 PR-D review r2+r3): a mix of confirmed-stale +
+        # unreadable must NOT report "cleaned"/rc0 while an un-inspected entry
+        # remains. The cleanup block above is gated on zero unreadable, so nothing
+        # was deleted here.
+        status = "indeterminate_unreadable"
+    elif stale_count == 0:
+        status = "clean"
+    elif apply_cleanup:
+        status = "cleanup_incomplete" if delete_errors else "cleaned"
+    else:
+        status = "shadow_detected"
+
+    payload = {
+        "status": status,
+        "platform": "Darwin",
+        "applied": apply_cleanup,
+        "claude_config_dir": claude_config_dir,
+        "expected_fingerprint": expected_fp,
+        "expected_source": expected_source,
+        "entries": entries,
+        "stale_count": stale_count,
+        "stale_services": stale_services,
+        "unreadable_count": unreadable_count,
+        "unreadable_services": unreadable_services,
+        "deleted": deleted,
+        "delete_errors": delete_errors,
+        # Remediation note (brief item 7): a plain `restart --no-continue` is NOT
+        # enough — a static/admin pane can still resolve `Claude Max`. After
+        # cleanup, restart the affected agent and verify the pane auth-mode flips
+        # to `Claude API`. Live pane-title detection is the restart/health path's
+        # job, not this auth helper's.
+        "remediation": (
+            "after cleanup, restart the affected agent and verify the pane "
+            "auth-mode reads 'Claude API' (not 'Claude Max'); a plain "
+            "restart --no-continue alone may not flip a shadowed pane"
+        ),
+    }
+
+    if json_mode:
+        json_dump(payload)
+    else:
+        cfg = claude_config_dir or "<operator-global>"
+        print(
+            f"reconcile-keychain: {status} (entries={len(entries)} "
+            f"stale={stale_count} applied={apply_cleanup}); "
+            f"expected_fp={expected_fp or '<none>'} ({expected_source}); "
+            f"CLAUDE_CONFIG_DIR={cfg}"
+        )
+        for entry in entries:
+            detail = entry["error"] or entry["fingerprint"] or "<none>"
+            print(f"  - {entry['service']}: {entry['match']} ({detail})")
+        if deleted:
+            print(f"  deleted: {', '.join(deleted)}")
+        if delete_errors:
+            failed = ", ".join(e["service"] for e in delete_errors)
+            print(f"  delete FAILED: {failed}")
+
+    if delete_errors:
+        return 1
+    if unreadable_count:
+        # Fail-closed: a relevant entry was found but could not be inspected
+        # (#2171 PR-D review r2+r3) — non-zero regardless of stale_count, and the
+        # cleanup block above already declined to mutate the keychain.
+        return 2
+    if stale_count and not apply_cleanup:
+        return 3
+    return 0
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Codex fleet-sync CLI handlers (#1470 Phase 2). Invoked by bridge-auth.sh
 # `codex-cred {register,sync,verify,source}` after the bash layer has
@@ -5870,6 +6768,20 @@ def _load_and_consume_request(
     return record if isinstance(record, dict) else {}
 
 
+def _nonnegative_int(raw: str) -> int:
+    """argparse ``type`` that rejects negative integers.
+
+    Used for ``--preflight-budget``: a negative value (only reachable via a
+    fat-fingered env override) must NOT silently fall through the
+    ``budget > 0`` gate and disable the budget — that would re-open the
+    unbounded ring the budget exists to close. Fail closed at parse time.
+    """
+    parsed = int(raw)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--registry", required=True)
@@ -5949,6 +6861,36 @@ def build_parser() -> argparse.ArgumentParser:
     # Recorded as the old row's `limited_until` so selection can skip
     # still-limited tokens. Timestamp only — never token bytes.
     rotate_parser.add_argument("--limited-until", default="")
+    # #2171 selected-candidate live preflight (opt-in, default OFF for backward
+    # compatibility). When set, the selected rotation candidate is LIVE-probed
+    # before the active pointer is committed — see cmd_rotate / _cmd_rotate_preflight.
+    rotate_parser.add_argument("--preflight", action="store_true")
+    # Short probe budget for the preflight so the new network op fits inside the
+    # daemon's rotate timeout (probe_claude_token's own default is 45s).
+    rotate_parser.add_argument("--preflight-timeout", type=int, default=12)
+    # #2171 PR-B2: GLOBAL preflight budget (total live-probe seconds across the
+    # whole ring pass). 0 (default) = unbounded — the legacy per-candidate-timeout
+    # behavior. The daemon passes a small positive budget so a multi-candidate
+    # ring can never out-run the rotate timeout, and a spent budget fail-closes
+    # the unprobed candidates (see _cmd_rotate_preflight). Non-negative only: a
+    # negative value would silently disable the budget gate (fail OPEN), so it is
+    # rejected at parse time.
+    rotate_parser.add_argument("--preflight-budget", type=_nonnegative_int, default=0)
+    # #2171 PR-B3: token-free measured-usage prefilter. Repeatable path(s) to the
+    # `.usage-cache.json` readings; the candidate-selection gate skips a token
+    # whose own digest maps to a near-limit reading. Absent ⇒ the prefilter is a
+    # no-op (the default until the daemon wires the cache paths through).
+    rotate_parser.add_argument(
+        "--measured-usage-cache", action="append", default=None, help=argparse.SUPPRESS
+    )
+    # Reuse the monitor's thresholds + freshness window for the prefilter (no new
+    # knobs): 5h ≥ --rotation-threshold or weekly ≥ --weekly-warn-threshold marks
+    # a window near-limit; a reading older than --cache-max-age-seconds is dropped.
+    rotate_parser.add_argument("--rotation-threshold", type=float, default=99.0, help=argparse.SUPPRESS)
+    rotate_parser.add_argument("--weekly-warn-threshold", type=float, default=95.0, help=argparse.SUPPRESS)
+    rotate_parser.add_argument(
+        "--cache-max-age-seconds", type=float, default=21600.0, help=argparse.SUPPRESS
+    )
     rotate_parser.add_argument("--sync", action="store_true", help=argparse.SUPPRESS)
     rotate_parser.add_argument("--agents", help=argparse.SUPPRESS)
     rotate_parser.add_argument("--json", action="store_true")
@@ -6140,6 +7082,39 @@ def build_parser() -> argparse.ArgumentParser:
     global_status_parser.add_argument("--claude-config", default=None)
     global_status_parser.add_argument("--json", action="store_true")
     global_status_parser.set_defaults(handler=cmd_global_auth_status)
+
+    # #2171 (incident #19460 M4 fleet-down) PR-D: macOS-only keychain shadow
+    # self-heal. Default = fail-closed diagnostic; --apply is the operator-
+    # approved cleanup that deletes ONLY the stale hashed-service shadow entries.
+    reconcile_kc_parser = sub.add_parser(
+        "reconcile-keychain",
+        help="diagnose (and with --apply, clean) a Claude Code keychain shadow (#2171, macOS-only)",
+        description=(
+            "Full-enumerate 'Claude Code-credentials*' login-keychain entries "
+            "(base + the hashed service-name variant Claude Code uses) and compare "
+            "each entry's OAuth access-token fingerprint with the EXPECTED active "
+            "pool token (the active registry token, or --expected-credentials's "
+            ".credentials.json). A mismatching entry is a stale shadow that makes a "
+            "session authenticate with the wrong token despite a correct "
+            ".credentials.json (the sean-m4 M4 RCA). Default is a FAIL-CLOSED "
+            "diagnostic (report, delete nothing, exit 3 on a detected shadow); "
+            "--apply is the operator-approved cleanup that deletes only the stale "
+            "entries. Fingerprint-only — the raw secret never reaches stdout."
+        ),
+    )
+    reconcile_kc_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="operator-approved cleanup: DELETE the stale shadow keychain entries (default: diagnostic only)",
+    )
+    reconcile_kc_parser.add_argument(
+        "--expected-credentials",
+        dest="expected_credentials",
+        default=None,
+        help="path to a per-agent .credentials.json whose accessToken is the EXPECTED fingerprint (default: active registry pool token)",
+    )
+    reconcile_kc_parser.add_argument("--json", action="store_true")
+    reconcile_kc_parser.set_defaults(handler=cmd_reconcile_keychain)
 
     # ── Codex fleet-sync adapter (#1470 Phase 2) ──────────────────────
     # register/sync/verify/source only — Codex has no rotation/recover/
