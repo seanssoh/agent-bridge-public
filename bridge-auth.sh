@@ -21,6 +21,7 @@ Usage:
   bash $SCRIPT_DIR/bridge-auth.sh claude-token sync [--agents static|all|csv] [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token sync-global [--json]   # #18849 Part 1: double-gated operator-global token PATCH for dynamic-vanilla Claude (default OFF)
   bash $SCRIPT_DIR/bridge-auth.sh claude-token global-auth-status [--json]
+  bash $SCRIPT_DIR/bridge-auth.sh claude-token reconcile-keychain [--apply] [--expected-credentials <path>] [--json]   # #2171 (M4 fleet-down): diagnose/clean a Claude Code keychain shadow (hashed service name). Default = fail-closed diagnostic; --apply = operator-approved cleanup. macOS-only.
   bash $SCRIPT_DIR/bridge-auth.sh claude-token backfill-settings [--agents static|all|csv] [--check] [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token keychain-free <enable|disable|status> [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token global-auth-sync <enable|disable|status> [--check] [--json]   # #18849: operator-global seamless token-sync opt-in (persisted; env override secondary). --check = exit-code-only effective-state probe (daemon early-skip)
@@ -1426,6 +1427,21 @@ case "$command" in
         [[ "$json_mode" == "1" ]] && global_args+=(--json)
         exec python3 "$SCRIPT_DIR/bridge-auth.py" --registry "$registry" \
           "$subcommand" "${global_args[@]}"
+        ;;
+      reconcile-keychain)
+        # #2171 (incident #19460 M4 fleet-down) PR-D: macOS-only Claude Code
+        # keychain shadow self-heal. Full-enumerates 'Claude Code-credentials*'
+        # (base + the HASHED service-name variant Claude Code uses) and compares
+        # each entry's OAuth access-token fingerprint with the active pool token.
+        # Default = FAIL-CLOSED diagnostic (report, delete nothing); --apply is
+        # the operator-approved cleanup that deletes ONLY the stale shadow
+        # entries. --apply / --expected-credentials / --json are NON-SECRET
+        # (fingerprint, not the raw token) → direct argv passthrough. The
+        # flag-guard fails closed on an unknown flag so a typo never silently
+        # turns the diagnostic into an unintended write.
+        bridge_auth_guard_wrapper_flags "claude-token reconcile-keychain" "--expected-credentials" "--json,--apply" "$@"
+        exec python3 "$SCRIPT_DIR/bridge-auth.py" --registry "$registry" \
+          reconcile-keychain "$@"
         ;;
       backfill-settings)
         # Issue #1855: create-if-absent keychain-free apiKeyHelper backfill for
