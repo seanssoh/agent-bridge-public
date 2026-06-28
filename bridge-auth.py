@@ -3935,11 +3935,11 @@ def operator_keychain_credentials_present() -> bool:
         return False
     service = (
         os.environ.get("BRIDGE_CLAUDE_KEYCHAIN_SERVICE", "").strip()
-        or "Claude Code-credentials"
+        or CLAUDE_KEYCHAIN_BASE_SERVICE
     )
     try:
         proc = subprocess.run(
-            ["security", "find-generic-password", "-s", service],
+            [_security_binary(), "find-generic-password", "-s", service],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=5,
@@ -3948,6 +3948,153 @@ def operator_keychain_credentials_present() -> bool:
     except Exception:  # noqa: BLE001 - detection is best-effort, never fatal
         return False
     return proc.returncode == 0
+
+
+# ─────────────────────────────────────────────────────────────────────
+# #2171 (incident #19460 M4 fleet-down) PR-D — Claude Code keychain shadow
+# self-heal. macOS-only. Claude Code (v2.1.195, confirmed on sean-m4) stores its
+# OAuth credential in the login keychain under a HASHED service name
+# (``Claude Code-credentials-<hash>``) alongside / instead of the base
+# ``Claude Code-credentials``. A keychain entry whose access token DIVERGES from
+# the agent's active pool token SHADOWS the per-agent ``.credentials.json`` — the
+# session authenticates with the stale keychain token (e.g. a personal
+# ``Claude Max`` subscription that hit a weekly limit → 429) even though
+# ``.credentials.json`` holds the correct rotating pool token. The base-only
+# ``find-generic-password -s 'Claude Code-credentials'`` MISSES the hashed
+# variant, so reconcile must FULL-ENUMERATE via ``dump-keychain``.
+#
+# Default = FAIL-CLOSED diagnostic (report the stale shadow, delete NOTHING,
+# non-zero exit so a health gate notices). Deletion happens only on the
+# operator-approved ``--apply`` path. Tokens are compared / logged by
+# FINGERPRINT (sha256 prefix) only — the raw secret never reaches stdout, the
+# diff, or the audit log.
+CLAUDE_KEYCHAIN_BASE_SERVICE = "Claude Code-credentials"
+
+
+def _security_binary() -> str:
+    """The ``security(1)`` binary to shell out to.
+
+    Honors the ``BRIDGE_SECURITY_BIN`` test seam (an injected mock keychain
+    tool) so the keychain smokes never touch the real login keychain; defaults
+    to the system ``security``.
+    """
+    return os.environ.get("BRIDGE_SECURITY_BIN", "").strip() or "security"
+
+
+def _extract_oauth_access_token(secret: str) -> str:
+    """The OAuth access token inside a keychain secret blob.
+
+    Claude Code stores ``{"claudeAiOauth": {"accessToken": "..."}}`` (also seen
+    with the token at top level); return that access token. A bare-token secret
+    (not JSON) is returned as-is so an older credential shape still fingerprints.
+    Never logs the secret.
+    """
+    try:
+        parsed = json.loads(secret)
+    except (ValueError, TypeError):
+        return secret
+    if isinstance(parsed, dict):
+        oauth = parsed.get("claudeAiOauth")
+        if isinstance(oauth, dict) and isinstance(oauth.get("accessToken"), str):
+            return oauth["accessToken"]
+        if isinstance(parsed.get("accessToken"), str):
+            return parsed["accessToken"]
+        return ""
+    return secret
+
+
+def keychain_claude_service_names(security_bin: str) -> list[str]:
+    """Full-enumerate every ``Claude Code-credentials*`` keychain service name.
+
+    Claude Code uses a HASHED service name, so a base-only
+    ``find-generic-password -s 'Claude Code-credentials'`` is insufficient — this
+    parses ``dump-keychain``'s ``"svce"<blob>="..."`` lines and returns every
+    service whose name is the base service OR a ``<base>-<suffix>`` hashed
+    variant, de-duplicated and order-preserved. Best-effort: a ``security(1)``
+    failure / missing binary yields an empty list (the caller reports "no
+    entries"). The service NAME is not a secret (the operator's working fix
+    prints it); the token it guards never leaves this module un-fingerprinted.
+    """
+    try:
+        proc = subprocess.run(
+            [security_bin, "dump-keychain"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+            check=False,
+            text=True,
+        )
+    except Exception:  # noqa: BLE001 - enumeration is best-effort, never fatal
+        return []
+    services: list[str] = []
+    seen: set[str] = set()
+    for line in (proc.stdout or "").splitlines():
+        if '"svce"' not in line:
+            continue
+        match = re.search(r'"svce"<blob>="(.+?)"\s*$', line)
+        if not match:
+            continue
+        value = match.group(1)
+        if value != CLAUDE_KEYCHAIN_BASE_SERVICE and not value.startswith(
+            CLAUDE_KEYCHAIN_BASE_SERVICE + "-"
+        ):
+            continue
+        if value in seen:
+            continue
+        seen.add(value)
+        services.append(value)
+    return services
+
+
+def keychain_entry_fingerprint(security_bin: str, service: str) -> tuple[str, str]:
+    """``(fingerprint, error)`` for a keychain entry's OAuth access token.
+
+    Reads the generic-password secret with ``find-generic-password -s <svc> -w``,
+    extracts the OAuth access token, and returns its ``token_fingerprint`` — never
+    the raw secret. On any failure returns ``("", reason)`` so the caller reports
+    the entry as unreadable without crashing the reconcile.
+    """
+    try:
+        proc = subprocess.run(
+            [security_bin, "find-generic-password", "-s", service, "-w"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+            check=False,
+            text=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - read is best-effort, never fatal
+        return "", f"read_failed:{type(exc).__name__}"
+    if proc.returncode != 0:
+        return "", "read_failed"
+    secret = (proc.stdout or "").strip()
+    if not secret:
+        return "", "empty"
+    token = _extract_oauth_access_token(secret)
+    if not token:
+        return "", "no_access_token"
+    return token_fingerprint(token), ""
+
+
+def keychain_delete_service(security_bin: str, service: str) -> tuple[bool, str]:
+    """Delete a keychain generic-password entry by service name (``--apply`` only).
+
+    Returns ``(deleted, error)``. Never raises; a ``security(1)`` failure is
+    reported so the reconcile can mark the cleanup incomplete (fail-closed).
+    """
+    try:
+        proc = subprocess.run(
+            [security_bin, "delete-generic-password", "-s", service],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+            check=False,
+        )
+    except Exception as exc:  # noqa: BLE001 - delete is best-effort, never fatal
+        return False, f"delete_failed:{type(exc).__name__}"
+    if proc.returncode != 0:
+        return False, "delete_failed"
+    return True, ""
 
 
 def _probe_cooldown_elapsed(row: dict[str, Any]) -> bool:
@@ -6068,6 +6215,176 @@ def cmd_global_auth_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reconcile_keychain(args: argparse.Namespace) -> int:
+    """Diagnose (and with ``--apply``, clean) a Claude Code keychain shadow (#2171).
+
+    macOS-only. Full-enumerates ``Claude Code-credentials*`` keychain entries
+    (base + hashed-service variants) and compares each entry's OAuth access-token
+    fingerprint with the EXPECTED active pool token. A matching entry is healthy;
+    a MISMATCHING entry is a stale shadow that makes a session ignore its rotating
+    ``.credentials.json`` and authenticate with the wrong (e.g. limit-hit
+    personal) token — the confirmed sean-m4 M4 fleet-down RCA.
+
+    Default = fail-closed diagnostic: report the shadow, delete NOTHING, exit 3
+    on a detected shadow so a health gate notices. ``--apply`` is the
+    operator-approved cleanup path that deletes ONLY the stale entries.
+    Fingerprint-only — the raw secret never reaches stdout / the audit log.
+    """
+    json_mode = bool(args.json)
+    apply_cleanup = bool(getattr(args, "apply", False))
+    registry_path = Path(args.registry).expanduser()
+    security_bin = _security_binary()
+    claude_config_dir = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+
+    # Non-Darwin hosts have no login keychain to shadow — report a clean no-op
+    # without shelling out to security(1).
+    if host_platform() != "Darwin":
+        payload = {
+            "status": "skipped_non_darwin",
+            "platform": host_platform(),
+            "applied": False,
+            "claude_config_dir": claude_config_dir,
+            "expected_fingerprint": "",
+            "expected_source": "",
+            "entries": [],
+            "stale_count": 0,
+            "stale_services": [],
+            "deleted": [],
+            "delete_errors": [],
+        }
+        if json_mode:
+            json_dump(payload)
+        else:
+            print(f"reconcile-keychain: skipped (non-Darwin host: {host_platform()})")
+        return 0
+
+    # The EXPECTED (good) fingerprint: a specific agent's `.credentials.json`
+    # OAuth access token when `--expected-credentials` is given, else the active
+    # registry pool token. With no determinable expected fingerprint every entry
+    # is INDETERMINATE — never classified stale, never deleted (fail-closed).
+    expected_fp = ""
+    expected_source = ""
+    expected_creds = getattr(args, "expected_credentials", None)
+    if expected_creds:
+        creds_path = Path(expected_creds).expanduser()
+        try:
+            secret = creds_path.read_text(encoding="utf-8").strip()
+        except Exception as exc:  # noqa: BLE001 - unreadable expected source is fatal
+            return fail(
+                f"reconcile-keychain: unreadable --expected-credentials: {exc}",
+                json_mode,
+            )
+        token = _extract_oauth_access_token(secret)
+        expected_fp = token_fingerprint(token) if token else ""
+        expected_source = f"credentials:{creds_path}"
+    else:
+        try:
+            registry = load_registry(registry_path)
+            active_id, active_token = active_registry_token(registry)
+            expected_fp = token_fingerprint(active_token)
+            expected_source = f"registry-active:{active_id}"
+        except Exception:  # noqa: BLE001 - no active token → indeterminate, never stale
+            expected_fp = ""
+            expected_source = "registry-active:<none>"
+
+    services = keychain_claude_service_names(security_bin)
+    entries: list[dict[str, str]] = []
+    stale_services: list[str] = []
+    for service in services:
+        fingerprint, err = keychain_entry_fingerprint(security_bin, service)
+        if err:
+            match_state = "unreadable"
+        elif not expected_fp:
+            match_state = "indeterminate"
+        elif fingerprint == expected_fp:
+            match_state = "match"
+        else:
+            match_state = "stale"
+            stale_services.append(service)
+        entries.append(
+            {
+                "service": service,
+                "fingerprint": fingerprint,
+                "match": match_state,
+                "error": err,
+            }
+        )
+
+    deleted: list[str] = []
+    delete_errors: list[dict[str, str]] = []
+    if apply_cleanup and stale_services:
+        for service in stale_services:
+            ok, derr = keychain_delete_service(security_bin, service)
+            if ok:
+                deleted.append(service)
+            else:
+                delete_errors.append({"service": service, "error": derr})
+
+    stale_count = len(stale_services)
+    if not services:
+        status = "clean_no_entries"
+    elif not expected_fp:
+        # Entries exist but no active pool token / expected source is readable —
+        # nothing can be CLASSIFIED (let alone deleted). Report honestly rather
+        # than a false "clean"; fail-closed leaves every entry untouched.
+        status = "indeterminate_no_active"
+    elif stale_count == 0:
+        status = "clean"
+    elif apply_cleanup:
+        status = "cleanup_incomplete" if delete_errors else "cleaned"
+    else:
+        status = "shadow_detected"
+
+    payload = {
+        "status": status,
+        "platform": "Darwin",
+        "applied": apply_cleanup,
+        "claude_config_dir": claude_config_dir,
+        "expected_fingerprint": expected_fp,
+        "expected_source": expected_source,
+        "entries": entries,
+        "stale_count": stale_count,
+        "stale_services": stale_services,
+        "deleted": deleted,
+        "delete_errors": delete_errors,
+        # Remediation note (brief item 7): a plain `restart --no-continue` is NOT
+        # enough — a static/admin pane can still resolve `Claude Max`. After
+        # cleanup, restart the affected agent and verify the pane auth-mode flips
+        # to `Claude API`. Live pane-title detection is the restart/health path's
+        # job, not this auth helper's.
+        "remediation": (
+            "after cleanup, restart the affected agent and verify the pane "
+            "auth-mode reads 'Claude API' (not 'Claude Max'); a plain "
+            "restart --no-continue alone may not flip a shadowed pane"
+        ),
+    }
+
+    if json_mode:
+        json_dump(payload)
+    else:
+        cfg = claude_config_dir or "<operator-global>"
+        print(
+            f"reconcile-keychain: {status} (entries={len(entries)} "
+            f"stale={stale_count} applied={apply_cleanup}); "
+            f"expected_fp={expected_fp or '<none>'} ({expected_source}); "
+            f"CLAUDE_CONFIG_DIR={cfg}"
+        )
+        for entry in entries:
+            detail = entry["error"] or entry["fingerprint"] or "<none>"
+            print(f"  - {entry['service']}: {entry['match']} ({detail})")
+        if deleted:
+            print(f"  deleted: {', '.join(deleted)}")
+        if delete_errors:
+            failed = ", ".join(e["service"] for e in delete_errors)
+            print(f"  delete FAILED: {failed}")
+
+    if delete_errors:
+        return 1
+    if stale_count and not apply_cleanup:
+        return 3
+    return 0
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Codex fleet-sync CLI handlers (#1470 Phase 2). Invoked by bridge-auth.sh
 # `codex-cred {register,sync,verify,source}` after the bash layer has
@@ -7177,6 +7494,39 @@ def build_parser() -> argparse.ArgumentParser:
     global_status_parser.add_argument("--claude-config", default=None)
     global_status_parser.add_argument("--json", action="store_true")
     global_status_parser.set_defaults(handler=cmd_global_auth_status)
+
+    # #2171 (incident #19460 M4 fleet-down) PR-D: macOS-only keychain shadow
+    # self-heal. Default = fail-closed diagnostic; --apply is the operator-
+    # approved cleanup that deletes ONLY the stale hashed-service shadow entries.
+    reconcile_kc_parser = sub.add_parser(
+        "reconcile-keychain",
+        help="diagnose (and with --apply, clean) a Claude Code keychain shadow (#2171, macOS-only)",
+        description=(
+            "Full-enumerate 'Claude Code-credentials*' login-keychain entries "
+            "(base + the hashed service-name variant Claude Code uses) and compare "
+            "each entry's OAuth access-token fingerprint with the EXPECTED active "
+            "pool token (the active registry token, or --expected-credentials's "
+            ".credentials.json). A mismatching entry is a stale shadow that makes a "
+            "session authenticate with the wrong token despite a correct "
+            ".credentials.json (the sean-m4 M4 RCA). Default is a FAIL-CLOSED "
+            "diagnostic (report, delete nothing, exit 3 on a detected shadow); "
+            "--apply is the operator-approved cleanup that deletes only the stale "
+            "entries. Fingerprint-only — the raw secret never reaches stdout."
+        ),
+    )
+    reconcile_kc_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="operator-approved cleanup: DELETE the stale shadow keychain entries (default: diagnostic only)",
+    )
+    reconcile_kc_parser.add_argument(
+        "--expected-credentials",
+        dest="expected_credentials",
+        default=None,
+        help="path to a per-agent .credentials.json whose accessToken is the EXPECTED fingerprint (default: active registry pool token)",
+    )
+    reconcile_kc_parser.add_argument("--json", action="store_true")
+    reconcile_kc_parser.set_defaults(handler=cmd_reconcile_keychain)
 
     # ── Codex fleet-sync adapter (#1470 Phase 2) ──────────────────────
     # register/sync/verify/source only — Codex has no rotation/recover/
