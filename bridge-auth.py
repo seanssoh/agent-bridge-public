@@ -6344,7 +6344,12 @@ def cmd_reconcile_keychain(args: argparse.Namespace) -> int:
 
     deleted: list[str] = []
     delete_errors: list[dict[str, str]] = []
-    if apply_cleanup and stale_services:
+    # Fail-closed: never MUTATE the keychain while ANY enumerated entry could not
+    # be read (#2171 PR-D review r3). With a mix of confirmed-stale + unreadable
+    # entries we cannot prove the unreadable one is not the active token, so we
+    # delete nothing until every relevant entry is classifiable — the operator
+    # resolves the unreadable entry (e.g. unlock the keychain) and re-runs --apply.
+    if apply_cleanup and stale_services and not unreadable_services:
         for service in stale_services:
             ok, derr = keychain_delete_service(security_bin, service)
             if ok:
@@ -6361,11 +6366,13 @@ def cmd_reconcile_keychain(args: argparse.Namespace) -> int:
         # nothing can be CLASSIFIED (let alone deleted). Report honestly rather
         # than a false "clean"; fail-closed leaves every entry untouched.
         status = "indeterminate_no_active"
-    elif stale_count == 0 and unreadable_count:
+    elif unreadable_count:
         # An enumerated Claude Code entry could not be READ, so we cannot tell
-        # whether it is the active token or a stale shadow. Fail-closed: never
-        # claim "clean" on an un-inspected entry (#2171 PR-D review r2). Nothing
-        # is deleted — only readable+stale entries ever enter stale_services.
+        # whether it is the active token or a stale shadow. Fail-closed REGARDLESS
+        # of stale_count (#2171 PR-D review r2+r3): a mix of confirmed-stale +
+        # unreadable must NOT report "cleaned"/rc0 while an un-inspected entry
+        # remains. The cleanup block above is gated on zero unreadable, so nothing
+        # was deleted here.
         status = "indeterminate_unreadable"
     elif stale_count == 0:
         status = "clean"
@@ -6421,12 +6428,13 @@ def cmd_reconcile_keychain(args: argparse.Namespace) -> int:
 
     if delete_errors:
         return 1
+    if unreadable_count:
+        # Fail-closed: a relevant entry was found but could not be inspected
+        # (#2171 PR-D review r2+r3) — non-zero regardless of stale_count, and the
+        # cleanup block above already declined to mutate the keychain.
+        return 2
     if stale_count and not apply_cleanup:
         return 3
-    if status == "indeterminate_unreadable":
-        # Fail-closed: a relevant entry was found but could not be inspected
-        # (#2171 PR-D review r2). Non-zero so a health gate notices the gap.
-        return 2
     return 0
 
 

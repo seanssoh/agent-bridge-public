@@ -305,6 +305,24 @@ test_unreadable_entry_failclosed() {
   [[ ! -f "$KC_DIR/deleted.log" ]] || smoke_fail "T11 must delete NOTHING for an unreadable entry, even under --apply"
 }
 
+# T12 — MIXED confirmed-stale + unreadable under --apply must STILL fail closed
+# (#2171 PR-D review r3). An unreadable entry dominates: never mutate the keychain
+# while an entry is un-inspected (so the confirmed-stale one is NOT deleted), and
+# never claim cleaned/rc0 while an unreadable entry remains.
+test_mixed_stale_unreadable_failclosed() {
+  kc_reset
+  kc_add "$SVC_HASH" "$SHADOW_TOKEN"                  # readable, divergent token → stale
+  local svc_unread="Claude Code-credentials-unread01"
+  printf '%s\n' "$svc_unread" >>"$KC_DIR/services"    # enumerable name, NO secret → unreadable
+  local out rc=0
+  out="$(reconcile --apply --json)" || rc=$?
+  smoke_assert_eq "2" "$rc" "T12 mixed stale+unreadable exits 2 (fail-closed, not cleaned)"
+  smoke_assert_contains "$out" '"status": "indeterminate_unreadable"' "T12 unreadable dominates stale in the status"
+  smoke_assert_contains "$out" '"deleted": []' "T12 nothing deleted while an entry is unreadable, even under --apply"
+  smoke_assert_file_exists "$KC_DIR/tok-$SVC_HASH" "T12 confirmed-stale entry NOT removed while inspection is incomplete"
+  [[ ! -f "$KC_DIR/deleted.log" ]] || smoke_fail "T12 must not mutate the keychain in a mixed unreadable set"
+}
+
 smoke_run "T1 matching fingerprint is a clean no-op"                  test_match_is_clean_noop
 smoke_run "T2 hashed-variant stale shadow is fail-closed (rc 3)"      test_hashed_stale_is_failclosed
 smoke_run "T3 base+hashed are both enumerated (base-only insufficient)" test_full_enumeration_base_plus_hashed
@@ -316,5 +334,6 @@ smoke_run "T8 --expected-credentials drives the expected fingerprint" test_expec
 smoke_run "T9 enumeration failure fails closed (rc 2, deletes nothing)" test_enumeration_failure_failclosed
 smoke_run "T10 present-guard sees the hashed-only service (F2)"        test_present_guard_sees_hashed
 smoke_run "T11 unreadable entry fails closed (rc 2, deletes nothing)"  test_unreadable_entry_failclosed
+smoke_run "T12 mixed stale+unreadable stays fail-closed (no mutation)" test_mixed_stale_unreadable_failclosed
 
 smoke_log "all checks passed"
