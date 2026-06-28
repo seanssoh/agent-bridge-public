@@ -87,6 +87,7 @@ def write_fake_claude(path: Path) -> None:
     """
     script = r'''#!/usr/bin/env python3
 import fcntl, json, os, sys, time, hashlib
+from pathlib import Path
 
 cfg = os.environ.get("CLAUDE_CONFIG_DIR", "")
 token = ""
@@ -112,7 +113,10 @@ if v.get("assert_unlocked"):
     reg = os.environ.get("AGB_PREFLIGHT_REGISTRY", "")
     result = "unknown"
     if marker and reg:
-        lock_path = os.path.splitext(reg)[0] + ".lock"
+        # #2171 PR-B1: registry_lock() locks ``<registry>.lock`` (suffix
+        # APPENDED, e.g. c1.json -> c1.json.lock), NOT splitext (c1.lock). The
+        # old splitext computed the wrong path, so the flock proof was vacuous.
+        lock_path = str(Path(reg).with_suffix(Path(reg).suffix + ".lock"))
         lfd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
             fcntl.flock(lfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -161,6 +165,11 @@ if status == "auth_failed":
         "result": "unauthorized",
     }))
     sys.exit(1)
+if status == "parse_unknown":
+    # #2171 PR-B1: non-JSON stdout with rc0. classify_probe's legacy fallback
+    # calls this "available"; the strict preflight MUST fail closed (exclude).
+    print("NOT JSON BUT RC0")
+    sys.exit(0)
 # available
 print(json.dumps({"is_error": False, "result": "OK"}))
 sys.exit(0)
@@ -298,11 +307,32 @@ def regression_off(work: Path) -> None:
     check("preflight" not in out, "OFF: no additive preflight trace in payload")
 
 
+def case2b_parse_unknown(work: Path) -> None:
+    print("[case 2b] #2171: parse-unknown (non-JSON + rc0) MUST fail closed, never commit")
+    # Direct repro of the gate finding: B is the ONLY alternate and its probe
+    # prints non-JSON stdout + rc0. classify_probe's legacy fallback calls that
+    # "available"; the strict preflight must EXCLUDE it, so with no other
+    # candidate the rotate refuses (all_tokens_limited) and active stays A.
+    # Pre-fix this committed the unparseable B.
+    reg = work / "c2b-parse-unknown.json"
+    write_registry(reg, [row("A", TOK["A"]), row("B", TOK["B"])], active="A")
+    rc, out, final, probes, _ = run_rotate(
+        work, reg, {TOK["B"]: {"status": "parse_unknown"}}, preflight=True, timeout=1,
+    )
+    check(out.get("status") == "skipped", "[parse_unknown] status=skipped (NOT rotated onto unparseable B)")
+    check(out.get("reason") == "all_tokens_limited", "[parse_unknown] reason=all_tokens_limited")
+    check(final["active_token_id"] == "A", "[parse_unknown] active UNCHANGED (unparseable B NOT committed)")
+    check(probes == [fp12(TOK["B"])], "[parse_unknown] probed B (bounded one pass)")
+    brow = next(r for r in final["tokens"] if r["id"] == "B")
+    check(brow.get("enabled") is True, "[parse_unknown] B never permanently disabled")
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="agb-2171.") as tmp:
         work = Path(tmp)
         case1_available(work)
         case2_adverse_cascade(work)
+        case2b_parse_unknown(work)
         case3_all_limited(work)
         case4_revalidation_discard(work)
         regression_off(work)

@@ -1253,6 +1253,11 @@ def classify_probe(stdout: str, stderr: str, returncode: int) -> tuple[str, dict
         "api_error_status": api_status_text,
         "reset_at": reset_at,
         "returncode": returncode,
+        # #2171 PR-B1: whether stdout parsed as JSON. The legacy fallback below
+        # treats unparseable stdout with rc0 as ``available`` (fail-OPEN, kept
+        # for the existing reactive paths); a strict caller (cmd_rotate
+        # live-preflight) must reject that "available" as parse-unknown.
+        "json_ok": payload is not None,
     }
 
     if api_status_text == "429" or any(marker in lower for marker in QUOTA_LIMIT_MARKERS):
@@ -1780,6 +1785,16 @@ def _cmd_rotate_preflight(
                 # rotate loop, operator activate, and the recovery sweep.
                 probe = probe_claude_token(candidate_token, preflight_timeout)
                 status = str(probe.get("status") or "failed")
+                # #2171 PR-B1 gate: parse-unknown fails CLOSED. classify_probe's
+                # legacy fallback returns ``available`` for non-JSON stdout with
+                # rc0; that is NOT well-formed healthy evidence for committing a
+                # rotation candidate. Only a parseable JSON success may authorize
+                # — anything else is excluded (selection guard, not a permanent
+                # account verdict). Override the local + the probe dict so the
+                # downstream commit gate, evidence write, and trace all see it.
+                if status == "available" and not bool(probe.get("json_ok")):
+                    status = "failed"
+                    probe["status"] = "failed"
                 probe_reset = str(probe.get("reset_at") or "")
                 probe_api = str(probe.get("api_error_status") or "")
 
