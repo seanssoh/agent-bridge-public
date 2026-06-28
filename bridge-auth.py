@@ -3933,21 +3933,15 @@ def operator_keychain_credentials_present() -> bool:
         return False
     if host_platform() != "Darwin":
         return False
-    service = (
-        os.environ.get("BRIDGE_CLAUDE_KEYCHAIN_SERVICE", "").strip()
-        or CLAUDE_KEYCHAIN_BASE_SERVICE
-    )
-    try:
-        proc = subprocess.run(
-            [_security_binary(), "find-generic-password", "-s", service],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
-            check=False,
-        )
-    except Exception:  # noqa: BLE001 - detection is best-effort, never fatal
-        return False
-    return proc.returncode == 0
+    # Full-enumerate base + hashed ``Claude Code-credentials*`` services. The old
+    # base-only ``find-generic-password -s 'Claude Code-credentials'`` MISSED the
+    # hashed-service variant (``Claude Code-credentials-<hash>``, Claude Code
+    # v2.1.195) — the exact M4 class this guard must catch (#2171 PR-D review F2).
+    # Fail-OPEN-to-absent is preserved: an enumeration error yields no services →
+    # False (a missed detection is not a divergence; the gated write only ever
+    # lands a freshly VERIFIED email — see docstring).
+    services, _enum_error = keychain_claude_service_names(_security_binary())
+    return len(services) > 0
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -4003,17 +3997,22 @@ def _extract_oauth_access_token(secret: str) -> str:
     return secret
 
 
-def keychain_claude_service_names(security_bin: str) -> list[str]:
+def keychain_claude_service_names(security_bin: str) -> tuple[list[str], str]:
     """Full-enumerate every ``Claude Code-credentials*`` keychain service name.
 
-    Claude Code uses a HASHED service name, so a base-only
-    ``find-generic-password -s 'Claude Code-credentials'`` is insufficient — this
-    parses ``dump-keychain``'s ``"svce"<blob>="..."`` lines and returns every
-    service whose name is the base service OR a ``<base>-<suffix>`` hashed
-    variant, de-duplicated and order-preserved. Best-effort: a ``security(1)``
-    failure / missing binary yields an empty list (the caller reports "no
-    entries"). The service NAME is not a secret (the operator's working fix
-    prints it); the token it guards never leaves this module un-fingerprinted.
+    Returns ``(services, error)``. Claude Code uses a HASHED service name, so a
+    base-only ``find-generic-password -s 'Claude Code-credentials'`` is
+    insufficient — this parses ``dump-keychain``'s ``"svce"<blob>="..."`` lines
+    and returns every service whose name is the base service OR a
+    ``<base>-<suffix>`` hashed variant, de-duplicated and order-preserved.
+
+    ``error`` is ``""`` on a successful enumeration (``services`` may still be
+    empty = genuinely no entries). A ``security(1)`` exception / missing binary /
+    non-zero exit returns ``([], "enumeration_failed:...")`` so the caller can
+    FAIL CLOSED — an enumeration that never ran must NOT look like "no shadow"
+    (#2171 PR-D review F1). The service NAME is not a secret (the operator's
+    working fix prints it); the token it guards never leaves this module
+    un-fingerprinted.
     """
     try:
         proc = subprocess.run(
@@ -4024,8 +4023,13 @@ def keychain_claude_service_names(security_bin: str) -> list[str]:
             check=False,
             text=True,
         )
-    except Exception:  # noqa: BLE001 - enumeration is best-effort, never fatal
-        return []
+    except Exception as exc:  # noqa: BLE001 - enumeration failure is SIGNALED, not swallowed
+        return [], f"enumeration_failed:{type(exc).__name__}"
+    if proc.returncode != 0:
+        # security(1) could not read the keychain (locked / denied / failing or
+        # stub binary). This is NOT "no entries" — signal it so the caller fails
+        # closed rather than reporting a vacuous clean (#2171 PR-D review F1).
+        return [], f"enumeration_failed:rc{proc.returncode}"
     services: list[str] = []
     seen: set[str] = set()
     for line in (proc.stdout or "").splitlines():
@@ -4043,7 +4047,7 @@ def keychain_claude_service_names(security_bin: str) -> list[str]:
             continue
         seen.add(value)
         services.append(value)
-    return services
+    return services, ""
 
 
 def keychain_entry_fingerprint(security_bin: str, service: str) -> tuple[str, str]:
@@ -6287,7 +6291,33 @@ def cmd_reconcile_keychain(args: argparse.Namespace) -> int:
             expected_fp = ""
             expected_source = "registry-active:<none>"
 
-    services = keychain_claude_service_names(security_bin)
+    services, enum_error = keychain_claude_service_names(security_bin)
+    if enum_error:
+        # Fail-CLOSED (#2171 PR-D review F1): enumeration never ran, so we CANNOT
+        # claim "no shadow". Report an explicit failure, delete NOTHING even
+        # under --apply, and exit non-zero so a health gate notices the gap.
+        payload = {
+            "status": "keychain_enumeration_failed",
+            "platform": "Darwin",
+            "applied": False,
+            "claude_config_dir": claude_config_dir,
+            "expected_fingerprint": expected_fp,
+            "expected_source": expected_source,
+            "entries": [],
+            "stale_count": 0,
+            "stale_services": [],
+            "deleted": [],
+            "delete_errors": [],
+            "error": enum_error,
+        }
+        if json_mode:
+            json_dump(payload)
+        else:
+            print(
+                f"reconcile-keychain: keychain_enumeration_failed ({enum_error}); "
+                "deleted nothing (cannot inspect keychain — fail-closed)"
+            )
+        return 2
     entries: list[dict[str, str]] = []
     stale_services: list[str] = []
     for service in services:

@@ -251,6 +251,42 @@ test_expected_credentials_source() {
   smoke_assert_contains "$out" '"expected_source": "credentials:' "T8 expected_source is the credentials file"
 }
 
+# T9 — enumeration FAILURE must fail closed (#2171 PR-D review F1). A security(1)
+# that cannot read the keychain (here: a non-zero stub) must NOT be reported as a
+# vacuous "clean"; the verb returns keychain_enumeration_failed, deletes nothing
+# even under --apply, and exits non-zero so a health gate notices the gap.
+test_enumeration_failure_failclosed() {
+  kc_reset
+  kc_add "$SVC_HASH" "$SHADOW_TOKEN"
+  local fail_bin="$SMOKE_TMP_ROOT/security-fail"
+  smoke_write_runtime_stub "$fail_bin" '#!/usr/bin/env python3
+import sys
+sys.exit(1)
+'
+  local out rc=0
+  out="$(BRIDGE_SECURITY_BIN="$fail_bin" MOCK_KC_DIR="$KC_DIR" \
+    BRIDGE_HOST_PLATFORM_OVERRIDE=Darwin \
+    python3 "$AUTH_PY" --registry "$REGISTRY" reconcile-keychain --apply --json)" || rc=$?
+  smoke_assert_eq "2" "$rc" "T9 enumeration failure exits non-zero (fail-closed, not a vacuous clean)"
+  smoke_assert_contains "$out" '"status": "keychain_enumeration_failed"' "T9 status keychain_enumeration_failed"
+  smoke_assert_contains "$out" '"applied": false' "T9 applied=false even though --apply was passed"
+  [[ ! -f "$KC_DIR/deleted.log" ]] || smoke_fail "T9 enumeration failure must delete NOTHING, even under --apply"
+}
+
+# T10 — the operator-keychain-present guard (the sync-global divergence gate) must
+# see the HASHED-only service, not just the base name (#2171 PR-D review F2). The
+# base-only find-generic-password returned False on the exact M4 setup, letting
+# sync-global diverge ~/.claude.json from the keychain-owned identity.
+test_present_guard_sees_hashed() {
+  kc_reset
+  kc_add "$SVC_HASH" "$SHADOW_TOKEN"   # hashed-only, NO base entry
+  local res
+  res="$(BRIDGE_SECURITY_BIN="$SECURITY_BIN" MOCK_KC_DIR="$KC_DIR" \
+    BRIDGE_HOST_PLATFORM_OVERRIDE=Darwin \
+    python3 -c 'import importlib.util,sys; s=importlib.util.spec_from_file_location("ba",sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print("PRESENT" if m.operator_keychain_credentials_present() else "ABSENT")' "$AUTH_PY")"
+  smoke_assert_eq "PRESENT" "$res" "T10 present-guard detects the hashed-only keychain entry (base-only would miss it)"
+}
+
 smoke_run "T1 matching fingerprint is a clean no-op"                  test_match_is_clean_noop
 smoke_run "T2 hashed-variant stale shadow is fail-closed (rc 3)"      test_hashed_stale_is_failclosed
 smoke_run "T3 base+hashed are both enumerated (base-only insufficient)" test_full_enumeration_base_plus_hashed
@@ -259,5 +295,7 @@ smoke_run "T5 non-Darwin host is a no-op (security never called)"     test_non_d
 smoke_run "T6 diagnostic emits fingerprints only (no raw token)"     test_no_raw_token_in_output
 smoke_run "T7 bash wrapper passthrough + unknown-flag fail-closed"   test_bash_wrapper
 smoke_run "T8 --expected-credentials drives the expected fingerprint" test_expected_credentials_source
+smoke_run "T9 enumeration failure fails closed (rc 2, deletes nothing)" test_enumeration_failure_failclosed
+smoke_run "T10 present-guard sees the hashed-only service (F2)"        test_present_guard_sees_hashed
 
 smoke_log "all checks passed"
