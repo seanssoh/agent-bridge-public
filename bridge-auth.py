@@ -1218,6 +1218,48 @@ def parse_reset_at(text: str, reference: datetime | None = None) -> str:
     return ""
 
 
+# Token-kind classification (#18696 / #2141) — backported to the v0.16 LTS line
+# for the #2171 PR-B1 live-preflight, which gates OAT-native probing on the kind
+# (the classifier shipped on mainline via #2141 but was not on the v0.16 line).
+CLAUDE_API_KEY_TOKEN_PREFIX = "sk-ant-api"
+CLAUDE_OAT_TOKEN_PREFIX = "sk-ant-oat"
+TOKEN_KIND_API_KEY = "api_key"
+TOKEN_KIND_OAUTH_OAT = "oauth_oat"
+TOKEN_KIND_UNKNOWN = "unknown"
+
+
+def classify_token_kind(token: str) -> str:
+    """Classify a Claude credential by prefix (#18696).
+
+    Returns one of ``api_key`` | ``oauth_oat`` | ``unknown``. FAIL-CLOSED: an
+    empty / malformed / unrecognized token classifies as ``unknown`` — NEVER
+    ``api_key``. The kind is always derived from the token bytes, never trusted
+    from a schema field (legacy rows carry no kind).
+    """
+    if not isinstance(token, str):
+        return TOKEN_KIND_UNKNOWN
+    candidate = token.strip()
+    if candidate.startswith(CLAUDE_API_KEY_TOKEN_PREFIX):
+        return TOKEN_KIND_API_KEY
+    if candidate.startswith(CLAUDE_OAT_TOKEN_PREFIX):
+        return TOKEN_KIND_OAUTH_OAT
+    return TOKEN_KIND_UNKNOWN
+
+
+def active_registry_token_kind(registry_path: Path) -> str:
+    """Kind of the active registry token, FAIL-CLOSED (#18696).
+
+    ``classify_token_kind(active_token)`` — or ``unknown`` when there is no
+    active token, it is disabled/missing/invalid, or the registry is unreadable.
+    """
+    try:
+        registry = load_registry(registry_path)
+        _active_id, token = active_registry_token(registry)
+    except Exception:  # noqa: BLE001 - any failure → fail-closed unknown
+        return TOKEN_KIND_UNKNOWN
+    return classify_token_kind(token)
+
+
 def classify_probe(stdout: str, stderr: str, returncode: int) -> tuple[str, dict[str, Any]]:
     raw = "\n".join(part for part in (stdout, stderr) if part)
     payload: Any = None
