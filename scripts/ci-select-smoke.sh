@@ -5507,6 +5507,19 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # under-lock contract. Pull it on every auth move so the prefilter can't go
       # silently inert (digest-format drift) or start reading cache under the lock.
       add_required 2171-prb3-measured-usage-prefilter
+      # Issue #2171 (incident #19460 M4 fleet-down) PR-D: bridge-auth.py now hosts
+      # the `reconcile-keychain` verb — macOS-only Claude Code keychain shadow
+      # self-heal. It FULL-ENUMERATES "Claude Code-credentials*" (base + the
+      # HASHED service-name variant Claude Code uses) via dump-keychain, compares
+      # each entry's OAuth access-token fingerprint with the active pool token,
+      # and FAILS CLOSED by default (diagnostic + exit 3 on a detected shadow,
+      # deletes nothing); only --apply deletes the stale entries. 2171-keychain-
+      # shadow-selfheal pins the full enumeration (base-only is insufficient), the
+      # fail-closed default, the --apply delete-only-stale, the non-Darwin no-op,
+      # the fingerprint-only (no raw token) floor, and the wrapper passthrough +
+      # unknown-flag fail-closed. Pull it on every bridge-auth move so a refactor
+      # cannot regress the keychain-credential safety contract.
+      add_required 2171-keychain-shadow-selfheal
       # Issue #1899: bridge-auth.sh's bridge_auth_codex_selected_agents +
       # codex sync loop now EXCLUDE dynamic vanilla Codex from the codex-cred
       # fleet sync (it inherits the operator-global ~/.codex/auth.json). Pull
