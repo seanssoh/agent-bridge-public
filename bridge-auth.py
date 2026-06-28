@@ -527,6 +527,22 @@ def token_fingerprint(token: str) -> str:
     return f"sha256:{digest[:12]}...{tail}"
 
 
+def _usage_cache_token_digest(token: str) -> str:
+    """One-way 16-char SHA-256 prefix that keys a token to its usage-cache reading.
+
+    #2171 PR-B3: the measured-usage prefilter matches a rotation candidate against
+    the `.usage-cache.json` `_token_digest` field, which the usage probe writes via
+    ``bridge-usage-probe.py:_token_signal_digest`` — a 16-char SHA-256 hex prefix
+    carrying NO token bytes. This MUST stay byte-for-byte identical to that digest
+    (a single-char drift makes every candidate miss the cache → the prefilter goes
+    silently inert). It is deliberately NOT ``token_fingerprint`` above, whose
+    ``sha256:<12>...<tail>`` display form appends the last 4 raw token chars and
+    would never match a cache key. Empty token → empty digest (no match)."""
+    if not token:
+        return ""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+
+
 def validate_token_id(token_id: str) -> None:
     if not TOKEN_ID_RE.match(token_id):
         raise ValueError("token id must match [A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
@@ -903,15 +919,122 @@ def _rotation_adverse_check_max_age_seconds() -> float:
     return float(ROTATION_ADVERSE_CHECK_MAX_AGE_SECONDS)
 
 
+def _coerce_usage_percent(value: Any) -> float | None:
+    """Coerce a usage-cache window value to a float percent, else None.
+
+    Mirrors the monitor's ``float(used_percent)`` try/except (bridge-usage.py) so
+    a non-numeric / absent window contributes no near-limit signal. ``bool`` is
+    rejected explicitly (``isinstance(True, int)`` is True in Python) so a stray
+    JSON boolean can never be read as 0%/1%."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_measured_usage_index(
+    cache_paths: "list[str | Path]",
+    *,
+    rotation_threshold: float,
+    weekly_warn_threshold: float,
+    cache_max_age_seconds: float,
+    now: datetime,
+) -> dict[str, dict[str, bool]]:
+    """Token-free measured-usage prefilter index, built OUTSIDE ``registry_lock``.
+
+    #2171 PR-B3: ``rotation_candidate_availability`` selects from LIGHT registry
+    stamps and never the candidate's own measured usage, so a near-limit-but-
+    unstamped token can still be chosen (the #19460 M4 fleet-down selection gap).
+    This builder reads each ``.usage-cache.json`` (the shape
+    ``bridge-usage-probe.py:map_payload_to_cache`` writes — ``data.fiveHour`` /
+    ``data.sevenDay`` used %, ``_token_digest``, ``_written_at``) and precomputes,
+    per token digest, whether each window is at/over its threshold:
+
+        {token_digest: {"5h": near_limit_bool, "weekly": near_limit_bool}}
+
+    The near-limit BOOLEANS are precomputed HERE so the eligibility predicate
+    hard-codes no threshold. Freshness + thresholds REUSE the monitor's semantics
+    (no new knobs): ``rotation_threshold`` for 5h, ``weekly_warn_threshold`` for
+    weekly, and the conservative ``_cache_is_fresh`` rule — a reading is dropped
+    ONLY when its ``_written_at`` is present, parseable, and older than
+    ``cache_max_age_seconds`` (a non-positive max-age disables the gate). EVERY
+    error path FAILS OPEN: an absent / unreadable / malformed cache, a non-dict
+    payload, a missing/empty ``_token_digest``, a provably-stale reading, or a
+    non-numeric window contributes nothing, so the candidate falls back to the
+    existing registry-stamp eligibility (additive, no regression; an install with
+    no usage cache is a no-op). NEVER returns token bytes — only digest keys.
+
+    All cache file IO lives here (outside the lock); the predicate reads only the
+    returned in-memory index."""
+    index: dict[str, dict[str, bool]] = {}
+    for raw_path in cache_paths:
+        try:
+            payload = json.loads(Path(str(raw_path)).expanduser().read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        digest = payload.get("_token_digest")
+        if not isinstance(digest, str) or not digest:
+            continue
+        if cache_max_age_seconds > 0:
+            written_at = payload.get("_written_at")
+            if isinstance(written_at, str) and written_at:
+                written_dt = iso_to_utc(written_at)
+                if written_dt is not None and (now - written_dt).total_seconds() > cache_max_age_seconds:
+                    continue
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            data = payload.get("lastGoodData")
+        if not isinstance(data, dict):
+            continue
+        five_hour = _coerce_usage_percent(data.get("fiveHour"))
+        seven_day = _coerce_usage_percent(data.get("sevenDay"))
+        entry = index.setdefault(digest, {"5h": False, "weekly": False})
+        if five_hour is not None and five_hour >= rotation_threshold:
+            entry["5h"] = True
+        if seven_day is not None and seven_day >= weekly_warn_threshold:
+            entry["weekly"] = True
+    return index
+
+
+def _measured_usage_index_from_args(
+    args: argparse.Namespace, now: datetime
+) -> dict[str, dict[str, bool]]:
+    """Build the measured-usage prefilter index from the rotate args (or empty).
+
+    No ``--measured-usage-cache`` paths (the default until PR-B2 wires the daemon)
+    => empty index => the eligibility gate is a no-op (byte-identical to before)."""
+    cache_paths = list(getattr(args, "measured_usage_cache", None) or [])
+    if not cache_paths:
+        return {}
+    return _build_measured_usage_index(
+        cache_paths,
+        rotation_threshold=float(getattr(args, "rotation_threshold", 99.0)),
+        weekly_warn_threshold=float(getattr(args, "weekly_warn_threshold", 95.0)),
+        cache_max_age_seconds=float(getattr(args, "cache_max_age_seconds", 21600)),
+        now=now,
+    )
+
+
 def rotation_candidate_availability(
     row: dict[str, Any],
     now: datetime,
     *,
     adverse_check_max_age_seconds: float,
-) -> tuple[bool, datetime | None]:
+    measured_usage_index: dict[str, dict[str, bool]] | None = None,
+) -> tuple[bool, datetime | None, str]:
     """Cascade availability of an enabled candidate token (#18849 Part 2).
 
-    Returns ``(available, reset_at)``. The candidate is UNAVAILABLE when it is
+    Returns ``(available, reset_at, reason)`` — ``reason`` is ``""`` when
+    available, ``"registry_stamp"`` for a light-signal block (the legacy cascade /
+    preflight Step A trace folds this into its existing ``stale_flag_unavailable``
+    string), or ``"measured_near_limit"`` for the #2171 PR-B3 prefilter block
+    below. The candidate is UNAVAILABLE when it is
     inside a known cooldown window — ``limited_until`` (#1789, the 429-derived
     rotate-away stamp) or ``disabled_until`` (the quota cooldown) still in the
     future — OR its most-recent ``last_check_status`` is a hard limit/auth error
@@ -932,6 +1055,18 @@ def rotation_candidate_availability(
     the daemon's pool-exhausted suppression/notice cadence). It is ``None`` for an
     adverse-check block (an auth error carries no reset), so an adverse-only
     exhaustion falls back to the daemon's short floor cooldown.
+
+    #2171 PR-B3: ``measured_usage_index`` (default empty ⇒ no-op) adds a cheap
+    selection-time prefilter AFTER the registry-stamp checks: a candidate that
+    otherwise looks available is still skipped when its OWN most-recent measured
+    usage is at/over a window threshold (the #19460 M4 gap where a near-limit-but-
+    unstamped token was chosen, then synced fleet-wide). The index is built OUTSIDE
+    the registry lock (``_build_measured_usage_index``) and injected here; this
+    predicate does NO cache IO — it only computes the candidate's one-way digest
+    and reads the precomputed near-limit booleans. Absent / no-digest-match ⇒
+    FAIL OPEN to the registry-stamp verdict (additive; LTS / no-cache installs are
+    a no-op). It does NOT close the stale/missing-cache worst case on its own — the
+    daemon's PR-B1 ``--preflight`` live probe (enabled by PR-B2) is that backstop.
     """
     reset_at: datetime | None = None
     for stamp in (
@@ -942,7 +1077,7 @@ def rotation_candidate_availability(
             if reset_at is None or stamp < reset_at:
                 reset_at = stamp
     if reset_at is not None:
-        return False, reset_at
+        return False, reset_at, "registry_stamp"
     if str(row.get("last_check_status") or "") in ROTATION_ADVERSE_CHECK_STATUSES:
         checked_at = iso_to_utc(str(row.get("last_checked_at") or ""))
         if checked_at is not None:
@@ -953,8 +1088,18 @@ def rotation_candidate_availability(
             # would strand the token until the future time + window, which the
             # fail-safe model forbids.
             if 0 <= age_seconds <= adverse_check_max_age_seconds:
-                return False, None
-    return True, None
+                return False, None, "registry_stamp"
+    # #2171 PR-B3 measured-usage prefilter (additive; fail-open). The candidate
+    # passed the registry-stamp checks; reject it ONLY when its own digest maps to
+    # a precomputed near-limit reading in the injected index. No index / no digest
+    # match ⇒ available, exactly as before.
+    if measured_usage_index:
+        token = str(row.get("token") or "")
+        if token:
+            entry = measured_usage_index.get(_usage_cache_token_digest(token))
+            if entry and (entry.get("5h") or entry.get("weekly")):
+                return False, None, "measured_near_limit"
+    return True, None, ""
 
 
 def redact_token(text: str, token: str) -> str:
@@ -1541,6 +1686,10 @@ def _cmd_rotate_preflight(
     budget_enabled = preflight_budget > 0
     budget_remaining = float(preflight_budget)
     adverse_max_age = _rotation_adverse_check_max_age_seconds()
+    # #2171 PR-B3: build the token-free measured-usage prefilter index BEFORE any
+    # registry_lock (all cache IO happens here, never under the lock). Empty when
+    # no --measured-usage-cache is supplied ⇒ the eligibility gate is a no-op.
+    measured_index = _measured_usage_index_from_args(args, now_utc())
 
     old_id = ""
     new_id = ""
@@ -1599,13 +1748,27 @@ def _cmd_rotate_preflight(
                             {"id": candidate, "outcome": "skipped", "reason": "row_absent"}
                         )
                         continue
-                    available, reset_at = rotation_candidate_availability(
-                        candidate_row, now, adverse_check_max_age_seconds=adverse_max_age
+                    available, reset_at, skip_reason = rotation_candidate_availability(
+                        candidate_row,
+                        now,
+                        adverse_check_max_age_seconds=adverse_max_age,
+                        measured_usage_index=measured_index,
                     )
                     if not available:
                         _note_reset(reset_at)
                         preflight_trace.append(
-                            {"id": candidate, "outcome": "skipped", "reason": "stale_flag_unavailable"}
+                            {
+                                "id": candidate,
+                                "outcome": "skipped",
+                                # A measured-usage prefilter skip carries its own
+                                # stable reason; every registry-stamp block keeps
+                                # the legacy ``stale_flag_unavailable`` string.
+                                "reason": (
+                                    "measured_near_limit"
+                                    if skip_reason == "measured_near_limit"
+                                    else "stale_flag_unavailable"
+                                ),
+                            }
                         )
                         continue
                     candidate_token = str(candidate_row.get("token") or "")
@@ -1706,7 +1869,10 @@ def _cmd_rotate_preflight(
                             and live_fp == candidate_fp
                             and bool(live_row.get("enabled", True))
                             and rotation_candidate_availability(
-                                live_row, now2, adverse_check_max_age_seconds=adverse_max_age
+                                live_row,
+                                now2,
+                                adverse_check_max_age_seconds=adverse_max_age,
+                                measured_usage_index=measured_index,
                             )[0]
                         )
                         if revalidate_ok:
@@ -1817,6 +1983,10 @@ def cmd_rotate(args: argparse.Namespace) -> int:
     # legacy stale-flag cascade below verbatim (backward-compatible).
     if bool(getattr(args, "preflight", False)):
         return _cmd_rotate_preflight(args, registry_path, json_mode)
+    # #2171 PR-B3: build the token-free measured-usage prefilter index BEFORE the
+    # registry_lock (all cache IO out of the lock). Empty without
+    # --measured-usage-cache ⇒ the eligibility gate stays byte-identical.
+    measured_index = _measured_usage_index_from_args(args, now_utc())
     # PR #799 r2 codex finding 3 — registry lock around the load->mutate->save.
     old_id = ""
     new_id = ""
@@ -1874,10 +2044,11 @@ def cmd_rotate(args: argparse.Namespace) -> int:
                     adverse_max_age = _rotation_adverse_check_max_age_seconds()
                     for candidate in ring:
                         candidate_row = find_token(registry, candidate) or {}
-                        available, reset_at = rotation_candidate_availability(
+                        available, reset_at, _skip_reason = rotation_candidate_availability(
                             candidate_row,
                             now,
                             adverse_check_max_age_seconds=adverse_max_age,
+                            measured_usage_index=measured_index,
                         )
                         if not available:
                             if reset_at is not None and (
@@ -6293,6 +6464,21 @@ def build_parser() -> argparse.ArgumentParser:
     # negative value would silently disable the budget gate (fail OPEN), so it is
     # rejected at parse time.
     rotate_parser.add_argument("--preflight-budget", type=_nonnegative_int, default=0)
+    # #2171 PR-B3: token-free measured-usage prefilter. Repeatable path(s) to the
+    # `.usage-cache.json` readings; the candidate-selection gate skips a token
+    # whose own digest maps to a near-limit reading. Absent ⇒ the prefilter is a
+    # no-op (the default until the daemon wires the cache paths through).
+    rotate_parser.add_argument(
+        "--measured-usage-cache", action="append", default=None, help=argparse.SUPPRESS
+    )
+    # Reuse the monitor's thresholds + freshness window for the prefilter (no new
+    # knobs): 5h ≥ --rotation-threshold or weekly ≥ --weekly-warn-threshold marks
+    # a window near-limit; a reading older than --cache-max-age-seconds is dropped.
+    rotate_parser.add_argument("--rotation-threshold", type=float, default=99.0, help=argparse.SUPPRESS)
+    rotate_parser.add_argument("--weekly-warn-threshold", type=float, default=95.0, help=argparse.SUPPRESS)
+    rotate_parser.add_argument(
+        "--cache-max-age-seconds", type=float, default=21600.0, help=argparse.SUPPRESS
+    )
     rotate_parser.add_argument("--sync", action="store_true", help=argparse.SUPPRESS)
     rotate_parser.add_argument("--agents", help=argparse.SUPPRESS)
     rotate_parser.add_argument("--json", action="store_true")
