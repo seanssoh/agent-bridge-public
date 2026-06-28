@@ -92,3 +92,12 @@ scripts/test-picker-sweep-registration.sh
 # enforcement primary-group seam); never a controller->iso boundary RW (same
 # shape as the #1520c / #1533 / #1766 fixture entries).
 scripts/smoke/1891-iso-create-path-completeness.sh
+
+# #2171 PR-B2 Part2 daemon active-dead-recover fixture — the only `.env` matches
+# are the daemon-owned #1789 pool-exhausted cooldown state file
+# (`usage/claude-pool-exhausted.env`) under a hermetic mktemp BRIDGE_STATE_DIR:
+# one `rm -f` reset before each C-scenario and one `smoke_assert_file_exists`
+# armed-window assertion. It is controller-side daemon state (same family as
+# claude-token-recovery.env), never a controller->iso boundary RW (same shape as
+# the #1520c / #1533 / #1685 test-fixture allowlist entries).
+scripts/smoke/2171-daemon-active-dead-recover.sh
