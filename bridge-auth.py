@@ -1097,6 +1097,11 @@ def classify_probe(stdout: str, stderr: str, returncode: int) -> tuple[str, dict
         "api_error_status": api_status_text,
         "reset_at": reset_at,
         "returncode": returncode,
+        # #2171 PR-B1: whether stdout parsed as JSON. The legacy fallback below
+        # treats unparseable stdout with rc0 as ``available`` (fail-OPEN, kept
+        # for the existing reactive paths); a strict caller (cmd_rotate
+        # live-preflight) must reject that "available" as parse-unknown.
+        "json_ok": payload is not None,
     }
 
     if api_status_text == "429" or any(marker in lower for marker in QUOTA_LIMIT_MARKERS):
@@ -1499,9 +1504,281 @@ def cmd_set(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_rotate_preflight(
+    args: argparse.Namespace, registry_path: Path, json_mode: bool
+) -> int:
+    """#2171 selected-candidate LIVE preflight rotation (opt-in ``--preflight``).
+
+    The default cmd_rotate selects a rotation candidate from STALE registry
+    health flags (``rotation_candidate_availability``, fail-open). On the #19460
+    M4 fleet-down incident that can pick a token that is itself stale/limited —
+    the daemon then syncs a dead credential fleet-wide. With ``--preflight`` the
+    selected candidate is LIVE-probed (``probe_claude_token`` — the exact probe
+    ``cmd_check`` uses) BEFORE the active pointer is committed: authorize ONLY on
+    ``available``; ``quota_limited`` / ``auth_failed`` / ``timeout`` / ``failed``
+    / a 403 / parse-``unknown`` ALL EXCLUDE the candidate (a 403 is an auth
+    error, never healthy evidence).
+
+    Mirrors the ``cmd_check`` lock dance PER candidate — locked snapshot →
+    UNLOCKED probe (NEVER under ``registry_lock``) → locked revalidate + commit
+    — and is bounded to ONE ring pass. Failed-candidate probe evidence is
+    persisted (bounded; an auth failure is recorded as a freshness-windowed
+    ``last_check_status``, NEVER a permanent disable) before the next candidate.
+    With ``--preflight`` OFF the legacy stale-flag cascade runs unchanged
+    (cmd_rotate), so this path is fully additive and backward-compatible.
+    """
+    retry_seconds = 1800
+    preflight_timeout = int(getattr(args, "preflight_timeout", 12) or 12)
+    adverse_max_age = _rotation_adverse_check_max_age_seconds()
+
+    old_id = ""
+    new_id = ""
+    committed_row: dict[str, Any] | None = None
+    skipped_payload: dict[str, Any] | None = None
+    soonest_reset: datetime | None = None
+    preflight_trace: list[dict[str, Any]] = []
+    ring: list[str] = []
+
+    def _note_reset(stamp: datetime | None) -> None:
+        nonlocal soonest_reset
+        if stamp is not None and (soonest_reset is None or stamp < soonest_reset):
+            soonest_reset = stamp
+
+    try:
+        # Phase 1 (locked): gate, snapshot the active token, durably stamp the
+        # rotating-away token's known 429 window (#1789), and build the ring.
+        with registry_lock(registry_path):
+            registry = load_registry(registry_path)
+            if args.if_auto_enabled and not bool(registry.get("auto_rotate_enabled", False)):
+                skipped_payload = {"status": "skipped", "reason": "auto_rotate_disabled"}
+            else:
+                ids = enabled_token_ids(registry)
+                if len(ids) < 2:
+                    skipped_payload = {
+                        "status": "skipped",
+                        "reason": "no_alternate_token",
+                        "active_token_id": registry.get("active_token_id") or "",
+                    }
+                else:
+                    old_id = str(registry.get("active_token_id") or "")
+                    if args.limited_until and old_id:
+                        old_row = find_token(registry, old_id)
+                        if old_row is not None and iso_to_utc(args.limited_until) is not None:
+                            old_row["limited_until"] = args.limited_until
+                            save_registry(registry_path, registry)
+                    if old_id in ids:
+                        start = ids.index(old_id) + 1
+                        ring = [ids[(start + i) % len(ids)] for i in range(len(ids) - 1)]
+                    else:
+                        ring = list(ids)
+
+        # Phase 2 (bounded ONE ring pass): per-candidate lock dance. ``ring`` is
+        # populated only on the >=2-enabled branch, so gating on it (not on a
+        # non-empty old_id) keeps parity with the OFF path when the active
+        # pointer is empty (the ring already excludes the active token).
+        if skipped_payload is None and ring:
+            for candidate in ring:
+                # Step A (locked): stale-flag gate + snapshot token/fp/kind.
+                now = now_utc()
+                with registry_lock(registry_path):
+                    registry = load_registry(registry_path)
+                    candidate_row = find_token(registry, candidate)
+                    if candidate_row is None:
+                        preflight_trace.append(
+                            {"id": candidate, "outcome": "skipped", "reason": "row_absent"}
+                        )
+                        continue
+                    available, reset_at = rotation_candidate_availability(
+                        candidate_row, now, adverse_check_max_age_seconds=adverse_max_age
+                    )
+                    if not available:
+                        _note_reset(reset_at)
+                        preflight_trace.append(
+                            {"id": candidate, "outcome": "skipped", "reason": "stale_flag_unavailable"}
+                        )
+                        continue
+                    candidate_token = str(candidate_row.get("token") or "")
+                    try:
+                        validate_token(candidate_token)
+                    except ValueError:
+                        preflight_trace.append(
+                            {"id": candidate, "outcome": "excluded", "reason": "invalid_token"}
+                        )
+                        continue
+                    candidate_fp = token_fingerprint(candidate_token)
+                    candidate_kind = classify_token_kind(candidate_token)
+
+                # Credential contract: ``probe_claude_token`` is the NATIVE OAuth
+                # (.credentials.json) probe. Probing an api-key / unknown token
+                # through it would be a silent wrong-protocol probe whose result
+                # is meaningless, so FAIL CLOSED for any non-OAT candidate with an
+                # explicit reason rather than committing on misleading evidence.
+                if candidate_kind != TOKEN_KIND_OAUTH_OAT:
+                    preflight_trace.append(
+                        {
+                            "id": candidate,
+                            "outcome": "excluded",
+                            "reason": f"preflight_unsupported_kind:{candidate_kind}",
+                            "fingerprint": candidate_fp,
+                        }
+                    )
+                    continue
+
+                # Step B (UNLOCKED): live probe. NEVER under registry_lock —
+                # holding the lock across the network op would block the daemon's
+                # rotate loop, operator activate, and the recovery sweep.
+                probe = probe_claude_token(candidate_token, preflight_timeout)
+                status = str(probe.get("status") or "failed")
+                # #2171 PR-B1 gate: parse-unknown fails CLOSED. classify_probe's
+                # legacy fallback returns ``available`` for non-JSON stdout with
+                # rc0; that is NOT well-formed healthy evidence for committing a
+                # rotation candidate. Only a parseable JSON success may authorize
+                # — anything else is excluded (selection guard, not a permanent
+                # account verdict). Override the local + the probe dict so the
+                # downstream commit gate, evidence write, and trace all see it.
+                if status == "available" and not bool(probe.get("json_ok")):
+                    status = "failed"
+                    probe["status"] = "failed"
+                probe_reset = str(probe.get("reset_at") or "")
+                probe_api = str(probe.get("api_error_status") or "")
+
+                # Step C (locked): revalidate against a FRESH view + commit on
+                # ``available``; otherwise persist bounded failure evidence and
+                # advance to the next candidate.
+                now2 = now_utc()
+                with registry_lock(registry_path):
+                    registry = load_registry(registry_path)
+                    live_row = find_token(registry, candidate)
+                    active_now = str(registry.get("active_token_id") or "")
+                    live_fp = (
+                        token_fingerprint(str(live_row.get("token") or ""))
+                        if live_row is not None and live_row.get("token")
+                        else ""
+                    )
+                    if status == "available":
+                        # Discard the probe DETERMINISTICALLY if anything moved
+                        # under us during the unlocked window — a concurrent
+                        # rotation (active changed), the candidate row vanished,
+                        # its token value was replaced (fingerprint mismatch), it
+                        # was disabled, or a fresh adverse signal landed. Never
+                        # commit a stale probe onto a moved/replaced row.
+                        revalidate_ok = (
+                            active_now == old_id
+                            and live_row is not None
+                            and live_fp == candidate_fp
+                            and bool(live_row.get("enabled", True))
+                            and rotation_candidate_availability(
+                                live_row, now2, adverse_check_max_age_seconds=adverse_max_age
+                            )[0]
+                        )
+                        if revalidate_ok:
+                            live_row.pop("limited_until", None)
+                            timestamp = now_iso()
+                            registry["active_token_id"] = candidate
+                            live_row["last_activated_at"] = timestamp
+                            registry["last_rotation"] = {
+                                "rotated_at": timestamp,
+                                "from": old_id,
+                                "to": candidate,
+                                "reason": args.reason or "",
+                            }
+                            save_registry(registry_path, registry)
+                            new_id = candidate
+                            committed_row = live_row
+                            preflight_trace.append(
+                                {"id": candidate, "outcome": "committed", "fingerprint": candidate_fp}
+                            )
+                            break
+                        preflight_trace.append(
+                            {
+                                "id": candidate,
+                                "outcome": "discarded",
+                                "reason": "revalidation_failed",
+                                "fingerprint": candidate_fp,
+                            }
+                        )
+                        if active_now != old_id:
+                            # Someone else rotated the pool; this pass is moot.
+                            break
+                        continue
+
+                    # Adverse / inconclusive probe → EXCLUDE this candidate.
+                    # Persist bounded evidence ONLY onto the SAME token we probed
+                    # (fingerprint guard mirrors cmd_check): quota / auth →
+                    # last_check_status within the freshness window so a later
+                    # pass skips it; never enabled=False (no permanent disable).
+                    if live_row is not None and live_fp == candidate_fp:
+                        update_row_from_probe(
+                            live_row,
+                            probe,
+                            enable_on_ok=False,
+                            disable_on_quota=False,
+                            retry_seconds=retry_seconds,
+                        )
+                        if status == "quota_limited" and probe_reset and iso_to_utc(probe_reset) is not None:
+                            live_row["limited_until"] = probe_reset
+                        save_registry(registry_path, registry)
+                    if status == "quota_limited" and probe_reset:
+                        _note_reset(iso_to_utc(probe_reset))
+                    preflight_trace.append(
+                        {
+                            "id": candidate,
+                            "outcome": "excluded",
+                            "reason": f"probe_{status}",
+                            "api_error_status": probe_api,
+                            "fingerprint": candidate_fp,
+                        }
+                    )
+    except Exception as exc:
+        return fail(str(exc), json_mode)
+
+    if skipped_payload is None and not new_id:
+        # No candidate cleared the live probe (every alternate is limited,
+        # adverse, un-probeable, or raced). Route to the existing
+        # ``all_tokens_limited`` refusal so the daemon's #1789 D2 pool-exhausted
+        # latch behaves exactly as before.
+        skipped_payload = {
+            "status": "skipped",
+            "reason": "all_tokens_limited",
+            "active_token_id": old_id,
+            "soonest_reset": (
+                soonest_reset.isoformat(timespec="seconds")
+                if soonest_reset is not None
+                else ""
+            ),
+        }
+
+    if skipped_payload is not None:
+        if preflight_trace:
+            skipped_payload["preflight"] = preflight_trace
+        if json_mode:
+            json_dump(skipped_payload)
+        else:
+            print(f"skipped: {skipped_payload['reason']}")
+        return 0
+
+    payload = {
+        "status": "rotated",
+        "old_active_token_id": old_id,
+        "active_token_id": new_id,
+        "fingerprint": token_fingerprint(str((committed_row or {}).get("token") or "")),
+        "reason": args.reason or "",
+        "preflight": preflight_trace,
+    }
+    if json_mode:
+        json_dump(payload)
+    else:
+        print(f"rotated: {old_id or '-'} -> {new_id} ({payload['fingerprint']})")
+    return 0
+
+
 def cmd_rotate(args: argparse.Namespace) -> int:
     json_mode = bool(args.json)
     registry_path = Path(args.registry).expanduser()
+    # #2171: opt-in selected-candidate live preflight. Default OFF preserves the
+    # legacy stale-flag cascade below verbatim (backward-compatible).
+    if bool(getattr(args, "preflight", False)):
+        return _cmd_rotate_preflight(args, registry_path, json_mode)
     # PR #799 r2 codex finding 3 — registry lock around the load->mutate->save.
     old_id = ""
     new_id = ""
@@ -5949,6 +6226,13 @@ def build_parser() -> argparse.ArgumentParser:
     # Recorded as the old row's `limited_until` so selection can skip
     # still-limited tokens. Timestamp only — never token bytes.
     rotate_parser.add_argument("--limited-until", default="")
+    # #2171 selected-candidate live preflight (opt-in, default OFF for backward
+    # compatibility). When set, the selected rotation candidate is LIVE-probed
+    # before the active pointer is committed — see cmd_rotate / _cmd_rotate_preflight.
+    rotate_parser.add_argument("--preflight", action="store_true")
+    # Short probe budget for the preflight so the new network op fits inside the
+    # daemon's 20s rotate timeout (probe_claude_token's own default is 45s).
+    rotate_parser.add_argument("--preflight-timeout", type=int, default=12)
     rotate_parser.add_argument("--sync", action="store_true", help=argparse.SUPPRESS)
     rotate_parser.add_argument("--agents", help=argparse.SUPPRESS)
     rotate_parser.add_argument("--json", action="store_true")
