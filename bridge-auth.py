@@ -1739,7 +1739,7 @@ def _converge_operator_global_inline(registry_path: Path) -> dict[str, Any]:
         # inline converge under the same parent-containment proof instead of
         # weakening it with allowed_root=None.
         op_home = global_path.parent.parent
-        allowed_root = op_home if op_home.is_dir() else None
+        allowed_root = op_home if op_home.is_dir() else None  # noqa: raw-pathlib-controller-only - operator-home containment derivation (controller-owned, never an iso-agent path)
         auto_rotate, opt_in, active_id, active_token = _global_auth_gate_state(
             registry_path
         )
