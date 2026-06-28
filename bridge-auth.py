@@ -6320,10 +6320,12 @@ def cmd_reconcile_keychain(args: argparse.Namespace) -> int:
         return 2
     entries: list[dict[str, str]] = []
     stale_services: list[str] = []
+    unreadable_services: list[str] = []
     for service in services:
         fingerprint, err = keychain_entry_fingerprint(security_bin, service)
         if err:
             match_state = "unreadable"
+            unreadable_services.append(service)
         elif not expected_fp:
             match_state = "indeterminate"
         elif fingerprint == expected_fp:
@@ -6351,6 +6353,7 @@ def cmd_reconcile_keychain(args: argparse.Namespace) -> int:
                 delete_errors.append({"service": service, "error": derr})
 
     stale_count = len(stale_services)
+    unreadable_count = len(unreadable_services)
     if not services:
         status = "clean_no_entries"
     elif not expected_fp:
@@ -6358,6 +6361,12 @@ def cmd_reconcile_keychain(args: argparse.Namespace) -> int:
         # nothing can be CLASSIFIED (let alone deleted). Report honestly rather
         # than a false "clean"; fail-closed leaves every entry untouched.
         status = "indeterminate_no_active"
+    elif stale_count == 0 and unreadable_count:
+        # An enumerated Claude Code entry could not be READ, so we cannot tell
+        # whether it is the active token or a stale shadow. Fail-closed: never
+        # claim "clean" on an un-inspected entry (#2171 PR-D review r2). Nothing
+        # is deleted — only readable+stale entries ever enter stale_services.
+        status = "indeterminate_unreadable"
     elif stale_count == 0:
         status = "clean"
     elif apply_cleanup:
@@ -6375,6 +6384,8 @@ def cmd_reconcile_keychain(args: argparse.Namespace) -> int:
         "entries": entries,
         "stale_count": stale_count,
         "stale_services": stale_services,
+        "unreadable_count": unreadable_count,
+        "unreadable_services": unreadable_services,
         "deleted": deleted,
         "delete_errors": delete_errors,
         # Remediation note (brief item 7): a plain `restart --no-continue` is NOT
@@ -6412,6 +6423,10 @@ def cmd_reconcile_keychain(args: argparse.Namespace) -> int:
         return 1
     if stale_count and not apply_cleanup:
         return 3
+    if status == "indeterminate_unreadable":
+        # Fail-closed: a relevant entry was found but could not be inspected
+        # (#2171 PR-D review r2). Non-zero so a health gate notices the gap.
+        return 2
     return 0
 
 

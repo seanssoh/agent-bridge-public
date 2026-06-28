@@ -287,6 +287,24 @@ test_present_guard_sees_hashed() {
   smoke_assert_eq "PRESENT" "$res" "T10 present-guard detects the hashed-only keychain entry (base-only would miss it)"
 }
 
+# T11 — an enumerated entry whose SECRET cannot be read must fail closed (#2171
+# PR-D review r2). The service name enumerates but find-generic-password -w
+# fails, so we cannot tell if it is the active token or a stale shadow: status
+# indeterminate_unreadable, rc 2, deletes NOTHING even under --apply. (Same
+# fail-closed boundary as enumeration failure, one level deeper.)
+test_unreadable_entry_failclosed() {
+  kc_reset
+  # Service name is enumerable, but NO secret file → mock -w read returns nonzero.
+  printf '%s\n' "$SVC_HASH" >>"$KC_DIR/services"
+  local out rc=0
+  out="$(reconcile --apply --json)" || rc=$?
+  smoke_assert_eq "2" "$rc" "T11 unreadable entry exits 2 (fail-closed, not a vacuous clean)"
+  smoke_assert_contains "$out" '"status": "indeterminate_unreadable"' "T11 status indeterminate_unreadable"
+  smoke_assert_contains "$out" '"match": "unreadable"' "T11 entry classified unreadable"
+  smoke_assert_contains "$out" "$SVC_HASH" "T11 the unreadable service is reported"
+  [[ ! -f "$KC_DIR/deleted.log" ]] || smoke_fail "T11 must delete NOTHING for an unreadable entry, even under --apply"
+}
+
 smoke_run "T1 matching fingerprint is a clean no-op"                  test_match_is_clean_noop
 smoke_run "T2 hashed-variant stale shadow is fail-closed (rc 3)"      test_hashed_stale_is_failclosed
 smoke_run "T3 base+hashed are both enumerated (base-only insufficient)" test_full_enumeration_base_plus_hashed
@@ -297,5 +315,6 @@ smoke_run "T7 bash wrapper passthrough + unknown-flag fail-closed"   test_bash_w
 smoke_run "T8 --expected-credentials drives the expected fingerprint" test_expected_credentials_source
 smoke_run "T9 enumeration failure fails closed (rc 2, deletes nothing)" test_enumeration_failure_failclosed
 smoke_run "T10 present-guard sees the hashed-only service (F2)"        test_present_guard_sees_hashed
+smoke_run "T11 unreadable entry fails closed (rc 2, deletes nothing)"  test_unreadable_entry_failclosed
 
 smoke_log "all checks passed"
