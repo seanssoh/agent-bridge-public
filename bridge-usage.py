@@ -16,9 +16,23 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+# #2171 PR-B3 Part 2: a one-way token digest is exactly 16 lowercase-hex chars
+# (bridge-usage-probe.py `_token_signal_digest`). The cache's `_token_digest`
+# field is operator-writable, so any value echoed into monitor output is
+# validated against this shape first — a malformed / hand-edited cache must never
+# leak arbitrary (or raw token) bytes through the cache-split diagnostic.
+_TOKEN_DIGEST_RE = re.compile(r"\A[0-9a-f]{16}\Z")
+
+
+def _safe_token_digest(value: Any) -> str:
+    """Return a value only if it is a well-formed 16-char hex digest, else a fixed
+    redaction marker (never the unvalidated value)."""
+    return value if isinstance(value, str) and _TOKEN_DIGEST_RE.match(value) else "<non-digest>"
 
 
 def now_iso() -> str:
@@ -751,6 +765,14 @@ def cmd_monitor(args: argparse.Namespace) -> int:
     # agent-A must NOT be masked by a 60% on agent-B sharing the same plan.
     worst_case_agent: str | None = None
     worst_case_percent: float = -1.0
+    # #2171 PR-B3 Part 2 (wrong-home cache-split diagnostic): a resolved claude
+    # cache whose one-way `_token_digest` does NOT match the live active-token
+    # digest is a cache the resolver read from the WRONG home (a different token's
+    # reading), not a usable signal for the active token. The rotation lane already
+    # treats it as no-signal (rotation_attribution_ok below); collect each such
+    # mismatch here so the split is VISIBLE in the monitor output instead of
+    # silently dropped. Digests only — never token bytes. No alternate-home search.
+    cache_split_diagnostics: list[dict[str, Any]] = []
 
     for snapshot in snapshots:
         # Issue #831 patch-dev r2 §4: include agent identity in the latching
@@ -809,6 +831,29 @@ def cmd_monitor(args: argparse.Namespace) -> int:
             snap_digest = snapshot.get("token_digest")
             if isinstance(snap_digest, str) and snap_digest and snap_digest != active_token_digest:
                 rotation_attribution_ok = False
+                # #2171 PR-B3 Part 2: surface the wrong-home cache-split. This
+                # reading stays inert for the rotation lane (folded into
+                # cache_fresh below = no-signal, never read as 0% and never a
+                # threshold crossing); the diagnostic only makes the mismatch
+                # observable. Digests are one-way — safe to emit; no token bytes.
+                cache_split_diagnostics.append(
+                    {
+                        "agent": snapshot_agent or "",
+                        "provider": "claude",
+                        "window": str(snapshot.get("window") or ""),
+                        # One-way digests only (NO token bytes). Keys deliberately
+                        # avoid the literal ``token_digest`` so the internal-gate
+                        # strip contract (no ``token_digest`` field in the monitor
+                        # envelope) is preserved. The cache value is operator-
+                        # writable, so it is validated to a 16-char hex shape
+                        # before emit — a malformed cache yields a redaction
+                        # marker, never raw bytes.
+                        "cache_digest": _safe_token_digest(snap_digest),
+                        "active_digest": _safe_token_digest(active_token_digest),
+                        "source": str(snapshot.get("source") or ""),
+                        "reason": "wrong_home_cache_split",
+                    }
+                )
         snapshot.pop("token_digest", None)
 
         # #17927 P2 (E10 Obs#1): freshness of THIS reading, computed BEFORE any
@@ -990,6 +1035,10 @@ def cmd_monitor(args: argparse.Namespace) -> int:
         "worst_case_agent": worst_case_agent,
         "per_agent_breakdown": per_agent_breakdown,
     }
+    # #2171 PR-B3 Part 2: only add the diagnostics key when a split was actually
+    # observed, so the steady-state monitor envelope is byte-identical to before.
+    if cache_split_diagnostics:
+        result["cache_split_diagnostics"] = cache_split_diagnostics
     if args.json:
         print(json.dumps(result, ensure_ascii=True, indent=2))
         return 0
