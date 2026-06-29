@@ -683,6 +683,73 @@ launch default는 이 작업과 함께 `claude-opus-4-7`에서 `claude-opus-4-8`
 갱신됐다(lib/bridge-state.sh:68); 기존 명시적 roster 항목은 건드리지 않는
 adjacent 변경이며 dry-run에 노출된다.
 
+### 10. dynamic→static convert — config-dir-aware 상태 마이그레이션 (issue #2061)
+
+`agent convert <agent> --to static`는 동적 Claude 에이전트를 정적 roster
+role로 승격하면서 **config-dir 상대 상태(transcript + auto-memory)를 함께
+이전**한다. 운영자-facing 동작은 [`OPERATIONS.md`](../OPERATIONS.md)의
+"Converting a dynamic agent to static" 절을, 데이터 손실 함정은 KNOWN_ISSUES
+#38을 본다.
+
+수정 지점:
+
+- **마이그레이션 엔진은 새 파일 `lib/bridge-agent-convert.sh`에 둔다** (root
+  스크립트를 키우지 말고 `lib/bridge-*.sh` 헬퍼로 — CLAUDE.md 편집 원칙).
+  순수 함수 세트(라이브 에이전트 의존 없음): `bridge_convert_resolve_config_dirs`
+  / `bridge_convert_enumerate_cwds` / `bridge_convert_build_manifest` /
+  `bridge_convert_apply_manifest`, 그리고 실패 시 복구용 내부 헬퍼
+  `bridge_convert_rollback`. dry-run/backup/byte-verify는 전부 이 파일 안에서
+  smoke로 검증 가능하다(`scripts/smoke/2061-convert-migration.sh`,
+  `scripts/ci-select-smoke.sh`에 등록).
+- **verb 배선(`run_convert`)은 `bridge-agent.sh`**에 추가하고 dispatch
+  `case`의 `reclassify)` 옆에 건다.
+
+이 영역을 만질 때 반드시 기억할 함정들:
+
+- **config-dir 클래스는 둘이 아니라 셋이다.** source config dir 도출은
+  "dynamic == operator home"으로 단순화하면 안 되고 반드시
+  `bridge_agent_is_dynamic_vanilla_claude`(lib/bridge-agents.sh:930)로
+  판정한다. 단일 진실원은 launch와 resume-detection이 공유하는 resolver
+  `bridge_resolve_agent_claude_config_dir`(lib/bridge-state.sh:4970)이며 세
+  클래스를 구분한다:
+  1. **dynamic vanilla claude** → resolver가 **empty**를 반환하고 launch가
+     `CLAUDE_CONFIG_DIR`를 안 넘김 → 운영자 글로벌 `~/.claude`
+     (`bridge_agent_operator_home_dir` lib/bridge-agents.sh:5963 + `/.claude`).
+     이게 stranding source(`syrs-shop-dev` 케이스).
+  2. **자기 dir을 가진 등록된 dynamic / iso** → `<agent-home>/.claude`. home/
+     workdir 보존 시 마이그레이션 불필요.
+  3. **static / admin** → `bridge_agent_claude_config_dir`
+     (lib/bridge-agents.sh:6037) = `<agent-home>/.claude`(iso-effective면 iso
+     UID home `.claude`). 변환 후 에이전트가 읽는 곳.
+
+  `source == target`(이미 격리된 dynamic)이면 마이그레이션은 no-op이고
+  roster flip + pin만 돈다.
+- **roster는 audited writer로만 쓴다.** `agent-roster.local.sh`는 hook으로
+  보호되는 시스템 config path라 Edit/Write/tee/`>>`가 전부 막힌다. 유일한
+  합법 경로는 create/update/reclassify가 쓰는 동일한 `bridge_write_role_block`
+  (bridge-agent.sh:1129)이다. 변환 중 데몬 auto-start를 막으려면
+  `start_policy=hold`를 baked로 넘기고, model/effort/discord는 no-op이 되지
+  않게 `launch_cmd`에 bake한다(#1427).
+- **crash-state-clear 단계는 필수다.** 옛 dynamic launch를 내린 뒤,
+  start 이전에 `bridge_agent_clear_crash_report <agent>`
+  (lib/bridge-state.sh:3968)를 호출해 `runtime/crash/`의 변환-전
+  `report.env`/`state.env`/`tail.log`/`body`를 비운다. 데몬의 stale-launch
+  guard(#2063)에만 의존하지 말 것 — 변환 직후 crash 알림/감사 churn이 0이어야
+  한다.
+- **마지막에 뒤집는다(last-flip 트랜잭션).** 변환은 `stop/quiesce → config-dir
+  도출 → manifest → home/settings materialize + 불변식 assert → apply+verify →
+  crash-state clear → roster flip(static) → resume-id pin → validate → optional
+  start` 순서로 돈다. roster flip이 상태를 stranding 시키는 마지막 mutation이라
+  중간 실패가 static-but-empty role을 남기지 않는다. materialize/apply/pin
+  단계에서 실패하면 내부 `bridge_convert_rollback`이 변환-전 상태를 복원한다.
+- **#1455 단일-트리 settings 불변식을 재사용으로 상속한다.** 정적 home 트리는
+  create의 `bridge_layout_materialize_identity`(lib/bridge-agent-layout.sh:393)
+  + shared-settings 렌더를 재사용해 만들고(일회성 copy 금지 — #1555),
+  변환 끝에 doctor detector `settings-two-tree-drift`(bridge-doctor.py)로
+  post-convert 불변식을 **assert** 한다. iso-effective 타깃으로의 write는
+  controller→iso 경계(§3.1)를 거쳐야 하므로 MVP는 iso-타깃 변환을 fail-closed로
+  거부한다(shared-mode/macOS 우선).
+
 ## 6. 개발할 때의 기본 작업 흐름
 
 ### 상태 파악
