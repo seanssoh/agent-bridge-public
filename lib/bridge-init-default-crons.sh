@@ -347,7 +347,7 @@ bridge_init_register_default_picker_sweep() {
       if [[ "$admin_text_titleonly" -eq 1 ]]; then
         printf '[init] picker-sweep cron migrate — id-less admin-targeted text-kind row remains (cannot title-delete safely); operator can remove it manually per OPERATIONS.md\n' >&2
       fi
-      printf '[init] picker-sweep cron skipped — non-iso host with a Claude run-as-agent cannot run a bridge-native shell cron (a text-kind shell payload dispatched through claude -p is a prompt, not an exec — #2087); schedule scripts/picker-sweep.sh via OS crontab per OPERATIONS.md "Scheduled shell scripts without iso v2"%s\n' \
+      printf '[init] picker-sweep cron skipped — non-iso host with a Claude run-as-agent cannot run a bridge-native shell cron (a text-kind shell payload reaches a Claude agent as a prompt in headless -p mode, not an exec — #2087); schedule scripts/picker-sweep.sh via OS crontab per OPERATIONS.md "Scheduled shell scripts without iso v2"%s\n' \
         "$([[ "${#admin_text_ids[@]}" -gt 0 ]] && printf ' (removed %s broken text-kind row(s))' "${#admin_text_ids[@]}")" >&2
       return 0
     fi
