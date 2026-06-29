@@ -3530,8 +3530,9 @@ Options:
   --model <model>        Bake --model into the static launch command.
   --effort <effort>      Persist the reasoning effort roster field.
   --carry-session live|none
-                         live (default) leaves a Track C resume-pin hook;
-                         none starts the converted agent fresh.
+                         live (default) pins the dynamic agent's last-active,
+                         transcript-validated session id so the static role
+                         --resumes it; none clears resume state (starts fresh).
   --start hold|auto      hold (default) leaves the agent stopped; auto starts it.
   --dry-run              Print the migration manifest and mutate NOTHING.
   --json                 Machine-readable output (manifest on --dry-run).
@@ -3693,6 +3694,40 @@ AGENT_CONVERT_HELP
   # bridge_ensure_auto_memory_isolation's seed convention).
   local slug=""
   slug="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]).replace(os.sep,"-").replace(".","-"))' "${BRIDGE_HOME:-}" 2>/dev/null || true)"
+
+  # --- Track C early capture (§0.1 step 1 / §3): resolve the carried resume id
+  # from the SOURCE config dir NOW, while the live transcript is still in place
+  # and BEFORE any mutation. For --carry-session live we detect the agent's
+  # last-active, transcript-validated session id scoped to ITS workdir — so a
+  # dynamic-vanilla agent that shares the operator-global ~/.claude can only
+  # match its own workdir-scoped sessions, never the operator's (the #1890
+  # boundary). The id is held in a shell local ONLY; it is not persisted until
+  # the post-flip pin (step 8), after Track A has migrated the transcript into
+  # the TARGET dir, so the resolver never validates it against the operator
+  # tree. `none` carries nothing (the resume state is cleared at the pin). This
+  # is read-only and harmless on the --dry-run path below (which returns before
+  # the pin).
+  local carried_session_id=""
+  if [[ "$carry_session" == "live" ]]; then
+    if [[ -n "${BRIDGE_CONVERT_FORCE_CARRY_SESSION_ID:-}" ]]; then
+      # Test-only fault-injection seam (smoke), default-off: force a known
+      # (possibly transcript-absent) carried id so the post-flip validate-reject
+      # path is exercisable without a live Claude session — the analog of T4's
+      # simulated apply failure and T7's forced field-write failure.
+      carried_session_id="$BRIDGE_CONVERT_FORCE_CARRY_SESSION_ID"
+    else
+      local _carry_max_hours="${BRIDGE_RESUME_MAX_AGE_HOURS:-48}"
+      _carry_max_hours="${_carry_max_hours%.*}"
+      [[ "$_carry_max_hours" =~ ^[0-9]+$ ]] || _carry_max_hours=48
+      local _carry_since_ms=$(( ($(date +%s) - _carry_max_hours * 3600) * 1000 ))
+      local _carry_quarantine=""
+      _carry_quarantine="$(bridge_agent_resume_quarantine_ids "$agent" 2>/dev/null || true)"
+      local _carry_iso_user=""
+      _carry_iso_user="$(bridge_resolve_agent_iso_sudo_user "$agent" 2>/dev/null || true)"
+      carried_session_id="$(bridge_detect_claude_session_id \
+        "$workdir" "$_carry_since_ms" "$_carry_quarantine" "$source_dir" "$_carry_iso_user" 2>/dev/null || true)"
+    fi
+  fi
 
   # --- build the dry-run manifest (§0.1 step 3, read-only) -----------------
   local manifest_file
@@ -3923,15 +3958,57 @@ sys.exit(0 if os.path.realpath(wd_link) == os.path.realpath(eff) else 1)
   bridge_roster_cache_invalidate
   bridge_load_roster
 
-  # --- step 8: resume-id pin = Track C (NOT implemented here) ---------------
-  # The agent is now static + stopped + start_policy=hold, which is the safe
-  # window the Track C pin needs (no live session for the daemon's
-  # refresh_missing_session_ids to recapture). Track C resolves the carried
-  # session id, migrates/validates its transcript against target_dir, and
-  # pins it atomically via bridge_set_agent_session_id.
-  #   Track C: pin --carry-session here (post-flip, transcript-validated)
-  # For --carry-session none the converted agent simply starts fresh; for live
-  # the pin is the next fixer's job. No resume-machinery is touched in MVP.
+  # --- step 8: resume-id pin = Track C -------------------------------------
+  # The agent is now static + stopped + start_policy=hold — the safe window the
+  # pin needs (§0.3): the daemon's refresh_missing_session_ids skips a stopped
+  # agent (not active) AND never overwrites a PRESENT id, and the carried id was
+  # captured from the SOURCE config dir in the read-only phase, so no live
+  # session competes. Track A has since copied the transcript into target_dir,
+  # and post-flip the agent is static (the dynamic-vanilla resume no-op is
+  # gone), so the id now transcript-validates against the TARGET. Pin atomically
+  # under the per-agent session lock via bridge_set_agent_session_id, then prove
+  # the pin resolves: a live carry that won't validate is the #1248-class silent
+  # fresh-start — fail LOUDLY through the internal rollback, never boot empty.
+  if [[ "$carry_session" == "none" ]]; then
+    # bridge_clear_agent_session_id persists through bridge_persist_agent_state,
+    # which can return nonzero on lock/write contention — do NOT swallow that.
+    # The POSTCONDITION (no persisted resume id) is the authority: a transient
+    # write failure with nothing actually persisted is benign, but a stale id
+    # left behind is a wrong-resume static role and MUST fail loudly.
+    if [[ "${BRIDGE_CONVERT_FORCE_CLEAR_NOOP:-0}" != "1" ]]; then
+      # Test-only fault-injection seam (smoke T5), default-off: skip the actual
+      # clear to simulate a persist/lock failure that leaves the id stranded, so
+      # the postcondition guard below is exercisable.
+      bridge_clear_agent_session_id "$agent" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$(bridge_agent_persisted_session_id "$agent" 2>/dev/null || true)" ]]; then
+      _convert_fail "could not clear the resume state for '$agent' (--carry-session none) — a stale resume id remains persisted; refusing to leave a wrong-resume static role (#2061)."
+    fi
+    carried_session_id=""
+  elif [[ -n "$carried_session_id" ]]; then
+    bridge_set_agent_session_id "$agent" "$carried_session_id" >/dev/null 2>&1 \
+      || _convert_fail "could not pin the carried resume id ($carried_session_id) for '$agent'."
+    if ! bridge_claude_session_id_exists "$carried_session_id" "$workdir" "$agent"; then
+      # Drop the just-pinned id before rolling back so no stale id is stranded
+      # in the history env for the restored role. A clear that does not actually
+      # land (lock/write failure leaving the bad id persisted) is itself fatal —
+      # surface the residual id in the rollback reason rather than swallow it.
+      bridge_clear_agent_session_id "$agent" >/dev/null 2>&1 || true
+      local _residual_sid=""
+      _residual_sid="$(bridge_agent_persisted_session_id "$agent" 2>/dev/null || true)"
+      if [[ -n "$_residual_sid" ]]; then
+        _convert_fail "the carried resume id ($carried_session_id) does not transcript-validate against the target config dir ($target_dir) AND a stale resume id ($_residual_sid) could not be cleared — inspect the agent history env. Refusing a silent fresh-start (#2061/#1248)."
+      fi
+      _convert_fail "the carried resume id ($carried_session_id) does not transcript-validate against the target config dir ($target_dir) — refusing to let '$agent' silently start fresh (#2061/#1248). Migrate the transcript first or re-run with --carry-session none."
+    fi
+    bridge_info "[convert] pinned resume session '$carried_session_id' for '$agent' (transcript-validated against the target config dir)."
+  else
+    # --carry-session live but the source config dir held no resumable
+    # transcript for this workdir (never ran / aged out): there is genuinely
+    # nothing to resume. Warn LOUDLY (not silent) — this is not the data-loss
+    # case (no session existed), so it is not a hard failure.
+    bridge_warn "convert: --carry-session live found no resumable session for '$agent' in the source config dir; it will start fresh (no transcript to carry)."
+  fi
 
   # Post-flip best-effort settings re-render so the static-class managed
   # defaults (autoCompactWindow) land; non-fatal and idempotent.
@@ -3958,6 +4035,7 @@ sys.exit(0 if os.path.realpath(wd_link) == os.path.realpath(eff) else 1)
     --detail source_config_dir="$source_dir" \
     --detail target_config_dir="$target_dir" \
     --detail carry_session="$carry_session" \
+    --detail resumed_session_id="$carried_session_id" \
     --detail start_policy=hold >/dev/null 2>&1 || true
 
   if [[ $json_mode -eq 1 ]]; then
@@ -3971,15 +4049,22 @@ print(json.dumps({
     "source_config_dir": sys.argv[3],
     "target_config_dir": sys.argv[4],
     "carry_session": sys.argv[5],
+    "resumed_session_id": sys.argv[7],
     "start_policy": "hold",
     "started": sys.argv[6] == "1",
 }, indent=2, sort_keys=True))
 ' "$agent" "$cur_source" "$source_dir" "$target_dir" "$carry_session" \
-      "$([[ "$start_mode" == "auto" ]] && printf 1 || printf 0)"
+      "$([[ "$start_mode" == "auto" ]] && printf 1 || printf 0)" \
+      "$carried_session_id"
   else
     printf 'converted: %s (dynamic→static)\n' "$agent"
     printf '  source_config_dir: %s\n' "$source_dir"
     printf '  target_config_dir: %s\n' "$target_dir"
+    if [[ -n "$carried_session_id" ]]; then
+      printf '  resumed_session_id: %s (transcript-validated)\n' "$carried_session_id"
+    else
+      printf '  resumed_session_id: (none — starts fresh)\n'
+    fi
     printf '  start_policy: hold (use '\''agent-bridge agent start %s'\'' to launch)\n' "$agent"
   fi
 }
