@@ -1056,6 +1056,138 @@ def _verify_cache_version_path(
     return True, ""
 
 
+def _ensure_cache_parent_dirs(plugin_cache_root: Path) -> None:
+    """Create the marketplace + plugin cache parent dirs at mode 0o700.
+
+    r4 codex Probe 7 — chmod the parents to 0o700 so a default umask (0o022)
+    does not leave the marketplace / plugin level world-readable above the
+    per-version cache. Extracted (Issue #2182) so the symlink-migrate,
+    stray-rebuild, first-time, and atomic temp-build paths share one
+    implementation instead of four divergent copies.
+    """
+    plugin_cache_root.mkdir(parents=True, exist_ok=True)
+    plugin_cache_root.chmod(0o700)
+    if plugin_cache_root.parent != cache_root() and plugin_cache_root.parent.exists():
+        plugin_cache_root.parent.chmod(0o700)
+
+
+def _atomic_build_cache_version(
+    source_path: Path,
+    cache_version_path: Path,
+    plugin_cache_root: Path,
+    root: Path,
+    agent: str = "",
+) -> None:
+    """Build a fresh per-agent plugin cache atomically (Issue #2182).
+
+    The previous fresh-build path created ``cache_version_path`` up front and
+    overlaid node_modules into it one file at a time. That exposed a partial,
+    in-progress directory to every concurrently launching agent: a second
+    agent would see ``cache_version_path.is_dir()`` → True, treat the partial
+    node_modules as "already present", skip it, and confirm a permanently
+    incomplete cache (``required-contract-missing-in-cache:@azure/...``) that a
+    channel-required launch then aborts on — a fleet wedge that verify-retry
+    could never escape because each retry reused the same partial.
+
+    Instead, assemble the FULL overlay (including node_modules) in a
+    pid-private temp dir under the SAME parent as the final cache (so the move
+    is a same-filesystem, atomic ``os.rename``), verify the required contract
+    on the temp, and only then publish it with ``os.rename``. The final path
+    therefore only ever appears as a complete, contract-verified directory, or
+    not at all — no partial snapshot is ever visible to a concurrent launch.
+
+    Concurrent winner: if another agent atomically published a complete cache
+    first, our ``os.rename`` onto the now-non-empty final fails; we keep the
+    winner and discard our temp. The temp is always removed (``finally``), so a
+    failed or raced build never leaks. The caller guarantees
+    ``cache_version_path`` is absent on entry (first-time / post-unlink /
+    post-remove); a concurrent winner is the only way it can reappear, and a
+    winner is always a complete, atomically-renamed cache.
+
+    Raises ``RequiredContractUnreadable`` (contract material missing after a
+    fresh build) or ``OSError`` (overlay / rename failure) so the caller maps
+    it to ``install-failed``.
+    """
+    _ensure_cache_parent_dirs(plugin_cache_root)
+    temp_path = plugin_cache_root / f".{cache_version_path.name}.tmp.{os.getpid()}"
+    try:
+        # Clear a stale temp left by a crashed earlier build that reused this
+        # pid. Other agents' in-progress temps carry a different pid, so this
+        # never touches a concurrent build.
+        remove_tree(temp_path)
+        temp_path.mkdir(parents=False, exist_ok=False, mode=0o700)
+        temp_path.chmod(0o700)  # explicit, defensive against umask
+        overlay_source_to_cache(
+            source_path, temp_path, source_root=root, agent=agent
+        )
+        # Verify the required contract on the TEMP before exposing it. A fresh
+        # build that came out missing contract material must never be promoted
+        # to the live cache path.
+        ok, reason = _verify_cache_version_path(temp_path, source_path)
+        if not ok:
+            raise RequiredContractUnreadable(
+                f"required-contract-missing-after-fresh-build:{reason}"
+            )
+        try:
+            os.rename(temp_path, cache_version_path)
+        except OSError:
+            # Lost the publish race: a concurrent agent atomically moved a
+            # complete cache into place first (``os.rename`` onto a non-empty
+            # dir fails). Keep the winner and discard our temp. Re-raise only
+            # when the destination is still absent — a genuine rename failure,
+            # not a concurrent winner.
+            if cache_version_path.is_dir():
+                return
+            raise
+    finally:
+        # No-op after a successful rename (temp no longer exists); cleans up the
+        # temp on the concurrent-winner path and on any raised failure so a
+        # partial/raced build never leaks a directory.
+        remove_tree(temp_path)
+
+
+def _retire_cache_if_incomplete(
+    cache_version_path: Path, source_path: Path, plugin_cache_root: Path
+) -> bool:
+    """Atomically retire cache_version_path IFF it is still incomplete (#2182).
+
+    Concurrent-winner + atomicity safety for the partial-recovery path:
+
+      * Path-identity revalidation — re-verify the required contract
+        immediately before the destructive action so a partial-recovery agent
+        never retires a cache that another agent has since atomically published
+        as complete. A complete cache (or any non-contract verify failure) is
+        left untouched and ``False`` is returned.
+      * Atomic removal — when the cache is still incomplete, rename it to a
+        pid-private sibling in ONE syscall (same parent, same filesystem) so the
+        live path transitions present→absent atomically and is never observed in
+        a half-deleted state, then recursively remove the private copy.
+
+    Returns ``True`` when an incomplete cache was retired (live path now absent),
+    ``False`` when nothing was retired (complete winner / non-contract failure /
+    vanished concurrently).
+
+    Residual: a complete cache published in the microsecond gap between the
+    re-verify and the rename would still be retired, but the caller then rebuilds
+    it complete — convergent, never a permanent loss. Portable Python has no
+    atomic non-empty-directory replace; closing that last gap would require full
+    per-version serialization, intentionally not taken for this hotfix.
+    """
+    ok, reason = _verify_cache_version_path(cache_version_path, source_path)
+    if ok or not reason.startswith("required-contract-missing-in-cache:"):
+        return False
+    doomed = plugin_cache_root / f".{cache_version_path.name}.doomed.{os.getpid()}"
+    try:
+        remove_tree(doomed)  # clear any stale same-pid doomed dir
+        os.rename(cache_version_path, doomed)
+    except OSError:
+        # Vanished or replaced concurrently between the re-verify and the
+        # rename — nothing for us to retire.
+        return False
+    remove_tree(doomed)
+    return True
+
+
 def sync_plugin_cache(root: Path, channel: str, agent: str = "") -> dict[str, str]:
     marketplace_name, plugins = load_marketplace(root)
 
@@ -1196,75 +1328,87 @@ def sync_plugin_cache(root: Path, channel: str, agent: str = "") -> dict[str, st
         # real per-agent directory (overlay copy of source into the
         # isolated home). Disk overhead 100-300 MB per agent acknowledged
         # in design v2 §"Per-Agent Cache Tradeoffs".
+        #
+        # Issue #2182 — fresh builds are assembled atomically
+        # (`_atomic_build_cache_version`: pid-private temp + contract verify +
+        # os.rename) so a partial cache is never exposed at
+        # `cache_version_path`. An existing dir that is already complete is
+        # cheaply refreshed in place; an existing dir that is INCOMPLETE (a
+        # raced/legacy partial node_modules) is deleted and rebuilt rather than
+        # reused — reusing it is exactly what wedged the verify-retry loop into
+        # a permanent failure (the partial was skipped + re-confirmed forever).
         if cache_version_path.is_symlink():
-            # Migrate any pre-existing symlink (from r1 or v0.9.6 install)
-            # into a real directory. Unlink the symlink, then mkdir +
-            # overlay source so the cache is genuinely per-agent.
+            # Migrate a pre-existing symlink (from r1 or v0.9.6 install) into a
+            # real per-agent directory: unlink, then atomically build a fresh
+            # cache.
             cache_version_path.unlink(missing_ok=True)
-            # r4 codex Probe 7 — also chmod parent dirs to 0700 so a
-            # default umask (0o022) does not leave the marketplace +
-            # plugin level world-readable above the per-version cache.
-            plugin_cache_root.mkdir(parents=True, exist_ok=True)
-            plugin_cache_root.chmod(0o700)
-            if plugin_cache_root.parent != cache_root() and plugin_cache_root.parent.exists():
-                plugin_cache_root.parent.chmod(0o700)
-            cache_version_path.mkdir(parents=False, exist_ok=False, mode=0o700)
-            cache_version_path.chmod(0o700)  # explicit, defensive against umask
-            overlay_source_to_cache(
-                source_path, cache_version_path, source_root=root, agent=agent
+            _atomic_build_cache_version(
+                source_path, cache_version_path, plugin_cache_root, root, agent=agent
             )
             status = "updated"
             cache_type = "directory"
         elif cache_version_path.is_dir():
-            # Already a real per-agent directory. Overlay source files
-            # except node_modules so operator edits to source reach the
-            # cache while the expensive dependency tree is preserved in
-            # place. Re-walking node_modules on every agent start can
-            # block launch behind filesystem/AV scans on live installs.
-            skip_names = set()
-            if (cache_version_path / NODE_MODULES_NAME).is_dir():
-                skip_names.add(NODE_MODULES_NAME)
-            changed = overlay_source_to_cache(
-                source_path,
-                cache_version_path,
-                source_root=root,
-                skip_names=skip_names,
-                agent=agent,
+            # Already a real per-agent directory.
+            #
+            # Issue #2182 — if the existing dir is INCOMPLETE (a partial
+            # node_modules from a raced/interrupted fresh build, or a legacy
+            # pre-fix partial), reusing it skips node_modules and re-confirms
+            # the same `required-contract-missing-in-cache` on every
+            # verify-retry → permanent wedge. Detect the missing-contract case
+            # and, IF it is still incomplete at a winner-guarded re-verify,
+            # atomically retire it and rebuild atomically so a single sync
+            # converges to a complete cache instead of looping. The
+            # `_retire_cache_if_incomplete` guard means we never delete a cache
+            # another agent has since published as complete: if a winner
+            # appeared, it returns False and we fall to the cheap in-place
+            # refresh below instead.
+            existing_ok, existing_reason = _verify_cache_version_path(
+                cache_version_path, source_path
             )
-            status = "updated" if changed else "unchanged"
+            if (
+                not existing_ok
+                and existing_reason.startswith("required-contract-missing-in-cache:")
+                and _retire_cache_if_incomplete(
+                    cache_version_path, source_path, plugin_cache_root
+                )
+            ):
+                _atomic_build_cache_version(
+                    source_path, cache_version_path, plugin_cache_root, root, agent=agent
+                )
+                status = "updated"
+            else:
+                # Complete cache, a concurrent winner that appeared since our
+                # verify, or a non-#2182 verify failure → cheap in-place source
+                # refresh so operator edits to source reach the cache while the
+                # expensive dependency tree is preserved in place (re-walking
+                # node_modules on every start can block launch behind
+                # filesystem/AV scans). ALWAYS skip node_modules: this path must
+                # never (re)build the dependency tree non-atomically on the live
+                # cache path. If node_modules is somehow absent, the post-link
+                # verify below fails and the cache is retired + atomically
+                # rebuilt rather than silently half-populated.
+                changed = overlay_source_to_cache(
+                    source_path,
+                    cache_version_path,
+                    source_root=root,
+                    skip_names={NODE_MODULES_NAME},
+                    agent=agent,
+                )
+                status = "updated" if changed else "unchanged"
             cache_type = "directory"
         elif cache_version_path.exists():
-            # Stray non-directory entry (file, special) — remove and
-            # rebuild as real directory.
+            # Stray non-directory entry (file, special) — remove and rebuild
+            # atomically as a real directory.
             remove_tree(cache_version_path)
-            # r4 codex Probe 7 — also chmod parent dirs to 0700 so a
-            # default umask (0o022) does not leave the marketplace +
-            # plugin level world-readable above the per-version cache.
-            plugin_cache_root.mkdir(parents=True, exist_ok=True)
-            plugin_cache_root.chmod(0o700)
-            if plugin_cache_root.parent != cache_root() and plugin_cache_root.parent.exists():
-                plugin_cache_root.parent.chmod(0o700)
-            cache_version_path.mkdir(parents=False, exist_ok=False, mode=0o700)
-            cache_version_path.chmod(0o700)  # explicit, defensive against umask
-            overlay_source_to_cache(
-                source_path, cache_version_path, source_root=root, agent=agent
+            _atomic_build_cache_version(
+                source_path, cache_version_path, plugin_cache_root, root, agent=agent
             )
             status = "updated"
             cache_type = "directory"
         else:
-            # First-time install — create the per-agent directory and
-            # overlay source files into it.
-            # r4 codex Probe 7 — also chmod parent dirs to 0700 so a
-            # default umask (0o022) does not leave the marketplace +
-            # plugin level world-readable above the per-version cache.
-            plugin_cache_root.mkdir(parents=True, exist_ok=True)
-            plugin_cache_root.chmod(0o700)
-            if plugin_cache_root.parent != cache_root() and plugin_cache_root.parent.exists():
-                plugin_cache_root.parent.chmod(0o700)
-            cache_version_path.mkdir(parents=False, exist_ok=False, mode=0o700)
-            cache_version_path.chmod(0o700)  # explicit, defensive against umask
-            overlay_source_to_cache(
-                source_path, cache_version_path, source_root=root, agent=agent
+            # First-time install — atomically build the per-agent directory.
+            _atomic_build_cache_version(
+                source_path, cache_version_path, plugin_cache_root, root, agent=agent
             )
             status = "linked"
             cache_type = "directory"
@@ -1345,6 +1489,20 @@ def sync_plugin_cache(root: Path, channel: str, agent: str = "") -> dict[str, st
     # reason and the criticality split decides block vs warn.
     verified, verify_reason = _verify_cache_version_path(cache_version_path, source_path)
     if not verified:
+        # Issue #2182 Part B (defense-in-depth) — fresh builds are now atomic +
+        # pre-verified and a partial existing cache is rebuilt above, so this
+        # should be unreachable for the contract-missing class. But if a
+        # required-contract file is somehow still missing here (e.g. a TOCTOU
+        # between the build and this check), retire the partial cache so the
+        # next launch verify-retry rebuilds clean instead of reusing the same
+        # partial forever (the permanent-wedge loop). `_retire_cache_if_incomplete`
+        # re-verifies immediately before the destructive action so a complete
+        # cache another agent published concurrently is never deleted, and
+        # removes the live path in a single atomic rename (never observed
+        # half-deleted). It is itself scoped to the contract-missing reason, so
+        # a source-side or permission failure leaves the directory untouched.
+        if verify_reason.startswith("required-contract-missing-in-cache:"):
+            _retire_cache_if_incomplete(cache_version_path, source_path, plugin_cache_root)
         return {
             "channel": channel,
             "plugin": plugin_name,

@@ -5136,6 +5136,16 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       add_required 1663-plugin-cache-sidecar-skip
       ;;
 
+    scripts/smoke/2182-plugin-cache-atomic-build.sh)
+      # Issue #2182: editing the atomic-build smoke re-runs it directly (the
+      # scripts/smoke/* catch-all already pulls it via the full static suite;
+      # this arm keeps the selection focused when only this file changes). The
+      # atomic temp-build + delete-partial-on-fail behavior itself lives in
+      # bridge-dev-plugin-cache.py, so the bridge-dev-plugin-cache.py arm above
+      # also selects this smoke on a build/verify change.
+      add_required 2182-plugin-cache-atomic-build
+      ;;
+
     scripts/smoke/1623-a2a-backpressure-failopen.sh)
       # Issue #1623: editing the backpressure fail-open smoke re-runs it directly
       # (the scripts/smoke/* catch-all already pulls it via the full static suite;
@@ -6180,7 +6190,15 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # merge-not-reset operator-installed entries on a channel-only re-sync.
       # Pull 1857-recreate-provisioning-preserve on every move so a refactor
       # of either writer cannot silently regress the contract.
-      add_required 1201-1202-directory-marketplace-seed channel-plugins 1208-lock-metadata-normalize ζ-1236-plugins-list-marketplaces β-1231-1236-fresh-install-seed-sudoers B-beta3-1249-1250-plugin-ux C1-beta3-1251-restart-preflight-rollback A3-beta3-1248-restart-session-id-resume C-beta4-logger-and-spec H-beta4-iso-ownership K-beta4-nits 1663-plugin-cache-sidecar-skip 1857-recreate-provisioning-preserve
+      # Issue #2182 (v0.16.19 LTS): bridge-dev-plugin-cache.py now assembles a
+      # fresh per-agent cache atomically (pid-private temp + contract verify +
+      # os.rename) and deletes/rebuilds an INCOMPLETE existing cache instead of
+      # reusing it, eliminating the teams version-bump fresh-build @azure
+      # partial-copy race that channel-required-aborted launches into a
+      # permanent verify-retry wedge. Pull 2182-plugin-cache-atomic-build on
+      # every bridge-dev-plugin-cache.py move so a refactor of the build/verify
+      # path cannot revert the atomic-build / delete-partial-on-fail contract.
+      add_required 1201-1202-directory-marketplace-seed channel-plugins 1208-lock-metadata-normalize ζ-1236-plugins-list-marketplaces β-1231-1236-fresh-install-seed-sudoers B-beta3-1249-1250-plugin-ux C1-beta3-1251-restart-preflight-rollback A3-beta3-1248-restart-session-id-resume C-beta4-logger-and-spec H-beta4-iso-ownership K-beta4-nits 1663-plugin-cache-sidecar-skip 1857-recreate-provisioning-preserve 2182-plugin-cache-atomic-build
       add_integration integration-minimal
       ;;
 
