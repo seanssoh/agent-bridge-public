@@ -3613,6 +3613,22 @@ AGENT_CONVERT_HELP
 
   bridge_require_agent "$agent"
 
+  # Issue #2061 (Blocker 1): caller-trust gating. `agent convert` mutates the
+  # protected agent-roster.local.sh via the audited bridge_write_role_block
+  # flip — the same system-config file `agent create` (run_create §#1047),
+  # `agent update`, and `agent roster materialize-fields` mutate, all of which
+  # reject an `agent-direct` caller. convert must enforce the SAME single
+  # caller-source contract: the source must be operator-tui / operator-trusted-id
+  # (a TTY-detected operator or a sanctioned non-interactive caller that sets
+  # BRIDGE_CALLER_SOURCE). Placed after agent validation (so a bad-name caller
+  # still gets the agent-not-found error) and before manifest build / dry-run /
+  # mutation, mirroring the create-side gate's --dry-run coverage.
+  local convert_caller_source
+  convert_caller_source="$(bridge_agent_update_caller_source)"
+  if [[ "$convert_caller_source" != "operator-tui" && "$convert_caller_source" != "operator-trusted-id" ]]; then
+    bridge_die "deny: caller source $convert_caller_source is not allowed to mutate system config (need operator-tui or operator-trusted-id)"
+  fi
+
   # --- capture live facts BEFORE any mutation (§0.1 step 1) ----------------
   # A real dynamic-vanilla agent is registered only via the live tmux-session
   # scan, so stopping it later can de-register it. Capture everything the
@@ -3714,14 +3730,30 @@ print("  (dry-run — nothing was changed)")
   # =========================================================================
   # MUTATING PHASE — the §0.1 last-flip transaction begins here.
   # =========================================================================
-  local apply_ts="" applied=0
+  local apply_ts="" applied=0 flipped=0
 
   # Internal failure handler: roll back the migration (Track A internal-only
   # rollback, §0.4) if it had already applied, then die. Because the roster
   # flip is step 7 (the LAST state-stranding mutation), any failure routed
-  # here leaves the role un-flipped (still dynamic) — never static-but-empty.
+  # here BEFORE the flip leaves the role un-flipped (still dynamic) — never
+  # static-but-empty. The ONLY post-flip step is the typed-field materialize
+  # (model/effort/channels); a failure there sets flipped=1, so excise the
+  # just-written static block first (the create-side rollback pattern) — a
+  # dynamic-vanilla agent re-registers from the live session scan, so excision
+  # restores the pre-convert "no managed block" rather than stranding a
+  # static-but-incomplete role reporting success (Blocker 2).
   _convert_fail() {
     local reason="$1"
+    if [[ $flipped -eq 1 ]]; then
+      bridge_warn "convert: excising the static roster flip for '$agent' after a post-flip failure: $reason"
+      if [[ -n "${SCRIPT_DIR:-}" && -f "$SCRIPT_DIR/lib/agent-cli-helpers/roster-excise-block.py" ]]; then
+        python3 "$SCRIPT_DIR/lib/agent-cli-helpers/roster-excise-block.py" \
+          "$BRIDGE_ROSTER_LOCAL_FILE" "$agent" >/dev/null 2>&1 \
+          || bridge_warn "convert: roster excision failed for '$agent' — inspect $BRIDGE_ROSTER_LOCAL_FILE."
+      fi
+      bridge_roster_cache_invalidate 2>/dev/null || true
+      bridge_load_roster 2>/dev/null || true
+    fi
     if [[ $applied -eq 1 && -n "$apply_ts" ]]; then
       bridge_warn "convert: rolling back migration for '$agent' ($apply_ts) after failure: $reason"
       bridge_convert_rollback "$agent" "$apply_ts" >/dev/null 2>&1 \
@@ -3820,6 +3852,7 @@ sys.exit(0 if os.path.realpath(wd_link) == os.path.realpath(eff) else 1)
         "hold" >/dev/null; then
     _convert_fail "the audited roster flip failed for '$agent'."
   fi
+  flipped=1
   bridge_roster_cache_invalidate
   bridge_load_roster
 
@@ -3834,11 +3867,33 @@ sys.exit(0 if os.path.realpath(wd_link) == os.path.realpath(eff) else 1)
   [[ -n "$res_model" ]] && mp=1
   [[ -n "$res_effort" ]] && ep=1
   [[ -n "$res_channels" ]] && cp=1
-  bridge_roster_materialize_fields_python \
-    "$agent" "$BRIDGE_ROSTER_LOCAL_FILE" "1" \
-    "BRIDGE_AGENT_MODEL${_us}${mp}${_us}${res_model}" \
-    "BRIDGE_AGENT_EFFORT${_us}${ep}${_us}${res_effort}" \
-    "BRIDGE_AGENT_CHANNELS${_us}${cp}${_us}${res_channels}" >/dev/null 2>&1 || true
+  # Blocker 2: the typed-field persistence is part of the §0.1 atomic flip, NOT
+  # best-effort. A successful convert means the role is static AND carries every
+  # resolved typed field (model/effort/channels), or it rolls back. The prior
+  # `>/dev/null 2>&1 || true` could leave a flipped-but-incomplete static role
+  # reporting success when this write failed — notably --effort, which reaches
+  # launch ONLY as a roster field (it is never baked into launch_cmd). Check the
+  # rc and route any failure through the internal rollback (which now also
+  # excises the flip via _convert_fail) instead of suppressing it.
+  local field_rc=0
+  if [[ "${BRIDGE_CONVERT_FORCE_FIELD_WRITE_FAIL:-0}" == "1" ]]; then
+    # Test-only fault injection (smoke T7), default-off. The flip and this
+    # materialize share the same writer + roster file, so a real failure cannot
+    # be injected structurally BETWEEN them (any file-level fault breaks the
+    # earlier flip first) — this seam is the analog of T4's simulated apply
+    # failure and exercises the post-flip rollback path.
+    field_rc=1
+  else
+    bridge_roster_materialize_fields_python \
+      "$agent" "$BRIDGE_ROSTER_LOCAL_FILE" "1" \
+      "BRIDGE_AGENT_MODEL${_us}${mp}${_us}${res_model}" \
+      "BRIDGE_AGENT_EFFORT${_us}${ep}${_us}${res_effort}" \
+      "BRIDGE_AGENT_CHANNELS${_us}${cp}${_us}${res_channels}" >/dev/null 2>&1 \
+      || field_rc=$?
+  fi
+  if [[ $field_rc -ne 0 ]]; then
+    _convert_fail "could not persist the typed roster fields (model/effort/channels) for '$agent' (field-write rc=$field_rc) — rolled back to avoid a static-but-incomplete role."
+  fi
   bridge_roster_cache_invalidate
   bridge_load_roster
 

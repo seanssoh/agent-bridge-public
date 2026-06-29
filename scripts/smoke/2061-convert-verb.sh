@@ -103,9 +103,14 @@ seed_operator_state() {
     > "$OPERATOR_HOME/.claude/projects/$sl/memory/MEMORY.md"
 }
 
-# Invoke the real verb with the operator HOME pinned.
+# Invoke the real verb with the operator HOME pinned. convert mutates the
+# protected roster, so it now requires an operator-trusted caller source
+# (Blocker 1); default it to operator-trusted-id for the happy-path tests while
+# still honoring an ambient BRIDGE_CALLER_SOURCE override (so running the whole
+# smoke under `BRIDGE_CALLER_SOURCE=agent-direct` exercises the deny gate).
 convert_cli() {
   HOME="$OPERATOR_HOME" BRIDGE_CONTROLLER_HOME="$OPERATOR_HOME" \
+    BRIDGE_CALLER_SOURCE="${BRIDGE_CALLER_SOURCE:-operator-trusted-id}" \
     "$BASH4_BIN" "$REPO_ROOT/bridge-agent.sh" convert "$@"
 }
 
@@ -214,7 +219,7 @@ test_t2_convert_apply() {
 import os, sys
 wd, eff = sys.argv[1], sys.argv[2]
 assert os.path.exists(wd), "workdir settings.json missing: " + wd
-assert os.path.exists(eff), "home settings.effective.json missing: " + eff
+assert os.path.exists(eff), "home settings.effective.json missing: " + eff  # noqa: iso-helper-boundary
 assert os.path.realpath(wd) == os.path.realpath(eff), "two-tree drift: %s != %s" % (os.path.realpath(wd), os.path.realpath(eff))
 ' "$workdir/.claude/settings.json" "$eff" \
     || smoke_fail "T2: #1455 single-tree settings invariant did not hold"
@@ -294,6 +299,7 @@ test_t5_iso_fail_closed() {
 
   local rc=0
   HOME="$OPERATOR_HOME" BRIDGE_CONTROLLER_HOME="$OPERATOR_HOME" \
+  BRIDGE_CALLER_SOURCE="${BRIDGE_CALLER_SOURCE:-operator-trusted-id}" \
   BRIDGE_HOST_PLATFORM_OVERRIDE="Linux" \
     "$BASH4_BIN" -c "unset BRIDGE_DISABLE_ISOLATION; exec '$REPO_ROOT/bridge-agent.sh' convert '$agent' --to static" \
     >/dev/null 2>&1 || rc=$?
@@ -305,11 +311,78 @@ test_t5_iso_fail_closed() {
   smoke_log "T5 OK — iso-effective target convert fails closed (rc 3); no roster flip"
 }
 
+# ===========================================================================
+# T6 — Blocker 1: an `agent-direct` (non-operator-trusted) caller is REJECTED
+# at the system-config gate BEFORE any mutation; the roster is never flipped.
+# ===========================================================================
+test_t6_caller_gate_rejects_agent_direct() {
+  init_roster
+  local agent="agentdirect" workdir="$SMOKE_TMP_ROOT/agentdirect-wd"
+  seed_dynamic_agent "$agent" "$workdir"
+  seed_operator_state "$workdir" "sidAD"
+
+  # Force the caller source to agent-direct (override the convert_cli default)
+  # — the same denial create / update / roster materialize-fields enforce.
+  local rc=0
+  HOME="$OPERATOR_HOME" BRIDGE_CONTROLLER_HOME="$OPERATOR_HOME" \
+  BRIDGE_CALLER_SOURCE="agent-direct" \
+    "$BASH4_BIN" "$REPO_ROOT/bridge-agent.sh" convert "$agent" --to static \
+    >/dev/null 2>&1 || rc=$?
+  [[ "$rc" -ne 0 ]] || smoke_fail "T6: agent-direct caller was NOT rejected (convert succeeded)"
+
+  # The seeded dynamic block survives intact; no static flip was written.
+  roster_has 'BRIDGE_AGENT_SOURCE["agentdirect"]="dynamic"' \
+    || smoke_fail "T6: the dynamic roster block was lost on a denied convert"
+  if roster_has 'BRIDGE_AGENT_SOURCE["agentdirect"]="static"'; then
+    smoke_fail "T6: roster was flipped to static despite the agent-direct denial"
+  fi
+  smoke_log "T6 OK — agent-direct caller rejected at the system-config gate; no roster flip"
+}
+
+# ===========================================================================
+# T7 — Blocker 2: a forced typed-field-write failure (post-flip) rolls back the
+# flip — NEVER leaves a static role reporting success without its typed fields.
+# Mirrors T4's simulated-failure pattern, one step later in the transaction.
+# ===========================================================================
+test_t7_field_write_failure_rolls_back() {
+  init_roster
+  local agent="fieldfail" workdir="$SMOKE_TMP_ROOT/fieldfail-wd"
+  seed_dynamic_agent "$agent" "$workdir"
+  seed_operator_state "$workdir" "sidFF"
+
+  # The flip and the typed-field materialize share the same writer + roster
+  # file, so the failure cannot be injected structurally between them; the
+  # default-off production seam BRIDGE_CONVERT_FORCE_FIELD_WRITE_FAIL simulates
+  # it (the analog of T4's projects/ symlink). A successful convert must carry
+  # model/effort/channels — or roll back.
+  local rc=0
+  HOME="$OPERATOR_HOME" BRIDGE_CONTROLLER_HOME="$OPERATOR_HOME" \
+  BRIDGE_CALLER_SOURCE="operator-trusted-id" \
+  BRIDGE_CONVERT_FORCE_FIELD_WRITE_FAIL=1 \
+    "$BASH4_BIN" "$REPO_ROOT/bridge-agent.sh" convert "$agent" --to static \
+      --model claude-opus-4 --effort high >/dev/null 2>&1 || rc=$?
+  [[ "$rc" -ne 0 ]] || smoke_fail "T7: convert reported success despite a forced typed-field-write failure"
+
+  # Rolled back: the flip was excised — NO static role survives, so a
+  # static-but-incomplete role can never report success.
+  if roster_has 'BRIDGE_AGENT_SOURCE["fieldfail"]="static"'; then
+    smoke_fail "T7: a static role survived a failed typed-field write (static-but-incomplete)"
+  fi
+  # The flipped managed block was fully excised (the dynamic-vanilla agent had
+  # no pre-convert block to restore; it re-registers from the live scan).
+  local n
+  n="$(grep -c '# BEGIN AGENT BRIDGE MANAGED ROLE: fieldfail' "$BRIDGE_ROSTER_LOCAL_FILE" || true)"
+  smoke_assert_eq "0" "$n" "T7: the flipped managed block was not excised on rollback"
+  smoke_log "T7 OK — forced typed-field-write failure rolls back the flip; no static-incomplete role reports success"
+}
+
 # --- run -------------------------------------------------------------------
 smoke_run "T1 --dry-run prints manifest + mutates nothing" test_t1_dry_run_no_mutation
 smoke_run "T2 convert flips roster static + migrates + clears crash + #1455" test_t2_convert_apply
 smoke_run "T3 idempotent re-run is a clean no-op" test_t3_idempotent
 smoke_run "T4 §0.1 apply-failure leaves no flipped roster (rollback ran)" test_t4_apply_failure_no_flip
 smoke_run "T5 iso-effective target fails closed (rc 3)" test_t5_iso_fail_closed
+smoke_run "T6 agent-direct caller rejected at the system-config gate" test_t6_caller_gate_rejects_agent_direct
+smoke_run "T7 forced typed-field-write failure rolls back (no static-incomplete)" test_t7_field_write_failure_rolls_back
 
-smoke_log "PASS — #2061 Track B convert verb: dry-run no-mutation, audited static flip with baked launch_cmd + hold, byte-equal migration, crash-clear, #1455 invariant, idempotent, last-flip rollback, iso fail-closed"
+smoke_log "PASS — #2061 Track B convert verb: dry-run no-mutation, audited static flip with baked launch_cmd + hold, byte-equal migration, crash-clear, #1455 invariant, idempotent, last-flip rollback, iso fail-closed, caller-source gate, typed-field-failure rollback"
