@@ -3534,6 +3534,11 @@ Options:
                          transcript-validated session id so the static role
                          --resumes it; none clears resume state (starts fresh).
   --start hold|auto      hold (default) leaves the agent stopped; auto starts it.
+  --include-cwd <path>   Also migrate an OUTSIDE-workdir cwd the agent used.
+                         The workdir and its descendant cwds are always
+                         migrated; an outside-workdir cwd is listed in the
+                         manifest as a candidate but NOT migrated unless you
+                         confirm it here (repeatable).
   --dry-run              Print the migration manifest and mutate NOTHING.
   --json                 Machine-readable output (manifest on --dry-run).
 AGENT_CONVERT_HELP

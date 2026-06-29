@@ -730,7 +730,7 @@ KNOWN_ISSUES #35) — `agent convert` exists to close exactly that trap.
 ```bash
 agent-bridge agent convert <agent> --to static \
     [--channel <id>] [--discord <...>] [--model <m>] [--effort <e>] \
-    [--carry-session live|none] [--start hold|auto] [--dry-run] [--json]
+    [--carry-session live|none] [--include-cwd <path>] [--start hold|auto] [--dry-run] [--json]
 ```
 
 With no flags the defaults are `--to static`, `--carry-session live`,
@@ -746,9 +746,11 @@ mutates state blindly:
 - `--dry-run [--json]` prints the full migration **manifest** — every
   `projects/<cwd>/*.jsonl` transcript (plus `subagents/**` / `workflows/**`),
   the `projects/<cwd>/memory/` auto-memory wiki, and the per-agent
-  `auto-memory/<key>/<agent>/` tree, for **every** cwd the agent used — with
-  source size and destination path. Zero omissions is the safety bar; run this
-  first.
+  `auto-memory/<key>/<agent>/` tree, for the agent's **workdir and its
+  descendant cwds** (always migrated) — with source size and destination path.
+  An outside-workdir cwd the agent also used is listed as an **`--include-cwd`
+  candidate** and is migrated only when you confirm it with `--include-cwd
+  <path>`. Zero omissions is the safety bar; run this first.
 - On apply, the source files are **copied** (the dynamic agent's `~/.claude`
   is left intact) into the target config dir, and a timestamped **backup** is
   written under `state/convert-backups/<agent>/<ts>/` before anything is
