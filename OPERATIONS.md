@@ -716,6 +716,75 @@ Caller validation matches `config set`: caller must be the admin agent
 (`operator-tui` / `operator-trusted-id`). Mutations that fail this gate
 are denied with an audit row and never touch the roster file.
 
+### Converting a dynamic agent to static (#2061)
+
+`agent convert` promotes a long-lived **dynamic** Claude agent into a managed
+**static** roster role in one audited command — and, critically, migrates the
+agent's config-dir-relative state so the converted agent does not boot "empty".
+Doing this by hand (`stop → create → update --set-launch-cmd → restart`) works
+but silently strands the agent's transcripts and accumulated auto-memory under
+the operator's `~/.claude` (see the **config-dir split** warning under
+"[Iso v2 agent troubleshooting](#iso-v2-agent-troubleshooting)" and
+KNOWN_ISSUES #35) — `agent convert` exists to close exactly that trap.
+
+```bash
+agent-bridge agent convert <agent> --to static \
+    [--channel <id>] [--discord <...>] [--model <m>] [--effort <e>] \
+    [--carry-session live|none] [--start hold|auto] [--dry-run] [--json]
+```
+
+With no flags the defaults are `--to static`, `--carry-session live`,
+`--start hold`: it migrates config-dir state, pins the dynamic agent's
+last-active (transcript-validated) session, flips the roster to a static role
+with the launch shape (model/effort/discord plugin) baked into `launch_cmd`
+(#1427), and **holds** — the daemon does not auto-start the agent, so you start
+it deliberately once you have verified the result.
+
+**Migration is manifest-first, backed up, and dry-runnable.** Convert never
+mutates state blindly:
+
+- `--dry-run [--json]` prints the full migration **manifest** — every
+  `projects/<cwd>/*.jsonl` transcript (plus `subagents/**` / `workflows/**`),
+  the `projects/<cwd>/memory/` auto-memory wiki, and the per-agent
+  `auto-memory/<key>/<agent>/` tree, for **every** cwd the agent used — with
+  source size and destination path. Zero omissions is the safety bar; run this
+  first.
+- On apply, the source files are **copied** (the dynamic agent's `~/.claude`
+  is left intact) into the target config dir, and a timestamped **backup** is
+  written under `state/convert-backups/<agent>/<ts>/` before anything is
+  flipped. A failed convert auto-restores from that backup; the backup also
+  gives you a documented manual-restore path.
+
+**Execution order (the last-flip transaction).** Convert runs its mutating
+steps so a failure can never leave a static-but-empty role:
+
+1. Stop/quiesce the live dynamic session and capture its live facts (engine,
+   workdir(s), channels, discord id/state, model/effort).
+2. Derive the source and target config dirs (the dynamic agent's current
+   config dir → the static target dir).
+3. Build the dry-run manifest.
+4. Materialize the static home/settings tree and assert the single-tree
+   settings invariant (#1455).
+5. Apply and byte-verify the migration into the target config dir.
+6. Clear any pre-conversion crash state so a stale report does not churn
+   notifications after the flip.
+7. **Flip the roster to `source=static`** (launch shape baked,
+   `start_policy=hold`) through the audited writer — this is the **last**
+   state-stranding mutation.
+8. Pin the carried resume id, then validate it against the migrated transcript
+   (a resume id whose transcript is absent is rejected, never a silent fresh
+   start).
+9. Optionally start (only with `--start auto`; default is hold).
+
+**MVP scope.** The first release targets **shared-mode (macOS / non-iso)
+conversions**. Converting *into* a Linux iso-effective identity is rejected
+with a clear message (fail-closed fast-follow). A first-class `--rollback`
+verb, `--keep-config-dir operator` (keep the agent on the operator's
+`~/.claude`), and an explicit `--carry-session <id>` are **planned
+fast-follows — not yet available**; MVP ships `--carry-session live|none`,
+`--dry-run`, `--start hold|auto`, the on-disk backup, and the documented
+manual-restore path.
+
 ## Worktree Workers
 
 When multiple agents may edit the same git repository, prefer isolated managed
@@ -2263,6 +2332,43 @@ The two supported flows:
    not caller-writable and `#1738` authorizes the agent-pane binding **TTY-free**
    — no operator session needed. Iso-v2 headless admins already have a working
    config-mutation path; the gap is exclusively the shared-UID + headless combo.
+
+#### Config-dir split: a converted or hand-migrated agent boots "empty" (#2061)
+
+> **Warning — the silent-data-loss trap.** Dynamic *vanilla* Claude agents and
+> static agents read **different** `CLAUDE_CONFIG_DIR`s. A dynamic vanilla
+> Claude agent launches with **no** config-dir override, so it uses the
+> operator-global **`~/.claude`** (#1890 / KNOWN_ISSUES #35). A static (or
+> admin) agent launches with an **isolated `<agent-home>/.claude`**. So if you
+> convert or hand-migrate a dynamic agent to static *without* moving its
+> Claude-side state, every transcript (`projects/<cwd>/*.jsonl`) and the entire
+> accumulated auto-memory wiki (`projects/<cwd>/memory/`) stay under the
+> operator's `~/.claude` and become invisible to the converted agent: it boots
+> looking empty — the resume picker shows nothing, `MEMORY.md` loads empty —
+> with **no warning**. The data is still on disk, just stranded in the wrong
+> config dir.
+
+There are **three** config-dir classes the resolver
+(`bridge_resolve_agent_claude_config_dir`) distinguishes, not two:
+
+- **Dynamic vanilla Claude** (engine claude + `source=dynamic` + not
+  iso-effective) → operator-global **`~/.claude`**. This is the stranding
+  source.
+- **Registered dynamic with its own dir / iso** → its own
+  **`<agent-home>/.claude`**. No migration needed if home/workdir are
+  preserved.
+- **Static / admin** → isolated **`<agent-home>/.claude`** (the iso UID's home
+  `.claude` when iso-effective). This is where the converted agent reads.
+
+**Do not hand-stitch the conversion.** Use
+`agent-bridge agent convert <agent> --to static` (see
+"[Converting a dynamic agent to static](#converting-a-dynamic-agent-to-static-2061)"):
+it is config-dir-aware — it derives the correct source dir, enumerates every
+cwd the agent used, migrates the transcripts and auto-memory into the target
+dir with a manifest + dry-run + backup, and pins a transcript-validated resume
+id. If you already migrated by hand and the agent boots empty, the data is
+under the operator's `~/.claude/projects/<cwd>/` — copy it (transcripts +
+`memory/`) into the agent's `<agent-home>/.claude/projects/<cwd>/` and restart.
 
 ## Migrating to layout v2
 
