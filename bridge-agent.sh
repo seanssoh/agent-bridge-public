@@ -59,6 +59,9 @@ Subcommands:
   show               Show one agent's roster + runtime state.
   describe           Print BRIDGE_AGENT_DESC[<agent>] (read-only getter).
   reclassify         Promote a runtime-detected admin to a static role.
+  convert            Convert a dynamic Claude agent into a static roster role,
+                     migrating its config-dir state (transcripts + memory) so
+                     it never boots empty (#2061). --dry-run shows the manifest.
   doctor             Run a 7-step CRUD self-check (create/update/registry/
                      show/reclassify/retire/delete) against an isolated fixture.
   roster             Roster-field surgery (materialize-fields writer, #1427).
@@ -3490,6 +3493,495 @@ run_rerender_settings() {
   fi
   rm -f "$rows_file"
   [[ $failed_count -eq 0 ]]
+}
+
+# ---------------------------------------------------------------------------
+# FR #2061 Track B — `agent convert <agent> --to static`
+#
+# run_convert orchestrates the §0.1 "last-flip transaction": a dynamic vanilla
+# Claude agent reads the operator-global ~/.claude while a static agent reads
+# an isolated <agent-home>/.claude, so flipping the roster without first
+# migrating the config-dir state strands every transcript + memory file and the
+# agent boots empty. The ordering below is the load-bearing correctness
+# contract — the audited roster flip is the LAST state-stranding mutation, so a
+# failure at any earlier step can never leave a static-but-empty role.
+#
+# This verb CALLS Track A's pure engine (bridge_convert_* in
+# lib/bridge-agent-convert.sh); it never re-implements migration. The
+# resume-id pin is Track C — only a documented hook is left here.
+# ---------------------------------------------------------------------------
+run_convert() {
+  local agent="${1:-}"
+  case "$agent" in
+    -h|--help|"")
+      cat <<'AGENT_CONVERT_HELP'
+Usage: agent-bridge agent convert <agent> --to static [options]
+
+Convert a dynamic Claude agent into a static roster role, migrating its
+CLAUDE_CONFIG_DIR-relative state (transcripts + project memory + auto-memory)
+from the operator-global ~/.claude into the agent's isolated config dir so it
+never boots empty (#2061). The roster flip is audited (bridge_write_role_block)
+and is the LAST mutation, so a mid-convert failure never strands the role.
+
+Options:
+  --to static            Target class (required; only `static` is supported).
+  --channel <id>         Discord channel id to carry/override.
+  --discord <spec>       Channels CSV / discord plugin spec to carry/override.
+  --model <model>        Bake --model into the static launch command.
+  --effort <effort>      Persist the reasoning effort roster field.
+  --carry-session live|none
+                         live (default) leaves a Track C resume-pin hook;
+                         none starts the converted agent fresh.
+  --start hold|auto      hold (default) leaves the agent stopped; auto starts it.
+  --dry-run              Print the migration manifest and mutate NOTHING.
+  --json                 Machine-readable output (manifest on --dry-run).
+AGENT_CONVERT_HELP
+      return 0
+      ;;
+  esac
+  shift || true
+
+  local to_class=""
+  local channel_flag="" channel_present=0
+  local discord_flag="" discord_present=0
+  local model_flag="" model_present=0
+  local effort_flag="" effort_present=0
+  local carry_session="live"
+  local start_mode="hold"
+  local dry_run=0
+  local json_mode=0
+  local include_cwd_csv=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --to)
+        to_class="${2:-}"; shift 2 || bridge_die "convert: --to requires a value (static)"
+        ;;
+      --channel)
+        channel_flag="${2:-}"; channel_present=1; shift 2 || bridge_die "convert: --channel requires a value"
+        ;;
+      --discord)
+        discord_flag="${2:-}"; discord_present=1; shift 2 || bridge_die "convert: --discord requires a value"
+        ;;
+      --model)
+        model_flag="${2:-}"; model_present=1; shift 2 || bridge_die "convert: --model requires a value"
+        ;;
+      --effort)
+        effort_flag="${2:-}"; effort_present=1; shift 2 || bridge_die "convert: --effort requires a value"
+        ;;
+      --carry-session)
+        carry_session="${2:-}"; shift 2 || bridge_die "convert: --carry-session requires a value (live|none)"
+        ;;
+      --include-cwd)
+        # §0.5 Q3: confirm an outside-workdir cwd discovered in dry-run.
+        local _inc="${2:-}"; shift 2 || bridge_die "convert: --include-cwd requires a path"
+        if [[ -n "$include_cwd_csv" ]]; then
+          include_cwd_csv="$include_cwd_csv,$_inc"
+        else
+          include_cwd_csv="$_inc"
+        fi
+        ;;
+      --start)
+        start_mode="${2:-}"; shift 2 || bridge_die "convert: --start requires a value (hold|auto)"
+        ;;
+      --dry-run)
+        dry_run=1; shift
+        ;;
+      --json)
+        json_mode=1; shift
+        ;;
+      --rollback|--keep-config-dir)
+        bridge_die "convert: $1 is deferred to fast-follow (MVP keeps the on-disk backup + a documented manual restore; see OPERATIONS.md)."
+        ;;
+      *)
+        bridge_die "convert: unsupported option: $1"
+        ;;
+    esac
+  done
+
+  # --- validate the closed flag value spaces -------------------------------
+  [[ "$to_class" == "static" ]] \
+    || bridge_die "convert: --to static is required (only dynamic→static is supported in MVP)."
+  case "$carry_session" in
+    live|none) ;;
+    *) bridge_die "convert: --carry-session must be live|none (explicit <id> is deferred to Track C fast-follow).";;
+  esac
+  case "$start_mode" in
+    hold|auto) ;;
+    *) bridge_die "convert: --start must be hold|auto.";;
+  esac
+
+  bridge_require_agent "$agent"
+
+  # Issue #2061 (Blocker 1): caller-trust gating. `agent convert` mutates the
+  # protected agent-roster.local.sh via the audited bridge_write_role_block
+  # flip — the same system-config file `agent create` (run_create §#1047),
+  # `agent update`, and `agent roster materialize-fields` mutate, all of which
+  # reject an `agent-direct` caller. convert must enforce the SAME single
+  # caller-source contract: the source must be operator-tui / operator-trusted-id
+  # (a TTY-detected operator or a sanctioned non-interactive caller that sets
+  # BRIDGE_CALLER_SOURCE). Placed after agent validation (so a bad-name caller
+  # still gets the agent-not-found error) and before manifest build / dry-run /
+  # mutation, mirroring the create-side gate's --dry-run coverage.
+  local convert_caller_source
+  convert_caller_source="$(bridge_agent_update_caller_source)"
+  if [[ "$convert_caller_source" != "operator-tui" && "$convert_caller_source" != "operator-trusted-id" ]]; then
+    bridge_die "deny: caller source $convert_caller_source is not allowed to mutate system config (need operator-tui or operator-trusted-id)"
+  fi
+
+  # --- capture live facts BEFORE any mutation (§0.1 step 1) ----------------
+  # A real dynamic-vanilla agent is registered only via the live tmux-session
+  # scan, so stopping it later can de-register it. Capture everything the
+  # roster flip + materialize need into locals NOW, while it is still loaded.
+  local engine
+  engine="$(bridge_agent_engine "$agent")"
+  [[ "$engine" == "claude" ]] \
+    || bridge_die "convert: agent '$agent' engine is '$engine'; only Claude dynamic→static convert is supported (#2061)."
+
+  local cur_source
+  cur_source="$(bridge_agent_source "$agent")"
+
+  local workdir session profile_home description
+  local cur_channels cur_discord cur_model cur_effort
+  local notify_kind notify_target notify_account
+  local isolation_mode os_user agent_class loop_mode continue_mode always_on
+  workdir="$(bridge_expand_user_path "$(bridge_agent_workdir "$agent")")"
+  session="$(bridge_agent_session "$agent")"
+  [[ -n "$session" ]] || session="$agent"
+  profile_home="$(bridge_expand_user_path "$(bridge_agent_profile_home "$agent" 2>/dev/null || true)")"
+  description="$(bridge_agent_desc "$agent" 2>/dev/null || true)"
+  [[ -n "$description" ]] || description="$agent static role"
+  cur_channels="$(bridge_agent_channels_csv "$agent" 2>/dev/null || true)"
+  cur_discord="$(bridge_agent_discord_channel_id "$agent" 2>/dev/null || true)"
+  cur_model="$(bridge_agent_model "$agent" 2>/dev/null || true)"
+  cur_effort="$(bridge_agent_effort "$agent" 2>/dev/null || true)"
+  notify_kind="$(bridge_agent_notify_kind "$agent" 2>/dev/null || true)"
+  notify_target="$(bridge_agent_notify_target "$agent" 2>/dev/null || true)"
+  notify_account="$(bridge_agent_notify_account "$agent" 2>/dev/null || true)"
+  isolation_mode="$(bridge_agent_isolation_mode "$agent" 2>/dev/null || true)"
+  os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
+  agent_class="$(bridge_agent_class "$agent" 2>/dev/null || true)"
+  loop_mode="$(bridge_agent_loop "$agent" 2>/dev/null || true)"
+  continue_mode="$(bridge_agent_continue "$agent" 2>/dev/null || true)"
+  always_on=0
+  [[ "$(bridge_agent_idle_timeout "$agent" 2>/dev/null || true)" == "0" ]] && always_on=1
+
+  # Resolved (flag-override-or-carry) channel wiring.
+  local res_channels="$cur_channels" res_discord="$cur_discord"
+  local res_model="$cur_model" res_effort="$cur_effort"
+  [[ $discord_present -eq 1 ]] && res_channels="$discord_flag"
+  [[ $channel_present -eq 1 ]] && res_discord="$channel_flag"
+  [[ $model_present -eq 1 ]] && res_model="$model_flag"
+  [[ $effort_present -eq 1 ]] && res_effort="$effort_flag"
+
+  # --- derive source/target config dirs (§0.1 step 2, read-only) -----------
+  # Track A computes the target as-if-static (independent of source=), so we
+  # do NOT require a pre-flipped roster. rc 3 = iso-effective target → MVP
+  # fail-closed (shared-mode/macOS only); surface that exit code cleanly.
+  local pair rc=0
+  pair="$(bridge_convert_resolve_config_dirs "$agent")" || rc=$?
+  if [[ $rc -eq 3 ]]; then
+    return 3
+  fi
+  [[ $rc -eq 0 && -n "$pair" ]] \
+    || bridge_die "convert: could not resolve source/target config dirs for '$agent' (rc=$rc)."
+  local source_dir target_dir
+  source_dir="$(printf '%s' "$pair" | cut -f1)"
+  target_dir="$(printf '%s' "$pair" | cut -f2)"
+
+  # auto-memory slug — realpath($BRIDGE_HOME) with "/" and "." → "-" (mirrors
+  # bridge_ensure_auto_memory_isolation's seed convention).
+  local slug=""
+  slug="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]).replace(os.sep,"-").replace(".","-"))' "${BRIDGE_HOME:-}" 2>/dev/null || true)"
+
+  # --- build the dry-run manifest (§0.1 step 3, read-only) -----------------
+  local manifest_file
+  manifest_file="$(mktemp "${TMPDIR:-/tmp}/agb-convert-manifest.XXXXXX")" \
+    || bridge_die "convert: cannot create a temp manifest file."
+  if ! bridge_convert_build_manifest "$agent" "$source_dir" "$target_dir" \
+        "$workdir" "$slug" "$include_cwd_csv" > "$manifest_file"; then
+    rm -f "$manifest_file"
+    bridge_die "convert: failed to build the migration manifest for '$agent'."
+  fi
+
+  # --- dry-run / preview: print the manifest and STOP (no mutation) --------
+  if [[ $dry_run -eq 1 ]]; then
+    if [[ $json_mode -eq 1 ]]; then
+      cat "$manifest_file"
+    else
+      python3 -c '
+import json, sys
+m = json.load(open(sys.argv[1]))
+print("convert (dry-run): " + m["agent"])
+print("  source_config_dir: " + m["source_config_dir"])
+print("  target_config_dir: " + m["target_config_dir"])
+print("  files to migrate : %d (%d bytes)" % (m["total_files"], m["total_bytes"]))
+for c in m.get("included_cwds", []):
+    print("  include cwd      : " + c["slug"] + " (" + (c["cwd"] or "?") + ")")
+for s in m.get("skipped_cwds", []):
+    print("  candidate cwd    : " + s["slug"] + " (" + str(s.get("cwd") or "?") + ") — pass --include-cwd to migrate")
+print("  (dry-run — nothing was changed)")
+' "$manifest_file"
+    fi
+    rm -f "$manifest_file"
+    return 0
+  fi
+
+  # =========================================================================
+  # MUTATING PHASE — the §0.1 last-flip transaction begins here.
+  # =========================================================================
+  local apply_ts="" applied=0 flipped=0
+
+  # Capture the pre-convert managed block for an idempotent re-run of an
+  # ALREADY-STATIC agent (cur_source=static): such an agent carries a
+  # legitimate pre-existing roster block, so a post-flip rollback must RESTORE
+  # it byte-for-byte — excising would DELETE a static role this convert did not
+  # create (agb-dev-codex r2 Blocker). A genuine dynamic→static convert leaves
+  # this empty: a real dynamic-vanilla agent has no roster block (it registers
+  # from the live session scan), so its just-written flip is excised on
+  # rollback exactly as before. cur_source (not block-presence) is the
+  # discriminator because the smoke seeds a roster block to stand in for the
+  # live-scan registration a dynamic agent cannot have in an isolated test.
+  # Reuses the audited restart snapshot/restore pair (full-line-anchored awk),
+  # never hand-parsing the hook-protected roster.
+  local prior_block_snapshot=""
+  if [[ "$cur_source" == "static" ]]; then
+    prior_block_snapshot="$(bridge_agent_restart_snapshot_managed_block "$agent" 2>/dev/null || true)"
+  fi
+
+  # Internal failure handler: roll back the migration (Track A internal-only
+  # rollback, §0.4) if it had already applied, then die. Because the roster
+  # flip is step 7 (the LAST state-stranding mutation), any failure routed
+  # here BEFORE the flip leaves the role un-flipped (still dynamic) — never
+  # static-but-empty. The ONLY post-flip step is the typed-field materialize
+  # (model/effort/channels); a failure there sets flipped=1. The roster repair
+  # then depends on whether a block PRE-EXISTED: an already-static re-run
+  # RESTORES its captured prior block (count stays 1, source/fields unchanged),
+  # while a first dynamic→static convert EXCISES the just-written static block
+  # (the create-side rollback pattern) — a dynamic-vanilla agent re-registers
+  # from the live session scan, so excision restores the pre-convert "no managed
+  # block" rather than stranding a static-but-incomplete role reporting success
+  # (Blocker 2).
+  _convert_fail() {
+    local reason="$1"
+    if [[ $flipped -eq 1 ]]; then
+      if [[ -n "$prior_block_snapshot" && -f "$prior_block_snapshot" ]]; then
+        bridge_warn "convert: restoring the pre-convert roster block for '$agent' after a post-flip failure: $reason"
+        bridge_agent_restart_restore_managed_block "$agent" "$prior_block_snapshot" >/dev/null 2>&1 \
+          || bridge_warn "convert: roster restore failed for '$agent' — inspect $BRIDGE_ROSTER_LOCAL_FILE and $prior_block_snapshot."
+      else
+        bridge_warn "convert: excising the static roster flip for '$agent' after a post-flip failure: $reason"
+        if [[ -n "${SCRIPT_DIR:-}" && -f "$SCRIPT_DIR/lib/agent-cli-helpers/roster-excise-block.py" ]]; then
+          python3 "$SCRIPT_DIR/lib/agent-cli-helpers/roster-excise-block.py" \
+            "$BRIDGE_ROSTER_LOCAL_FILE" "$agent" >/dev/null 2>&1 \
+            || bridge_warn "convert: roster excision failed for '$agent' — inspect $BRIDGE_ROSTER_LOCAL_FILE."
+        fi
+      fi
+      bridge_roster_cache_invalidate 2>/dev/null || true
+      bridge_load_roster 2>/dev/null || true
+    fi
+    if [[ $applied -eq 1 && -n "$apply_ts" ]]; then
+      bridge_warn "convert: rolling back migration for '$agent' ($apply_ts) after failure: $reason"
+      bridge_convert_rollback "$agent" "$apply_ts" >/dev/null 2>&1 \
+        || bridge_warn "convert: rollback reported errors for '$agent' ($apply_ts) — inspect state/convert-backups/$agent/$apply_ts."
+    fi
+    rm -f "$manifest_file"
+    bridge_die "convert: $reason"
+  }
+
+  # --- step 1: stop/quiesce the live session (frees the name + stops the
+  # daemon racing). No-op when no live session exists.
+  if bridge_tmux_session_exists "$session" 2>/dev/null; then
+    bridge_manual_stop_agent_session "$agent" \
+      || _convert_fail "could not stop the live session for '$agent' before conversion."
+    bridge_refresh_runtime_state >/dev/null 2>&1 || true
+  fi
+
+  # Bake the static launch command (#1427): base Claude launch + --model so the
+  # roster carries a self-describing launch_cmd. effort/channels are persisted
+  # as typed roster fields below; #1763 dedupes the model against this bake.
+  local baked_launch_cmd
+  baked_launch_cmd="$(bridge_agent_launch_cmd_raw "$agent" 2>/dev/null || true)"
+  [[ -n "$baked_launch_cmd" ]] || baked_launch_cmd="$(bridge_agent_default_launch_cmd claude)"
+  if [[ -n "$res_model" && "$baked_launch_cmd" != *"--model "* ]]; then
+    baked_launch_cmd="$baked_launch_cmd --model $res_model"
+  fi
+
+  # --- step 4: materialize the target home/settings + assert the #1455
+  # single-tree invariant. The settings link is the load-bearing piece; the
+  # identity materialize + auto-memory seed are best-effort scaffolding.
+  mkdir -p "$workdir/.claude" 2>/dev/null || true
+  if declare -F bridge_layout_materialize_identity >/dev/null 2>&1; then
+    bridge_layout_materialize_identity "$agent" "$engine" "$workdir" >/dev/null 2>&1 \
+      || bridge_warn "convert: identity materialize for '$agent' was a no-op or failed (non-fatal; existing workdir identity preserved)."
+  fi
+  if declare -F bridge_link_claude_settings_to_shared >/dev/null 2>&1; then
+    bridge_link_claude_settings_to_shared "$workdir" "$baked_launch_cmd" "$agent" >/dev/null 2>&1 \
+      || _convert_fail "could not render the single-tree settings for '$agent' (#1455)."
+  fi
+  if declare -F bridge_ensure_auto_memory_isolation >/dev/null 2>&1; then
+    bridge_ensure_auto_memory_isolation "$agent" "$workdir" "$isolation_mode" "$os_user" >/dev/null 2>&1 || true
+  fi
+  # Assert the #1455 invariant: the workdir settings.json must resolve to the
+  # per-agent home settings.effective.json (single tree). Fail loudly.
+  local effective_file
+  effective_file="$(bridge_hook_per_agent_settings_effective_file "$agent")"
+  if ! python3 -c '
+import os, sys
+wd_link, eff = sys.argv[1], sys.argv[2]
+if not os.path.exists(wd_link) or not os.path.exists(eff):
+    sys.exit(2)
+sys.exit(0 if os.path.realpath(wd_link) == os.path.realpath(eff) else 1)
+' "$workdir/.claude/settings.json" "$effective_file"; then
+    _convert_fail "the #1455 single-tree settings invariant did not hold for '$agent' (workdir settings.json must resolve to $effective_file)."
+  fi
+
+  # --- step 5: apply + verify the migration manifest (Track A copy) --------
+  apply_ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  if ! bridge_convert_apply_manifest "$manifest_file" "$apply_ts" >/dev/null; then
+    applied=1
+    _convert_fail "migration apply failed for '$agent' (incomplete copy — see the apply log)."
+  fi
+  applied=1
+
+  # --- step 6: clear pre-conversion crash state (§0.2, mandatory) ----------
+  # Leave no pre-conversion report.env/state.env/tail.log/body for the daemon
+  # to keep re-alarming on; do NOT rely solely on the #2063 stale-launch guard.
+  bridge_agent_clear_crash_report "$agent"
+
+  # --- step 7: audited roster flip — the LAST state-stranding mutation -----
+  # bridge_write_role_block unconditionally writes BRIDGE_AGENT_SOURCE=static
+  # (the only hook-audited roster writer). start_policy_value="hold" (positional
+  # 22) keeps the daemon from auto-starting mid-conversion.
+  if ! bridge_write_role_block \
+        "$agent" \
+        "$description" \
+        "$engine" \
+        "$session" \
+        "$workdir" \
+        "$profile_home" \
+        "$baked_launch_cmd" \
+        "$res_channels" \
+        "$res_discord" \
+        "$notify_kind" \
+        "$notify_target" \
+        "$notify_account" \
+        "$loop_mode" \
+        "$continue_mode" \
+        "$always_on" \
+        "$isolation_mode" \
+        "$os_user" \
+        "1" \
+        "$agent_class" \
+        "0" \
+        "" \
+        "hold" >/dev/null; then
+    _convert_fail "the audited roster flip failed for '$agent'."
+  fi
+  flipped=1
+  bridge_roster_cache_invalidate
+  bridge_load_roster
+
+  # Materialize the typed model/effort/channels roster fields (#1427) now that
+  # the managed block exists, so the static launch + settings render consume
+  # them (model dedupes against the baked launch_cmd via #1763).
+  # bridge_write_role_block has no model/effort positional, so these are the
+  # ONLY persistence path for them — materialize whenever a resolved value
+  # exists (carried OR flag-overridden), not just when a flag was passed.
+  local _us=$'\x1f'
+  local mp=0 ep=0 cp=0
+  [[ -n "$res_model" ]] && mp=1
+  [[ -n "$res_effort" ]] && ep=1
+  [[ -n "$res_channels" ]] && cp=1
+  # Blocker 2: the typed-field persistence is part of the §0.1 atomic flip, NOT
+  # best-effort. A successful convert means the role is static AND carries every
+  # resolved typed field (model/effort/channels), or it rolls back. The prior
+  # `>/dev/null 2>&1 || true` could leave a flipped-but-incomplete static role
+  # reporting success when this write failed — notably --effort, which reaches
+  # launch ONLY as a roster field (it is never baked into launch_cmd). Check the
+  # rc and route any failure through the internal rollback (which now also
+  # excises the flip via _convert_fail) instead of suppressing it.
+  local field_rc=0
+  if [[ "${BRIDGE_CONVERT_FORCE_FIELD_WRITE_FAIL:-0}" == "1" ]]; then
+    # Test-only fault injection (smoke T7), default-off. The flip and this
+    # materialize share the same writer + roster file, so a real failure cannot
+    # be injected structurally BETWEEN them (any file-level fault breaks the
+    # earlier flip first) — this seam is the analog of T4's simulated apply
+    # failure and exercises the post-flip rollback path.
+    field_rc=1
+  else
+    bridge_roster_materialize_fields_python \
+      "$agent" "$BRIDGE_ROSTER_LOCAL_FILE" "1" \
+      "BRIDGE_AGENT_MODEL${_us}${mp}${_us}${res_model}" \
+      "BRIDGE_AGENT_EFFORT${_us}${ep}${_us}${res_effort}" \
+      "BRIDGE_AGENT_CHANNELS${_us}${cp}${_us}${res_channels}" >/dev/null 2>&1 \
+      || field_rc=$?
+  fi
+  if [[ $field_rc -ne 0 ]]; then
+    _convert_fail "could not persist the typed roster fields (model/effort/channels) for '$agent' (field-write rc=$field_rc) — rolled back to avoid a static-but-incomplete role."
+  fi
+  bridge_roster_cache_invalidate
+  bridge_load_roster
+
+  # --- step 8: resume-id pin = Track C (NOT implemented here) ---------------
+  # The agent is now static + stopped + start_policy=hold, which is the safe
+  # window the Track C pin needs (no live session for the daemon's
+  # refresh_missing_session_ids to recapture). Track C resolves the carried
+  # session id, migrates/validates its transcript against target_dir, and
+  # pins it atomically via bridge_set_agent_session_id.
+  #   Track C: pin --carry-session here (post-flip, transcript-validated)
+  # For --carry-session none the converted agent simply starts fresh; for live
+  # the pin is the next fixer's job. No resume-machinery is touched in MVP.
+
+  # Post-flip best-effort settings re-render so the static-class managed
+  # defaults (autoCompactWindow) land; non-fatal and idempotent.
+  if declare -F bridge_link_claude_settings_to_shared >/dev/null 2>&1; then
+    bridge_link_claude_settings_to_shared "$workdir" "$baked_launch_cmd" "$agent" >/dev/null 2>&1 || true
+  fi
+
+  rm -f "$manifest_file"
+  # Tidy the pre-convert block snapshot on the success path (an already-static
+  # re-run that did NOT need rollback); a future restart re-snapshots fresh.
+  if [[ -n "$prior_block_snapshot" && -f "$prior_block_snapshot" ]]; then
+    rm -f "$prior_block_snapshot" 2>/dev/null || true
+  fi
+
+  # --- step 10: optional start (default hold) ------------------------------
+  if [[ "$start_mode" == "auto" ]]; then
+    bridge_info "[convert] starting '$agent' (--start auto)…"
+    run_start "$agent" || bridge_warn "convert: '$agent' converted but auto-start failed; start it manually with 'agent-bridge agent start $agent'."
+  fi
+
+  bridge_audit_log "$(bridge_admin_agent_id 2>/dev/null || printf agent-convert)" "agent_converted_to_static" "$agent" \
+    --detail old_source="$cur_source" \
+    --detail new_source=static \
+    --detail source_config_dir="$source_dir" \
+    --detail target_config_dir="$target_dir" \
+    --detail carry_session="$carry_session" \
+    --detail start_policy=hold >/dev/null 2>&1 || true
+
+  if [[ $json_mode -eq 1 ]]; then
+    python3 -c '
+import json, sys
+print(json.dumps({
+    "agent": sys.argv[1],
+    "status": "converted",
+    "old_source": sys.argv[2],
+    "new_source": "static",
+    "source_config_dir": sys.argv[3],
+    "target_config_dir": sys.argv[4],
+    "carry_session": sys.argv[5],
+    "start_policy": "hold",
+    "started": sys.argv[6] == "1",
+}, indent=2, sort_keys=True))
+' "$agent" "$cur_source" "$source_dir" "$target_dir" "$carry_session" \
+      "$([[ "$start_mode" == "auto" ]] && printf 1 || printf 0)"
+  else
+    printf 'converted: %s (dynamic→static)\n' "$agent"
+    printf '  source_config_dir: %s\n' "$source_dir"
+    printf '  target_config_dir: %s\n' "$target_dir"
+    printf '  start_policy: hold (use '\''agent-bridge agent start %s'\'' to launch)\n' "$agent"
+  fi
 }
 
 run_create() {
@@ -8589,6 +9081,11 @@ case "$subcommand" in
     ;;
   reclassify)
     run_reclassify "$@"
+    ;;
+  convert)
+    # FR #2061 Track B: convert a dynamic Claude agent to a static roster
+    # role, migrating its config-dir-relative state via the Track A engine.
+    run_convert "$@"
     ;;
   roster)
     # template-sync (#1427): roster-field surgery sub-dispatch. Hosts the
