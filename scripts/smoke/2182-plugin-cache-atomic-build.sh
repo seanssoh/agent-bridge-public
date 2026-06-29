@@ -235,15 +235,19 @@ t2_failed_build_no_partial_final() {
   local mktroot="$SMOKE_TMP_ROOT/$case_id/mkt"
   local srcdir; srcdir="$(build_fixture "$mktroot")"
 
-  # Make a required-contract file (a nested @azure package.json) a symlink
+  # Make a required-contract file (the plugin's OWN server.ts) a symlink
   # resolving OUTSIDE the marketplace root → the overlay fails loud mid-build.
   # This is a path-resolution failure (works as root too), forcing the fresh
-  # build to abort partway.
+  # build to abort partway. NOTE: the trigger must be the plugin's own contract
+  # file, not a node_modules-internal one — since Issue #2098 a transitive
+  # dependency's manifest reached through a symlink-outside is a NON-fatal skip
+  # (a type-only / symlinked devDep no longer aborts the seed), so a nested
+  # @azure symlink would no longer force the abort this atomicity test needs.
   local outside="$SMOKE_TMP_ROOT/$case_id/outside"
   mkdir -p "$outside"
-  printf '{"name":"@azure/core-client"}\n' >"$outside/package.json"
-  rm -f "$srcdir/node_modules/@azure/core-client/package.json"
-  ln -s "$outside/package.json" "$srcdir/node_modules/@azure/core-client/package.json"
+  printf "console.log('outside')\n" >"$outside/server.ts"
+  rm -f "$srcdir/server.ts"
+  ln -s "$outside/server.ts" "$srcdir/server.ts"
 
   local out rc
   out="$(run_sync "$mktroot" "$case_id" 2>/dev/null)"
@@ -371,11 +375,14 @@ t5_temp_leak_zero_on_failure() {
   local mktroot="$SMOKE_TMP_ROOT/$case_id/mkt"
   local srcdir; srcdir="$(build_fixture "$mktroot")"
 
+  # Force a fail-loud build via the plugin's OWN contract file (server.ts) as a
+  # symlink-outside — a node_modules-internal symlink is a non-fatal skip since
+  # Issue #2098, so it can no longer force the abort this temp-leak test needs.
   local outside="$SMOKE_TMP_ROOT/$case_id/outside"
   mkdir -p "$outside"
-  printf '{"name":"@azure/core-client"}\n' >"$outside/package.json"
-  rm -f "$srcdir/node_modules/@azure/core-client/package.json"
-  ln -s "$outside/package.json" "$srcdir/node_modules/@azure/core-client/package.json"
+  printf "console.log('outside')\n" >"$outside/server.ts"
+  rm -f "$srcdir/server.ts"
+  ln -s "$outside/server.ts" "$srcdir/server.ts"
 
   local out rc
   out="$(run_sync "$mktroot" "$case_id" 2>/dev/null)"
@@ -462,11 +469,104 @@ t6_winner_guarded_retire() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# T7 (Issue #2098) — a node_modules-internal contract file reached through a
+# symlink resolving OUTSIDE the source root is a transitive type-only/symlinked
+# devDep (the `bun-types` repro shape): it must NOT break the seed (skip + WARN,
+# non-fatal). The plugin's own contract and REAL nested dep manifests stay
+# required + present, and a genuinely-incomplete cache is still caught — so the
+# exclusion is scoped to symlinked transitive deps, not a global weakening.
+# ---------------------------------------------------------------------------
+t7_symlinked_devdep_seeds_clean() {
+  local case_id="t7"
+  local mktroot="$SMOKE_TMP_ROOT/$case_id/mkt"
+  local srcdir; srcdir="$(build_fixture "$mktroot")"
+
+  # Type-only / symlinked devDep: a real node_modules/<dep> dir whose
+  # package.json is a symlink resolving outside the marketplace root (the
+  # bun / pnpm global-store install shape from the issue's bun-types repro).
+  local outside="$SMOKE_TMP_ROOT/$case_id/outside-bun-types"
+  mkdir -p "$outside" "$srcdir/node_modules/bun-types"
+  printf '{"name":"bun-types"}\n' >"$outside/package.json"
+  ln -s "$outside/package.json" "$srcdir/node_modules/bun-types/package.json"
+
+  local out rc cvd
+  out="$(run_sync "$mktroot" "$case_id" 2>/dev/null)"; rc=$?
+  cvd="$(cache_version_dir "$case_id")"
+
+  smoke_assert_eq "0" "$rc" "T7 symlinked devDep seed must exit 0"
+  smoke_assert_eq "linked-verified" "$(json_status "$out")" \
+    "T7 status must be linked-verified (symlinked devDep is a non-fatal skip)"
+  # The plugin's own contract + REAL nested @azure manifests still land in cache.
+  smoke_assert_file_exists "$cvd/package.json" "T7 plugin's own package.json present"
+  smoke_assert_file_exists "$cvd/server.ts" "T7 plugin's own server.ts present"
+  smoke_assert_eq "2" "$(azure_contract_count "$cvd")" \
+    "T7 both REAL @azure nested manifests present (real deps stay required)"
+  # The symlinked-outside devDep manifest is omitted (skipped), not linked.
+  [[ -e "$cvd/node_modules/bun-types/package.json" ]] && \
+    smoke_fail "T7 symlinked-outside devDep manifest must NOT be copied into cache"
+
+  # Fail-closed: the exclusion is scoped to symlinked transitive deps only — a
+  # genuinely-incomplete cache missing a REAL nested manifest is still caught
+  # and rebuilt (NOT certified unchanged).
+  rm -f "$cvd/node_modules/@azure/core-client/package.json"
+  out="$(run_sync "$mktroot" "$case_id" 2>/dev/null)"; rc=$?
+  smoke_assert_eq "0" "$rc" "T7 re-sync after cache damage must exit 0"
+  smoke_assert_eq "updated-verified" "$(json_status "$out")" \
+    "T7 missing REAL @azure manifest is re-detected + rebuilt (fail-closed)"
+  smoke_assert_file_exists "$cvd/node_modules/@azure/core-client/package.json" \
+    "T7 rebuilt cache restores the REAL @azure manifest"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# T8 (Issue #2098 / codex r1 boundary-asymmetry) — a node_modules dep manifest
+# symlinked to an INTRA-marketplace sibling (resolves INSIDE the marketplace
+# root but OUTSIDE the plugin dir) is COPIED by the overlay, so verify must keep
+# it REQUIRED using the same marketplace boundary the overlay uses. If verify
+# used the narrower plugin dir as its boundary it would wrongly exclude this
+# manifest and certify a cache that is actually missing it. Distinct from
+# #2098's OUTSIDE-marketplace symlink (T7), which IS correctly skipped.
+# ---------------------------------------------------------------------------
+t8_intra_marketplace_symlinked_manifest_required() {
+  local case_id="t8"
+  local mktroot="$SMOKE_TMP_ROOT/$case_id/mkt"
+  local srcdir; srcdir="$(build_fixture "$mktroot")"
+
+  local shared="$mktroot/shared/dep"
+  mkdir -p "$shared" "$srcdir/node_modules/intra-dep"
+  printf '{"name":"intra-dep"}\n' >"$shared/package.json"
+  # Symlinked manifest resolving inside the marketplace, outside the plugin dir.
+  ln -s "$shared/package.json" "$srcdir/node_modules/intra-dep/package.json"
+
+  local out rc cvd
+  out="$(run_sync "$mktroot" "$case_id" 2>/dev/null)"; rc=$?
+  cvd="$(cache_version_dir "$case_id")"
+  smoke_assert_eq "0" "$rc" "T8 intra-marketplace symlinked dep seed must exit 0"
+  smoke_assert_eq "linked-verified" "$(json_status "$out")" \
+    "T8 status must be linked-verified (intra-marketplace symlink is copied)"
+  smoke_assert_file_exists "$cvd/node_modules/intra-dep/package.json" \
+    "T8 intra-marketplace symlinked manifest is copied into cache"
+
+  # Fail-closed: deleting it from the cache must be re-detected. This only holds
+  # when verify's boundary is the marketplace root, not the plugin dir (codex r1).
+  rm -f "$cvd/node_modules/intra-dep/package.json"
+  out="$(run_sync "$mktroot" "$case_id" 2>/dev/null)"; rc=$?
+  smoke_assert_eq "0" "$rc" "T8 re-sync after cache damage must exit 0"
+  smoke_assert_eq "updated-verified" "$(json_status "$out")" \
+    "T8 missing intra-marketplace manifest is re-detected (boundary=marketplace, not plugin)"
+  smoke_assert_file_exists "$cvd/node_modules/intra-dep/package.json" \
+    "T8 rebuilt cache restores the intra-marketplace manifest"
+  return 0
+}
+
 smoke_run "T1 partial existing cache → single-sync clean rebuild" t1_partial_rebuilds_clean
 smoke_run "T2 failed fresh build leaves no partial final (atomicity)" t2_failed_build_no_partial_final
 smoke_run "T3 verify-retry converges, no permanent wedge" t3_verify_retry_converges
 smoke_run "T4 concurrent winner kept, temp discarded" t4_concurrent_winner_kept
 smoke_run "T5 temp-leak zero on a failed fresh build" t5_temp_leak_zero_on_failure
 smoke_run "T6 winner-guarded retire (no stale-delete of a winner)" t6_winner_guarded_retire
+smoke_run "T7 symlinked devDep seeds clean, real deps stay required (#2098)" t7_symlinked_devdep_seeds_clean
+smoke_run "T8 intra-marketplace symlinked manifest stays required (#2098 boundary)" t8_intra_marketplace_symlinked_manifest_required
 
 smoke_log "passed"
