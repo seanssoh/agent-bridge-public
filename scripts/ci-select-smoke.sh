@@ -893,6 +893,15 @@ select_for_path() {
           # launch_cmd + start_policy=hold flip, crash-state cleanup, and the
           # iso-target fail-closed (rc 3) cannot silently regress.
           add_required 2061-convert-verb
+          # FR #2061 Track C: run_convert's --carry-session live|none resume-id
+          # pin — early-capture the dynamic agent's last-active transcript id
+          # from the SOURCE config dir, pin it atomically post-flip (agent
+          # stopped + hold), and validate it against the TARGET config dir
+          # (fail loudly, never a silent fresh-start). Pull 2061-convert-resume
+          # on every bridge-agent.sh move so the capture/pin/validate ordering,
+          # the transcript-absent reject + rollback, the `none` clear, and the
+          # daemon-recapture acceptance cannot silently regress.
+          add_required 2061-convert-resume
           ;;
       esac
       # Issue #1795: the `agent-bridge` create path parses `--ephemeral` /
@@ -1177,6 +1186,16 @@ select_for_path() {
         # quarantine refused. 1890-dynamic-vanilla-claude pins all of that plus
         # static-unchanged; pull it on every bridge-state.sh move.
         add_required 1890-dynamic-vanilla-claude
+        # FR #2061 Track C: the `agent convert` resume-pin consumes the
+        # bridge-state.sh atomic writer/validator triad
+        # (bridge_set_agent_session_id / bridge_clear_agent_session_id /
+        # bridge_claude_session_id_exists) plus bridge_detect_claude_session_id
+        # for the source-side last-active capture. Pull 2061-convert-resume on
+        # every bridge-state.sh move so a refactor of those helpers cannot
+        # silently re-introduce the #1248-class silent fresh-start (a carried
+        # id that no longer transcript-validates against the target config dir)
+        # or let a daemon recapture overwrite the pin in the stopped/held window.
+        add_required 2061-convert-resume
         # Issue #1899 (Codex sibling): bridge-state.sh now branches the codex
         # launch builder + resume-decline + normalize/refresh/resolve no-ops on
         # bridge_agent_is_dynamic_vanilla_codex so dynamic Codex launches `codex
