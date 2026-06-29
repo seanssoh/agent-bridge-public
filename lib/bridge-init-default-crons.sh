@@ -147,10 +147,13 @@ _bridge_init_picker_sweep_shell_kind_supported() {
 
 # Register the TEXT-kind picker-sweep cron — the supported form on a non-iso /
 # macOS host where `--kind shell` is structurally unavailable (#2041 / #2042).
-# This is the legacy text payload form (#833 predecessor): the cron runner wraps
-# the payload in `claude -p` / `codex exec`, so a disposable cron CHILD (NOT the
-# live interactive session — so it is not itself blocked by the picker the sweep
-# clears) runs `bash $BRIDGE_HOME/scripts/picker-sweep.sh`. scripts/picker-sweep.sh
+# This is the legacy text payload form (#833 predecessor). The caller only reaches
+# it for a CODEX run-as agent (#2087 engine gate): the cron runner wraps the
+# payload in `codex exec`, so a disposable cron CHILD (NOT the live interactive
+# session — so it is not itself blocked by the picker the sweep clears) runs
+# `bash $BRIDGE_HOME/scripts/picker-sweep.sh`. A Claude run-as agent would instead
+# be handed the payload as a `claude -p` PROMPT and never exec it (#2087), which is
+# why the caller skips this form for Claude. scripts/picker-sweep.sh
 # reads the BRIDGE_PICKER_SWEEP_* env the payload carries. Targets the admin so
 # no codex pair is required; an upgraded host where #2042 confirmed text-kind
 # works already runs this shape. `$BRIDGE_HOME` is expanded by the cron runner at
@@ -196,11 +199,16 @@ _bridge_init_picker_sweep_register_text_kind() {
 # PLATFORM/ISO-AWARE (#2041 / #2042): shell-kind is only registered when this
 # host accepts it (iso v2 effective OR run-as resolves to the controller UID —
 # `_bridge_init_picker_sweep_shell_kind_supported`). On a non-iso / macOS host
-# where `--kind shell` is structurally rejected, the desired/converged form is
-# the TEXT-kind cron: a pre-existing text-kind row is the converged state (skip,
-# NO re-`failed` line every upgrade), and a fresh install registers text-kind.
-# This is a platform BRANCH, not a blanket revert — the iso/Linux shell-kind
-# path is unchanged.
+# where `--kind shell` is structurally rejected, the TEXT-kind cron is the only
+# bridge-native form — but it is runnable ONLY when the run-as agent is a
+# non-Claude (codex) engine that `codex exec`s the payload. ENGINE-GATED (#2087):
+# when the admin runs the Claude engine (the macOS default) the text-kind payload
+# would be fed to `claude -p` as a prompt and fail every interval, so registration
+# is SKIPPED (and any pre-existing admin text row removed) rather than registering
+# a perpetually-failing cron. For a codex run-as agent a pre-existing admin
+# text-kind row is the converged state (skip, NO re-`failed` line every upgrade)
+# and a fresh install registers text-kind. This is a platform BRANCH, not a
+# blanket revert — the iso/Linux shell-kind path is unchanged.
 #
 # Args:
 #   $1 = agent-bridge CLI path (the live CLI under $BRIDGE_HOME)
@@ -251,6 +259,11 @@ bridge_init_register_default_picker_sweep() {
   # codex-pair) text row ids that must be migrated off rather than treated as
   # converged.
   local admin_text_seen=0 noniso_legacy_ids=() noniso_legacy_titleonly=0
+  # #2087: ids of EXISTING text-kind rows that TARGET the admin. On a non-iso host
+  # whose admin runs the Claude engine these can never run (a text-kind shell
+  # payload dispatched through `claude -p` is fed to the model as a prompt, not
+  # executed), so they are REMOVED rather than treated as the converged form.
+  local admin_text_ids=() admin_text_titleonly=0
   enum_lines="$(_bridge_init_picker_sweep_enumerate "$agent_bridge_cli")"
   local _line _id _rest _kind _agent
   while IFS= read -r _line; do
@@ -288,6 +301,9 @@ bridge_init_register_default_picker_sweep() {
     # codex pair) is broken and must be migrated, not skipped.
     if [[ "$_agent" == "$admin_agent" ]]; then
       admin_text_seen=1
+      # #2087: track the id so a Claude-admin non-iso host can remove this
+      # perpetually-failing row instead of converging on it.
+      if [[ -n "$_id" ]]; then admin_text_ids+=("$_id"); else admin_text_titleonly=1; fi
     elif [[ -n "$_id" ]]; then
       noniso_legacy_ids+=("$_id")
     else
@@ -315,6 +331,26 @@ bridge_init_register_default_picker_sweep() {
   #     working job instead of a silent no-op).
   if [[ "$shell_seen" -ne 1 ]] \
       && ! _bridge_init_picker_sweep_shell_kind_supported "$admin_agent"; then
+    # #2087 ENGINE GATE. A TEXT-kind cron is dispatched through the run-as-agent's
+    # ENGINE: `codex exec` runs the `bash <script>` payload, but `claude -p` feeds
+    # it to the model as a PROMPT (never executed) and the daemon-spawned child has
+    # no login keychain ("Not logged in"), so a Claude-targeted text-kind
+    # picker-sweep fails every interval. Per the `agb cron` help text the text-kind
+    # shell form is runnable ONLY against a non-Claude (codex) agent. On a non-iso
+    # host whose admin is Claude (the macOS default) there is therefore NO runnable
+    # bridge-native form: register NOTHING and remove any perpetually-failing
+    # admin-targeted text-kind row this host already carries (the rc3 #2041/#2042
+    # regression). The operator schedules scripts/picker-sweep.sh via OS crontab —
+    # OPERATIONS.md "Scheduled shell scripts without iso v2".
+    if [[ "$(bridge_agent_engine "$admin_agent" 2>/dev/null)" != "codex" ]]; then
+      _bridge_init_picker_sweep_remove_legacy_by_id "$agent_bridge_cli" "${admin_text_ids[@]:-}"
+      if [[ "$admin_text_titleonly" -eq 1 ]]; then
+        printf '[init] picker-sweep cron migrate — id-less admin-targeted text-kind row remains (cannot title-delete safely); operator can remove it manually per OPERATIONS.md\n' >&2
+      fi
+      printf '[init] picker-sweep cron skipped — non-iso host with a Claude run-as-agent cannot run a bridge-native shell cron (a text-kind shell payload dispatched through claude -p is a prompt, not an exec — #2087); schedule scripts/picker-sweep.sh via OS crontab per OPERATIONS.md "Scheduled shell scripts without iso v2"%s\n' \
+        "$([[ "${#admin_text_ids[@]}" -gt 0 ]] && printf ' (removed %s broken text-kind row(s))' "${#admin_text_ids[@]}")" >&2
+      return 0
+    fi
     if [[ "$admin_text_seen" -eq 1 ]]; then
       # Converged: a working admin-targeted text row is present. Clean up any
       # coexisting legacy codex-pair text row(s) by id (precise — the create is
