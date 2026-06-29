@@ -1273,6 +1273,64 @@ def apply_onboarding_state_complete(text: str) -> str:
     )
 
 
+def ratchet_session_type_layer_complete(path: Path, dry_run: bool) -> bool:
+    """Issue #2084: ratchet ONE runtime SESSION-TYPE.md layer copy to
+    ``Onboarding State: complete`` in place.
+
+    The marker-authority repair in ``migrate_agent_home`` only ratchets the
+    controller-owned profile-source copy (``agents/<agent>/SESSION-TYPE.md``).
+    The v2 layout also splits SESSION-TYPE.md into a ``workdir`` and an
+    identity ``home`` copy, and ``bridge-watchdog.py`` resolves
+    ``onboarding_state`` from the WORKDIR copy — so a workdir copy left at the
+    stale template ``pending`` produces a false ``agent profile drift`` warn
+    (status=warn, restart_readiness=onboarding-pending) on an install that
+    recorded completion. Mirror the source ratchet onto these copies.
+
+    Conservative + idempotent + one-way:
+      * rewrites ONLY the single ``Onboarding State:`` line (every other byte
+        preserved), only when the copy already carries that line and is not
+        already ``complete``;
+      * only when the copy is owned by THIS (controller) process — a copy owned
+        by a different uid is a per-UID isolated runtime file under linux-user
+        isolation; the controller must never rewrite it directly (that would
+        strip its owner/group + mode), so it is left for the isolation-aware
+        runtime write path and the agent's own next session;
+      * any stat/read/write error is swallowed (best-effort, never fatal).
+
+    Returns True iff the line was (or, under ``dry_run``, would be) rewritten.
+    """
+    try:
+        owner_uid = path.stat().st_uid  # noqa: raw-pathlib-controller-only
+    except OSError:
+        return False
+    if owner_uid != os.geteuid():
+        return False
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    if not text or re.search(
+        r"^-?\s*Onboarding State:\s*complete\b", text, re.MULTILINE | re.IGNORECASE
+    ):
+        return False
+    repaired = apply_onboarding_state_complete(text)
+    if repaired == text:
+        return False
+    if dry_run:
+        return True
+    tmp = path.with_name(f".{path.name}.onboarding2084.tmp")
+    try:
+        tmp.write_text(repaired, encoding="utf-8")  # noqa: raw-pathlib-controller-only
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()  # noqa: raw-pathlib-controller-only
+        except OSError:
+            pass
+        return False
+    return True
+
+
 def detect_engine(agent_dir: Path, session_type: str) -> str:
     if session_type == "static-codex":
         return "codex"
@@ -1520,6 +1578,17 @@ def migrate_agent_home(
                     updated_files.append("SESSION-TYPE.md")
                     if not dry_run:
                         session_target.write_text(repaired, encoding="utf-8")
+            # Issue #2084: the ratchet above only fixes the controller-owned
+            # profile-source copy. The watchdog reads onboarding_state from the
+            # v2 WORKDIR copy, so a stale-pending workdir (or identity-home)
+            # copy still trips a false profile-drift warn after the repair.
+            # Mirror the ratchet onto those runtime copies (controller-owned
+            # copies only; one-way; idempotent). `v2_session_type_candidates`
+            # returns [source, workdir, home]; the source is `session_target`,
+            # already handled above.
+            for layer_path in v2_session_type_candidates(agent_dir)[1:]:
+                if ratchet_session_type_layer_complete(layer_path, dry_run):
+                    updated_files.append("SESSION-TYPE.md")
             if repair_onboarding_complete_markers(agent_dir, dry_run):
                 updated_files.append("onboarding-complete")
         elif detect_stale_pending_onboarding(agent_dir):
