@@ -3732,24 +3732,50 @@ print("  (dry-run — nothing was changed)")
   # =========================================================================
   local apply_ts="" applied=0 flipped=0
 
+  # Capture the pre-convert managed block for an idempotent re-run of an
+  # ALREADY-STATIC agent (cur_source=static): such an agent carries a
+  # legitimate pre-existing roster block, so a post-flip rollback must RESTORE
+  # it byte-for-byte — excising would DELETE a static role this convert did not
+  # create (agb-dev-codex r2 Blocker). A genuine dynamic→static convert leaves
+  # this empty: a real dynamic-vanilla agent has no roster block (it registers
+  # from the live session scan), so its just-written flip is excised on
+  # rollback exactly as before. cur_source (not block-presence) is the
+  # discriminator because the smoke seeds a roster block to stand in for the
+  # live-scan registration a dynamic agent cannot have in an isolated test.
+  # Reuses the audited restart snapshot/restore pair (full-line-anchored awk),
+  # never hand-parsing the hook-protected roster.
+  local prior_block_snapshot=""
+  if [[ "$cur_source" == "static" ]]; then
+    prior_block_snapshot="$(bridge_agent_restart_snapshot_managed_block "$agent" 2>/dev/null || true)"
+  fi
+
   # Internal failure handler: roll back the migration (Track A internal-only
   # rollback, §0.4) if it had already applied, then die. Because the roster
   # flip is step 7 (the LAST state-stranding mutation), any failure routed
   # here BEFORE the flip leaves the role un-flipped (still dynamic) — never
   # static-but-empty. The ONLY post-flip step is the typed-field materialize
-  # (model/effort/channels); a failure there sets flipped=1, so excise the
-  # just-written static block first (the create-side rollback pattern) — a
-  # dynamic-vanilla agent re-registers from the live session scan, so excision
-  # restores the pre-convert "no managed block" rather than stranding a
-  # static-but-incomplete role reporting success (Blocker 2).
+  # (model/effort/channels); a failure there sets flipped=1. The roster repair
+  # then depends on whether a block PRE-EXISTED: an already-static re-run
+  # RESTORES its captured prior block (count stays 1, source/fields unchanged),
+  # while a first dynamic→static convert EXCISES the just-written static block
+  # (the create-side rollback pattern) — a dynamic-vanilla agent re-registers
+  # from the live session scan, so excision restores the pre-convert "no managed
+  # block" rather than stranding a static-but-incomplete role reporting success
+  # (Blocker 2).
   _convert_fail() {
     local reason="$1"
     if [[ $flipped -eq 1 ]]; then
-      bridge_warn "convert: excising the static roster flip for '$agent' after a post-flip failure: $reason"
-      if [[ -n "${SCRIPT_DIR:-}" && -f "$SCRIPT_DIR/lib/agent-cli-helpers/roster-excise-block.py" ]]; then
-        python3 "$SCRIPT_DIR/lib/agent-cli-helpers/roster-excise-block.py" \
-          "$BRIDGE_ROSTER_LOCAL_FILE" "$agent" >/dev/null 2>&1 \
-          || bridge_warn "convert: roster excision failed for '$agent' — inspect $BRIDGE_ROSTER_LOCAL_FILE."
+      if [[ -n "$prior_block_snapshot" && -f "$prior_block_snapshot" ]]; then
+        bridge_warn "convert: restoring the pre-convert roster block for '$agent' after a post-flip failure: $reason"
+        bridge_agent_restart_restore_managed_block "$agent" "$prior_block_snapshot" >/dev/null 2>&1 \
+          || bridge_warn "convert: roster restore failed for '$agent' — inspect $BRIDGE_ROSTER_LOCAL_FILE and $prior_block_snapshot."
+      else
+        bridge_warn "convert: excising the static roster flip for '$agent' after a post-flip failure: $reason"
+        if [[ -n "${SCRIPT_DIR:-}" && -f "$SCRIPT_DIR/lib/agent-cli-helpers/roster-excise-block.py" ]]; then
+          python3 "$SCRIPT_DIR/lib/agent-cli-helpers/roster-excise-block.py" \
+            "$BRIDGE_ROSTER_LOCAL_FILE" "$agent" >/dev/null 2>&1 \
+            || bridge_warn "convert: roster excision failed for '$agent' — inspect $BRIDGE_ROSTER_LOCAL_FILE."
+        fi
       fi
       bridge_roster_cache_invalidate 2>/dev/null || true
       bridge_load_roster 2>/dev/null || true
@@ -3914,6 +3940,11 @@ sys.exit(0 if os.path.realpath(wd_link) == os.path.realpath(eff) else 1)
   fi
 
   rm -f "$manifest_file"
+  # Tidy the pre-convert block snapshot on the success path (an already-static
+  # re-run that did NOT need rollback); a future restart re-snapshots fresh.
+  if [[ -n "$prior_block_snapshot" && -f "$prior_block_snapshot" ]]; then
+    rm -f "$prior_block_snapshot" 2>/dev/null || true
+  fi
 
   # --- step 10: optional start (default hold) ------------------------------
   if [[ "$start_mode" == "auto" ]]; then

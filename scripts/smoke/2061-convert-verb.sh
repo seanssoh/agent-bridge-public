@@ -376,6 +376,50 @@ test_t7_field_write_failure_rolls_back() {
   smoke_log "T7 OK — forced typed-field-write failure rolls back the flip; no static-incomplete role reports success"
 }
 
+# ===========================================================================
+# T8 — Blocker (agb-dev-codex r2): a forced typed-field-write failure on an
+# idempotent re-run of an ALREADY-STATIC agent must RESTORE the pre-existing
+# static block, NOT excise it. T7 covers the first dynamic→static convert
+# (no pre-existing role → excise); T8 covers the already-static rerun
+# (pre-existing role → restore). Self-contained + run-order-independent.
+# ===========================================================================
+test_t8_already_static_rerun_restores() {
+  init_roster
+  local agent="restoreme" workdir="$SMOKE_TMP_ROOT/restoreme-wd"
+  seed_dynamic_agent "$agent" "$workdir"
+  seed_operator_state "$workdir" "sidR8"
+
+  # First: a clean dynamic→static convert so the agent is NOW static and
+  # carries exactly one managed block — the pre-existing role T8 protects.
+  local out
+  out="$(convert_cli "$agent" --to static --model claude-opus-4)" \
+    || smoke_fail "T8: initial dynamic→static convert exited non-zero: $out"
+  roster_has 'BRIDGE_AGENT_SOURCE["restoreme"]="static"' \
+    || smoke_fail "T8: initial convert did not flip to source=static"
+  local before_count
+  before_count="$(grep -c '# BEGIN AGENT BRIDGE MANAGED ROLE: restoreme' "$BRIDGE_ROSTER_LOCAL_FILE" || true)"
+  smoke_assert_eq "1" "$before_count" "T8: initial convert did not leave exactly one managed block"
+
+  # Then: rerun convert on the ALREADY-STATIC agent with a forced post-flip
+  # typed-field-write failure. The rollback must RESTORE the pre-existing
+  # static block (count stays 1, source=static) — it must NOT delete it.
+  local rc=0
+  HOME="$OPERATOR_HOME" BRIDGE_CONTROLLER_HOME="$OPERATOR_HOME" \
+  BRIDGE_CALLER_SOURCE="operator-trusted-id" \
+  BRIDGE_CONVERT_FORCE_FIELD_WRITE_FAIL=1 \
+    "$BASH4_BIN" "$REPO_ROOT/bridge-agent.sh" convert "$agent" --to static \
+      --model claude-opus-4 --effort high >/dev/null 2>&1 || rc=$?
+  [[ "$rc" -ne 0 ]] || smoke_fail "T8: forced field-write failure on an already-static rerun reported success"
+
+  # The pre-existing static role SURVIVES: exactly one block, still static.
+  local after_count
+  after_count="$(grep -c '# BEGIN AGENT BRIDGE MANAGED ROLE: restoreme' "$BRIDGE_ROSTER_LOCAL_FILE" || true)"
+  smoke_assert_eq "1" "$after_count" "T8: the pre-existing static block was DELETED on rollback (must be RESTORED)"
+  roster_has 'BRIDGE_AGENT_SOURCE["restoreme"]="static"' \
+    || smoke_fail "T8: the restored block is not source=static (role corrupted on rollback)"
+  smoke_log "T8 OK — already-static rerun + forced field-fail RESTORES the pre-existing static block (count=1, source=static)"
+}
+
 # --- run -------------------------------------------------------------------
 smoke_run "T1 --dry-run prints manifest + mutates nothing" test_t1_dry_run_no_mutation
 smoke_run "T2 convert flips roster static + migrates + clears crash + #1455" test_t2_convert_apply
@@ -384,5 +428,6 @@ smoke_run "T4 §0.1 apply-failure leaves no flipped roster (rollback ran)" test_
 smoke_run "T5 iso-effective target fails closed (rc 3)" test_t5_iso_fail_closed
 smoke_run "T6 agent-direct caller rejected at the system-config gate" test_t6_caller_gate_rejects_agent_direct
 smoke_run "T7 forced typed-field-write failure rolls back (no static-incomplete)" test_t7_field_write_failure_rolls_back
+smoke_run "T8 already-static rerun + field-fail RESTORES the pre-existing block" test_t8_already_static_rerun_restores
 
-smoke_log "PASS — #2061 Track B convert verb: dry-run no-mutation, audited static flip with baked launch_cmd + hold, byte-equal migration, crash-clear, #1455 invariant, idempotent, last-flip rollback, iso fail-closed, caller-source gate, typed-field-failure rollback"
+smoke_log "PASS — #2061 Track B convert verb: dry-run no-mutation, audited static flip with baked launch_cmd + hold, byte-equal migration, crash-clear, #1455 invariant, idempotent, last-flip rollback, iso fail-closed, caller-source gate, typed-field-failure rollback (dynamic→static excise + already-static restore)"
