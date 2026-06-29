@@ -230,6 +230,7 @@ _BRIDGE_CONVERT_APPLY_PY='
 import hashlib
 import json
 import os
+import stat
 import sys
 
 CHUNK = 65536
@@ -244,55 +245,66 @@ target = manifest.get("target_config_dir", "")
 files = manifest.get("files", [])
 
 
-def sha256(path):
+def open_nofollow_rdonly(path):
+    # Open the FINAL path component read-only with O_NOFOLLOW so a symlink
+    # swapped into the leaf AFTER the islink/dest_is_safe pre-checks raises
+    # OSError (ELOOP) here instead of being followed. The caller fails closed
+    # rather than reading THROUGH the link and recording a false skip-success
+    # (closes the read-side TOCTOU codex r2/Phase-4 flagged). This is the read
+    # complement to the O_NOFOLLOW write/backup opens below.
+    return os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+
+
+def sha256_fd(fd):
+    # Hash from an already-open O_NOFOLLOW fd, never re-opening by path. Seek to
+    # 0 first so the fd can be reused (size compare -> hash -> copy/backup).
     digest = hashlib.sha256()
-    with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(CHUNK), b""):
-            digest.update(chunk)
+    os.lseek(fd, 0, os.SEEK_SET)
+    while True:
+        chunk = os.read(fd, CHUNK)
+        if not chunk:
+            break
+        digest.update(chunk)
     return digest.hexdigest()
 
 
-def copy_nofollow(src, dest, mode, atime, mtime):
+def copy_fd_nofollow(sfd, dest, mode, atime, mtime):
     # Write dest with O_NOFOLLOW so a symlink swapped in at the final component
     # AFTER the dest_is_safe pre-check cannot redirect the write outside the
-    # target tree (closes the TOCTOU window codex r2 flagged). mode + mtimes are
-    # set on the fd, never re-opening dest by path.
-    sfd = os.open(src, os.O_RDONLY)
+    # target tree. The SOURCE is read from the already-open O_NOFOLLOW fd (sfd),
+    # never re-opened by path, so a source-leaf symlink swap cannot be followed
+    # either. mode + mtimes are set on the fd, never re-opening dest by path.
+    os.lseek(sfd, 0, os.SEEK_SET)
+    dfd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
     try:
-        dfd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        while True:
+            chunk = os.read(sfd, CHUNK)
+            if not chunk:
+                break
+            os.write(dfd, chunk)
         try:
-            while True:
-                chunk = os.read(sfd, CHUNK)
-                if not chunk:
-                    break
-                os.write(dfd, chunk)
-            try:
-                os.fchmod(dfd, mode & 0o777)
-            except OSError:
-                pass
-            os.utime(dfd, (atime, mtime))
-        finally:
-            os.close(dfd)
+            os.fchmod(dfd, mode & 0o777)
+        except OSError:
+            pass
+        os.utime(dfd, (atime, mtime))
     finally:
-        os.close(sfd)
+        os.close(dfd)
 
 
-def backup_nofollow(dest, bpath):
-    # Read the existing dest with O_NOFOLLOW so a symlinked dest is never backed
-    # up THROUGH the link; the backup lands under the controlled backup dir.
-    sfd = os.open(dest, os.O_RDONLY | os.O_NOFOLLOW)
-    try:
-        st = os.fstat(sfd)
-        os.makedirs(os.path.dirname(bpath), exist_ok=True)
-        with open(bpath, "wb") as out:
-            while True:
-                chunk = os.read(sfd, CHUNK)
-                if not chunk:
-                    break
-                out.write(chunk)
-        os.utime(bpath, (st.st_atime, st.st_mtime))
-    finally:
-        os.close(sfd)
+def backup_fd_nofollow(dfd, bpath, atime, mtime):
+    # Back up the existing dest from its already-open O_NOFOLLOW fd so a dest
+    # leaf is never backed up THROUGH a symlink; the backup lands under the
+    # controlled backup dir. Seek to 0 so the same fd that fed the equality
+    # compare can be re-read here.
+    os.makedirs(os.path.dirname(bpath), exist_ok=True)
+    os.lseek(dfd, 0, os.SEEK_SET)
+    with open(bpath, "wb") as out:
+        while True:
+            chunk = os.read(dfd, CHUNK)
+            if not chunk:
+                break
+            out.write(chunk)
+    os.utime(bpath, (atime, mtime))
 
 
 def dest_is_safe(dest):
@@ -350,31 +362,57 @@ for entry in files:
         log.append({"rel": rel, "dest": dest, "action": "unsafe-dest"})
         unsafe += 1
         continue
+    sfd = None
+    dfd = None
     try:
-        st = os.stat(src)
-        existed = os.path.isfile(dest) and not os.path.islink(dest)
-        if existed and os.path.getsize(src) == os.path.getsize(dest) and sha256(src) == sha256(dest):
+        # Open the source leaf O_NOFOLLOW ONCE and drive every read (size, hash,
+        # copy) from that fd: a symlink swapped into the source leaf after the
+        # islink pre-check raises here (ELOOP) and we fail closed, never reading
+        # THROUGH the link.
+        sfd = open_nofollow_rdonly(src)
+        sst = os.fstat(sfd)
+        # Open an existing dest leaf O_NOFOLLOW so the equality compare + backup
+        # read the REAL file, never a symlink swapped into the dest leaf between
+        # dest_is_safe() and here. A symlinked dest leaf raises a non-ENOENT
+        # OSError (ELOOP) -> outer except -> unsafe (no false skip-success); a
+        # missing dest is simply the create path.
+        try:
+            dfd = open_nofollow_rdonly(dest)
+        except FileNotFoundError:
+            dfd = None
+        existed = False
+        if dfd is not None:
+            dst = os.fstat(dfd)
+            existed = stat.S_ISREG(dst.st_mode)
+        if existed and sst.st_size == dst.st_size and sha256_fd(sfd) == sha256_fd(dfd):
             log.append({"rel": rel, "dest": dest, "action": "skip"})
             skipped += 1
             continue
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         if existed:
             bpath = os.path.join(overwritten_root, rel)
-            backup_nofollow(dest, bpath)
+            backup_fd_nofollow(dfd, bpath, dst.st_atime, dst.st_mtime)
             record({"action": "overwrite", "dest": dest, "backup": bpath})
-            copy_nofollow(src, dest, st.st_mode, st.st_atime, st.st_mtime)
+            copy_fd_nofollow(sfd, dest, sst.st_mode, sst.st_atime, sst.st_mtime)
             log.append({"rel": rel, "dest": dest, "action": "overwrote", "backup": bpath})
             overwrote += 1
         else:
             record({"action": "create", "dest": dest})
-            copy_nofollow(src, dest, st.st_mode, st.st_atime, st.st_mtime)
+            copy_fd_nofollow(sfd, dest, sst.st_mode, sst.st_atime, sst.st_mtime)
             log.append({"rel": rel, "dest": dest, "action": "created"})
             created += 1
     except OSError as exc:
-        # A symlink swapped in after the pre-check fails the O_NOFOLLOW open
-        # here — record it unsafe and fail closed rather than write outside.
+        # A symlink swapped into the source OR dest leaf after the pre-check
+        # makes the O_NOFOLLOW open raise here (ELOOP) — record it unsafe and
+        # fail closed rather than read/write THROUGH the link or record a false
+        # skip-success.
         log.append({"rel": rel, "dest": dest, "action": "unsafe-dest", "error": str(exc)})
         unsafe += 1
+    finally:
+        if sfd is not None:
+            os.close(sfd)
+        if dfd is not None:
+            os.close(dfd)
 
 journal.close()
 with open(os.path.join(backup_dir, "apply-log.json"), "w", encoding="utf-8") as fh:

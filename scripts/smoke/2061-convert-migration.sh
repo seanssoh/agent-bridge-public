@@ -346,6 +346,105 @@ test_t10_overwrite_backup_restore() {
 }
 
 # ===========================================================================
+# T11 — leaf/final-component DEST symlink: a symlink swapped into the FINAL dest
+# component (parents are real dirs) is REJECTED as unsafe and never recorded as
+# a false skip-success — distinct from T9's target-DIR symlink. The outside
+# canary it points at has bytes identical to the source leaf, so a read that
+# FOLLOWED the link would size+hash-match and (in the pre-fix code) record a
+# "skip". Fail-closed reads must record it unsafe, never skip.
+# ===========================================================================
+test_t11_dest_leaf_symlink_rejected() {
+  local fresh="$SMOKE_TMP_ROOT/agent-home-t11/.claude"
+  local rel="projects/$SLUG_A/sid1.jsonl"
+  local manifest="$SMOKE_TMP_ROOT/m11.json"
+  bridge_convert_build_manifest tester "$SRC" "$fresh" "$WORKDIR" "$SLUG" > "$manifest"
+
+  # Outside canary whose bytes MATCH the source leaf -> a followed read would
+  # size+hash-match and falsely "skip".
+  local canary="$SMOKE_TMP_ROOT/t11-canary-outside"
+  cp "$SRC/$rel" "$canary"
+
+  # Swap a symlink into the FINAL dest component; the parents are real dirs so
+  # the rejection is specifically about the leaf, not an intermediate.
+  mkdir -p "$fresh/projects/$SLUG_A"
+  ln -s "$canary" "$fresh/$rel"
+
+  local result rc=0
+  result="$(bridge_convert_apply_manifest "$manifest" "TS-T11")" || rc=$?
+  smoke_assert_eq "1" "$rc" "T11: apply must fail closed when a dest leaf is a symlink"
+
+  local unsafe skipped created
+  unsafe="$(printf '%s' "$result" | python3 -c 'import json,sys; print(json.load(sys.stdin)["unsafe_dest"])')"
+  skipped="$(printf '%s' "$result" | python3 -c 'import json,sys; print(json.load(sys.stdin)["skipped"])')"
+  created="$(printf '%s' "$result" | python3 -c 'import json,sys; print(json.load(sys.stdin)["created"])')"
+  [[ "$unsafe" -ge 1 ]] || smoke_fail "T11: symlinked dest leaf not rejected as unsafe (unsafe=$unsafe)"
+  smoke_assert_eq "0" "$skipped" "T11: a symlinked dest leaf was recorded as a false skip-success"
+  smoke_assert_eq "$((EXPECTED_COUNT - 1))" "$created" "T11: the non-symlinked siblings did not migrate"
+  # The link was never followed into a real migrated file: the leaf is still the
+  # symlink, never converted to a copied regular file.
+  [[ -L "$fresh/$rel" ]] || smoke_fail "T11: dest leaf symlink was followed/replaced instead of rejected"
+  smoke_log "T11 OK — dest leaf symlink rejected (unsafe), never a false skip; siblings still migrate"
+}
+
+# ===========================================================================
+# T12 — leaf/final-component SOURCE symlink: a symlink swapped into the FINAL
+# source component (the build->apply window) is REJECTED and never followed into
+# the target. The outside canary it points at must stay untouched and no dest is
+# created from it.
+# ===========================================================================
+test_t12_src_leaf_symlink_rejected() {
+  local fresh="$SMOKE_TMP_ROOT/agent-home-t12/.claude"
+  local rel="projects/$SLUG_A/sid1.jsonl"
+  local manifest="$SMOKE_TMP_ROOT/m12.json"
+  bridge_convert_build_manifest tester "$SRC" "$fresh" "$WORKDIR" "$SLUG" > "$manifest"
+
+  local canary="$SMOKE_TMP_ROOT/t12-canary-outside"
+  printf 'CANARY-OUTSIDE-T12\n' > "$canary"
+
+  # Replace the real source leaf with a symlink AFTER the manifest is built (the
+  # build->apply window) — a final-component source symlink swap.
+  rm -f "$SRC/$rel"
+  ln -s "$canary" "$SRC/$rel"
+
+  local result rc=0
+  result="$(bridge_convert_apply_manifest "$manifest" "TS-T12")" || rc=$?
+  smoke_assert_eq "1" "$rc" "T12: apply must fail closed when a source leaf is a symlink"
+  local missing
+  missing="$(printf '%s' "$result" | python3 -c 'import json,sys; print(json.load(sys.stdin)["missing_src"])')"
+  [[ "$missing" -ge 1 ]] || smoke_fail "T12: symlinked source leaf not rejected (missing_src=$missing)"
+  # The symlinked source was never followed into the target.
+  [[ ! -e "$fresh/$rel" ]] || smoke_fail "T12: a dest was created from the symlinked source (link followed)"
+  grep -q 'CANARY-OUTSIDE-T12' "$canary" || smoke_fail "T12: outside canary content changed (source link followed)"
+
+  # Restore the fixture leaf for later cases.
+  rm -f "$SRC/$rel"
+  printf '{"cwd":"%s","sessionId":"sid1"}\n' "$WORKDIR" > "$SRC/$rel"
+  smoke_log "T12 OK — source leaf symlink rejected (missing-src); link never followed into target"
+}
+
+# ===========================================================================
+# T13 — read-side anchor: the equality fast-path + source read MUST be
+# O_NOFOLLOW fd-based. A revert to path-following reads (os.path.getsize /
+# open(...,"rb") / os.open(src, os.O_RDONLY)) re-opens the final-component
+# leaf-swap TOCTOU and MUST fail this smoke.
+# ===========================================================================
+test_t13_apply_reads_are_nofollow() {
+  local apply="$_BRIDGE_CONVERT_APPLY_PY"
+  printf '%s' "$apply" | grep -q 'os.O_RDONLY | os.O_NOFOLLOW' \
+    || smoke_fail "T13: apply lost the O_NOFOLLOW source/dest leaf read (read-side TOCTOU reopened)"
+  if printf '%s' "$apply" | grep -q 'os.path.getsize('; then
+    smoke_fail "T13: apply uses path-following os.path.getsize() for the equality compare"
+  fi
+  if printf '%s' "$apply" | grep -Eq 'open\([^)]*"rb"\)'; then
+    smoke_fail "T13: apply hashes a leaf via path-following open(...,\"rb\")"
+  fi
+  if printf '%s' "$apply" | grep -q 'os.open(src,'; then
+    smoke_fail "T13: apply re-opens the source by path (must read from the nofollow fd)"
+  fi
+  smoke_log "T13 OK — apply source/dest leaf reads are O_NOFOLLOW fd-based (read-side TOCTOU closed)"
+}
+
+# ===========================================================================
 # T7 — resolve_config_dirs: dynamic-vanilla source/target derivation + iso
 # fail-closed. Roster-driven, so run in a fresh bash that loads bridge-lib.
 # ===========================================================================
@@ -423,6 +522,9 @@ smoke_run "T6 internal rollback restores pre-apply target" test_t6_rollback
 smoke_run "T8 missing source fails apply closed (rollback-recoverable)" test_t8_missing_src_fail_closed
 smoke_run "T9 symlinked target rejected (no traversal escape)" test_t9_symlink_fail_closed
 smoke_run "T10 overwrite backs up + rollback restores the original" test_t10_overwrite_backup_restore
+smoke_run "T11 dest leaf symlink rejected (no false skip-success)" test_t11_dest_leaf_symlink_rejected
+smoke_run "T12 source leaf symlink rejected (link never followed)" test_t12_src_leaf_symlink_rejected
+smoke_run "T13 apply source/dest leaf reads are O_NOFOLLOW fd-based" test_t13_apply_reads_are_nofollow
 smoke_run "T7 resolve dynamic-vanilla source/target derivation" test_t7_resolve
 smoke_run "T7 iso-effective target fails closed" test_t7_iso_fail_closed
 
