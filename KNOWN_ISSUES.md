@@ -1130,12 +1130,13 @@ agent's transcripts (`projects/<cwd>/*.jsonl`) and accumulated auto-memory
 Sanctioned path:
 
 - `agent-bridge agent convert <agent> --to static` is the config-dir-aware
-  converter (OPERATIONS.md "Converting a dynamic agent to static"). It enumerates
-  every cwd the agent used, migrates transcripts + auto-memory into the target
-  config dir with a **manifest + `--dry-run` + on-disk backup**, pins a
-  **transcript-validated** resume id, and flips the roster (the last
-  state-stranding step) through the audited writer so a partial failure never
-  leaves a static-but-empty role.
+  converter (OPERATIONS.md "Converting a dynamic agent to static"). It migrates
+  the agent's workdir + descendant cwds (transcripts + auto-memory) into the
+  target config dir — surfacing any outside-workdir cwd the agent used as an
+  `--include-cwd` candidate (migrated only when confirmed) — with a **manifest +
+  `--dry-run` + on-disk backup**, pins a **transcript-validated** resume id, and
+  flips the roster (the last state-stranding step) through the audited writer so
+  a partial failure never leaves a static-but-empty role.
 
 MVP scope (do not expect the rest yet):
 
