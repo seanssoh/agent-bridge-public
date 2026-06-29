@@ -191,14 +191,18 @@ test_t2_apply_byte_equal() {
 
   # Byte-equality + mtime over the MIGRATED set (the manifest's src/dest pairs),
   # NOT the whole source tree — the skipped sibling cwd is deliberately absent.
-  local src dest
+  # NOTE: route the pair list through a temp file with a plain file redirect,
+  # NOT a process substitution feeding the while-loop — the procsub form is
+  # flagged by the lint-heredoc-ban baseline ratchet (H3, footgun #11 family).
+  local src dest _t2pairs="${manifest}.t2pairs"
+  python3 -c 'import json,sys
+m=json.load(open(sys.argv[1]))
+for f in m["files"]:
+    print(f["src"] + "\t" + f["dest"])' "$manifest" > "$_t2pairs"
   while IFS=$'\t' read -r src dest; do
     [[ -n "$src" ]] || continue
     cmp -s "$src" "$dest" || smoke_fail "T2: dest not byte-equal to src: $dest"
-  done < <(python3 -c 'import json,sys
-m=json.load(open(sys.argv[1]))
-for f in m["files"]:
-    print(f["src"] + "\t" + f["dest"])' "$manifest")
+  done < "$_t2pairs"
 
   python3 -c '
 import json, os, sys
