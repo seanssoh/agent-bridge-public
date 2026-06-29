@@ -494,6 +494,25 @@ def _is_required_contract_name(name: str) -> bool:
     return name in _REQUIRED_CONTRACT_NAMES
 
 
+def _is_node_modules_internal(rel: Path) -> bool:
+    """True when ``rel`` lives *inside* a ``node_modules`` directory. Issue #2098.
+
+    Structural building block for the required-contract policy: a file whose
+    basename matches the plugin contract (``package.json`` etc.) but that sits
+    under a ``node_modules`` ancestor belongs to a *transitive dependency*, not
+    the plugin itself. Callers combine this with the overlay's symlink-outside
+    skip so a type-only / symlinked devDep does not break the seed while a real
+    nested dependency manifest stays required (Issue #2182). Only ancestor
+    directory components are inspected (``rel.parts[:-1]``) so the plugin's own
+    top-level ``package.json`` / ``plugin.json`` / ``server.ts`` — which have no
+    ``node_modules`` ancestor — are never matched. ``rel`` must be relative to
+    the source/marketplace root, not absolute, so a host path that merely
+    happens to contain a ``node_modules`` segment above the source root can
+    never match.
+    """
+    return NODE_MODULES_NAME in rel.parts[:-1]
+
+
 SENSITIVE_KEY_PARTS = (
     "authorization",
     "api_key",
@@ -694,7 +713,22 @@ def _overlay_entry(
     # copies it and returns the changed flag. Non-required entries skip
     # this branch and fall through to the normal skip/copy policy below.
     if _is_required_contract_name(name):
-        return _overlay_required_contract_entry(entry, target, source_root, agent=agent)
+        # Resolve the PARENT (not the leaf, so a symlinked contract file is not
+        # followed) before taking the path relative to the resolved source_root.
+        # This keeps the node_modules check robust when the source path and the
+        # resolved source_root differ only by a symlinked prefix, e.g. macOS
+        # /var -> /private/var (otherwise `relative_to` raises and the entry is
+        # misclassified). On any failure, stay strict (fail-closed) and treat it
+        # as the plugin's own contract.
+        try:
+            rel = (entry.parent.resolve() / name).relative_to(source_root)
+        except (OSError, ValueError):
+            rel = Path(name)
+        # A transitive dep's manifest under node_modules is NOT the plugin's
+        # own contract (#2098) — let it follow the normal skip/copy policy so a
+        # type-only / symlinked dep cannot fail-loud the whole cache build.
+        if not _is_node_modules_internal(rel):
+            return _overlay_required_contract_entry(entry, target, source_root, agent=agent)
 
     sidecar_reason = _sidecar_skip_reason(name)
     if sidecar_reason is not None:
@@ -949,7 +983,7 @@ def link_source_node_modules(source_path: Path, cache_version_path: Path) -> tup
 
 
 def _find_missing_required_contract(
-    cache_version_path: Path, source_path: Path
+    cache_version_path: Path, source_path: Path, source_root: Path | None = None
 ) -> str | None:
     """Return a reason if a required-contract file in source is absent in cache.
 
@@ -960,14 +994,33 @@ def _find_missing_required_contract(
     cache that is missing its contract material.
 
     Invariant: every required-contract file that EXISTS in the source tree
-    (matched by basename, at any depth) must be present at the same
-    relative path in the cache. We only require what the source has — a
-    `.mjs` proxy plugin that legitimately ships without `package.json` /
-    `server.ts` is not penalized (we never assert a file the source lacks).
+    (matched by basename, at any depth) must be present at the same relative
+    path in the cache. We only require what the source has — a `.mjs` proxy
+    plugin that legitimately ships without `package.json` / `server.ts` is not
+    penalized (we never assert a file the source lacks).
+
+    One exclusion (Issue #2098): a required-contract file *inside*
+    ``node_modules`` that is a symlink resolving OUTSIDE the marketplace source
+    root is a transitive dependency the overlay (correctly) skips as a
+    v1-isolation / type-only-devDep leftover — it is not the plugin's own
+    contract, so verify must mirror that skip instead of failing an
+    otherwise-complete cache. The boundary MUST be the same marketplace
+    ``source_root`` the overlay uses (not just the plugin dir): a dep manifest
+    symlinked to an intra-marketplace sibling is copied by the overlay and must
+    stay required here too — using the narrower plugin dir would wrongly exclude
+    it and certify an incomplete cache (codex r1). A REAL nested dependency
+    manifest (e.g. ``node_modules/@azure/.../package.json``) is not a symlink,
+    stays required, and a partial copy of it is still caught (preserves the
+    Issue #2182 partial-copy detection). When ``source_root`` is omitted (legacy
+    callers) the plugin ``source_path`` is the boundary, as before.
 
     Any I/O error walking the source is reported as a verify failure (a
     source we cannot enumerate is not a cache we can certify).
     """
+    try:
+        boundary = (source_root if source_root is not None else source_path).resolve()
+    except OSError as exc:
+        return f"required-contract-source-resolve-failed:{exc}"
     try:
         source_entries = list(os.walk(source_path, followlinks=False))
     except OSError as exc:
@@ -981,6 +1034,15 @@ def _find_missing_required_contract(
                 rel = src_file.relative_to(source_path)
             except ValueError:
                 continue
+            # A node_modules-internal contract file reached through a symlink
+            # resolving outside the marketplace source root is a transitive dep
+            # the overlay skips (#2098) — mirror that skip. A real nested
+            # manifest is not a symlink, so it stays required and #2182
+            # partial-copy detection is preserved.
+            if _is_node_modules_internal(rel) and _is_symlink_outside_source_root(
+                src_file, boundary
+            ):
+                continue
             cache_file = cache_version_path / rel
             try:
                 present = cache_file.is_file()
@@ -992,7 +1054,7 @@ def _find_missing_required_contract(
 
 
 def _verify_cache_version_path(
-    cache_version_path: Path, source_path: Path
+    cache_version_path: Path, source_path: Path, source_root: Path | None = None
 ) -> tuple[bool, str]:
     """Post-link verification under the running UID.
 
@@ -1049,7 +1111,9 @@ def _verify_cache_version_path(
     # Issue #1663 (P1 defense-in-depth) — a usable cache dir is not enough;
     # the required-contract material must actually be in it. Fail verify if
     # any required-contract file present in source is missing from cache.
-    missing = _find_missing_required_contract(resolved, source_path)
+    # `source_root` (the marketplace root) is forwarded so the #2098 exclusion
+    # uses the same symlink-outside boundary the overlay uses (codex r1).
+    missing = _find_missing_required_contract(resolved, source_path, source_root)
     if missing is not None:
         return False, missing
 
@@ -1123,7 +1187,7 @@ def _atomic_build_cache_version(
         # Verify the required contract on the TEMP before exposing it. A fresh
         # build that came out missing contract material must never be promoted
         # to the live cache path.
-        ok, reason = _verify_cache_version_path(temp_path, source_path)
+        ok, reason = _verify_cache_version_path(temp_path, source_path, source_root=root)
         if not ok:
             raise RequiredContractUnreadable(
                 f"required-contract-missing-after-fresh-build:{reason}"
@@ -1147,7 +1211,10 @@ def _atomic_build_cache_version(
 
 
 def _retire_cache_if_incomplete(
-    cache_version_path: Path, source_path: Path, plugin_cache_root: Path
+    cache_version_path: Path,
+    source_path: Path,
+    plugin_cache_root: Path,
+    source_root: Path | None = None,
 ) -> bool:
     """Atomically retire cache_version_path IFF it is still incomplete (#2182).
 
@@ -1173,7 +1240,7 @@ def _retire_cache_if_incomplete(
     atomic non-empty-directory replace; closing that last gap would require full
     per-version serialization, intentionally not taken for this hotfix.
     """
-    ok, reason = _verify_cache_version_path(cache_version_path, source_path)
+    ok, reason = _verify_cache_version_path(cache_version_path, source_path, source_root)
     if ok or not reason.startswith("required-contract-missing-in-cache:"):
         return False
     doomed = plugin_cache_root / f".{cache_version_path.name}.doomed.{os.getpid()}"
@@ -1363,13 +1430,13 @@ def sync_plugin_cache(root: Path, channel: str, agent: str = "") -> dict[str, st
             # appeared, it returns False and we fall to the cheap in-place
             # refresh below instead.
             existing_ok, existing_reason = _verify_cache_version_path(
-                cache_version_path, source_path
+                cache_version_path, source_path, source_root=root
             )
             if (
                 not existing_ok
                 and existing_reason.startswith("required-contract-missing-in-cache:")
                 and _retire_cache_if_incomplete(
-                    cache_version_path, source_path, plugin_cache_root
+                    cache_version_path, source_path, plugin_cache_root, source_root=root
                 )
             ):
                 _atomic_build_cache_version(
@@ -1487,7 +1554,9 @@ def sync_plugin_cache(root: Path, channel: str, agent: str = "") -> dict[str, st
     # the running UID before promoting the status to a `*-verified`
     # label. Failure relabels to `linked-failed` with a structured
     # reason and the criticality split decides block vs warn.
-    verified, verify_reason = _verify_cache_version_path(cache_version_path, source_path)
+    verified, verify_reason = _verify_cache_version_path(
+        cache_version_path, source_path, source_root=root
+    )
     if not verified:
         # Issue #2182 Part B (defense-in-depth) — fresh builds are now atomic +
         # pre-verified and a partial existing cache is rebuilt above, so this
@@ -1502,7 +1571,9 @@ def sync_plugin_cache(root: Path, channel: str, agent: str = "") -> dict[str, st
         # half-deleted). It is itself scoped to the contract-missing reason, so
         # a source-side or permission failure leaves the directory untouched.
         if verify_reason.startswith("required-contract-missing-in-cache:"):
-            _retire_cache_if_incomplete(cache_version_path, source_path, plugin_cache_root)
+            _retire_cache_if_incomplete(
+                cache_version_path, source_path, plugin_cache_root, source_root=root
+            )
         return {
             "channel": channel,
             "plugin": plugin_name,
