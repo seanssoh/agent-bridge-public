@@ -124,6 +124,17 @@ if [[ "${_PSW_ENABLED:-1}" != "1" ]]; then
     exit 0
 fi
 
+# #2217 roadmap step 4: source the shared reactive-rotation cooldown helpers so a
+# rate-limit rotation by picker-sweep and by the daemon's reactive-429 path
+# share ONE "already rotated this event" gate (the lock dir already matches; the
+# cooldown is the cross-path dedup). Self-contained (no full bridge-lib chain) —
+# best-effort: if the helper is absent (older install) picker-sweep keeps its own
+# local cooldown only, exactly as before.
+if [[ -r "$BRIDGE_HOME/lib/bridge-reactive-rotate.sh" ]]; then
+    # shellcheck source=../lib/bridge-reactive-rotate.sh
+    source "$BRIDGE_HOME/lib/bridge-reactive-rotate.sh" 2>/dev/null || true
+fi
+
 # ---------------------------------------------------------------------------
 # Required runtime knobs. We do NOT fall back to BRIDGE_ADMIN_AGENT_ID even
 # when the roster is sourced — silent admin-as-default would re-introduce the
@@ -331,6 +342,17 @@ _psw_rate_limit_rotation_due() {
     local cooldown="${BRIDGE_PICKER_SWEEP_RATE_LIMIT_ROTATE_COOLDOWN_SECONDS:-1800}"
     local file="" next_ts="" now=0
 
+    # #2217 roadmap step 4: respect the SHARED cross-path cooldown first — a
+    # recent rotate by the daemon's reactive-429 path (or a prior picker rotate
+    # that wrote the shared stamp) suppresses this one, so picker + daemon never
+    # double-rotate one rate-limit event. Best-effort: when the shared helper is
+    # not loaded (older install) this is a no-op and the local cooldown governs.
+    if declare -f bridge_reactive_rotate_cooldown_active >/dev/null 2>&1; then
+        if bridge_reactive_rotate_cooldown_active; then
+            return 1
+        fi
+    fi
+
     [[ "$cooldown" =~ ^[0-9]+$ ]] || cooldown=1800
     (( cooldown > 0 )) || return 0
 
@@ -345,6 +367,18 @@ _psw_rate_limit_rotation_due() {
 _psw_note_rate_limit_rotation_attempt() {
     local cooldown="${BRIDGE_PICKER_SWEEP_RATE_LIMIT_ROTATE_COOLDOWN_SECONDS:-1800}"
     local file="" now=0 next_ts=0
+
+    # #2217 roadmap step 4: stamp the SHARED cross-path cooldown FIRST so a picker
+    # rotate suppresses a same-event daemon reactive-429 rotate. This MUST run
+    # independently of the picker's LOCAL cooldown knob — when
+    # BRIDGE_PICKER_SWEEP_RATE_LIMIT_ROTATE_COOLDOWN_SECONDS=0 (local cooldown
+    # disabled) the local stamp below early-returns, but the shared cooldown (with
+    # its own BRIDGE_REACTIVE_ROTATE_COOLDOWN_SECONDS default) must still latch or
+    # the daemon could re-rotate the same event after the lock releases. Best-
+    # effort: a no-op when the shared helper is not loaded (older install).
+    if declare -f bridge_reactive_rotate_cooldown_note >/dev/null 2>&1; then
+        bridge_reactive_rotate_cooldown_note || true
+    fi
 
     [[ "$cooldown" =~ ^[0-9]+$ ]] || cooldown=1800
     (( cooldown > 0 )) || return 0
