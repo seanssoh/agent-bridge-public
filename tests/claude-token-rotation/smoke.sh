@@ -1143,9 +1143,58 @@ if mod.parse_reset_at("resets Jul 1,12pm (UTC)", ref) != "2026-07-01T12:00:00+00
 for bad in ("resets Jul 1 at 12pm (Mars/Phobos)", "resets Jul 1 at 12pm (Not_A_Zone)"):
     if mod.parse_reset_at(bad, ref) != "":
         raise SystemExit(f"unknown tz should yield '' for {bad!r}")
+
+# Session-limit (5h) 429 carries a BARE clock with no date —
+# ``You've hit your session limit · resets 12:10pm (Asia/Seoul)``. The
+# date-anchored weekly regex never matches it (a digit right after ``resets``
+# fails its month-name group), so before this branch reset_at came back "" and
+# a ~hours session cap was indistinguishable from a multi-day weekly cap.
+# Resolve to the NEXT occurrence of the wall-clock in the named zone. Guard the
+# zone-dependent asserts on tzdata availability (same contract as the weekly
+# named-tz cases above).
+if mod._resolve_reset_tz("Asia/Seoul") is not None:
+    seoul_cases = {
+        # 12:10pm KST = 03:10 UTC; ref(00:00Z) is earlier the same Seoul day -> today.
+        "resets 12:10pm (Asia/Seoul)": "2026-01-01T03:10:00+00:00",
+        "You've hit your session limit · resets 12:10pm (Asia/Seoul)": "2026-01-01T03:10:00+00:00",
+    }
+    for text, expect in seoul_cases.items():
+        got = mod.parse_reset_at(text, ref)
+        if got != expect:
+            raise SystemExit(f"bare-clock session parse wrong: {text!r} -> {got!r} (want {expect!r})")
+    # Late-night WRAP: at 2026-01-02 05:00 KST the next 1am is the 3rd (KST) =
+    # 2026-01-02T16:00Z. Proves the in-zone next-day roll (not a UTC "today").
+    ref_wrap = datetime(2026, 1, 1, 20, 0, tzinfo=timezone.utc)
+    got = mod.parse_reset_at("resets 1am (Asia/Seoul)", ref_wrap)
+    if got != "2026-01-02T16:00:00+00:00":
+        raise SystemExit(f"bare-clock late-night wrap wrong: {got!r} (want 2026-01-02T16:00:00+00:00)")
+
+# (UTC) bare clock, no minutes, resolves the same way (UTC always resolvable).
+if mod.parse_reset_at("resets 3am (UTC)", ref) != "2026-01-01T03:00:00+00:00":
+    raise SystemExit("bare-clock (UTC) form must parse")
+
+# A bare clock with NO zone parens must REJECT (no over-match on a stray time).
+if mod.parse_reset_at("resets 12:10pm", ref) != "":
+    raise SystemExit("bare clock without a zone must reject")
+# Unknown zone on a bare clock -> graceful "" (never raises).
+if mod.parse_reset_at("resets 12:10pm (Mars/Phobos)", ref) != "":
+    raise SystemExit("bare-clock unknown tz should yield ''")
+
+# Real session-message SHAPE (prose + middle-dot + bare clock) must parse on
+# ANY host — use (UTC) so this asserts the regex/anchor unconditionally, even
+# where Asia/Seoul tzdata is absent and the named cases above were skipped.
+if mod.parse_reset_at("You've hit your session limit · resets 12:10pm (UTC)", ref) != "2026-01-01T12:10:00+00:00":
+    raise SystemExit("real session-limit prose shape must parse via (UTC)")
+
+# Malformed bare clocks must FAIL CLOSED ("") instead of raising out of the
+# probe — parse_reset_at returns "" for anything it cannot turn into a real
+# instant (mirrors the unknown-zone contract).
+for bad in ("resets 13pm (UTC)", "resets 12:60pm (UTC)", "resets 99:99pm (UTC)"):
+    if mod.parse_reset_at(bad, ref) != "":
+        raise SystemExit(f"malformed bare clock must yield '' (no raise) for {bad!r}")
 PY
 [[ $? -eq 0 ]] || fail "parse_reset_at named-tz / fallback unit cases failed (#17927 G1)"
-pass "parse_reset_at parses the named-tz weekly reset, keeps legacy forms, falls back on unknown tz"
+pass "parse_reset_at parses named-tz weekly + bare-clock session resets, keeps legacy forms, falls back on unknown tz"
 
 # ---------------------------------------------------------------------------
 # #17927 G1/G2 — mark-quota stamps limited_until from the parsed reset, and

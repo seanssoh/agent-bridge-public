@@ -1365,6 +1365,55 @@ def parse_reset_at(text: str, reference: datetime | None = None) -> str:
                 candidate = local.replace(year=reference.year + 1).astimezone(timezone.utc)
             return candidate.isoformat(timespec="seconds")
 
+    # The 5-hour SESSION-limit 429 carries a BARE clock time with no date —
+    # ``You've hit your session limit · resets 12:10pm (Asia/Seoul)`` — which the
+    # date-anchored ``absolute`` pattern never matches (it requires a month name
+    # + day, and the digit right after ``resets`` makes its ``[A-Za-z]+`` month
+    # group fail). Parse the bare clock and resolve it to the NEXT occurrence of
+    # that wall-clock time in the named zone (a session window always reopens
+    # within a few hours). The ``(zone)`` parens are REQUIRED so a stray bare
+    # ``resets 3pm`` with no zone cannot over-match. Without this branch the
+    # probe records the 429 but leaves ``reset_at`` empty, so a short ~hours
+    # session cap is indistinguishable downstream from a multi-day weekly cap.
+    bare_clock = re.search(
+        r"\bresets?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*\(\s*([A-Za-z0-9_+\-/]+)\s*\)",
+        text,
+        re.IGNORECASE,
+    )
+    if bare_clock:
+        zone = _resolve_reset_tz(bare_clock.group(4))
+        if zone is not None:
+            hour = int(bare_clock.group(1))
+            minute = int(bare_clock.group(2) or "0")
+            meridiem = bare_clock.group(3).lower()
+            # Fail closed on a malformed clock (``13pm``, ``12:60pm``,
+            # ``99:99pm``) instead of letting datetime() raise out of the probe
+            # later: parse_reset_at's contract is to return "" for anything it
+            # cannot turn into a real instant, exactly like the unknown-zone path.
+            if not (1 <= hour <= 12 and 0 <= minute <= 59):
+                return ""
+            if meridiem == "pm" and hour != 12:
+                hour += 12
+            if meridiem == "am" and hour == 12:
+                hour = 0
+            # "Today" is computed in the STATED zone, not UTC: at 01:32Z the
+            # Seoul wall date is already the 30th and 12:10pm Seoul is still
+            # ahead — anchoring on a UTC "today" would mis-date it. If the
+            # wall-clock already passed today in-zone (late-night wrap), roll to
+            # the next calendar day in-zone (rebuilt, not +24h, so a DST day
+            # keeps the same wall-clock).
+            local_now = reference.astimezone(zone)
+            local = datetime(
+                local_now.year, local_now.month, local_now.day,
+                hour, minute, tzinfo=zone,
+            )
+            if local.astimezone(timezone.utc) < reference:
+                nxt = local_now + timedelta(days=1)
+                local = datetime(
+                    nxt.year, nxt.month, nxt.day, hour, minute, tzinfo=zone,
+                )
+            return local.astimezone(timezone.utc).isoformat(timespec="seconds")
+
     relative = re.search(r"\bresets?\s+in\s+(\d+)h(?:\s+(\d+)m)?", text, re.IGNORECASE)
     if relative:
         hours = int(relative.group(1))
