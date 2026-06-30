@@ -1139,7 +1139,12 @@ the cron disposable child. On Darwin the probe reads the kernel pressure tier
 `sysctl kern.memorystatus_vm_pressure_level` (`1`=Normal, `2`=Warn,
 `4`=Critical — Apple's calibrated metric, the same one Activity Monitor's
 "Memory Pressure" graph uses) and rejects dispatch only when the level meets
-or exceeds `BRIDGE_CRON_DARWIN_PRESSURE_LEVEL` (default `2` = Warn).
+or exceeds `BRIDGE_CRON_DARWIN_PRESSURE_LEVEL` (default `4` = Critical). Warn
+(`2`) is a normal-operational, chronically *sticky* macOS tier — defaulting the
+gate to Warn deferred cron dispatch **indefinitely** on a single transient
+spike (the 11h fleet-wide cron outage of #2197), so the default defers only at
+true Critical pressure; set the knob lower (e.g. `2`) only if you want the
+conservative Warn-tier gate.
 `vm.swapusage` is **not** a pressure signal on macOS — the kernel uses swap as
 a normal tier of the memory hierarchy, so a healthy host routinely sits at
 80–90 %+ swap, and gating on swap-percent chronically false-defers all cron

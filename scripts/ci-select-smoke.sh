@@ -1006,7 +1006,8 @@ select_for_path() {
         # gating on swap-percent chronically false-defers ALL cron dispatch on
         # macOS (a healthy host routinely sits at 80-90%+ swap). Pull the smoke
         # on every bridge-cron.sh move so a refactor cannot revert to the
-        # swap-only gate or disable the real-pressure (level>=Warn) defer.
+        # swap-only gate or disable the real-pressure (level>=Critical default,
+        # #2197) defer.
         add_required 1929-macos-memory-pressure
         # Incident #8807: bridge_check_memory_pressure is the primitive the
         # resource-guard (lib/bridge-resource-guard.sh) delegates its mem-pressure
