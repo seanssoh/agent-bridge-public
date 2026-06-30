@@ -570,7 +570,7 @@ def _daemon_is_launchd_managed() -> bool:
     if sys.platform != "darwin":
         return False
     config_path = BRIDGE_STATE_DIR / "launchagent.config"
-    if config_path.is_file():
+    if config_path.is_file():  # noqa: raw-pathlib-controller-only — controller-owned launchagent.config
         try:
             for line in config_path.read_text(
                 encoding="utf-8", errors="replace"
@@ -591,7 +591,7 @@ def _daemon_is_launchd_managed() -> bool:
     if not plist:
         home = os.environ.get("HOME", "").strip() or str(Path.home())
         plist = str(Path(home) / "Library" / "LaunchAgents" / f"{label}.plist")
-    return bool(label and Path(plist).is_file())
+    return bool(label and Path(plist).is_file())  # noqa: raw-pathlib-controller-only — controller-owned launchd plist
 
 
 def _daemon_owner_record() -> dict:
@@ -603,7 +603,7 @@ def _daemon_owner_record() -> dict:
     unreadable owner record must never escape into the escalation path).
     """
     owner_path = Path(f"{BRIDGE_DAEMON_PID_FILE}.owner")
-    if not owner_path.is_file():
+    if not owner_path.is_file():  # noqa: raw-pathlib-controller-only — daemon-owned singleton .owner record
         return {}
     record: dict = {}
     try:
