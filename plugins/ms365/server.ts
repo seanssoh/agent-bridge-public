@@ -56,6 +56,7 @@ import {
 import {
   chmodSync,
   closeSync,
+  existsSync,
   mkdirSync,
   openSync,
   readdirSync,
@@ -68,7 +69,7 @@ import {
   writeSync,
 } from 'fs'
 import { homedir, hostname } from 'os'
-import { basename, resolve, sep, join } from 'path'
+import { basename, dirname, resolve, sep, join } from 'path'
 import { randomUUID } from 'crypto'
 import {
   hasChatDisclaimerBeenSent,
@@ -1403,25 +1404,44 @@ function isPathInside(parent: string, child: string): boolean {
 
 function resolveAttachmentSaveDir(raw: unknown): string {
   const root = resolve(ATTACHMENTS_DIR)
+  // realpath the root once (it exists — ensureDirs created it) so a symlinked
+  // ATTACHMENTS_DIR normalizes consistently on both sides of every check.
+  const realRoot = realpathSync(root)
   const s = String(raw ?? '').trim()
   const target = s ? resolve(root, s) : root
   // Lexical containment is a fast first gate, but path.resolve does NOT follow
   // symlinks, so a save_dir like `escape` where `<root>/escape` is a symlink to
-  // a directory OUTSIDE the root passes this check and then mkdir/write follow
-  // the link out of the sandbox (codex review: real lands in /tmp/outside/...).
+  // a directory OUTSIDE the root passes this check; without the realpath gate
+  // below, mkdir/chmod/write would then follow the link out of the sandbox.
   if (!isPathInside(root, target)) {
     throw new Error(`save_dir must be inside the ms365 attachments directory (${root})`)
   }
+  // Validate BEFORE any filesystem mutation. mkdirSync({recursive:true}) and
+  // chmodSync FOLLOW symlinks, so a post-mkdir realpath check is too late — it
+  // would already have created a dir or chmod'd a target THROUGH a symlinked
+  // component that points outside the root (codex r2: repro1 chmod'd /tmp/outside
+  // to 0700; repro2 `mid -> /outside2` + save_dir=`mid/newdir` created
+  // /tmp/outside2/newdir). Resolve the longest ALREADY-EXISTING ancestor of the
+  // target (which collapses any symlinked target OR intermediate component) and
+  // require it to sit inside the real root before we touch the filesystem.
+  let ancestor = target
+  while (!existsSync(ancestor)) {
+    const parent = dirname(ancestor)
+    if (parent === ancestor) break // reached filesystem root
+    ancestor = parent
+  }
+  const realAncestor = realpathSync(ancestor)
+  if (!isPathInside(realRoot, realAncestor)) {
+    throw new Error(`save_dir must resolve inside the ms365 attachments directory (${realRoot})`)
+  }
+  // The existing ancestor is inside root; any remaining components do not exist
+  // yet (so they cannot be pre-planted symlinks). Create + lock them down.
   mkdirSync(target, { recursive: true, mode: 0o700 })
   try {
     chmodSync(target, 0o700)
   } catch {}
-  // Re-check containment with ALL symlinks resolved (root + target now exist).
-  // realpathSync collapses every symlinked component, so a target that lexically
-  // sat under the root but physically resolves outside it is rejected BEFORE any
-  // attachment is written. realpath the root too so a symlinked ATTACHMENTS_DIR
-  // is normalized consistently on both sides.
-  const realRoot = realpathSync(root)
+  // Final defense-in-depth: realpath the now-created target and re-verify it did
+  // not escape (closes any residual race on the freshly-created leaf).
   const realTarget = realpathSync(target)
   if (!isPathInside(realRoot, realTarget)) {
     throw new Error(`save_dir must resolve inside the ms365 attachments directory (${realRoot})`)
