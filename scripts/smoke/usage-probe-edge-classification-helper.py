@@ -51,6 +51,7 @@ import importlib.util
 import json
 import os
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -390,6 +391,14 @@ def main() -> int:
         reg_a = _registry(tmp, MOCK_TOKEN_A)
         res = _run(tmp, http_get=_stub_http_error(429, RATE_LIMIT_BODY, 3143.0, headers=ANTHROPIC_HEADERS), registry=reg_a, now=1000.0)
         cache_path = Path(res["cache_path"])
+        # Freshness keys on the payload's `_written_at` (content age), so model the
+        # write at the SAME synthetic write-clock as `now=1000` (in production both
+        # the write and the later read use wall time, so age is real elapsed). The
+        # probe stamps `_written_at` from the real clock, so normalize it here to
+        # the synthetic write time and keep mtime aligned for the legacy fallback.
+        _c = json.loads(cache_path.read_text())
+        _c["_written_at"] = datetime.fromtimestamp(1000.0, timezone.utc).isoformat()
+        cache_path.write_text(json.dumps(_c), encoding="utf-8")
         os.utime(cache_path, (1000.0, 1000.0))
         # Same token, within max_age → fresh (no call).
         calls = {"n": 0}
@@ -466,6 +475,88 @@ def main() -> int:
         r_stale = _run(tmp, http_get=_stub_ok(OK_BODY, calls=calls), registry=reg, now=5500.0, max_age=300.0)
         check(calls["n"] == 1, "stale tap cache (age 500s) no longer suppresses the probe")
         check(r_stale["status"] == "written", "probe refreshed the cache on the headless path")
+
+    # --- (E2) #20832: freshness is judged by CONTENT age (`_written_at`), NOT
+    # the file mtime. The live sean-mac bug: a statusLine tap re-touches the cache
+    # file mtime far more often than it writes a NEW rate_limits payload, so an
+    # mtime-first gate trusted a 9h-old (and a 16-day-old) `stdin-tap` body whose
+    # mtime was fresh and PERMANENTLY suppressed the native probe → the active
+    # token hard-capped with no rotation. `_written_at` (stamped only on a REAL
+    # measurement) is now authoritative; mtime is a legacy-only fallback.
+    print("[E2] content-age (`_written_at`) gates freshness, not file mtime (#20832 live bug)")
+
+    def _written(now_clock: float, age_s: float) -> str:
+        return datetime.fromtimestamp(now_clock - age_s, timezone.utc).isoformat()
+
+    NOW = 1_700_000_000.0
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        reg = _registry(tmp, MOCK_TOKEN_A)
+        cache_path = tmp / "plugins" / "claude-hud" / ".usage-cache.json"
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+        def _put(source, written_age_s, *, mtime_age_s, digest=None):
+            payload = {"data": {"planName": "subscription", "fiveHour": 16.0, "sevenDay": 41.0,
+                                "fiveHourResetAt": None, "sevenDayResetAt": None},
+                       "_source": source, "_written_at": _written(NOW, written_age_s)}
+            if digest is not None:
+                payload["_token_digest"] = digest
+            cache_path.write_text(json.dumps(payload), encoding="utf-8")
+            t = NOW - mtime_age_s
+            os.utime(cache_path, (t, t))
+
+        # (1) THE LIVE BUG: stdin-tap, _written_at 9h old, mtime FRESH → the probe
+        #     must RUN and write a native cache (a stale body no longer hides behind
+        #     a touched mtime).
+        _put("stdin-tap", 9 * 3600, mtime_age_s=1)
+        calls = {"n": 0}
+        r = _run(tmp, http_get=_stub_ok(OK_BODY, calls=calls), registry=reg, now=NOW, max_age=300.0)
+        check(calls["n"] == 1, "(1) stale `_written_at` tap + FRESH mtime → probe runs (the #20832 fix)")
+        check(r["status"] == "written", "(1) probe overwrote the stale tap with a fresh native reading")
+
+        # (2) Fresh _written_at tap → ZERO HTTP even if the mtime is old (live tap
+        #     data still wins; the gate did not flip to mtime-strict).
+        _put("stdin-tap", 10, mtime_age_s=99_999)
+        calls = {"n": 0}
+        r = _run(tmp, http_get=_stub_ok(OK_BODY, calls=calls), registry=reg, now=NOW, max_age=300.0)
+        check(calls["n"] == 0, "(2) fresh `_written_at` tap → probe stands down (no HTTP), even with an OLD mtime")
+        check(json.loads(cache_path.read_text())["_source"] == "stdin-tap", "(2) live tap reading intact")
+
+        # (3) Stale _written_at native + MATCHING digest → still re-probes on content age.
+        digest = probe._token_signal_digest(MOCK_TOKEN_A)
+        _put("native-oauth-probe", 9 * 3600, mtime_age_s=1, digest=digest)
+        calls = {"n": 0}
+        r = _run(tmp, http_get=_stub_ok(OK_BODY, calls=calls), registry=reg, now=NOW, max_age=300.0)
+        check(calls["n"] == 1, "(3) stale `_written_at` native + matching digest → probe refreshes")
+
+        # (4) Digest MISMATCH → stale regardless of a fresh `_written_at` (ping-pong
+        #     guard preserved; a just-rotated token must not inherit the old reading).
+        _put("native-oauth-probe", 10, mtime_age_s=1, digest="deadbeefdeadbeef")
+        calls = {"n": 0}
+        r = _run(tmp, http_get=_stub_ok(OK_BODY, calls=calls), registry=reg, now=NOW, max_age=300.0)
+        check(calls["n"] == 1, "(4) fresh `_written_at` but mismatched digest → still stale → probe runs")
+
+    # (A+B) stale stdin-tap + an anthropic-origin 429 rate_limit_error → the probe
+    # runs (content-stale) AND emits the rate-limited synthetic signal cache (the
+    # reactive-on-429 backstop fires through the same freshened path).
+    print("[E3] stale tap + anthropic-origin 429 → probe runs and writes the rate-limited signal cache")
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        reg = _registry(tmp, MOCK_TOKEN_A)
+        cache_path = tmp / "plugins" / "claude-hud" / ".usage-cache.json"
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"data": {"planName": "subscription", "fiveHour": 16.0, "sevenDay": 41.0,
+                            "fiveHourResetAt": None, "sevenDayResetAt": None},
+                   "_source": "stdin-tap", "_written_at": _written(NOW, 9 * 3600)}
+        cache_path.write_text(json.dumps(payload), encoding="utf-8")
+        os.utime(cache_path, (NOW - 1, NOW - 1))  # fresh mtime, stale content
+        calls = {"n": 0}
+        _run(tmp, http_get=_stub_http_error(429, RATE_LIMIT_BODY, 3600.0, headers=ANTHROPIC_HEADERS, calls=calls),
+             registry=reg, now=NOW, max_age=300.0)
+        check(calls["n"] == 1, "(A+B) stale tap no longer suppressed the probe → the 429 HTTP call went out")
+        signal_cache = json.loads(cache_path.read_text())
+        check(signal_cache.get("_signal") == "rate_limit_429",
+              "(A+B) anthropic-origin 429 wrote the synthetic rate-limited signal (reactive backstop fires)")
 
     # ================= (F) audit TSV `-` sentinel ===========================
     print("[F] usage-probe-result-parse emits `-` for empty columns (no field collapse)")

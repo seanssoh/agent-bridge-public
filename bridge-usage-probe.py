@@ -777,16 +777,21 @@ def cache_is_fresh(
     (especially a synthetic near-limit signal, which would instantly re-rotate
     the fresh token: the rotation ping-pong bug). Tap caches carry no digest
     and are unaffected.
+
+    Freshness is judged by CONTENT age (the payload's ``_written_at`` stamp),
+    NOT the file mtime. The statusLine tap (hud-usage-tap.py) stamps
+    ``_written_at`` only when it writes a REAL rate_limits measurement, but the
+    cache file's mtime can be touched far more often (re-renders, re-reads),
+    so an mtime-first gate trusts a body that is hours/days stale and PERMANENTLY
+    suppresses the native probe — the #20832 sean-mac live bug: a 9h-old (and a
+    16-day-old) ``stdin-tap`` body with a fresh mtime blocked rotation-on-cap, so
+    the active token hard-capped with no proactive rotation. ``_written_at`` is
+    the authoritative content-freshness signal; mtime is only a fallback for a
+    legacy cache that predates the stamp (missing / unparseable).
     """
     try:
         st = cache_path.stat()
     except OSError:
-        return False
-    age = now - st.st_mtime
-    # A future-dated mtime (age < 0) means clock skew or a synthetic clock —
-    # do NOT treat it as fresh (better to re-probe than to trust a cache we
-    # cannot age). Anything older than max_age is stale.
-    if age < 0 or age >= max_age_seconds:
         return False
     try:
         payload = json.loads(cache_path.read_text(encoding="utf-8"))
@@ -795,6 +800,25 @@ def cache_is_fresh(
     if not isinstance(payload, dict):
         return False
     if payload.get("_source") not in FRESH_CACHE_SOURCES:
+        return False
+    # Content age from `_written_at` (authoritative); fall back to the file
+    # mtime ONLY when the stamp is missing/unparseable (legacy caches).
+    age: float | None = None
+    written_at = payload.get("_written_at")
+    if isinstance(written_at, str) and written_at:
+        try:
+            written_dt = datetime.fromisoformat(written_at.replace("Z", "+00:00"))
+            if written_dt.tzinfo is None:
+                written_dt = written_dt.replace(tzinfo=timezone.utc)
+            age = now - written_dt.timestamp()
+        except Exception:
+            age = None
+    if age is None:
+        age = now - st.st_mtime
+    # A future-dated stamp (age < 0) means clock skew or a synthetic clock —
+    # do NOT treat it as fresh (better to re-probe than to trust a cache we
+    # cannot age). Anything older than max_age is stale.
+    if age < 0 or age >= max_age_seconds:
         return False
     if active_token_digest:
         cache_digest = payload.get("_token_digest") or payload.get("_signal_token")

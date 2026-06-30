@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+from datetime import datetime, timezone
 import os
 import sys
 import tempfile
@@ -251,11 +252,16 @@ def main() -> int:
         # First probe writes a fresh native cache at now=5000.
         res1 = _run(tmp, http_get=_stub_ok(FIXTURE_1), registry=reg, now=5000.0, max_age=300.0)
         check(res1["status"] == "written", "initial probe wrote cache")
-        # Align the written cache's mtime with the synthetic clock so the
-        # freshness gate ages it against `now` consistently (production uses a
-        # real clock for both mtime and now, so this only matters under the
-        # synthetic test clock).
-        os.utime(Path(res1["cache_path"]), (5000.0, 5000.0))
+        # Align the written cache's CONTENT age (`_written_at`) AND mtime with the
+        # synthetic clock so the freshness gate ages it against `now` consistently
+        # (#20832: freshness now keys on `_written_at`; production uses a real clock
+        # for both the write and the read, so this only matters under the synthetic
+        # test clock).
+        _cp = Path(res1["cache_path"])
+        _c = json.loads(_cp.read_text())
+        _c["_written_at"] = datetime.fromtimestamp(5000.0, timezone.utc).isoformat()
+        _cp.write_text(json.dumps(_c), encoding="utf-8")
+        os.utime(_cp, (5000.0, 5000.0))
         marker = {"called": False}
 
         def _should_not_run(url, headers, timeout):
