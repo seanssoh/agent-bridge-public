@@ -143,10 +143,13 @@ export type DevReqAutofillIntent = {
 // allowlist (#20704: `suggestedPrice` + `manufacturingSuggestedPrice` are the
 // ONLY sales-permitted price fields; `mSuggestedReason` is forbidden). The
 // field-name set below is the golden's `forbidden` array, INLINED so this module
-// stays dependency-free; cardintent.test.ts reads the vendored .gen.json and
-// hash-pins it (recomputed sha256 over sorted forbidden∪allow === the file's own
-// `hash` === FORBIDDEN_COST_KEYS_GOLDEN_HASH) so ANY drift between this inlined
-// list and the SSOT fails CI. Closes #92.
+// stays dependency-free; cardintent.test.ts hash-pins it by recomputing the crm
+// digest (sha256 over sorted forbidden∪allow) over this INLINED exported list
+// plus the explicit two-key allowlist and asserting it === the golden's hash ===
+// FORBIDDEN_COST_KEYS_GOLDEN_HASH — so ANY drift in this inlined list fails CI.
+// (The vendored .gen.json is committed as the byte-for-byte SSOT provenance; the
+// test does not read it — it recomputes over the inlined list, which is the
+// runtime source of truth.) Closes #92.
 //
 // These keys must NEVER reach Teams: if any appears anywhere in the rendered
 // Adaptive Card JSON bytes we reject the card and fall back to text-only. The
