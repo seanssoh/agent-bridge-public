@@ -1210,6 +1210,181 @@ export function buildDevStatusCard(intent: DevStatusIntent): AcElement {
 }
 
 // ---------------------------------------------------------------------------
+// quoteRequest CardIntent (the 견적의뢰 미리보기 card — #17138 card 6).
+//
+// A FOURTH, independent card kind that reuses the same fence + §10 + seam
+// machinery as quoteResult/devReqAutofill/devStatus but renders a read-only
+// pre-submission FactSet: the title, then one Container per section (제품 기본정보
+// + 견적 종류, interleaved per product), each an Accent header + a FactSet whose
+// rows go through the same renderValueState path as quoteResult (so a
+// masked/calculating/notRequested row never leaks its raw value). The single
+// card-level action is confirmQuoteRequest — the [승인 (견적의뢰 제출)] approval
+// button. UNLIKE the other three kinds it is a confirm/submit callback, not a
+// web/d navigation, so the renderer emits an Action.Submit (NOT an OpenUrl
+// deeplink). The renderer SUPPLIES the submit data — a single {actionId} object
+// — and IGNORES the cardintent's action payload entirely (same zero-injection
+// posture as the other kinds: a forbidden cost key smuggled into the payload is
+// never echoed into the card, and the §10 byte-scan still covers the row values).
+//
+// LOCKED golden (the render must match it):
+// cosmax-crm-cli contract/adaptivecard/golden_quoterequest_preview.json
+// (TestQuoteRequestGoldenMatches on crm main; 2 products → 기본정보 + 견적 종류
+// section pairs, a single confirmQuoteRequest action, a fallbackMarkdown body).
+// ---------------------------------------------------------------------------
+
+// Closed enum of quoteRequest action ids. An actionId outside this set is
+// dropped (the renderer never emits an action it cannot map). The 견적의뢰
+// 미리보기 card carries exactly one card-level action: the [승인 (견적의뢰 제출)]
+// confirmQuoteRequest approval button.
+export const QUOTEREQUEST_ACTION_IDS = ['confirmQuoteRequest'] as const
+export type QuoteRequestActionId = (typeof QUOTEREQUEST_ACTION_IDS)[number]
+
+export type QuoteRequestAction = {
+  actionId: QuoteRequestActionId
+  // payload carries identifier-only fields (project_id) and is NEVER echoed into
+  // the rendered Action.Submit data (the renderer supplies a minimal {actionId}
+  // data object) — so a forbidden cost key smuggled here is never serialized into
+  // the card, and the §10 byte scan over the rendered card still covers the rest.
+  label: string
+  payload?: Record<string, unknown>
+}
+
+export type QuoteRequestIntent = {
+  kind: 'quoteRequest'
+  title: string
+  // One Section per aspect, interleaved per product: 제품 기본정보 + 견적 종류.
+  sections: Section[]
+  actions?: QuoteRequestAction[]
+  fallbackMarkdown: string
+}
+
+function validateQuoteRequestAction(a: unknown, where: string): string | null {
+  if (!isPlainObject(a)) return `${where}: action must be an object`
+  // Fail-closed: actionId must be a STRING in the quoteRequest closed enum (a
+  // non-string like ["confirmQuoteRequest"] would stringify past a String() check).
+  if (typeof a.actionId !== 'string' || !(QUOTEREQUEST_ACTION_IDS as readonly string[]).includes(a.actionId)) {
+    return `${where}: actionId "${String(a.actionId)}" not a string in the quoteRequest allowed enum`
+  }
+  if (typeof a.label !== 'string' || a.label.length === 0) {
+    return `${where}: action.label must be a non-empty string`
+  }
+  if (a.payload !== undefined && !isPlainObject(a.payload)) {
+    return `${where}: action.payload must be an object when present`
+  }
+  return null
+}
+
+export type QuoteRequestValidationResult =
+  | { ok: true; intent: QuoteRequestIntent }
+  | { ok: false; reason: string }
+
+// Strict validation for the quoteRequest shape. Rows are validated by the same
+// validateSection/validateRow as quoteResult (string-only values, enum-checked
+// valueState — so a masked/calculating row can never leak its raw value).
+// Top-level actions are validated against the quoteRequest action enum;
+// section-level actions are not used.
+export function validateQuoteRequest(value: unknown): QuoteRequestValidationResult {
+  if (!isPlainObject(value)) return { ok: false, reason: 'root is not an object' }
+  if (value.kind !== 'quoteRequest') {
+    return { ok: false, reason: `kind must be "quoteRequest" (got ${JSON.stringify(value.kind)})` }
+  }
+  if (typeof value.title !== 'string') return { ok: false, reason: 'title must be a string' }
+  if (typeof value.fallbackMarkdown !== 'string') {
+    return { ok: false, reason: 'fallbackMarkdown must be a string' }
+  }
+  if (!Array.isArray(value.sections)) return { ok: false, reason: 'sections must be an array' }
+  if (value.sections.length === 0) return { ok: false, reason: 'sections must be non-empty' }
+  for (let i = 0; i < value.sections.length; i++) {
+    const err = validateSection(value.sections[i], `sections[${i}]`)
+    if (err) return { ok: false, reason: err }
+  }
+  if (value.actions !== undefined) {
+    if (!Array.isArray(value.actions)) return { ok: false, reason: 'actions must be an array when present' }
+    for (let i = 0; i < value.actions.length; i++) {
+      const err = validateQuoteRequestAction(value.actions[i], `actions[${i}]`)
+      if (err) return { ok: false, reason: err }
+    }
+  }
+  return { ok: true, intent: value as unknown as QuoteRequestIntent }
+}
+
+// A quoteRequest FactSet: each row → {title,value}. A 'value'-state row whose
+// value is a non-empty string renders VERBATIM (a literal '—' is a real datum
+// here — it is the server's notRequested rendering); an empty 'value' string
+// renders as an em dash. A non-'value' state (masked/calculating/notRequested)
+// NEVER falls through to the raw row.value — route it through renderValueState
+// (defense-in-depth: a masked row must not leak its data).
+function quoteRequestFactSet(rows: Row[]): AcElement {
+  return {
+    type: 'FactSet',
+    facts: rows.map(r => {
+      if (r.valueState === 'value') {
+        const v = typeof r.value === 'string' ? r.value.trim() : ''
+        return { title: r.label, value: v.length > 0 ? v : EMDASH }
+      }
+      return { title: r.label, value: renderValueState(r).text }
+    }),
+  }
+}
+
+// One section Container: an Accent header (section.label = 제품 #N · … / 견적
+// 종류 #N) then the field FactSet. Mobile-safe (no wide grid / Table /
+// targetWidth) — the same per-section stack as the quoteResult detail layout.
+function renderQuoteRequestContainer(section: Section): AcElement {
+  return {
+    type: 'Container',
+    separator: true,
+    spacing: 'Medium',
+    items: [
+      textBlock(section.label, { weight: 'Bolder', color: 'Accent' }),
+      quoteRequestFactSet(section.rows),
+    ],
+  }
+}
+
+function renderQuoteRequestBody(intent: QuoteRequestIntent): AcElement[] {
+  const body: AcElement[] = [textBlock(intent.title, { weight: 'Bolder', size: 'Medium' })]
+  for (const section of intent.sections) {
+    body.push(renderQuoteRequestContainer(section))
+  }
+  return body
+}
+
+// Map a validated quoteRequest action → an Action.Submit. The RENDERER supplies
+// the submit data ({ actionId } only), IGNORING the cardintent's payload entirely
+// — so a forbidden cost key smuggled into the payload is never echoed into the
+// card (zero-injection; same posture as toDevReqAction dropping the payload
+// entity-id). A non-confirm actionId → null (dropped). This is the ONLY card kind
+// that emits an Action.Submit: confirmQuoteRequest is a 제출 confirm callback (a
+// trusted server-side handler routes on the actionId), not a web/d navigation, so
+// an OpenUrl deeplink would be the wrong shape.
+function toQuoteRequestAction(a: QuoteRequestAction): AcElement | null {
+  if (!(QUOTEREQUEST_ACTION_IDS as readonly string[]).includes(a.actionId)) return null
+  return { type: 'Action.Submit', title: a.label, data: { actionId: a.actionId } }
+}
+
+// Build the quoteRequest Adaptive Card. The only action emitted is the
+// renderer-supplied [승인 (견적의뢰 제출)] Action.Submit whose data is a single
+// { actionId } object (the cardintent's payload is never echoed); a non-confirm
+// actionId is dropped. No actions key when nothing survives the filter (an empty
+// actions array renders an empty action bar).
+export function buildQuoteRequestCard(intent: QuoteRequestIntent): AcElement {
+  const card: AcElement = {
+    type: AC_TYPE,
+    $schema: 'http://adaptivecards.io/schemas/adaptive-card.json',
+    version: AC_VERSION,
+    body: renderQuoteRequestBody(intent),
+  }
+  if (intent.actions && intent.actions.length > 0) {
+    const actions = intent.actions.map(toQuoteRequestAction).filter((a): a is AcElement => a !== null)
+    if (actions.length > 0) {
+      card.actions = actions
+    }
+  }
+  return card
+}
+
+// ---------------------------------------------------------------------------
 // §10 forbidden-key golden over the rendered bytes
 // ---------------------------------------------------------------------------
 
@@ -1302,8 +1477,9 @@ export function renderOutbound(
 
   // Validate shape + render — branch on the card kind. quoteResult is the
   // original path (untouched); devReqAutofill is the 개발의뢰 draft card;
-  // devStatus is the 개발현황 card. All three share the §10 byte-scan, size
-  // guard, and success-suppression tail below.
+  // devStatus is the 개발현황 card; quoteRequest is the 견적의뢰 미리보기 card.
+  // All four share the §10 byte-scan, size guard, and success-suppression tail
+  // below.
   let card: AcElement
   const kind = isPlainObject(parsed) ? parsed.kind : undefined
   if (kind === 'devReqAutofill') {
@@ -1323,6 +1499,16 @@ export function renderOutbound(
     }
     try {
       card = buildDevStatusCard(validation.intent)
+    } catch (err) {
+      return fail(`cardintent render failed: ${(err as Error).message}`)
+    }
+  } else if (kind === 'quoteRequest') {
+    const validation = validateQuoteRequest(parsed)
+    if (!validation.ok) {
+      return fail(`cardintent validation failed: ${validation.reason}`)
+    }
+    try {
+      card = buildQuoteRequestCard(validation.intent)
     } catch (err) {
       return fail(`cardintent render failed: ${(err as Error).message}`)
     }

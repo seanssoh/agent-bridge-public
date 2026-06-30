@@ -1,6 +1,6 @@
 {
   "name": "claude-channel-teams",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "license": "Apache-2.0",
   "type": "module",
   "bin": "./server.ts",
