@@ -1220,6 +1220,7 @@ async function graphBytes(
   path: string,
   query?: Record<string, string | number | undefined>,
   version: 'v1.0' | 'beta' = 'v1.0',
+  maxBytes?: number,
 ): Promise<Buffer> {
   const token = await getAccessToken(upn)
   let url = `https://graph.microsoft.com/${version}${path}`
@@ -1243,6 +1244,53 @@ async function graphBytes(
     throw new Error(
       `graph ${method} ${path} failed (${res.status}): ${scrubSecretShapedText(text || `HTTP ${res.status}`).slice(0, 500)}`,
     )
+  }
+  // When a cap is requested, reject a declared Content-Length over the cap
+  // before reading any body, then stream with a hard running cap so an absent
+  // or falsely-small Content-Length cannot push us past the limit. This keeps
+  // the worst-case memory bounded by maxBytes (+ one chunk) rather than the
+  // full attachment size.
+  if (maxBytes != null) {
+    const declared = Number(res.headers.get('content-length') ?? '')
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      throw new Error(
+        `attachment too large (${declared} bytes > max ${maxBytes}); raise MS365_ATTACHMENT_MAX_BYTES if needed`,
+      )
+    }
+    const body = res.body
+    if (body) {
+      const reader = body.getReader()
+      const chunks: Uint8Array[] = []
+      let total = 0
+      try {
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) break
+          if (value && value.length) {
+            total += value.length
+            if (total > maxBytes) {
+              try { await reader.cancel() } catch {}
+              throw new Error(
+                `attachment too large (>${maxBytes} bytes); raise MS365_ATTACHMENT_MAX_BYTES if needed`,
+              )
+            }
+            chunks.push(value)
+          }
+        }
+      } finally {
+        try { reader.releaseLock() } catch {}
+      }
+      return Buffer.concat(chunks)
+    }
+    // No streamable body handle: fall back to arrayBuffer but still enforce
+    // the cap so the guarantee holds.
+    const buf = Buffer.from(await res.arrayBuffer())
+    if (buf.length > maxBytes) {
+      throw new Error(
+        `attachment too large (${buf.length} bytes > max ${maxBytes}); raise MS365_ATTACHMENT_MAX_BYTES if needed`,
+      )
+    }
+    return buf
   }
   return Buffer.from(await res.arrayBuffer())
 }
@@ -1699,44 +1747,44 @@ const tools: ToolDef[] = [
       const attachmentId = String(args.attachment_id ?? '').trim()
       if (!messageId) throw new Error('message_id is required')
       if (!attachmentId) throw new Error('attachment_id is required')
-      const data = await graph(
+      // Resolve metadata from the list endpoint (metadata-only $select). The
+      // single-resource GET would return a fileAttachment's base64 contentBytes
+      // by default, pulling the whole payload into memory before any size guard
+      // runs. Reading size from the metadata-only listing lets us reject an
+      // oversized attachment before downloading a single byte.
+      const listData = await graph(
         upn,
         'GET',
-        `/me/messages/${encodeURIComponent(messageId)}/attachments/${encodeURIComponent(attachmentId)}`,
+        `/me/messages/${encodeURIComponent(messageId)}/attachments`,
+        undefined,
+        { $select: 'id,name,contentType,size,isInline' },
       )
-      const kind = attachmentKind(data?.['@odata.type'])
+      const meta = (listData?.value ?? []).find((a: any) => a?.id === attachmentId)
+      if (!meta) {
+        throw new Error(`attachment ${attachmentId} not found on message ${messageId}`)
+      }
+      const kind = attachmentKind(meta['@odata.type'])
       if (kind === 'reference' || kind === 'item') {
         throw new Error(`attachment kind ${kind} is not downloadable yet; only fileAttachment is supported`)
       }
-      const declaredSize = typeof data.size === 'number' ? data.size : null
+      const declaredSize = typeof meta.size === 'number' ? meta.size : null
       if (declaredSize != null && declaredSize > ATTACHMENT_MAX_BYTES) {
         throw new Error(
           `attachment too large (${declaredSize} bytes > max ${ATTACHMENT_MAX_BYTES}); raise MS365_ATTACHMENT_MAX_BYTES if needed`,
         )
       }
-      let bytes: Buffer
-      if (typeof data.contentBytes === 'string' && data.contentBytes) {
-        const estimatedBytes = Math.ceil(data.contentBytes.length * 3 / 4)
-        if (estimatedBytes > ATTACHMENT_MAX_BYTES) {
-          throw new Error(
-            `attachment too large (~${estimatedBytes} bytes > max ${ATTACHMENT_MAX_BYTES}); raise MS365_ATTACHMENT_MAX_BYTES if needed`,
-          )
-        }
-        bytes = Buffer.from(data.contentBytes, 'base64')
-      } else {
-        bytes = await graphBytes(
-          upn,
-          'GET',
-          `/me/messages/${encodeURIComponent(messageId)}/attachments/${encodeURIComponent(attachmentId)}/$value`,
-        )
-      }
-      if (bytes.length > ATTACHMENT_MAX_BYTES) {
-        throw new Error(
-          `attachment too large (${bytes.length} bytes > max ${ATTACHMENT_MAX_BYTES}); raise MS365_ATTACHMENT_MAX_BYTES if needed`,
-        )
-      }
+      // Download the raw bytes through $value with a hard streaming cap; never
+      // rely on Graph's base64 JSON response for the primary download path.
+      const bytes = await graphBytes(
+        upn,
+        'GET',
+        `/me/messages/${encodeURIComponent(messageId)}/attachments/${encodeURIComponent(attachmentId)}/$value`,
+        undefined,
+        'v1.0',
+        ATTACHMENT_MAX_BYTES,
+      )
       const saveDir = resolveAttachmentSaveDir(args.save_dir)
-      const name = sanitizeAttachmentFilename(data.name)
+      const name = sanitizeAttachmentFilename(meta.name)
       const path = attachmentOutputPath(saveDir, name)
       writeFileSync(path, bytes, { mode: 0o600 })
       try {
@@ -1745,7 +1793,7 @@ const tools: ToolDef[] = [
       return textResult({
         path,
         name,
-        contentType: data.contentType ?? null,
+        contentType: meta.contentType ?? null,
         size: bytes.length,
         declaredSize,
         kind,
