@@ -241,8 +241,18 @@ export const FORBIDDEN_COST_FIELD_KEYS: readonly string[] = [
 // is REMOVED (and removing it also stops the allowed `가공비제시가` from
 // false-tripping on the `제시가` substring); `제시사유` (mSuggestedReason) is
 // forbidden and ADDED here for the visible-text scan (the field key is already in
-// the golden). TODO(governance #92-followup): fold visible Korean terms into the
-// crm golden so this layer is SSOT-governed too, not teams-maintained.
+// the golden).
+//
+// GOVERNANCE (crm-dev #20652, owner decision): this layer is intentionally
+// teams-OWNED and NOT folded into the crm hash-pinned golden. The field-name
+// golden is the by-construction security SSOT (the renderer's allowlist
+// projection never serializes a raw cost VALUE, so a Korean label cannot leak a
+// number); Korean cost words are open-ended fuzzy synonyms that would make a
+// closed, hash-pinned golden brittle; and display-text validation is the
+// renderer's layer, not the crm data SSOT's. Each term below is DERIVED from a
+// crm forbidden field (the visible Korean rendering of it) — KOREAN_TERM_ORIGIN
+// records that correspondence and a test asserts every term's origin field is in
+// the vendored golden, so the two layers cannot silently diverge.
 const FORBIDDEN_COST_KOREAN_TERMS: readonly string[] = [
   '원가',
   '마진',
@@ -255,6 +265,23 @@ const FORBIDDEN_COST_KOREAN_TERMS: readonly string[] = [
   '고객요청가',
   '제시사유',
 ]
+
+// Provenance for the visible Korean layer: each visible term → the crm forbidden
+// FIELD key it is the Korean rendering of. The consistency test (crm-dev #20652
+// alternative) asserts every origin field is present in the vendored golden, so a
+// Korean term can never outlive the removal of its underlying forbidden field.
+export const KOREAN_TERM_ORIGIN: Readonly<Record<string, string>> = {
+  '원가': 'realCost',
+  '마진': 'expectedProfitRate',
+  '공헌이익': 'recoveryOfFixedCost',
+  '영업이익': 'operatingProfitRate',
+  '네고율': 'negotiationRate',
+  '회수율': 'recoveryRatePct',
+  '작업장명': 'workplaceP',
+  '임률': 'activityPrice',
+  '고객요청가': 'customerRequested',
+  '제시사유': 'mSuggestedReason',
+}
 
 // The §10 scan set = vendored field-name SSOT ∪ teams visible Korean terms.
 export const FORBIDDEN_COST_KEYS: readonly string[] = [

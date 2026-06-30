@@ -25,6 +25,7 @@ import {
   FORBIDDEN_COST_KEYS,
   FORBIDDEN_COST_FIELD_KEYS,
   FORBIDDEN_COST_KEYS_GOLDEN_HASH,
+  KOREAN_TERM_ORIGIN,
   isAllowedDeeplink,
   isDetailLayout,
   quoteResultDeeplink,
@@ -926,6 +927,22 @@ describe('§10 visible-text fail-closed (mutation-proof)', () => {
     const hex = Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('')
     expect(hex).toBe(FORBIDDEN_COST_KEYS_GOLDEN_HASH)
     expect(hex).toBe('99f20d8c8efca4521415a030afd954d555edf0b5b201c3d3b5797b44327fcba7')
+  })
+
+  test('visible Korean layer is DERIVED from the golden — every term origin is a forbidden field (crm-dev #20652 consistency guard)', () => {
+    // The Korean visible-text layer is teams-owned, NOT in the crm hash. To stop
+    // the two layers silently diverging, every Korean term records the crm
+    // forbidden FIELD it is the rendering of (KOREAN_TERM_ORIGIN); that origin
+    // field MUST still be in the vendored golden. If crm ever un-forbids a field,
+    // this fails and forces the Korean term to be re-evaluated.
+    const field = new Set(FORBIDDEN_COST_FIELD_KEYS)
+    for (const [term, origin] of Object.entries(KOREAN_TERM_ORIGIN)) {
+      expect(field.has(origin)).toBe(true)
+      // and the term itself is actually on the active scan list
+      expect(FORBIDDEN_COST_KEYS).toContain(term)
+    }
+    // 제시가 is NOT mapped (its field suggestedPrice is sales-ALLOWED, not forbidden).
+    expect(KOREAN_TERM_ORIGIN['제시가']).toBeUndefined()
   })
 })
 
