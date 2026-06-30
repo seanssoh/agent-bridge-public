@@ -34,8 +34,10 @@
 #      monitor never reads) is caught.
 #
 # Footgun #11 (heredoc-stdin deadlock class): no heredoc-stdin / here-string is
-# piped to a subprocess; grep runs over source files (file-as-argv) and the
-# resolver-body match is a pure-bash glob, not a piped grep.
+# piped to a subprocess. grep runs over source files (file-as-argv); the only
+# pipes are plain file->grep->grep (comment-strip and printf-branch filters) and
+# the resolver body is awk-extracted to a temp file — none of which is the
+# heredoc/here-string-into-command-substitution shape that deadlocks.
 # Exits 0 on full pass, non-zero on any failed assertion.
 
 set -uo pipefail
@@ -63,11 +65,22 @@ for entry in bridge-start.sh bridge-run.sh bridge-upgrade.sh; do
     _fail "R1 $entry" "file missing at $f"
     continue
   fi
-  if grep -nEq "$_call_re" "$f"; then
+  # Strip full-line comments to a temp file BEFORE matching so a commented-out
+  # call (`# bridge_ensure_hud_usage_tap "$X"`) cannot satisfy the ratchet (codex
+  # #2218 r1). Going through a file (not a `grep -v | grep -q` pipe) avoids the
+  # pipefail+SIGPIPE trap: `grep -q` quits on first match and SIGPIPEs the
+  # upstream `grep -v`, which `set -o pipefail` would surface as a (racy)
+  # failure. The call regex then requires a real call: the function name +
+  # whitespace + a `"`/`$` first-arg token — which also excludes the
+  # `bridge_ensure_hud_usage_tap() {` definition (where `(` follows the name).
+  noncomment="$(mktemp)"
+  grep -vE '^[[:space:]]*#' "$f" >"$noncomment" 2>/dev/null || true
+  if grep -Eq "$_call_re" "$noncomment"; then
     _pass "R1 $entry invokes bridge_ensure_hud_usage_tap (managed-Claude tap wired)"
   else
     _fail "R1 $entry" "no bridge_ensure_hud_usage_tap CALL — managed Claude agents launched/upgraded via $entry would be untapped → monitor sees no used_percent → proactive rotation blind"
   fi
+  rm -f "$noncomment"
 done
 
 # ---------------------------------------------------------------------------
@@ -77,26 +90,38 @@ SUFFIX='plugins/claude-hud/.usage-cache.json'
 TAP="$REPO_ROOT/scripts/hud-usage-tap.py"
 USAGE="$REPO_ROOT/bridge-usage.sh"
 
-# WRITE side: hud-usage-tap.py composes Path(home)/"plugins"/"claude-hud" then
-# /".usage-cache.json".
+# WRITE side: match the actual ASSIGNMENT statements, not a bare suffix grep —
+# `.usage-cache.json` also appears in the tap's docstring, so a rename of the
+# real writer must not pass on docstring text alone (codex #2218 r1). The writer
+# is `cache_dir = Path(home) / "plugins" / "claude-hud"` then
+# `cache_path = cache_dir / ".usage-cache.json"`.
 if [[ -f "$TAP" ]] \
-  && grep -Eq '"plugins"[[:space:]]*/[[:space:]]*"claude-hud"' "$TAP" \
-  && grep -q '\.usage-cache\.json' "$TAP"; then
-  _pass "R2 write: hud-usage-tap.py writes under plugins/claude-hud/.usage-cache.json"
+  && grep -Eq 'cache_dir[[:space:]]*=[[:space:]]*Path\(home\)[[:space:]]*/[[:space:]]*"plugins"[[:space:]]*/[[:space:]]*"claude-hud"' "$TAP" \
+  && grep -Eq 'cache_path[[:space:]]*=[[:space:]]*cache_dir[[:space:]]*/[[:space:]]*"\.usage-cache\.json"' "$TAP"; then
+  _pass "R2 write: hud-usage-tap.py cache_dir/cache_path assignments compose plugins/claude-hud/.usage-cache.json"
 else
-  _fail "R2 write" "hud-usage-tap.py no longer composes the plugins/claude-hud/.usage-cache.json suffix"
+  _fail "R2 write" "hud-usage-tap.py cache_dir/cache_path assignment(s) no longer compose plugins/claude-hud/.usage-cache.json (docstring text alone does not satisfy this)"
 fi
 
-# READ side: bridge_usage_resolve_claude_cache_path emits the same suffix on
-# every branch. Extract the real shipped function body (single source of truth,
-# same awk-extract pattern as 17927-p2 E5) and glob-match the suffix — no piped
-# grep (footgun #11 class).
-RESOLVER="$(awk '/^bridge_usage_resolve_claude_cache_path\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$USAGE")"
-if [[ -n "$RESOLVER" && "$RESOLVER" == *"$SUFFIX"* ]]; then
-  _pass "R2 read: bridge_usage_resolve_claude_cache_path resolves the same $SUFFIX suffix"
+# READ side: the resolver has THREE cache-path emit branches (iso, per-agent
+# config-dir, $HOME fallback). Asserting the suffix appears SOMEWHERE in the
+# body lets one branch drift while another keeps it (codex #2218 r1). Instead,
+# extract the real shipped function body (single source of truth, same
+# awk-extract pattern as 17927-p2 E5) to a temp file and assert EVERY `printf`
+# cache-path branch carries the full suffix — a single renamed branch fails.
+RESOLVER_FILE="$(mktemp)"
+awk '/^bridge_usage_resolve_claude_cache_path\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$USAGE" >"$RESOLVER_FILE"
+# emit_total = printf lines that emit a usage cache path; emit_full = those that
+# carry the full plugins/claude-hud/.usage-cache.json suffix. Equal (and >= the
+# 3 known branches) ⇒ no branch drifted.
+emit_total="$(grep -Ec 'printf[[:space:]].*(claude-hud|usage-cache)' "$RESOLVER_FILE" 2>/dev/null || true)"
+emit_full="$(grep -E 'printf[[:space:]].*(claude-hud|usage-cache)' "$RESOLVER_FILE" 2>/dev/null | grep -Fc "$SUFFIX" 2>/dev/null || true)"
+if [[ -s "$RESOLVER_FILE" ]] && (( emit_total >= 3 )) && [[ "$emit_total" == "$emit_full" ]]; then
+  _pass "R2 read: all $emit_total resolver cache-path branches carry $SUFFIX"
 else
-  _fail "R2 read" "resolver body absent or suffix drifted from $SUFFIX (write/read cache paths would diverge → tap writes where the monitor never reads)"
+  _fail "R2 read" "resolver cache-path branches: $emit_total emit line(s) but $emit_full carry $SUFFIX (a branch drifted, or the resolver body was not extracted) → write/read cache paths would diverge"
 fi
+rm -f "$RESOLVER_FILE"
 
 # ---------------------------------------------------------------------------
 if (( FAILS > 0 )); then
