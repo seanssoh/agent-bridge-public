@@ -15,6 +15,7 @@ import {
   buildAdaptiveCard,
   buildDevReqAutofillCard,
   buildDevStatusCard,
+  buildQuoteRequestCard,
   DEFAULT_QUOTE_RESULT_DEEPLINK,
   deeplinkHosts,
   devReqDeeplink,
@@ -37,9 +38,11 @@ import {
   validateCardIntent,
   validateDevReqAutofill,
   validateDevStatus,
+  validateQuoteRequest,
   type CardIntent,
   type DevReqAutofillIntent,
   type DevStatusIntent,
+  type QuoteRequestIntent,
   type Row,
 } from './cardintent.ts'
 
@@ -1580,5 +1583,291 @@ describe('quoteResult + devReqAutofill paths are unchanged by the devStatus addi
     expect(body.filter(el => el.type === 'Container' && el.style === 'emphasis').length).toBe(2)
     const actions = (card.actions as Array<Record<string, unknown>>) ?? []
     expect(actions.map(a => a.url)).toEqual([devReqDeeplink(), devReqDeeplink()])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// quoteRequest (견적의뢰 미리보기 card — #17138 card 6)
+//
+// A FOURTH card kind: a read-only pre-submission FactSet. One Container per
+// section (제품 기본정보 + 견적 종류, interleaved per product), each an Accent
+// header + a FactSet whose rows route through renderValueState (so a
+// masked/calculating/notRequested row never leaks its raw value). The single
+// card-level action is confirmQuoteRequest — and UNLIKE the other three kinds it
+// renders as an Action.Submit (a 제출 confirm callback, not a web/d navigation),
+// whose data is the renderer-supplied { actionId } only (the cardintent's payload
+// is NEVER echoed). Same §10 byte-scan → text fallback path as the other kinds.
+// ---------------------------------------------------------------------------
+
+// VENDORED copy of the LOCKED golden:
+// cosmax-crm-cli contract/adaptivecard/golden_quoterequest_preview.json
+// (TestQuoteRequestGoldenMatches on crm main). The copy is embedded (NOT read
+// from disk) so the suite stays hermetic in CI. Kept byte-identical to the golden
+// so a drift between this fixture and the on-disk golden is caught by review.
+function goldenQuoteRequestIntent(): QuoteRequestIntent {
+  return {
+    kind: 'quoteRequest',
+    title: '견적의뢰 미리보기 — 제품 2건 (승인 요청)',
+    sections: [
+      {
+        label: '제품 #1 · 헤메코 수분진정 바디크림',
+        rows: [
+          { label: '고객', value: '주식회사 헤메코', valueState: 'value' },
+          { label: '제품', value: '헤메코 수분진정 바디크림', valueState: 'value' },
+          { label: '랩넘버', value: 'TESTHMC0609', valueState: 'value' },
+          { label: '용량 / 수량', value: '200 ml / 5000 EA', valueState: 'value' },
+          { label: '충전재', value: '튜브 충전', valueState: 'value' },
+          { label: '포장재', value: '단상자, 라벨, 펌프', valueState: 'value' },
+        ],
+      },
+      {
+        label: '견적 종류 #1',
+        rows: [
+          { label: '내용물 견적', value: '의뢰', valueState: 'value' },
+          { label: '가공비 견적', value: '제조 · 충전 · 포장', valueState: 'value' },
+        ],
+      },
+      {
+        label: '제품 #2 · 헤메코 비타 세럼',
+        rows: [
+          { label: '고객', value: '주식회사 헤메코', valueState: 'value' },
+          { label: '제품', value: '헤메코 비타 세럼', valueState: 'value' },
+          { label: '랩넘버', value: 'TESTHMC0610', valueState: 'value' },
+          { label: '용량 / 수량', value: '30 ml / 3000 EA', valueState: 'value' },
+          { label: '충전재', value: '—', valueState: 'notRequested' },
+          { label: '포장재', value: '—', valueState: 'notRequested' },
+        ],
+      },
+      {
+        label: '견적 종류 #2',
+        rows: [
+          { label: '내용물 견적', value: '의뢰', valueState: 'value' },
+          { label: '가공비 견적', value: '미의뢰', valueState: 'value' },
+        ],
+      },
+    ],
+    actions: [{ actionId: 'confirmQuoteRequest', label: '승인 (견적의뢰 제출)' }],
+    fallbackMarkdown:
+      '견적의뢰 미리보기 — 제품 2건 (승인 요청)\n\n## 제품 #1 · 헤메코 수분진정 바디크림\n### 기본정보\n- 고객: 주식회사 헤메코\n- 제품: 헤메코 수분진정 바디크림\n- 랩넘버: TESTHMC0609\n- 용량 / 수량: 200 ml / 5000 EA\n- 충전재: 튜브 충전\n- 포장재: 단상자, 라벨, 펌프\n\n### 견적 종류\n- 내용물 견적: 의뢰\n- 가공비 견적: 제조 · 충전 · 포장\n\n\n## 제품 #2 · 헤메코 비타 세럼\n### 기본정보\n- 고객: 주식회사 헤메코\n- 제품: 헤메코 비타 세럼\n- 랩넘버: TESTHMC0610\n- 용량 / 수량: 30 ml / 3000 EA\n- 충전재: —\n- 포장재: —\n\n### 견적 종류\n- 내용물 견적: 의뢰\n- 가공비 견적: 미의뢰',
+  }
+}
+
+function quoteRequestFence(intent: unknown): string {
+  return '견적의뢰 미리보기 카드입니다.\n\n```cardintent\n' + JSON.stringify(intent) + '\n```'
+}
+
+describe('quoteRequest validation', () => {
+  test('accepts the golden intent', () => {
+    expect(validateQuoteRequest(goldenQuoteRequestIntent()).ok).toBe(true)
+  })
+  test('rejects the wrong kind', () => {
+    expect(validateQuoteRequest({ ...goldenQuoteRequestIntent(), kind: 'quoteResult' }).ok).toBe(false)
+  })
+  test('rejects a non-string row value (unformatted cost leak shape)', () => {
+    const bad = goldenQuoteRequestIntent()
+    ;(bad.sections[0].rows[0] as unknown as Record<string, unknown>).value = 12345
+    expect(validateQuoteRequest(bad).ok).toBe(false)
+  })
+  test('rejects a non-enum valueState (fail-closed)', () => {
+    const bad = goldenQuoteRequestIntent()
+    ;(bad.sections[0].rows[0] as unknown as Record<string, unknown>).valueState = ['value']
+    expect(validateQuoteRequest(bad).ok).toBe(false)
+  })
+  test('rejects empty sections', () => {
+    expect(validateQuoteRequest({ ...goldenQuoteRequestIntent(), sections: [] }).ok).toBe(false)
+  })
+  test('rejects missing title / fallbackMarkdown', () => {
+    const noTitle: any = goldenQuoteRequestIntent()
+    delete noTitle.title
+    expect(validateQuoteRequest(noTitle).ok).toBe(false)
+    const noFallback: any = goldenQuoteRequestIntent()
+    delete noFallback.fallbackMarkdown
+    expect(validateQuoteRequest(noFallback).ok).toBe(false)
+  })
+  test('rejects an unknown action id (fail-closed)', () => {
+    const bad = goldenQuoteRequestIntent()
+    ;(bad.actions![0] as unknown as Record<string, unknown>).actionId = 'deleteEverything'
+    expect(validateQuoteRequest(bad).ok).toBe(false)
+  })
+  test('rejects a non-string action id (array smuggle)', () => {
+    const bad = goldenQuoteRequestIntent()
+    ;(bad.actions![0] as unknown as Record<string, unknown>).actionId = ['confirmQuoteRequest']
+    expect(validateQuoteRequest(bad).ok).toBe(false)
+  })
+})
+
+describe('quoteRequest render shape (one Container per section + Action.Submit)', () => {
+  test('the golden renders a title + 4 section Containers, each an Accent header + FactSet', () => {
+    const card = buildQuoteRequestCard(goldenQuoteRequestIntent()) as Record<string, unknown>
+    expect(card.type).toBe('AdaptiveCard')
+    expect(card.version).toBe('1.2')
+    const body = card.body as Array<Record<string, unknown>>
+    expect((body[0].text as string)).toBe('견적의뢰 미리보기 — 제품 2건 (승인 요청)')
+    const containers = body.filter(el => el.type === 'Container')
+    expect(containers.length).toBe(4)
+    const head = (c: Record<string, unknown>) => ((c.items as Array<Record<string, unknown>>)[0] as Record<string, unknown>)
+    expect(head(containers[0]).text).toBe('제품 #1 · 헤메코 수분진정 바디크림')
+    expect(head(containers[0]).color).toBe('Accent')
+    expect(head(containers[0]).weight).toBe('Bolder')
+    expect(head(containers[1]).text).toBe('견적 종류 #1')
+    expect(head(containers[2]).text).toBe('제품 #2 · 헤메코 비타 세럼')
+    expect(head(containers[3]).text).toBe('견적 종류 #2')
+    // each Container's FactSet carries the section's rows verbatim (value state)
+    const factsOf = (c: Record<string, unknown>) => {
+      const items = c.items as Array<Record<string, unknown>>
+      const fs = items.find(el => el.type === 'FactSet') as Record<string, unknown>
+      return fs.facts as Array<{ title: string; value: string }>
+    }
+    const f0 = factsOf(containers[0])
+    expect(f0.length).toBe(6)
+    expect(f0.map(f => f.title)).toEqual(['고객', '제품', '랩넘버', '용량 / 수량', '충전재', '포장재'])
+    expect(f0.find(f => f.title === '고객')!.value).toBe('주식회사 헤메코')
+    expect(f0.find(f => f.title === '용량 / 수량')!.value).toBe('200 ml / 5000 EA')
+  })
+
+  test("a notRequested row renders the en dash (–), never the raw value", () => {
+    const card = buildQuoteRequestCard(goldenQuoteRequestIntent()) as Record<string, unknown>
+    const body = card.body as Array<Record<string, unknown>>
+    const containers = body.filter(el => el.type === 'Container')
+    // 제품 #2 (container index 2): 충전재 / 포장재 are notRequested → renderValueState '–'.
+    const items = containers[2].items as Array<Record<string, unknown>>
+    const fs = items.find(el => el.type === 'FactSet') as Record<string, unknown>
+    const facts = fs.facts as Array<{ title: string; value: string }>
+    expect(facts.find(f => f.title === '충전재')!.value).toBe('–')
+    expect(facts.find(f => f.title === '포장재')!.value).toBe('–')
+  })
+
+  test('confirmQuoteRequest renders a single renderer-supplied Action.Submit ({actionId} data only)', () => {
+    const card = buildQuoteRequestCard(goldenQuoteRequestIntent()) as Record<string, unknown>
+    const actions = card.actions as Array<Record<string, unknown>>
+    expect(actions.length).toBe(1)
+    expect(actions[0].type).toBe('Action.Submit')
+    expect(actions[0].title).toBe('승인 (견적의뢰 제출)')
+    // the renderer supplies the submit data — a single {actionId} object
+    expect(actions[0].data).toEqual({ actionId: 'confirmQuoteRequest' })
+  })
+
+  test('the action payload is NEVER echoed into the submit data (zero injection)', () => {
+    const intent = goldenQuoteRequestIntent()
+    intent.actions = [
+      { actionId: 'confirmQuoteRequest', label: '승인 (견적의뢰 제출)', payload: { project_id: 'evil/../../etc', url: 'https://evil.example.com/x' } },
+    ]
+    const card = buildQuoteRequestCard(intent) as Record<string, unknown>
+    const actions = card.actions as Array<Record<string, unknown>>
+    expect(actions[0].data).toEqual({ actionId: 'confirmQuoteRequest' })
+    const bytes = JSON.stringify(card)
+    expect(bytes).not.toContain('evil/../../etc')
+    expect(bytes).not.toContain('evil.example.com')
+  })
+
+  test('AC v1.2 only — no Table / targetWidth / ToggleVisibility / OpenUrl', () => {
+    const card = buildQuoteRequestCard(goldenQuoteRequestIntent())
+    const types = collectTypes(card)
+    expect(types).not.toContain('Table')
+    expect(types).not.toContain('Action.ToggleVisibility')
+    // quoteRequest is the only kind that DOES emit Action.Submit — but never OpenUrl.
+    expect(types).not.toContain('Action.OpenUrl')
+    const bytes = JSON.stringify(card)
+    expect(bytes).not.toContain('targetWidth')
+    expect((card as Record<string, unknown>).version).toBe('1.2')
+  })
+
+  test('a non-confirm actionId is DROPPED (no actions key)', () => {
+    const intent = goldenQuoteRequestIntent()
+    // smuggle a different (validation-rejected) id only via cast — buildQuoteRequestCard
+    // is the last line of defense even past validation.
+    ;(intent.actions![0] as unknown as Record<string, unknown>).actionId = 'createQuoteDoc'
+    const card = buildQuoteRequestCard(intent) as Record<string, unknown>
+    expect('actions' in card).toBe(false)
+    expect(JSON.stringify(card)).not.toContain('Action.Submit')
+  })
+
+  test('no actions key when nothing maps', () => {
+    const intent = goldenQuoteRequestIntent()
+    intent.actions = []
+    const card = buildQuoteRequestCard(intent) as Record<string, unknown>
+    expect('actions' in card).toBe(false)
+  })
+
+  test('a masked/calculating row NEVER leaks its raw value', () => {
+    const intent = goldenQuoteRequestIntent()
+    intent.sections[0].rows.push({ label: '비밀', value: 'SECRET-9999', valueState: 'masked' })
+    intent.sections[0].rows.push({ label: '진행', value: 'SECRET-CALC-0001', valueState: 'calculating' })
+    const card = buildQuoteRequestCard(intent)
+    const bytes = JSON.stringify(card)
+    expect(bytes).not.toContain('SECRET-9999')
+    expect(bytes).not.toContain('SECRET-CALC-0001')
+    expect(bytes).toContain('●●●') // masked
+    expect(bytes).toContain('산출중') // calculating
+  })
+})
+
+describe('quoteRequest via renderOutbound (seam + §10 + suppression)', () => {
+  test('golden round-trip: fence → 4 Containers + Action.Submit + suppressed text', () => {
+    const out = renderOutbound(quoteRequestFence(goldenQuoteRequestIntent()))
+    expect(out.attachments.length).toBe(1)
+    expect(out.text).toBe('')
+    expect(out.warning).toBeUndefined()
+    const card = out.attachments[0].content as Record<string, unknown>
+    expect(card.type).toBe('AdaptiveCard')
+    const containers = (card.body as Array<Record<string, unknown>>).filter(el => el.type === 'Container')
+    expect(containers.length).toBe(4)
+    const actions = card.actions as Array<Record<string, unknown>>
+    expect(actions.map(a => a.type)).toEqual(['Action.Submit'])
+    expect(actions[0].data).toEqual({ actionId: 'confirmQuoteRequest' })
+  })
+
+  // MUTATION-PROOF: a §10 forbidden cost key anywhere in the quoteRequest card
+  // bytes (here smuggled into a row value) must reject the WHOLE card → text-only,
+  // routing through the SAME findForbiddenCostKey byte-scan as the other kinds. If
+  // the §10 byte-scan is reverted or the quoteRequest dispatch bypasses it, this
+  // test fails (the card would attach and the forbidden key would reach Teams).
+  test('§10 forbidden cost key in a quoteRequest row → text-only fallback (no leak)', () => {
+    const bad = goldenQuoteRequestIntent()
+    bad.sections[0].rows.push({ label: '비고', value: '원가 12000', valueState: 'value' })
+    const out = renderOutbound(quoteRequestFence(bad))
+    expect(out.attachments.length).toBe(0)
+    expect(out.warning).toContain('§10')
+    expect(out.text).not.toContain('원가')
+    expect(out.text).not.toContain('12000')
+  })
+
+  test('§10 forbidden FIELD-name key smuggled into a row → caught over the rendered bytes', () => {
+    // A vendored field-name key (realCost) smuggled into a string row value lands
+    // in the rendered FactSet bytes and must trip the §10 golden over the card.
+    const bad = goldenQuoteRequestIntent()
+    bad.sections[1].rows.push({ label: '비고', value: 'realCost 1200', valueState: 'value' })
+    const out = renderOutbound(quoteRequestFence(bad))
+    expect(out.attachments.length).toBe(0)
+    expect(out.warning).toContain('forbidden cost key')
+    expect(out.text).not.toContain('realCost')
+  })
+
+  test('an invalid quoteRequest intent degrades to text-only, never throws', () => {
+    const bad = { ...goldenQuoteRequestIntent(), title: 123 }
+    expect(() => renderOutbound(quoteRequestFence(bad))).not.toThrow()
+    const out = renderOutbound(quoteRequestFence(bad))
+    expect(out.attachments.length).toBe(0)
+    expect(out.warning).toContain('validation failed')
+  })
+})
+
+describe('quoteResult / devReqAutofill / devStatus paths are unchanged by the quoteRequest addition (regression)', () => {
+  test('a valid quoteResult intent still renders with only its OpenUrl deeplink', () => {
+    const out = renderOutbound(fence(validListIntent()))
+    expect(out.attachments.length).toBe(1)
+    const card = out.attachments[0].content as Record<string, unknown>
+    const actions = (card.actions as Array<Record<string, unknown>>) ?? []
+    expect(actions.map(a => a.type)).toEqual(['Action.OpenUrl'])
+  })
+
+  test('a valid devStatus intent still renders 4 product Containers + its OpenUrl deeplink', () => {
+    const out = renderOutbound(devStatusFence(goldenDevStatusIntent()))
+    expect(out.attachments.length).toBe(1)
+    const card = out.attachments[0].content as Record<string, unknown>
+    const containers = (card.body as Array<Record<string, unknown>>).filter(el => el.type === 'Container')
+    expect(containers.length).toBe(4)
+    const actions = (card.actions as Array<Record<string, unknown>>) ?? []
+    expect(actions.map(a => a.type)).toEqual(['Action.OpenUrl'])
   })
 })
