@@ -1460,6 +1460,66 @@ _bridge_upgrade_reenable_on_abort() {
 }
 # END: Issue #2055 durable quiesce-intent marker
 
+# BEGIN: Issue #2211 interrupted-apply marker helpers (write/advance/clear)
+# `upgrade --apply` writes a DISTINCT strict-schema JSON marker at
+# state/upgrade/apply-in-progress.json AFTER the backup manifest succeeds and
+# BEFORE the first live mutation (apply-live), advances its `phase` at each apply
+# barrier (apply-live → write-state → plugin-install → migrate → finalize →
+# restart), and CLEARS it only once the durable upgrade-complete (work-complete)
+# marker is on disk. An interruption (SIGTERM/137/power-loss) mid-run leaves the
+# marker behind → the next invocation (resolve) / status / doctor (detect) can
+# tell a partial-but-looks-upgraded install from a healthy one, and the apply
+# start can resume idempotently (reuse the ORIGINAL backup_root + transaction id,
+# skip a fresh backup) or FAIL CLOSED. The schema + resume/detect decision logic
+# is the SSOT in bridge-upgrade.py (`apply-marker` verbs) — these are thin Bash
+# wrappers (file-as-argv, no heredoc-stdin — footgun #11) so the shell apply
+# sequence owns the WHERE while Python owns the WHAT.
+#
+# This is purely additive (option 3 marker/detect + constrained option 2 resume):
+# it does NOT reorder the apply sequence (option 1 / version-flip-last deferred).
+# Best-effort on write/advance: a marker-write failure WARNs but never aborts the
+# upgrade (the recovery hint is lost for this run, the apply still proceeds).
+
+# Advance/create the marker for the given phase. $1=phase. All other fields are
+# read from the apply-flow globals (set well before the first marker write). On
+# a phase ADVANCE the Python writer preserves the immutable fields (transaction /
+# started_at / target / backup) from the on-disk marker — we only need to pass
+# the full field set on the FIRST (apply-live) write, but passing it every time
+# is harmless (the writer ignores them on advance) and keeps the call uniform.
+_bridge_upgrade_apply_marker_write() {
+  local phase="$1"
+  [[ $DRY_RUN -eq 0 ]] || return 0
+  local args=(
+    apply-marker --target-root "$TARGET_ROOT" --op write --phase "$phase"
+    --transaction "${UPGRADE_RUN_ID:-}"
+    --target-version "${SOURCE_VERSION:-}"
+    --target-head "${TARGET_HEAD:-}"
+    --target-ref "${TARGET_REF:-}"
+    --source-head "${SOURCE_HEAD:-}"
+    --source-ref "${SOURCE_REF:-}"
+    --installed-version "${INSTALLED_VERSION:-}"
+    --backup-root "${BACKUP_ROOT:-}"
+  )
+  [[ "${BACKUP:-0}" == "1" ]] && args+=(--backup-enabled)
+  [[ "${RESTART_DAEMON:-0}" == "1" ]] && args+=(--restart-daemon)
+  [[ "${RESTART_AGENTS:-0}" == "1" ]] && args+=(--restart-agents)
+  if ! python3 "$SOURCE_ROOT/bridge-upgrade.py" "${args[@]}" >/dev/null 2>&1; then
+    echo "[bridge-upgrade] WARN: could not write/advance the apply-in-progress marker (phase=$phase) — interrupted-apply recovery hint is unavailable for this run; the upgrade itself is unaffected." >&2
+  fi
+  return 0
+}
+
+# Clear the apply-in-progress marker. $1 (optional) == "archive" moves it aside
+# instead of unlinking (the quiet-reconcile path). Idempotent + best-effort.
+_bridge_upgrade_apply_marker_clear() {
+  [[ $DRY_RUN -eq 0 ]] || return 0
+  local args=(apply-marker --target-root "$TARGET_ROOT" --op clear)
+  [[ "${1:-}" == "archive" ]] && args+=(--archive)
+  python3 "$SOURCE_ROOT/bridge-upgrade.py" "${args[@]}" >/dev/null 2>&1 || true
+  return 0
+}
+# END: Issue #2211 interrupted-apply marker helpers
+
 # BEGIN: Issue #1905 systemd-aware quiesce/restart around the #1820 reconcile
 # On a sudo-self systemd install the daemon lifecycle is owned by
 # `agent-bridge-daemon.service` (Restart=) + `agent-bridge-daemon-liveness.timer`.
@@ -2779,6 +2839,16 @@ if [[ "$SUBCOMMAND" == "rollback" ]]; then
     rollback_args+=(--dry-run)
   fi
   ROLLBACK_JSON="$(python3 "$SOURCE_ROOT/bridge-upgrade.py" "${rollback_args[@]}")"
+  # Issue #2211: a SUCCESSFUL rollback (restored=true) returned the install to the
+  # pre-upgrade snapshot, so any interrupted-apply marker that drove the partial
+  # apply no longer reflects reality — clear/archive it so the next invocation /
+  # status / doctor does not warn about an apply the rollback already undid.
+  # Compose with the existing rollback contract; do not redesign it. Best-effort,
+  # gated on the rollback actually restoring (not --dry-run, not a no-op).
+  if [[ $DRY_RUN -eq 0 ]] && printf '%s' "$ROLLBACK_JSON" | grep -q '"restored": true'; then
+    python3 "$SOURCE_ROOT/bridge-upgrade.py" apply-marker \
+      --target-root "$TARGET_ROOT" --op clear --archive >/dev/null 2>&1 || true
+  fi
   if [[ $RESTART_DAEMON -eq 1 && $DRY_RUN -eq 0 ]]; then
     # --force: the upgrader is the sanctioned daemon stop+restart path
     # (issue #314 Layer 3 / #315 Track 3). Bypass the active-agent guard.
@@ -2853,6 +2923,67 @@ if [[ -f "$TARGET_ROOT/agent-roster.local.sh" ]]; then
   fi
 fi
 
+# BEGIN: Issue #2211 interrupted-apply resume resolution
+# Before any mutation (backup / apply-live), decide what a pending
+# apply-in-progress marker means for THIS run. Pure read — the Python resolver
+# never mutates. Only on the mutating apply path (DRY_RUN=0); --dry-run / analyze
+# / rollback never reach here as a mutating start. The decision drives:
+#   resume          → reuse the ORIGINAL backup_root + transaction id and SKIP a
+#                     fresh backup (so the rollback default stays the pre-upgrade
+#                     snapshot, not the partial state).
+#   reconcile-clear → the apply actually finished (a matching complete marker);
+#                     the clear simply didn't land — archive the stale marker
+#                     quietly and proceed normally (fresh backup).
+#   fail-closed     → malformed marker / different target / backup-enabled marker
+#                     with no valid backup_root → bridge_die with operator
+#                     guidance. NEVER silently proceed off an untrusted marker.
+#   none            → no marker; normal fresh-backup apply.
+_BRIDGE_UPGRADE_RESUME_SKIP_BACKUP=0
+_BRIDGE_RESUMED_RUN_ID=""
+if [[ "$SUBCOMMAND" == "apply" && $DRY_RUN -eq 0 ]]; then
+  _resume_decision_json="$(python3 "$SOURCE_ROOT/bridge-upgrade.py" apply-marker \
+    --target-root "$TARGET_ROOT" --op resolve \
+    --target-version "${SOURCE_VERSION:-}" --target-head "${TARGET_HEAD:-}" 2>/dev/null || printf '{"decision":"none"}')"
+  _resume_payload_dir="$(mktemp -d "${TMPDIR:-/tmp}/bridge-upgrade-resume-json.XXXXXX")"
+  printf '%s' "$_resume_decision_json" >"$_resume_payload_dir/resolve.json"
+  # Read decision fields without a heredoc (footgun #11) — file-as-argv into a
+  # tiny extractor that prints `decision\tbackup_root\ttransaction\treason\tguidance`.
+  _resume_fields="$(python3 "$SOURCE_ROOT/lib/upgrade-helpers/apply-marker-resolve-fields.py" "$_resume_payload_dir/resolve.json" 2>/dev/null || printf 'none\t\t\t\t')"
+  rm -rf "$_resume_payload_dir"
+  _resume_decision="$(printf '%s' "$_resume_fields" | cut -f1)"
+  case "$_resume_decision" in
+    resume)
+      _resume_backup_root="$(printf '%s' "$_resume_fields" | cut -f2)"
+      _resume_txn="$(printf '%s' "$_resume_fields" | cut -f3)"
+      if [[ -n "$_resume_backup_root" ]]; then
+        BACKUP_ROOT="$_resume_backup_root"
+      fi
+      if [[ -n "$_resume_txn" ]]; then
+        _BRIDGE_RESUMED_RUN_ID="$_resume_txn"
+      fi
+      _BRIDGE_UPGRADE_RESUME_SKIP_BACKUP=1
+      echo "[bridge-upgrade] RESUMING an interrupted apply (transaction ${_resume_txn:-?}). Reusing the original backup (${BACKUP_ROOT:-none}) + transaction id and SKIPPING a fresh backup so the rollback default stays the pre-upgrade snapshot; re-running the idempotent apply steps to converge." >&2
+      ;;
+    reconcile-clear)
+      _bridge_upgrade_apply_marker_clear archive
+      echo "[bridge-upgrade] note: a stale apply-in-progress marker was found but the upgrade-complete marker shows the apply finished — archived the stale marker and proceeding normally." >&2
+      ;;
+    fail-closed)
+      _resume_reason="$(printf '%s' "$_resume_fields" | cut -f4)"
+      _resume_guidance="$(printf '%s' "$_resume_fields" | cut -f5)"
+      _BRIDGE_UPGRADE_DIE_REASON="interrupted-apply marker blocks resume: ${_resume_reason}"
+      _BRIDGE_UPGRADE_DIE_REMEDIATION="$_resume_guidance"
+      bridge_die "refusing to start: ${_resume_reason}
+  remediation: ${_resume_guidance}
+  (the prior apply was NOT cleanly finished; resolve the marker before retrying — no mutation has occurred this run)"
+      ;;
+    *)
+      : # none — normal apply
+      ;;
+  esac
+fi
+# END: Issue #2211 interrupted-apply resume resolution
+
 if [[ $MIGRATE_AGENTS -eq 1 ]]; then
   migrate_preview_args=(migrate-agents --source-root "$SOURCE_ROOT" --target-root "$TARGET_ROOT" --admin-agent "$ADMIN_AGENT_ID" --dry-run)
   if [[ $MIGRATE_ALL_AGENTS -eq 1 ]]; then
@@ -2861,7 +2992,13 @@ if [[ $MIGRATE_AGENTS -eq 1 ]]; then
   MIGRATION_PREVIEW_JSON="$(python3 "$SOURCE_ROOT/bridge-upgrade.py" "${migrate_preview_args[@]}")"
 fi
 
-if [[ $BACKUP -eq 1 ]]; then
+# Issue #2211: on a constrained resume we DELIBERATELY skip CREATING a fresh
+# backup so the rollback default stays the pre-upgrade snapshot (the original
+# backup_root the resolved marker recorded), not the partial mid-apply state. We
+# gate ONLY the backup-live creation step on the resume flag — BACKUP stays 1 so
+# the JSON envelope and the backup-manifest EXTEND path (relay cleanup, docs)
+# still see backup_enabled=true and the still-valid original BACKUP_ROOT.
+if [[ $BACKUP -eq 1 && $_BRIDGE_UPGRADE_RESUME_SKIP_BACKUP -eq 0 ]]; then
   backup_args=(backup-live --target-root "$TARGET_ROOT" --backup-root "$BACKUP_ROOT" --source-root "$SOURCE_ROOT")
   _backup_payload_dir="$(mktemp -d "${TMPDIR:-/tmp}/bridge-upgrade-backup-json.XXXXXX")"
   if [[ "$ANALYSIS_JSON" != "{}" ]]; then
@@ -2899,6 +3036,12 @@ print(payload.get("base_ref", ""))
 # reconcile call is best-effort: if `state/upgrade-conflicts/` is empty
 # or unreadable we still continue with apply.
 UPGRADE_RUN_ID="$(date -u '+%Y%m%dT%H%M%SZ')-$$"
+# Issue #2211: on a constrained resume, reuse the ORIGINAL transaction id from
+# the resolved marker so the resumed apply-live, the marker, and the audit trail
+# all share ONE transaction across the original + resume runs.
+if [[ -n "${_BRIDGE_RESUMED_RUN_ID:-}" ]]; then
+  UPGRADE_RUN_ID="$_BRIDGE_RESUMED_RUN_ID"
+fi
 RECONCILE_JSON='{"mode":"upgrade-conflicts-reconcile","skipped":true,"archived_count":0}'
 if [[ $DRY_RUN -eq 0 ]]; then
   set +e
@@ -3067,6 +3210,13 @@ except Exception:
   set -e
 fi
 
+# Issue #2211: write the apply-in-progress marker NOW — after the backup
+# manifest succeeded (or was deliberately reused on a resume) and BEFORE the
+# first live mutation that flips VERSION (apply-live below). On a resume this is
+# a phase-advance that preserves the original transaction/started_at/target/
+# backup fields. Best-effort: a marker-write failure WARNs but never aborts.
+_bridge_upgrade_apply_marker_write apply-live
+
 apply_args=(apply-live --source-root "$SOURCE_ROOT" --target-root "$TARGET_ROOT" --run-id "$UPGRADE_RUN_ID")
 if [[ -n "$BASE_REF" ]]; then
   apply_args+=(--base-ref "$BASE_REF")
@@ -3132,6 +3282,9 @@ unset _helper_dir
 # and is safe to re-run — re-invoking the upgrader idempotently re-writes
 # the same payload.
 if [[ $DRY_RUN -eq 0 ]]; then
+  # Issue #2211: VERSION + tracked files are now flipped (apply-live done);
+  # advance the apply marker to the write-state barrier.
+  _bridge_upgrade_apply_marker_write write-state
   _write_state_payload_dir="$(mktemp -d "${TMPDIR:-/tmp}/bridge-upgrade-state-json.XXXXXX")"
   printf '%s' "$ANALYSIS_JSON" >"$_write_state_payload_dir/analysis.json"
   # NOTE: `--channel "$CHANNEL"` here records the channel into
@@ -3237,6 +3390,9 @@ if [[ $DRY_RUN -eq 0 ]]; then
   # `agb setup <plugin> <agent>` or fix bun availability and retry).
   #
   # Footgun #11: file-as-argv via standalone helper (no heredoc-stdin).
+  # Issue #2211: advance to the plugin-install barrier — this is the slow
+  # (~2min+ bun install) step the 06-30 interruption landed in.
+  _bridge_upgrade_apply_marker_write plugin-install
   set +e
   _bundled_plugins_tmp="$(mktemp "${TMPDIR:-/tmp}/agb-upg-bundled-plugins.XXXXXX")"
   bridge_upgrade_with_target_env "$TARGET_ROOT" \
@@ -3438,6 +3594,12 @@ PY
     echo "[bridge-upgrade] WARN: telegram-relay residue cleanup preview exited non-zero ($_relay_cleanup_preview_rc); skipping cleanup, manual procedure may be required (see docs/proposals/v0.7.0-install-cleanup-verification-prompt.md)" >&2
   fi
 fi
+
+# Issue #2211: advance to the migrate barrier. Unconditional (gated only on
+# DRY_RUN inside the helper) so the phase progresses monotonically even under
+# --no-migrate-agents — the migrate/finalize/restart barriers still mark how far
+# the apply got for resume/detect.
+_bridge_upgrade_apply_marker_write migrate
 
 if [[ $MIGRATE_AGENTS -eq 1 ]]; then
   if [[ $DRY_RUN -eq 1 ]]; then
@@ -3900,6 +4062,10 @@ fi
 #
 # Skip on dry-run (no work was actually applied) and on analyze/check paths
 # (they exit earlier and never reach here).
+#
+# Issue #2211: advance the apply marker to the finalize barrier — every mutating
+# apply/migrate step is done; the durable work-complete marker write is next.
+_bridge_upgrade_apply_marker_write finalize
 # BEGIN: Issue #1662 upgrade-complete marker + restart notice
 if [[ $DRY_RUN -eq 0 ]]; then
   _bridge_upgrade_write_complete_marker \
@@ -3917,6 +4083,16 @@ if [[ $DRY_RUN -eq 0 ]]; then
   fi
 fi
 # END: Issue #1662 upgrade-complete marker + restart notice
+
+# Issue #2211: the durable work-complete marker (the SUCCESS source of truth) is
+# now on disk — all VERSION-flipping mutating work finished. CLEAR the
+# apply-in-progress marker here, BEFORE the restart phase: from this point an
+# interruption (incl. the exit-137 self-restart SIGKILL) is no longer a partial
+# apply — success is already recorded by upgrade-complete.json, and the daemon
+# restart half is covered by the #2055 quiesce marker + restart-complete
+# promotion. Leaving the apply marker past work-complete would make a normal
+# self-restart look like an interrupted apply on the next invocation.
+_bridge_upgrade_apply_marker_clear
 
 if [[ $RESTART_DAEMON -eq 1 && $DRY_RUN -eq 0 ]]; then
   if [[ "${_UPGRADE_DAEMON_SYSTEMD_MANAGED:-0}" == "1" ]]; then

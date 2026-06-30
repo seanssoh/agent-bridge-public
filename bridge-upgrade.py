@@ -3494,6 +3494,484 @@ def latest_backup_manifest(target_root: Path) -> dict[str, Any]:
     return load_json(root / "manifest.json", {})
 
 
+# --- Issue #2211: interrupted-apply marker (strict-schema + resume/detect) ----
+#
+# `upgrade --apply` writes a DISTINCT marker at
+# state/upgrade/apply-in-progress.json AFTER the backup manifest succeeds and
+# BEFORE the first live mutation (apply-live), updates its `phase` at each apply
+# barrier, and CLEARS it only once the durable work-complete marker is on disk.
+# An interruption (SIGTERM/137/power-loss) mid-run leaves the marker behind →
+# the version may be flipped while finalize/restart never ran (a partial that
+# *looks* upgraded). The marker is the discriminator that lets the next
+# invocation resume idempotently (reusing the ORIGINAL backup_root + transaction
+# id, skipping a fresh backup) — or FAIL CLOSED when it cannot prove a safe
+# resume.
+#
+# This is option 3 (marker + detect/warn) + a CONSTRAINED option 2 (idempotent
+# resume). It does NOT reorder the apply sequence (option 1 / version-flip-last
+# is deferred): the marker is purely additive observability + recovery wiring.
+#
+# Schema is STRICT (fail-closed): the set of keys is fixed, `schema_version` /
+# `kind` are pinned, `phase` is an enum, and any unknown key / missing key /
+# wrong type makes the marker UNRESUMABLE — a malformed marker must never drive a
+# wrong resume.
+
+APPLY_MARKER_SCHEMA_VERSION = 1
+APPLY_MARKER_KIND = "apply-in-progress"
+APPLY_MARKER_STATUS = "in-progress"
+# Apply barriers, in order. The shell updates `phase` as it crosses each. The
+# enum STOPS at `finalize` (the agreed design): the marker is CLEARED right after
+# the durable work-complete marker, BEFORE the restart phase, so `restart` is
+# never a valid marker phase — accepting it would let a marker outlive success.
+APPLY_MARKER_PHASES = (
+    "apply-live",
+    "write-state",
+    "plugin-install",
+    "migrate",
+    "finalize",
+)
+# The exact, complete key set. Strict validation rejects anything that is not
+# this set (no extra keys, no missing keys).
+APPLY_MARKER_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "status",
+        "phase",
+        "transaction",
+        "pid",
+        "psid",
+        "uid",
+        "target_root",
+        "installed_version",
+        "target_version",
+        "target_head",
+        "target_ref",
+        "source_head",
+        "source_ref",
+        "backup_enabled",
+        "backup_root",
+        "restart_daemon",
+        "restart_agents",
+        "started_at",
+        "updated_at",
+    }
+)
+APPLY_MARKER_STR_KEYS = frozenset(
+    {
+        "kind",
+        "status",
+        "phase",
+        "transaction",
+        "psid",
+        "uid",
+        "target_root",
+        "installed_version",
+        "target_version",
+        "target_head",
+        "target_ref",
+        "source_head",
+        "source_ref",
+        "backup_root",
+        "started_at",
+        "updated_at",
+    }
+)
+APPLY_MARKER_BOOL_KEYS = frozenset({"backup_enabled", "restart_daemon", "restart_agents"})
+
+
+def apply_marker_path(target_root: Path) -> Path:
+    return target_root / "state" / "upgrade" / "apply-in-progress.json"
+
+
+def upgrade_complete_marker_path(target_root: Path) -> Path:
+    return target_root / "state" / "upgrade" / "upgrade-complete.json"
+
+
+def validate_apply_marker(raw: Any) -> tuple[dict[str, Any] | None, str]:
+    """Strict-validate a parsed apply-in-progress marker.
+
+    Returns (marker, "") on success, or (None, reason) on rejection. A rejection
+    reason is short + operator-actionable. The validation is FAIL-CLOSED: any
+    structural surprise (wrong type, unknown/missing key, bad enum, bad schema
+    version/kind/status) returns None so the caller never resumes off a
+    marker it could not fully trust.
+    """
+    if not isinstance(raw, dict):
+        return None, "marker is not a JSON object"
+    keys = set(raw.keys())
+    unknown = keys - set(APPLY_MARKER_KEYS)
+    if unknown:
+        return None, f"unknown key(s): {','.join(sorted(unknown))}"
+    missing = set(APPLY_MARKER_KEYS) - keys
+    if missing:
+        return None, f"missing key(s): {','.join(sorted(missing))}"
+    if raw.get("schema_version") != APPLY_MARKER_SCHEMA_VERSION:
+        return None, f"schema_version != {APPLY_MARKER_SCHEMA_VERSION}"
+    if raw.get("kind") != APPLY_MARKER_KIND:
+        return None, f"kind != {APPLY_MARKER_KIND!r}"
+    if raw.get("status") != APPLY_MARKER_STATUS:
+        return None, f"status != {APPLY_MARKER_STATUS!r}"
+    if raw.get("phase") not in APPLY_MARKER_PHASES:
+        return None, f"phase {raw.get('phase')!r} not in {APPLY_MARKER_PHASES}"
+    for key in APPLY_MARKER_STR_KEYS:
+        if not isinstance(raw.get(key), str):
+            return None, f"key {key!r} is not a string"
+    for key in APPLY_MARKER_BOOL_KEYS:
+        if not isinstance(raw.get(key), bool):
+            return None, f"key {key!r} is not a boolean"
+    if not isinstance(raw.get("pid"), int) or isinstance(raw.get("pid"), bool):
+        return None, "key 'pid' is not an integer"
+    if not str(raw.get("target_root") or "").strip():
+        return None, "target_root is empty"
+    if not str(raw.get("transaction") or "").strip():
+        return None, "transaction is empty"
+    return dict(raw), ""
+
+
+def load_apply_marker(target_root: Path) -> tuple[dict[str, Any] | None, str, bool]:
+    """Read + strict-validate the apply marker.
+
+    Returns (marker, reason, present):
+      * (None, "", False)          — no marker on disk (clean).
+      * (None, reason, True)       — a marker is present but MALFORMED.
+      * (marker, "", True)         — a valid pending marker.
+    A present-but-unreadable/unparseable file is treated as malformed (fail
+    closed), never as absent.
+    """
+    path = apply_marker_path(target_root)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, "", False
+    except OSError as exc:
+        return None, f"marker unreadable: {exc}", True
+    try:
+        raw = json.loads(text)
+    except (ValueError, json.JSONDecodeError) as exc:
+        return None, f"marker is not valid JSON: {exc}", True
+    marker, reason = validate_apply_marker(raw)
+    if marker is None:
+        return None, reason, True
+    return marker, "", True
+
+
+def complete_marker_matches(target_root: Path, marker: dict[str, Any]) -> bool:
+    """True when a durable upgrade-complete marker corroborates this apply.
+
+    The apply actually finished (the marker clear simply did not land) when the
+    success marker exists, is status=ok, and records the SAME target version the
+    apply marker was driving. That is the "reconcile quietly" case — not a scary
+    interrupted-apply warning.
+    """
+    complete = load_json(upgrade_complete_marker_path(target_root), {})
+    if not isinstance(complete, dict):
+        return False
+    if complete.get("status") != "ok":
+        return False
+    target_version = str(marker.get("target_version") or "").strip()
+    complete_version = str(complete.get("version") or "").strip()
+    return bool(target_version) and target_version == complete_version
+
+
+def backup_root_is_valid(target_root: Path, backup_root: str) -> bool:
+    """A recorded backup_root is usable for a rollback-preserving resume only
+    when its directory exists AND carries a readable manifest.json with at least
+    one entry. Fail-closed: anything short of that is 'no valid backup'."""
+    raw = (backup_root or "").strip()
+    if not raw:
+        return False
+    root = Path(raw).expanduser()
+    if not root.is_dir():  # noqa: raw-pathlib-controller-only — probe of a controller-owned upgrade backup dir under <bridge_home>/backups; the upgrader runs as the controller and treats any unreadable backup as "invalid" (fail-closed), so the safe-wrapper sudo escalation the lint guards against is intentionally NOT wanted here.
+        return False
+    manifest = load_json(root / "manifest.json", None)
+    if not isinstance(manifest, dict):
+        return False
+    entries = manifest.get("entries")
+    return isinstance(entries, list)
+
+
+def resolve_apply_marker(
+    target_root: Path,
+    requested_target_version: str,
+    requested_target_head: str,
+) -> dict[str, Any]:
+    """Decide what an `upgrade --apply` start should do about a pending marker.
+
+    Pure read — never mutates. Returns a decision dict:
+      * decision="none"            — no marker; proceed normally (fresh backup).
+      * decision="reconcile-clear" — stale marker + matching complete marker;
+                                     the apply finished, just clear the marker.
+      * decision="resume"          — valid pending marker for the SAME target;
+                                     reuse backup_root + transaction, skip a
+                                     fresh backup.
+      * decision="fail-closed"     — malformed marker, target mismatch, or a
+                                     backup-enabled marker without a valid
+                                     backup_root/manifest. `reason` + `guidance`
+                                     tell the operator how to recover.
+    The decision carries the marker fields the shell needs (backup_root,
+    transaction, backup_enabled) so the caller does not re-parse.
+    """
+    marker, reason, present = load_apply_marker(target_root)
+    if not present:
+        return {"decision": "none"}
+    if marker is None:
+        # Malformed / unreadable: NEVER resume off it.
+        return {
+            "decision": "fail-closed",
+            "reason": f"a pending apply-in-progress marker is malformed ({reason})",
+            "guidance": (
+                "The interrupted-apply marker at "
+                f"{apply_marker_path(target_root)} could not be validated, so a "
+                "safe automatic resume is not possible. Inspect it, then either "
+                "re-run the ORIGINAL upgrade target explicitly once the marker is "
+                "removed, or `agent-bridge upgrade rollback --backup-root <dir>` "
+                "with the backup directory recorded in the pre-upgrade backup "
+                "(see state/upgrade/last-upgrade.json:backup_root)."
+            ),
+        }
+    # Target-ROOT match is the first gate (before reconcile OR resume): a marker
+    # whose recorded target_root is not THIS install (e.g. copied/restored from a
+    # different BRIDGE_HOME) must NEVER drive a resume or a quiet reconcile here,
+    # even if its version/head happen to match. Compare resolved paths so a
+    # symlink/trailing-slash difference does not spuriously mismatch.
+    marker_root = str(marker.get("target_root") or "").strip()
+    try:
+        marker_root_norm = str(Path(marker_root).expanduser().resolve(strict=False)) if marker_root else ""
+        this_root_norm = str(Path(target_root).expanduser().resolve(strict=False))
+    except OSError:
+        marker_root_norm, this_root_norm = marker_root, str(target_root)
+    if not marker_root_norm or marker_root_norm != this_root_norm:
+        return {
+            "decision": "fail-closed",
+            "reason": (
+                "a pending apply-in-progress marker records a DIFFERENT target_root "
+                f"({marker_root or '<empty>'}) than this install ({target_root})"
+            ),
+            "guidance": (
+                "The interrupted-apply marker belongs to another install (it may "
+                "have been copied or restored from a different BRIDGE_HOME). "
+                "Refusing to resume off a foreign marker. Remove "
+                f"{apply_marker_path(target_root)} if it does not belong to this "
+                "install, or re-run the original upgrade against the install the "
+                "marker names."
+            ),
+        }
+    # A valid marker whose apply ACTUALLY finished (clear didn't land): reconcile.
+    if complete_marker_matches(target_root, marker):
+        return {
+            "decision": "reconcile-clear",
+            "transaction": str(marker.get("transaction") or ""),
+            "target_version": str(marker.get("target_version") or ""),
+        }
+    marker_version = str(marker.get("target_version") or "").strip()
+    marker_head = str(marker.get("target_head") or "").strip()
+    req_version = (requested_target_version or "").strip()
+    req_head = (requested_target_head or "").strip()
+    # Target match: the version must match; if both heads are known they must
+    # match too (a same-version different-head retarget is still a mismatch).
+    version_matches = bool(marker_version) and marker_version == req_version
+    head_mismatch = bool(marker_head) and bool(req_head) and marker_head != req_head
+    if not version_matches or head_mismatch:
+        return {
+            "decision": "fail-closed",
+            "reason": (
+                "a pending apply-in-progress marker targets "
+                f"{marker_version or '?'} ({marker_head[:12] or '?'}) but this run "
+                f"requests {req_version or '?'} ({req_head[:12] or '?'})"
+            ),
+            "guidance": (
+                "An earlier `upgrade --apply` to a DIFFERENT target was "
+                "interrupted. Re-run that ORIGINAL target to converge it first "
+                f"(installed={marker.get('installed_version') or '?'} → "
+                f"{marker_version or '?'}), or roll back with "
+                "`agent-bridge upgrade rollback --backup-root "
+                f"{marker.get('backup_root') or '<recorded backup>'}` before "
+                "switching targets. Refusing to resume a mismatched target."
+            ),
+        }
+    backup_enabled = bool(marker.get("backup_enabled"))
+    backup_root = str(marker.get("backup_root") or "")
+    if backup_enabled and not backup_root_is_valid(target_root, backup_root):
+        return {
+            "decision": "fail-closed",
+            "reason": (
+                "a pending backup-enabled apply marker has no valid backup_root/"
+                f"manifest (recorded: {backup_root or '<empty>'})"
+            ),
+            "guidance": (
+                "The interrupted apply recorded a backup but its directory/"
+                "manifest is missing, so resume cannot preserve the pre-upgrade "
+                "rollback snapshot. Re-run with `--no-backup` to resume without a "
+                "rollback point (NOT recommended), supply `--backup-root <dir>` "
+                "pointing at the real pre-upgrade backup, or "
+                "`agent-bridge upgrade rollback --backup-root <dir>` if you can "
+                "locate it."
+            ),
+        }
+    return {
+        "decision": "resume",
+        "transaction": str(marker.get("transaction") or ""),
+        "backup_root": backup_root,
+        "backup_enabled": backup_enabled,
+        "phase": str(marker.get("phase") or ""),
+        "target_version": marker_version,
+        "started_at": str(marker.get("started_at") or ""),
+    }
+
+
+def detect_apply_marker(target_root: Path) -> dict[str, Any]:
+    """Read-only detector for status/doctor.
+
+    Returns a dict with `state` one of:
+      * "clean"      — no pending marker.
+      * "reconcile"  — stale marker but the apply finished (complete marker
+                       corroborates); a quiet archive, not a warning.
+      * "interrupted"— a pending marker with no corroborating success; the
+                       loud, operator-facing interrupted-apply warning.
+      * "malformed"  — a present-but-unvalidatable marker (fail-closed warning).
+    Carries `warning` + `recovery` strings for the warning surfaces.
+    """
+    marker, reason, present = load_apply_marker(target_root)
+    if not present:
+        return {"state": "clean"}
+    if marker is None:
+        return {
+            "state": "malformed",
+            "reason": reason,
+            "warning": (
+                "A previous `upgrade --apply` left a MALFORMED interrupted-apply "
+                f"marker ({reason})."
+            ),
+            "recovery": (
+                "Inspect "
+                f"{apply_marker_path(target_root)}; re-run the original upgrade "
+                "target once it is removed, or `agent-bridge upgrade rollback "
+                "--backup-root <dir>`."
+            ),
+        }
+    if complete_marker_matches(target_root, marker):
+        return {
+            "state": "reconcile",
+            "target_version": str(marker.get("target_version") or ""),
+            "phase": str(marker.get("phase") or ""),
+        }
+    return {
+        "state": "interrupted",
+        "phase": str(marker.get("phase") or ""),
+        "installed_version": str(marker.get("installed_version") or ""),
+        "target_version": str(marker.get("target_version") or ""),
+        "backup_root": str(marker.get("backup_root") or ""),
+        "started_at": str(marker.get("started_at") or ""),
+        "warning": (
+            "A previous `upgrade --apply` to "
+            f"{marker.get('target_version') or '?'} was INTERRUPTED at phase "
+            f"'{marker.get('phase') or '?'}' and never finalized — the install "
+            "may be version-skewed (new files under the old/new VERSION with the "
+            "daemon/finalize incomplete)."
+        ),
+        "recovery": (
+            "Re-run `agent-bridge upgrade --apply` to the SAME target to converge "
+            "it idempotently (it reuses the original backup + transaction), or "
+            "`agent-bridge upgrade rollback --backup-root "
+            f"{marker.get('backup_root') or '<recorded backup>'}` to return to "
+            "the pre-upgrade version."
+        ),
+    }
+
+
+def write_apply_marker(
+    target_root: Path,
+    *,
+    phase: str,
+    transaction: str,
+    target_version: str,
+    target_head: str = "",
+    target_ref: str = "",
+    source_head: str = "",
+    source_ref: str = "",
+    installed_version: str = "",
+    backup_enabled: bool,
+    backup_root: str = "",
+    restart_daemon: bool,
+    restart_agents: bool,
+    started_at: str = "",
+) -> dict[str, Any]:
+    """Write/update the apply-in-progress marker atomically.
+
+    On a phase UPDATE (marker already present + valid) the immutable fields
+    (transaction, started_at, target, backup) are preserved from the existing
+    marker — only `phase` + `updated_at` advance. The strict schema is enforced
+    on write so the file we emit always round-trips through validate_apply_marker.
+    """
+    if phase not in APPLY_MARKER_PHASES:
+        raise SystemExit(f"invalid apply-marker phase: {phase!r}")
+    existing, _reason, present = load_apply_marker(target_root)
+    now = now_iso()
+    if present and existing is not None:
+        # Phase advance: keep the original transaction/started/target/backup.
+        marker = dict(existing)
+        marker["phase"] = phase
+        marker["updated_at"] = now
+        marker["pid"] = os.getpid()
+    else:
+        marker = {
+            "schema_version": APPLY_MARKER_SCHEMA_VERSION,
+            "kind": APPLY_MARKER_KIND,
+            "status": APPLY_MARKER_STATUS,
+            "phase": phase,
+            "transaction": transaction,
+            "pid": os.getpid(),
+            "psid": "",
+            "uid": str(os.getuid()),
+            "target_root": str(target_root),
+            "installed_version": installed_version,
+            "target_version": target_version,
+            "target_head": target_head,
+            "target_ref": target_ref,
+            "source_head": source_head,
+            "source_ref": source_ref,
+            "backup_enabled": bool(backup_enabled),
+            "backup_root": backup_root,
+            "restart_daemon": bool(restart_daemon),
+            "restart_agents": bool(restart_agents),
+            "started_at": started_at or now,
+            "updated_at": now,
+        }
+    validated, reason = validate_apply_marker(marker)
+    if validated is None:
+        raise SystemExit(f"refusing to write an invalid apply marker: {reason}")
+    save_json(apply_marker_path(target_root), validated)
+    return validated
+
+
+def clear_apply_marker(target_root: Path, *, archive: bool = False) -> bool:
+    """Clear (or archive) the apply-in-progress marker. Idempotent.
+
+    Returns True when a marker was removed/archived, False when none existed.
+    When `archive` is set, the marker is moved to a timestamped
+    apply-in-progress.<ts>.archived.json sibling (used by the quiet-reconcile
+    path so the historical record survives); otherwise it is unlinked.
+    """
+    path = apply_marker_path(target_root)
+    if not path.exists():  # noqa: raw-pathlib-controller-only — probe of the controller-owned apply marker under <bridge_home>/state; the upgrader runs as the controller, never an isolated agent UID.
+        return False
+    if archive:
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        dest = path.with_name(f"apply-in-progress.{ts}.archived.json")
+        try:
+            path.replace(dest)
+            return True
+        except OSError:
+            # Fall through to an unlink so a stale marker never wedges the path.
+            pass
+    try:
+        path.unlink()  # noqa: raw-pathlib-controller-only — removal of the controller-owned apply marker under <bridge_home>/state; the upgrader runs as the controller, never an isolated agent UID.
+        return True
+    except FileNotFoundError:
+        return False
+
+
 def resolve_base_ref(target_root: Path, explicit_ref: str) -> str:
     if explicit_ref:
         return explicit_ref
@@ -5367,6 +5845,54 @@ def cmd_write_state(args: argparse.Namespace) -> int:
     return emit_json(payload, 0)
 
 
+def cmd_apply_marker(args: argparse.Namespace) -> int:
+    """Issue #2211 apply-in-progress marker operations (one verb per --op).
+
+    Verbs:
+      write     — create/advance the marker for `--phase`.
+      clear     — remove the marker (idempotent). `--archive` moves it aside.
+      resolve   — decide what an apply START should do about a pending marker
+                  (none/resume/reconcile-clear/fail-closed). rc=0 always; the
+                  caller reads `decision` from JSON.
+      detect    — read-only status/doctor classification (clean/interrupted/
+                  reconcile/malformed). rc=0 always.
+    All verbs emit JSON. `write`/`clear` mutate; `resolve`/`detect` are pure.
+    """
+    target_root = Path(args.target_root).expanduser()
+    op = args.op
+    if op == "write":
+        marker = write_apply_marker(
+            target_root,
+            phase=args.phase,
+            transaction=str(args.transaction or ""),
+            target_version=str(args.target_version or ""),
+            target_head=str(args.target_head or ""),
+            target_ref=str(args.target_ref or ""),
+            source_head=str(args.source_head or ""),
+            source_ref=str(args.source_ref or ""),
+            installed_version=str(args.installed_version or ""),
+            backup_enabled=bool(args.backup_enabled),
+            backup_root=str(args.backup_root or ""),
+            restart_daemon=bool(args.restart_daemon),
+            restart_agents=bool(args.restart_agents),
+            started_at=str(args.started_at or ""),
+        )
+        return emit_json({"op": "write", "marker": marker}, 0)
+    if op == "clear":
+        removed = clear_apply_marker(target_root, archive=bool(args.archive))
+        return emit_json({"op": "clear", "removed": removed, "archived": bool(args.archive)}, 0)
+    if op == "resolve":
+        decision = resolve_apply_marker(
+            target_root,
+            str(args.target_version or ""),
+            str(args.target_head or ""),
+        )
+        return emit_json(decision, 0)
+    if op == "detect":
+        return emit_json(detect_apply_marker(target_root), 0)
+    raise SystemExit(f"unknown apply-marker op: {op!r}")
+
+
 def cmd_rollback_live(args: argparse.Namespace) -> int:
     target_root = Path(args.target_root).expanduser()
     backup_root = Path(args.backup_root).expanduser() if args.backup_root else latest_backup_root(target_root)
@@ -6050,6 +6576,30 @@ def build_parser() -> argparse.ArgumentParser:
     rollback.add_argument("--backup-root", default="")
     rollback.add_argument("--dry-run", action="store_true")
     rollback.set_defaults(handler=cmd_rollback_live)
+
+    # Issue #2211: interrupted-apply marker operations. The Bash apply path
+    # (bridge-upgrade.sh) wires write/clear at the apply barriers + resolve at
+    # start; status/doctor call detect. One verb per `--op`.
+    apply_marker = subparsers.add_parser("apply-marker")
+    apply_marker.add_argument("--target-root", required=True)
+    apply_marker.add_argument(
+        "--op", required=True, choices=("write", "clear", "resolve", "detect")
+    )
+    apply_marker.add_argument("--phase", default="", choices=("", *APPLY_MARKER_PHASES))
+    apply_marker.add_argument("--transaction", default="")
+    apply_marker.add_argument("--target-version", default="")
+    apply_marker.add_argument("--target-head", default="")
+    apply_marker.add_argument("--target-ref", default="")
+    apply_marker.add_argument("--source-head", default="")
+    apply_marker.add_argument("--source-ref", default="")
+    apply_marker.add_argument("--installed-version", default="")
+    apply_marker.add_argument("--backup-enabled", action="store_true")
+    apply_marker.add_argument("--backup-root", default="")
+    apply_marker.add_argument("--restart-daemon", action="store_true")
+    apply_marker.add_argument("--restart-agents", action="store_true")
+    apply_marker.add_argument("--started-at", default="")
+    apply_marker.add_argument("--archive", action="store_true")
+    apply_marker.set_defaults(handler=cmd_apply_marker)
 
     # Issue #394: lifecycle subcommands for `*.upgrade-conflict` files.
     # The Bash dispatcher (`bridge-upgrade.sh conflicts ...`) forwards
