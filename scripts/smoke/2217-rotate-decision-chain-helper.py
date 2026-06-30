@@ -145,6 +145,9 @@ def _monitor_candidates(cache_path: Path, state_path: Path) -> int:
     ns.native_usage_cache = None
     ns.active_token_digest = None
     ns.state_file = str(state_path)
+    # Pin the monitor's content-age window explicitly (the default is 21600s /
+    # 6h) so the stale-tap age below is deterministically past it.
+    ns.cache_max_age_seconds = MONITOR_CACHE_MAX_AGE_SECONDS
     ns.json = True
     import contextlib
     import io
@@ -157,6 +160,9 @@ def _monitor_candidates(cache_path: Path, state_path: Path) -> int:
 
 
 NOW = 1_700_000_000.0
+# The monitor's content-freshness window (default 21600s / 6h). A tap body whose
+# `_written_at` is older than this is inert for the rotation lane.
+MONITOR_CACHE_MAX_AGE_SECONDS = 21600.0
 # Content-age of the tap body. Mutation hook: the shell driver re-runs L1 with
 # CHAIN_TAP_CONTENT_AGE pushed past max_age to prove the content-freshness gate
 # (#2214) is what falls the chain through to the probe layer.
@@ -230,20 +236,45 @@ def verdict_l1_tap_fresh() -> str:
 def verdict_l2_edge_blocked() -> str:
     """L2 — tap blind, native probe runs into an EDGE-BLOCKED 429 (no anthropic
     origin headers): the probe classifies edge-blocked, writes NO synthetic
-    near-limit cache, and the monitor surfaces NO proactive candidate. This is
-    the precise blind condition the reactive backstop must cover. Mutation:
-    swapping the edge headers for anthropic-origin headers (CHAIN_PROBE_ORIGIN=1)
-    makes the SAME 429 a #1468 account signal → a synthetic at-cap cache IS
-    written → a proactive candidate appears (NOT the sean-mac blind mode)."""
+    near-limit cache, and the REAL monitor surfaces NO proactive candidate from
+    the on-disk cache. This is the precise blind condition the reactive backstop
+    must cover. Mutation: swapping the edge headers for anthropic-origin headers
+    (CHAIN_PROBE_ORIGIN=1) makes the SAME 429 a #1468 account signal → a
+    synthetic at-cap cache IS written → the SAME real monitor now surfaces a
+    proactive candidate (NOT the sean-mac blind mode).
+
+    The 0-vs-≥1 distinction is produced by the REAL bridge-usage.py monitor on
+    the cache the probe leaves on disk — NEVER a hardcoded constant. To give the
+    monitor a non-empty cache to (correctly) reject in the blind case, we seed a
+    STALE at-cap stdin-tap body on the SAME cache_path BEFORE the probe: the
+    edge-blocked probe leaves it untouched (serve-stale), and the monitor must
+    still emit 0 candidates because the tap body is content-stale (`_written_at`
+    past the max-age window → `cache_fresh=False` → inert for the rotation lane).
+    A monitor that instead read that stale at-cap body as a live 100% reading
+    would emit a candidate, so the 0 assertion has real teeth on the monitor's
+    staleness gate. The origin mutation overwrites the stale tap with a FRESH
+    synthetic near-limit cache, so the monitor emits ≥1."""
     origin = os.environ.get("CHAIN_PROBE_ORIGIN", "0") == "1"
     headers = ANTHROPIC_HEADERS if origin else CF_HEADERS
+    import time
+
+    real_now = time.time()
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         reg = _registry(tmp, MOCK_TOKEN_A)
         cache_path = tmp / "plugins" / "claude-hud" / ".usage-cache.json"
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        # No tap cache on disk (headless / stale-cleared): the probe is the only
-        # proactive source, and it is blind.
+        # Seed a STALE at-cap stdin-tap body (the sean-mac headless state: a tap
+        # body that is on disk but content-stale). `_written_at` is anchored to
+        # the REAL wall clock the monitor ages against, pushed well past the
+        # monitor's max-age window so a correct monitor treats it as inert.
+        stale_age = MONITOR_CACHE_MAX_AGE_SECONDS + 86_400
+        cache_path.write_text(
+            json.dumps(_tap_cache_at_cap(real_now, stale_age)), encoding="utf-8"
+        )
+        # Fresh mtime over the stale content (the live bug shape): content age,
+        # not mtime, is what the gate must judge.
+        os.utime(cache_path, (real_now - 1, real_now - 1))
         calls = {"n": 0}
         res = _run_probe(
             tmp,
@@ -252,14 +283,18 @@ def verdict_l2_edge_blocked() -> str:
             now=NOW,
             max_age=MAX_AGE,
         )
-        synthetic_written = cache_path.is_file()
-        candidates = _monitor_candidates(cache_path, tmp / "ms.json") if synthetic_written else 0
+        # ALWAYS drive the REAL monitor on whatever cache is on disk now — the
+        # candidate count is the monitor's verdict, never a hardcoded constant.
+        candidates = _monitor_candidates(cache_path, tmp / "ms.json")
+        synthetic_written = res["status"] == "rate-limited-signal"
         if origin:
-            # Mutation control: an origin 429 IS the #1468 signal path.
-            if res["status"] == "rate-limited-signal" and synthetic_written and candidates >= 1:
+            # Mutation control: an origin 429 IS the #1468 signal path — a FRESH
+            # synthetic at-cap cache replaces the stale tap → the monitor rotates.
+            if synthetic_written and candidates >= 1:
                 return "probe-signal"
             return f"unexpected-origin:status={res['status']}:written={synthetic_written}:cand={candidates}"
-        # The real sean-mac condition: edge-blocked, no synthetic cache, blind.
+        # The real sean-mac condition: edge-blocked, no synthetic cache; the real
+        # monitor surfaces NO candidate from the content-stale tap left on disk.
         if res["status"] == "edge-blocked" and not synthetic_written and candidates == 0:
             return "probe-blind"
         return f"unexpected:status={res['status']}:written={synthetic_written}:cand={candidates}"
