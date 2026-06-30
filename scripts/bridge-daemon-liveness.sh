@@ -1151,9 +1151,18 @@ maybe_restart_on_gateway_stall() {
 
 # Bounded local timeout wrapper. The watcher deliberately does NOT source
 # bridge-lib (heavy: tmux/queue/state modules), so we cannot reuse
-# bridge_with_timeout. timeout(1)/gtimeout(1) → preferred; absent, run unwrapped
-# (status quo for a bare host). $1 = seconds, rest = command. rc is the command's
-# (124/137 on a timeout kill — caller treats any non-zero as a failed phase).
+# bridge_with_timeout. $1 = seconds, rest = command. rc is the command's (124 on a
+# timeout kill — caller treats any non-zero as a failed phase).
+#
+# Tiering, in order:
+#   1. timeout(1)/gtimeout(1) — preferred (GNU coreutils).
+#   2. perl `alarm` — PORTABLE bounded fallback. Stock macOS ships NO coreutils
+#      (no timeout/gtimeout) but DOES ship perl, so this keeps the emergency tick
+#      BOUNDED on a bare macOS host (Issue #2207 codex r2 finding 2 — an unwrapped
+#      exec on macOS violated the bounded-local-timeout requirement). Mirrors
+#      timeout(1): exit 124 on the deadline.
+#   3. fail-CLOSED — neither available: do NOT run unbounded. Return 124 (treated
+#      as a failed phase) so the caller audits the gap instead of risking a hang.
 token_lifeline_timeout() {
   local secs="$1"; shift
   [[ "$secs" =~ ^[0-9]+$ ]] || secs=60
@@ -1163,8 +1172,27 @@ token_lifeline_timeout() {
     "$bin" "$secs" "$@"
     return $?
   fi
-  "$@"
-  return $?
+  if command -v perl >/dev/null 2>&1; then
+    # perl alarm()-based bound (fork+waitpid so the parent keeps the SIGALRM after
+    # the child execs the target — a plain `exec` would drop perl's handler). On
+    # the deadline the parent kills the child and exits 124 (timeout(1) parity);
+    # otherwise it propagates the child's exit status / signal.
+    BRIDGE_TL_TIMEOUT_SECS="$secs" perl -e '
+      my $s = $ENV{BRIDGE_TL_TIMEOUT_SECS} || 60;
+      my $pid = fork();
+      if (!defined $pid) { exit 127 }
+      if ($pid == 0) { exec @ARGV or exit 127 }
+      $SIG{ALRM} = sub { kill "TERM", $pid; kill "KILL", $pid; exit 124 };
+      alarm $s;
+      waitpid($pid, 0);
+      my $st = $?;
+      alarm 0;
+      exit($st & 127 ? 128 + ($st & 127) : $st >> 8);
+    ' "$@"
+    return $?
+  fi
+  # Tier 3: no bounded mechanism on PATH — fail CLOSED rather than exec unbounded.
+  return 124
 }
 
 # Interval throttle. Returns 0 (due) when the lifeline has NOT run within
@@ -1206,6 +1234,16 @@ run_token_lifeline() {
   local auth_sh="$BRIDGE_AUTH_SH"
   local tmo="$BRIDGE_DAEMON_TOKEN_LIFELINE_TIMEOUT_SECONDS"
   local agent_scope="$BRIDGE_CLAUDE_TOKEN_SYNC_AGENTS"
+  # Issue #2207 (codex r2 finding 1): resolve recover-due's check-timeout /
+  # retry-seconds from the SAME envs the daemon uses (bridge-daemon.sh
+  # process_claude_token_recovery), with the SAME defaults, and pass both flags.
+  # Otherwise an operator's BRIDGE_CLAUDE_TOKEN_CHECK_TIMEOUT_SECONDS /
+  # _RETRY_SECONDS override silently DIVERGES while the daemon is down — the
+  # emergency tick must behave like the daemon's recover-due, not a stripped one.
+  local check_timeout="${BRIDGE_CLAUDE_TOKEN_CHECK_TIMEOUT_SECONDS:-45}"
+  local retry_seconds="${BRIDGE_CLAUDE_TOKEN_CHECK_RETRY_SECONDS:-1800}"
+  [[ "$check_timeout" =~ ^[0-9]+$ ]] || check_timeout=45
+  [[ "$retry_seconds" =~ ^[0-9]+$ ]] || retry_seconds=1800
 
   [[ "${BRIDGE_DAEMON_TOKEN_LIFELINE_ENABLED:-1}" == "1" ]] || return 0
   [[ -f "$auth_sh" ]] || return 0
@@ -1213,11 +1251,11 @@ run_token_lifeline() {
 
   # Interval throttle — at most one lifeline per interval per stale host.
   token_lifeline_due || return 0
-  # Record the attempt BEFORE running (record-even-on-failure) so a hanging /
-  # persistently-failing auth call cannot hot-loop the lifeline every poll.
-  token_lifeline_record
 
   if [[ "$BRIDGE_DAEMON_LIVENESS_DRY_RUN" == "1" ]]; then
+    # Issue #2207 (codex r2 finding 3): DRY_RUN must mutate NOTHING — do NOT write
+    # the throttle state file here, or a DRY_RUN tick would suppress the next REAL
+    # stale tick. The record happens only on the real (mutating) path below.
     emit_audit daemon_liveness_token_lifeline \
       --detail trigger="$trigger" \
       --detail heartbeat_age_seconds="$heartbeat_age" \
@@ -1230,11 +1268,20 @@ run_token_lifeline() {
     return 0
   fi
 
+  # Record the attempt BEFORE running the auth calls (record-even-on-failure) so a
+  # hanging / persistently-failing auth call cannot hot-loop the lifeline every
+  # poll. Only the REAL path records — DRY_RUN returned above without mutating.
+  token_lifeline_record
+
   # Phase 1 — recover-due. Re-enables a recovered registry row; on its own it does
-  # NOT propagate to live sessions (that is phase 2). rc!=0 → failed/timeout.
+  # NOT propagate to live sessions (that is phase 2). Same --timeout/--retry-seconds
+  # the daemon passes (flag fidelity). rc!=0 → failed/timeout.
   local recover_status="ok"
   token_lifeline_timeout "$tmo" \
-    "$BRIDGE_BASH_BIN" "$auth_sh" claude-token recover-due --json >/dev/null 2>&1 \
+    "$BRIDGE_BASH_BIN" "$auth_sh" claude-token recover-due \
+    --timeout "$check_timeout" \
+    --retry-seconds "$retry_seconds" \
+    --json >/dev/null 2>&1 \
     || recover_status="failed"
 
   # Phase 2 — sync (UNCONDITIONAL). This is the correctness crux: recover-due

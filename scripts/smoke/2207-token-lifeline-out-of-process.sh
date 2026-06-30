@@ -103,6 +103,9 @@ life_setup() {
 life_run() {
   local hb_age="$1"; shift || true
   local hb_file="$LIFE_STATE_DIR/daemon.heartbeat"
+  # Deliberate test-fixture filename (the #1973 recovery-marker path the watcher
+  # writes on a restart); not a real iso-helper boundary callsite.
+  local renudge_file="$LIFE_STATE_DIR/recovery.env"  # noqa: iso-helper-boundary
   local now mtime
   now="$(date +%s)"
   mtime=$(( now - hb_age ))
@@ -124,7 +127,7 @@ life_run() {
     BRIDGE_DAEMON_GATEWAY_STALL_SECONDS="${BRIDGE_DAEMON_GATEWAY_STALL_SECONDS:-300}" \
     BRIDGE_DAEMON_GATEWAY_STATUS_CMD="${BRIDGE_DAEMON_GATEWAY_STATUS_CMD:-}" \
     BRIDGE_DAEMON_GATEWAY_STALL_STATE_FILE="$LIFE_STATE_DIR/gateway-stall.ts" \
-    BRIDGE_DAEMON_RECOVERY_RENUDGE_FILE="$LIFE_STATE_DIR/recovery.env" \
+    BRIDGE_DAEMON_RECOVERY_RENUDGE_FILE="$renudge_file" \
     BRIDGE_DAEMON_LIVENESS_DRY_RUN="${BRIDGE_DAEMON_LIVENESS_DRY_RUN:-1}" \
     BRIDGE_AUTH_SH="$AUTH_SHIM" \
     BRIDGE_BASH_BIN="bash" \
@@ -281,7 +284,17 @@ step_t7_dry_run_no_mutation() {
     || smoke_fail "T7: DRY_RUN audit row missing the dry_run=1 marker"
   grep -q 'DRY_RUN .*token lifeline' "$LIFE_STATE_DIR/liveness.out" \
     || smoke_fail "T7: DRY_RUN did not log the would-run line"
-  smoke_log "T7: OK — DRY_RUN audits but mutates nothing"
+  # codex r2 finding 3: DRY_RUN must mutate NOTHING — the throttle state file must
+  # NOT be written, or a DRY_RUN tick would suppress the next REAL stale tick.
+  if [[ -e "$LIFE_STATE_DIR/token-lifeline.ts" ]]; then
+    smoke_fail "T7: DRY_RUN wrote the throttle state file token-lifeline.ts — it would suppress the next real tick (codex r2 finding 3)"
+  fi
+  # And prove it does NOT suppress a subsequent REAL tick: a real run right after
+  # the DRY_RUN must actually invoke the auth shim (throttle was never armed).
+  BRIDGE_DAEMON_LIVENESS_DRY_RUN=0 life_run 900
+  [[ "$(auth_count 'recover-due')" == "1" ]] \
+    || smoke_fail "T7: a real tick after a DRY_RUN was throttled — DRY_RUN must not arm the throttle (log: $(cat "$AUTH_LOG"))"
+  smoke_log "T7: OK — DRY_RUN audits but mutates nothing (state file absent; real tick not suppressed)"
 }
 
 # ===========================================================================
@@ -372,6 +385,102 @@ step_t10_stale_plus_gateway_stall() {
   smoke_log "T10: OK — lifeline runs before the gateway-stall early-return"
 }
 
+# ===========================================================================
+# T11 — recover-due flag fidelity (--timeout / --retry-seconds from the envs)
+# ===========================================================================
+# codex r2 finding 1: the emergency tick's recover-due MUST carry the same
+# --timeout/--retry-seconds the daemon passes (resolved from
+# BRIDGE_CLAUDE_TOKEN_CHECK_TIMEOUT_SECONDS / _CHECK_RETRY_SECONDS), or those
+# overrides silently diverge while the daemon is down. We set both envs to
+# non-default sentinels and assert the recorded recover-due argv carries them.
+step_t11_recover_due_flag_fidelity() {
+  smoke_log "T11: recover-due carries --timeout/--retry-seconds from the daemon's envs"
+  life_setup
+  BRIDGE_CLAUDE_TOKEN_CHECK_TIMEOUT_SECONDS=37 \
+  BRIDGE_CLAUDE_TOKEN_CHECK_RETRY_SECONDS=2400 \
+  BRIDGE_DAEMON_LIVENESS_DRY_RUN=0 life_run 900
+  # The shim logs the full argv on a `cmd:` line; assert the recover-due line has
+  # both flags with the sentinel values.
+  grep -q 'recover-due .*--timeout 37' "$AUTH_LOG" \
+    || smoke_fail "T11: recover-due is MISSING --timeout 37 from BRIDGE_CLAUDE_TOKEN_CHECK_TIMEOUT_SECONDS (log: $(cat "$AUTH_LOG"))"
+  grep -q 'recover-due .*--retry-seconds 2400' "$AUTH_LOG" \
+    || smoke_fail "T11: recover-due is MISSING --retry-seconds 2400 from BRIDGE_CLAUDE_TOKEN_CHECK_RETRY_SECONDS (log: $(cat "$AUTH_LOG"))"
+  smoke_log "T11: OK — recover-due flag fidelity matches the daemon"
+}
+
+# ===========================================================================
+# T12 — bounded fail-closed when no timeout tool is on PATH
+# ===========================================================================
+# codex r2 finding 2: stock macOS ships NO timeout/gtimeout. The bounded-timeout
+# helper must NOT exec unbounded — it must use a portable bound (perl) or, if even
+# that is absent, FAIL CLOSED (skip the auth call, audit the phase as failed). We
+# drive the watcher with a PATH that has NEITHER timeout/gtimeout NOR perl AND a
+# SLOW auth shim (sleep 30); the tick must return promptly (bounded) and audit the
+# phases as failed — never hang on the unbounded exec.
+step_t12_bounded_fail_closed() {
+  smoke_log "T12: no timeout tool + no perl → bounded fail-closed, NOT an unbounded exec"
+  life_setup
+  # A slow auth shim: every call sleeps 30s. If the helper ran it UNBOUNDED the
+  # watcher would hang ~30s+; bounded fail-closed returns immediately.
+  local slow_shim="$STUB_DIR/bridge-auth-slow.sh"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'printf "cmd: %%s\\n" "$*" >>"%s"\n' "$AUTH_LOG"
+    printf 'sleep 30\n'
+    printf 'exit 0\n'
+  } >"$slow_shim"
+  chmod +x "$slow_shim"
+  # A minimal PATH that excludes timeout/gtimeout AND perl but keeps bash + the
+  # coreutils the watcher needs (date/stat/etc come from /usr/bin and /bin).
+  local minbin="$SMOKE_TMP_ROOT/minbin"
+  rm -rf "$minbin"; mkdir -p "$minbin"
+  local c src
+  for c in bash sh env date stat tr head cut grep sed mkdir dirname printf cat rm sleep python3 command; do
+    src="$(command -v "$c" 2>/dev/null || true)"
+    [[ -n "$src" ]] && ln -sf "$src" "$minbin/$c" 2>/dev/null || true
+  done
+  # Sanity: neither timeout/gtimeout nor perl resolvable under this PATH.
+  if PATH="$minbin" command -v timeout >/dev/null 2>&1 || PATH="$minbin" command -v gtimeout >/dev/null 2>&1; then
+    smoke_skip "T12 setup: could not strip timeout/gtimeout from the test PATH" && return 0
+  fi
+  if PATH="$minbin" command -v perl >/dev/null 2>&1; then
+    smoke_skip "T12 setup: could not strip perl from the test PATH" && return 0
+  fi
+  local hb_file="$LIFE_STATE_DIR/daemon.heartbeat"
+  local now mtime start end
+  now="$(date +%s)"; mtime=$(( now - 900 ))
+  printf '%s\n' "$mtime" >"$hb_file"
+  if date -r "$mtime" >/dev/null 2>&1; then
+    touch -t "$(date -r "$mtime" +%Y%m%d%H%M.%S 2>/dev/null)" "$hb_file" 2>/dev/null || true
+  fi
+  start="$(date +%s)"
+  PATH="$minbin" env \
+    BRIDGE_HOME="$BRIDGE_HOME" \
+    BRIDGE_STATE_DIR="$LIFE_STATE_DIR" \
+    BRIDGE_AUDIT_LOG="$LIFE_STATE_DIR/audit.jsonl" \
+    BRIDGE_DAEMON_HEARTBEAT_FILE="$hb_file" \
+    BRIDGE_DAEMON_PID_FILE="$LIFE_STATE_DIR/daemon.pid" \
+    BRIDGE_DAEMON_LIVENESS_THRESHOLD_SECONDS=600 \
+    BRIDGE_DAEMON_LIVENESS_COOLDOWN_SECONDS=0 \
+    BRIDGE_DAEMON_GATEWAY_STALL_DISABLE=1 \
+    BRIDGE_DAEMON_LIVENESS_DRY_RUN=0 \
+    BRIDGE_AUTH_SH="$slow_shim" \
+    BRIDGE_BASH_BIN="bash" \
+    BRIDGE_DAEMON_TOKEN_LIFELINE_STATE_FILE="$LIFE_STATE_DIR/token-lifeline.ts" \
+    BRIDGE_DAEMON_TOKEN_LIFELINE_TIMEOUT_SECONDS=2 \
+    bash "$LIVENESS_SRC" >"$LIFE_STATE_DIR/liveness.out" 2>&1 || true
+  end="$(date +%s)"
+  # Bounded: the whole tick (3 sleeping phases, each fail-closed at rc=124) must
+  # finish WELL under the 30s-per-call unbounded floor. Allow generous slack.
+  if (( end - start >= 25 )); then
+    smoke_fail "T12: the tick ran UNBOUNDED ($(( end - start ))s) — the slow auth call was not bounded/fail-closed"
+  fi
+  # The audit row must mark the phases failed (fail-closed), not ok.
+  grep -q 'recover_due.*failed' "$LIFE_STATE_DIR/audit.jsonl" \
+    || smoke_fail "T12: fail-closed recover-due was not audited as failed (audit: $(cat "$LIFE_STATE_DIR/audit.jsonl" 2>/dev/null))"
+  smoke_log "T12: OK — no-timeout-tool path is bounded + fail-closed (elapsed $(( end - start ))s)"
+}
+
 # ---------------------------------------------------------------------------
 main() {
   step_t1_fresh_no_calls
@@ -384,6 +493,8 @@ main() {
   step_t8_no_rotation
   step_t9_interval_throttle
   step_t10_stale_plus_gateway_stall
+  step_t11_recover_due_flag_fidelity
+  step_t12_bounded_fail_closed
   smoke_log "PASS"
 }
 
