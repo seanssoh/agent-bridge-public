@@ -5197,18 +5197,22 @@ bridge_codex_app_server_reaper_run() {
 # `app-server-broker.mjs` orphan pairs (broker reparented to launchd ppid==1,
 # NOT backed by a live codex session, older than the age floor). macOS-scoped.
 # Cadence-gated (default hourly) via bridge_daemon_pass_due so a busy 5s tick
-# never re-runs the ps scan. REAPS by default (the whole point is to stop the
-# unbounded leak); set BRIDGE_CODEX_APP_SERVER_REAPER_MODE=scan for observe-only
-# or BRIDGE_CODEX_APP_SERVER_REAPER_ENABLED=0 to disable. Returns 0 when it
-# reaped/found something (cycle changed), 1 when gated/clean/non-macOS.
+# never re-runs the ps scan. SCANS (observe-only) by default — the FIRST rollout
+# of an automatic process-killer is intentionally conservative: it reports leaked
+# orphan counts to the audit log without killing, so an operator can soak the
+# detection against real fleets before promoting to active reaping (operator
+# directive 2026-06-30). Promote with BRIDGE_CODEX_APP_SERVER_REAPER_MODE=reap
+# once a soak window is clean; BRIDGE_CODEX_APP_SERVER_REAPER_ENABLED=0 disables.
+# An invalid mode falls back to the SAFE mode (scan), never to reap. Returns 0
+# when it reaped/found something (cycle changed), 1 when gated/clean/non-macOS.
 process_codex_app_server_reaper() {
   local interval="${BRIDGE_CODEX_APP_SERVER_REAPER_INTERVAL_SECONDS:-3600}"
-  local mode="${BRIDGE_CODEX_APP_SERVER_REAPER_MODE:-reap}"
+  local mode="${BRIDGE_CODEX_APP_SERVER_REAPER_MODE:-scan}"
   local report total
 
   [[ "${BRIDGE_CODEX_APP_SERVER_REAPER_ENABLED:-1}" == "1" ]] || return 1
   [[ "$(uname -s 2>/dev/null || true)" == "Darwin" ]] || return 1
-  [[ "$mode" == "scan" || "$mode" == "reap" ]] || mode="reap"
+  [[ "$mode" == "scan" || "$mode" == "reap" ]] || mode="scan"
   [[ "$interval" =~ ^[0-9]+$ ]] || interval=3600
   bridge_daemon_pass_due "codex_app_server_reaper" "$interval" || return 1
 

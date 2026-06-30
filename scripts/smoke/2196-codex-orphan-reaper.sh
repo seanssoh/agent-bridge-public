@@ -198,6 +198,15 @@ kill "${_pids6[@]}" 2>/dev/null || true
 smoke_log "D: daemon wires the periodic pass + standalone subcommand; #68 gates the verb"
 grep -q 'process_codex_app_server_reaper' "$DAEMON_SH" || \
   smoke_fail "bridge-daemon.sh does not define/wire the periodic reaper pass"
+# Operator safety directive (2026-06-30): the AUTOMATIC periodic pass must ship
+# SCAN-first (observe-only) on its first rollout — a clean soak promotes it to
+# reap. Lock that default so it cannot silently regress to auto-kill. The
+# explicit operator verb (cmd_reap_codex_orphans) keeps reaping by design.
+grep -qE 'BRIDGE_CODEX_APP_SERVER_REAPER_MODE:-scan' "$DAEMON_SH" || \
+  smoke_fail "periodic reaper pass must DEFAULT to scan-first, not reap (operator 2026-06-30 safety directive)"
+if grep -q 'BRIDGE_CODEX_APP_SERVER_REAPER_MODE:-reap' "$DAEMON_SH"; then
+  smoke_fail "periodic reaper pass still defaults to reap — must be scan-first until soak-promoted"
+fi
 grep -q 'codex_app_server_reaper' "$DAEMON_SH" || \
   smoke_fail "bridge-daemon.sh missing the cadence-gated pass key"
 grep -q 'reap-codex-orphans)' "$DAEMON_SH" || \
