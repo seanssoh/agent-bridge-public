@@ -12265,6 +12265,16 @@ bash "$REPO_ROOT/scripts/smoke/δ-1234-daemon-start-policy.sh"
 log "running watchdog-silence-stderr-capture smoke (#946 L3)"
 bash "$REPO_ROOT/scripts/smoke/watchdog-silence-stderr-capture.sh"
 
+# Issue #2208 — a hung `restart --force` (rc 124) used to fail OPEN: the
+# silence watchdog wrote a 300s cooldown and returned, parking the daemon
+# DOWN for the full window with no harder kill or OS-init re-arm. The fix
+# escalates (SIGKILL the wedged pid on non-launchd hosts + ONE bounded
+# `restart --force` re-arm) before falling back to the cooldown. This
+# smoke pins the escalate path AND keeps rc==2 (out-of-band split) fail-
+# closed; it is the mutation oracle for the fail-open regression.
+log "running 2208-watchdog-hung-restart-escalate smoke (issue #2208)"
+bash "$REPO_ROOT/scripts/smoke/2208-watchdog-hung-restart-escalate.sh"
+
 # Issue #981 — operator-initiated `agent restart` previously lost the
 # in-flight conversation because bridge_kill_agent_session's SIGKILL
 # interrupted Claude's transcript flush and the post-kill resolver gate
