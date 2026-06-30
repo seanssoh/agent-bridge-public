@@ -1914,12 +1914,18 @@ _bridge_upgrade_daemon_live_within() {
     if BRIDGE_HOME="$target_root" BRIDGE_STATE_DIR="$target_state" \
        BRIDGE_DAEMON_PID_FILE="$target_pidfile" \
        bridge_daemon_is_running 2>/dev/null; then
+      # Require BOTH a live pid AND a FRESH numeric heartbeat. A pid that is up
+      # but whose heartbeat is missing / empty / unparseable / stale is the #815
+      # silent-wedge shape the brief says must NOT count as live (the canonical
+      # helper returns empty + rc=1 for a missing heartbeat, and the health layer
+      # classifies pid-up-without-a-fresh-tick as "silent", not "ok"). Do NOT
+      # early-accept an empty age — keep polling; a genuinely just-restarted
+      # daemon writes its first tick within ~1s, well inside the poll window, so
+      # it converges to a fresh numeric age. If the heartbeat never goes
+      # fresh+numeric within `max`, fall through to return 1 → recovery fires
+      # (codex Phase-4 #2085 re-review #20623: pid AND fresh heartbeat).
       age="$(BRIDGE_STATE_DIR="$target_state" bridge_daemon_heartbeat_age_seconds 2>/dev/null || true)"
-      if [[ -z "$age" ]]; then
-        # pid alive, heartbeat not parseable yet (just-started daemon writes its
-        # first tick within ~1s) — accept as live.
-        return 0
-      elif [[ "$age" =~ ^[0-9]+$ ]] && (( age <= fresh )); then
+      if [[ "$age" =~ ^[0-9]+$ ]] && (( age <= fresh )); then
         return 0
       fi
     fi
