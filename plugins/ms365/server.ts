@@ -59,6 +59,7 @@ import {
   mkdirSync,
   openSync,
   readdirSync,
+  realpathSync,
   readFileSync,
   renameSync,
   statSync,
@@ -1404,6 +1405,10 @@ function resolveAttachmentSaveDir(raw: unknown): string {
   const root = resolve(ATTACHMENTS_DIR)
   const s = String(raw ?? '').trim()
   const target = s ? resolve(root, s) : root
+  // Lexical containment is a fast first gate, but path.resolve does NOT follow
+  // symlinks, so a save_dir like `escape` where `<root>/escape` is a symlink to
+  // a directory OUTSIDE the root passes this check and then mkdir/write follow
+  // the link out of the sandbox (codex review: real lands in /tmp/outside/...).
   if (!isPathInside(root, target)) {
     throw new Error(`save_dir must be inside the ms365 attachments directory (${root})`)
   }
@@ -1411,7 +1416,17 @@ function resolveAttachmentSaveDir(raw: unknown): string {
   try {
     chmodSync(target, 0o700)
   } catch {}
-  return target
+  // Re-check containment with ALL symlinks resolved (root + target now exist).
+  // realpathSync collapses every symlinked component, so a target that lexically
+  // sat under the root but physically resolves outside it is rejected BEFORE any
+  // attachment is written. realpath the root too so a symlinked ATTACHMENTS_DIR
+  // is normalized consistently on both sides.
+  const realRoot = realpathSync(root)
+  const realTarget = realpathSync(target)
+  if (!isPathInside(realRoot, realTarget)) {
+    throw new Error(`save_dir must resolve inside the ms365 attachments directory (${realRoot})`)
+  }
+  return realTarget
 }
 
 function attachmentOutputPath(saveDir: string, name: string): string {
