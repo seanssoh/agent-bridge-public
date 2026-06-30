@@ -484,6 +484,12 @@ UNIT_CONTENT="$(
   printf '%s\n' \
     'Restart=always' \
     'RestartSec=5' \
+    '# Issue #2206: make the daemon a *last* OOM victim, not a first. A leaked' \
+    '# managed child (e.g. codex app-server/broker.mjs, #2196) can drive system' \
+    '# memory pressure; the OOM killer must not take the daemon down with it,' \
+    "# since the in-daemon reapers/token-lifeline die with it. -800 is strongly" \
+    '# protected without -1000 total immunity (which can starve the OOM killer).' \
+    'OOMScoreAdjust=-800' \
     '# Without KillMode=process the default control-group mode SIGKILLs every' \
     "# child in the daemon's service cgroup on every restart — tmux servers," \
     '# claude, codex, plugin processes — which makes "stop the daemon" silently' \
