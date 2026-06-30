@@ -536,8 +536,11 @@ _ROOM_AUTOJOIN_KEY = "BRIDGE_A2A_ROOM_AUTOJOIN"
 
 def flag_strict_probes() -> None:
     """#19234 r2 — prove the flag_one validator + env override are LITERAL "1"
-    only (no .strip() normalization), and that tightening the shared flag_one
-    type does NOT regress BRIDGE_A2A_ROOM_AUTOJOIN (exact "1" still accepted)."""
+    only (no .strip() normalization) for BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC, and
+    (#2024 B default-on flip) that BRIDGE_A2A_ROOM_AUTOJOIN is now FLAG_BOOL:
+    exact "1" still accepted AND the whitespace-padded " 1 " canonicalizes to
+    "1" (flag_bool strips/canonicalizes valid spellings), while garbage is
+    still rejected."""
     auth = _load_repo_module("bridge-auth.py", "bridge_auth_flagprobe")
     config = _load_repo_module("bridge-config.py", "bridge_config_flagprobe")
 
@@ -562,16 +565,22 @@ def flag_strict_probes() -> None:
     if canon != "1" or reason is not None:
         _fail(f"validator did NOT accept the literal '1' -> ({canon!r}, {reason!r})")
 
-    # 3) ROOM_AUTOJOIN zero-regression: shared flag_one type, exact "1" still
-    #    accepted; the whitespace-padded form is rejected the SAME way.
+    # 3) ROOM_AUTOJOIN is now FLAG_BOOL (#2024 B default-on flip), NOT flag_one:
+    #    exact "1" is accepted AND the whitespace-padded " 1 " canonicalizes to
+    #    "1" (flag_bool strips/canonicalizes valid spellings — unlike the
+    #    literal-1-only flag_one probed above). Garbage is still rejected, so the
+    #    probe keeps teeth.
     canon, reason = config.validate_env_value(_ROOM_AUTOJOIN_KEY, "1")
     if canon != "1" or reason is not None:
-        _fail(f"ROOM_AUTOJOIN regression: exact '1' rejected -> ({canon!r}, {reason!r})")
+        _fail(f"ROOM_AUTOJOIN (flag_bool): exact '1' not accepted -> ({canon!r}, {reason!r})")
     canon, reason = config.validate_env_value(_ROOM_AUTOJOIN_KEY, " 1 ")
+    if canon != "1" or reason is not None:
+        _fail(f"ROOM_AUTOJOIN (flag_bool): padded ' 1 ' should canonicalize to '1' -> ({canon!r}, {reason!r})")
+    canon, reason = config.validate_env_value(_ROOM_AUTOJOIN_KEY, "garbage")
     if canon is not None or reason is None:
-        _fail(f"ROOM_AUTOJOIN: padded ' 1 ' ACCEPTED -> {canon!r} (must reject)")
+        _fail(f"ROOM_AUTOJOIN (flag_bool): garbage ACCEPTED -> {canon!r} (must reject)")
 
-    print("OK flag-strict-probes: literal-1-only enforced; ROOM_AUTOJOIN '1' still accepted")
+    print("OK flag-strict-probes: GLOBAL_AUTH_SYNC literal-1-only; ROOM_AUTOJOIN flag_bool ('1' + padded ' 1 ' accepted, garbage rejected)")
 
 
 def json_field(field: str) -> None:

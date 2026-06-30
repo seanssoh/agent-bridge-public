@@ -3887,9 +3887,10 @@ class HandoffHandler(BaseHTTPRequestHandler):
                 cfg, peer_id=peer_id, client_ip=client_ip, raw=raw,
                 message_id=message_id)
             if peer is None:
-                # Either auto-join is disabled (default-unchanged hard 403) or
-                # the token did not validate / could not derive a key — the
-                # reject was already audited + replied by the helper.
+                # Either the operator opted OUT of auto-join (default-ON since
+                # #2024 B; the off-spelling returns a posture-only 403) or the
+                # token did not validate / could not derive a key — the reject
+                # was already audited + replied by the helper.
                 return
             bootstrapped = True
 
@@ -4223,7 +4224,8 @@ class HandoffHandler(BaseHTTPRequestHandler):
         derived per-pair key, skew, durable dedupe, leader-node, token re-verify,
         rate-limit, leader-approval gate). Returns None — having already audited +
         replied — when:
-          - auto-join is disabled (env gate unset → DEFAULT-UNCHANGED hard 403);
+          - the operator opted OUT of auto-join (default-ON since #2024 B; an
+            explicit off-spelling → posture-only 403);
           - the body / room / token does not validate;
           - no key seed is available to derive a per-pair key.
 
@@ -4250,29 +4252,32 @@ class HandoffHandler(BaseHTTPRequestHandler):
           * `inbound_allowlist` is the room's `leader_agent` (room-derived, NOT
             bridge_id).
         """
-        # --- env gate: feature-enable, DEFAULT-UNCHANGED. Unset/!=1 → a 403 that
-        # reveals the leader's POSTURE ONLY (auto-join disabled), so a first-
-        # contact joiner is told the gate is off and to ask the leader to enable
-        # it rather than rotating the invite (the code does NOT assert the invite
-        # is valid — it is returned before any token check) (#2024 A.3). NB
-        # (SK-2): the body is
+        # --- env gate: feature-enable. DEFAULT-ON (#2024 B): an unset env now
+        # resolves ENABLED, so a first-contact joiner with a valid invite token
+        # lands a (still leader-approved) PENDING row by default. The operator
+        # opt-out is preserved — an explicit off-spelling (BRIDGE_A2A_ROOM_AUTOJOIN=0
+        # / off / false) forces this branch and returns the POSTURE-ONLY 403 that
+        # reveals the leader's posture (auto-join disabled), so the joiner is told
+        # the gate is off and to ask the leader to enable it rather than rotating
+        # the invite (the code does NOT assert the invite is valid — it is
+        # returned before any token check) (#2024 A.3). NB (SK-2): the body is
         # read BEFORE this reject (hoisted above find_peer so the bootstrap path
         # can inspect room_id/token), so it is not literally byte-for-byte at the
         # I/O level — but the read is bounded by the 8KB Content-Length guard +
         # the socket request timeout, so it adds no unbounded work.
         #
-        # POSTURE ONLY — NO ORACLE (codex HIGH-RISK #6): the gate fires HERE,
-        # before ANY body shape parse, room lookup, or token verify below. The
-        # reply + audit are therefore independent of whether the room exists or
-        # the token is valid — they disclose only that auto-join is OFF, never
-        # room existence or token validity. The `room_id` is deliberately NOT in
-        # the reply/audit (the body is not parsed under the disabled gate). A
-        # malformed body that fails the shape parse once the gate is ON still
-        # gets the opaque `unknown peer`; that distinction does NOT widen the
-        # disabled path's disclosure. This is the feature flag, NOT a POC `=1`
-        # test toggle: when ON the production path is always-on, gated by TOKEN
-        # VALIDITY (never on the env alone). ---
-        if os.environ.get("BRIDGE_A2A_ROOM_AUTOJOIN") != "1":  # noqa: iso-helper-boundary - feature env gate, not a .env file
+        # POSTURE ONLY — NO ORACLE (codex HIGH-RISK #6): when the operator has
+        # opted OUT, this branch fires HERE, before ANY body shape parse, room
+        # lookup, or token verify below. The reply + audit are therefore
+        # independent of whether the room exists or the token is valid — they
+        # disclose only that auto-join is OFF, never room existence or token
+        # validity. The `room_id` is deliberately NOT in the reply/audit (the
+        # body is not parsed under the disabled gate). A malformed body that
+        # fails the shape parse once the gate is ON still gets the opaque
+        # `unknown peer`; that distinction does NOT widen the disabled path's
+        # disclosure. When ON (the default), the production path is gated by
+        # TOKEN VALIDITY + the full unchanged preamble (never the env alone). ---
+        if not a2a.room_autojoin_enabled():
             audit("room_join_reject", reason="autojoin_disabled",
                   peer=peer_id, client=client_ip, message_id=message_id,
                   security=True)

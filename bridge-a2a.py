@@ -2543,8 +2543,8 @@ def _setup_detect_state(
 
 
 def _receiver_room_autojoin_enabled() -> bool:
-    """Best-effort: will the A2A receiver's effective env have
-    ``BRIDGE_A2A_ROOM_AUTOJOIN=1`` on its next (re)start?  (#2024 A.1)
+    """Best-effort: will the A2A receiver's effective env have room auto-join
+    ENABLED on its next (re)start?  (#2024 A.1; default-ON since #2024 B)
 
     Mirrors what the receiver inherits at startup: the live process env
     first, then the managed install-wide override file
@@ -2552,36 +2552,56 @@ def _receiver_room_autojoin_enabled() -> bool:
     receiver spawn path sources that file directly before launch (#15783,
     lib/bridge-a2a.sh:bridge_a2a_source_env_overrides), so both `agb a2a
     daemon start|restart` and a direct `bash bridge-handoff-daemon.sh start`
-    pick up the override. Returns False on any read error (fail-loud: hint
-    when in doubt)."""
+    pick up the override.
+
+    Default-ON resolution (#2024 B): ON unless an explicit off-spelling (`=0` /
+    `off` / `false`) is set. A LIVE-env value wins; otherwise the managed-file
+    value decides (so a durable `set-env BRIDGE_A2A_ROOM_AUTOJOIN=0` correctly
+    predicts an OFF receiver after a restart); absent both, the default (ON)
+    applies. Uses the same resolver as the receiver gate so hint and runtime
+    never disagree."""
     # noqa: iso-helper-boundary - feature env gate, not a .env file
-    if os.environ.get("BRIDGE_A2A_ROOM_AUTOJOIN") == "1":
-        return True
+    live = os.environ.get("BRIDGE_A2A_ROOM_AUTOJOIN")
+    if live is not None:
+        return a2a.room_autojoin_value_enabled(live)
+    return a2a.room_autojoin_value_enabled(_managed_env_value("BRIDGE_A2A_ROOM_AUTOJOIN"))
+
+
+def _managed_env_value(key: str) -> str | None:
+    """Return the value of `key` from the managed `agent-env.local.sh` override
+    file, or None if absent / unreadable. The managed file is one
+    `export KEY='value'` per line (bridge-config.py render_env_export_line)."""
     env_file = a2a.bridge_home() / "agent-env.local.sh"
     try:
         text = env_file.read_text(encoding="utf-8")  # noqa: raw-pathlib-controller-only
     except OSError:
-        return False
+        return None
+    prefix = f"export {key}='"
+    value: str | None = None
     for line in text.splitlines():
-        if line.strip() == "export BRIDGE_A2A_ROOM_AUTOJOIN='1'":
-            return True
-    return False
+        stripped = line.strip()
+        if stripped.startswith(prefix) and stripped.endswith("'"):
+            value = stripped[len(prefix):-1]  # last write wins (file order)
+    return value
 
 
 def _print_room_autojoin_hint() -> None:
     """After A2A transport setup is DONE, surface the cross-node ROOM
     self-service onboarding posture (#2024 A.1/A.2). Transport setup (S0–S6)
-    pairs two KNOWN peers; it does NOT enable first-contact room auto-join,
-    which is a separate, default-OFF gate. Tell the operator how to turn it on
-    if they intend to use the signed-invite room onboarding flow."""
+    pairs two KNOWN peers. First-contact room auto-join is a separate gate that
+    is ON by default since #2024 B; this hint confirms the posture and shows the
+    opt-out for an operator who wants the conservative default-OFF behavior."""
     if _receiver_room_autojoin_enabled():
-        print("  cross-node room auto-join: ENABLED "
+        print("  cross-node room auto-join: ENABLED (default) "
               "(first-contact `room join` of a signed invite is admitted to a "
-              "leader-approved PENDING join).")
+              "leader-approved PENDING join). To opt OUT on this leader "
+              "receiver: `agb config set-env BRIDGE_A2A_ROOM_AUTOJOIN=0` + "
+              "`agb a2a daemon restart`.")
         return
-    print("  cross-node room auto-join: DISABLED (default). A first-contact "
+    print("  cross-node room auto-join: DISABLED (you opted out via "
+          "BRIDGE_A2A_ROOM_AUTOJOIN). A first-contact "
           "`agb room join '<signed invite>'` will 403 "
-          "(code=room_autojoin_disabled). To enable self-service room "
+          "(code=room_autojoin_disabled). To re-enable self-service room "
           "onboarding on THIS leader receiver:")
     print("    agb config set-env BRIDGE_A2A_ROOM_AUTOJOIN=1")
     print("    agb a2a daemon restart   # the restart spawn re-sources the "

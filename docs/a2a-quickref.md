@@ -164,32 +164,32 @@ leader approves**. The verbs exist today:
    agb room approve <room_id> <agent|agent@node>
    ```
 
-### Important: self-service join is gated OFF by default today
+### Self-service join is ON by default (opt-out available)
 
 The "unregistered joiner's request is accepted into a *pending* state on a valid
-invite token" step is guarded by an env gate on the **leader's receiver** that is
-**off by default**: the receiver checks `BRIDGE_A2A_ROOM_AUTOJOIN` and, unless it
-is `1`, rejects the request with **403 `unknown peer`** (the request never
-becomes a pending row). See `bridge-handoffd.py` (the `room_join` unknown-peer
-path). This is the live behavior tracked by **#2024**.
+invite token" step is guarded by an env gate on the **leader's receiver**,
+`BRIDGE_A2A_ROOM_AUTOJOIN`. **Since #2024 B this gate is ON by default**: an
+unset receiver admits a valid first-contact invite token to a (still
+leader-approved) **pending** join. Only an explicit off-spelling
+(`BRIDGE_A2A_ROOM_AUTOJOIN=0` / `off` / `false`) forces the conservative
+**403 `room_autojoin_disabled`** posture. See `bridge-handoffd.py` (the
+`room_join` unknown-peer path) and `bridge_a2a_common.room_autojoin_enabled`.
 
-So **today**, unless the leader's receiver process was started with
-`BRIDGE_A2A_ROOM_AUTOJOIN=1` in its environment, step 2 returns
-`403 unknown peer` and onboarding falls back to the **manual peer-first** path:
-the leader registers the joiner as a peer (shared HMAC secret out-of-band,
-reciprocal `handoff.local.json`) *before* the join, then approves. The
-approval gate itself is unchanged — even with auto-join enabled, nobody joins
-without an explicit leader `approve`.
+The approval gate is unchanged — even with auto-join ON, nobody joins without an
+explicit leader `approve`. Auto-join being on by default only converts a hard
+403 into a fully-checked pending row for a valid token; every other gate (per-
+pair HMAC, `remote_addr` pin, token TTL/revocation, dedupe, leader-approval)
+still runs and a forged/expired token is still rejected with no pending row.
 
-> **(coming, #2024)** a discoverable, first-class way to enable the gate (wizard
-> prompt + runbook), an actionable rejection that distinguishes
-> "auto-join disabled (enable on the leader)" from "invalid token" — surfaced as
-> a `room_autojoin_disabled` reason instead of a flat `unknown peer` — and
-> verification that the joiner side derives its per-pair key from the invite
-> token. Until #2024 lands there is **no supported operator verb** to flip the
-> gate (it is not in the `agb config set-env` allowlist), so treat the
-> single-invite flow as "verbs present, gate off" and use the manual path for a
-> new machine. See **#2024** for the full self-service / autojoin design.
+**Opt out** (restore the conservative default-OFF posture on a leader receiver):
+
+```bash
+agb config set-env BRIDGE_A2A_ROOM_AUTOJOIN=0   # writes $BRIDGE_HOME/agent-env.local.sh
+agb a2a daemon restart                          # re-sources the override (#15783; a direct bash start sources it too)
+```
+
+To re-enable after opting out, set it back to `1` and restart. See **#2024** for
+the full self-service / autojoin design.
 
 ---
 
@@ -216,7 +216,8 @@ managed (iso) agent cannot pass `--as <leader>` to satisfy a leader-only verb.
 
 | Symptom | Likely cause | What to do |
 | --- | --- | --- |
-| `agb room join …` → **403 `unknown peer`** | Self-service auto-join gate is off on the leader (`BRIDGE_A2A_ROOM_AUTOJOIN` ≠ `1`), or the token is invalid/expired. | Use the manual peer-first onboarding path, or have the leader enable auto-join (see #2024). |
+| `agb room join …` → **403 `room_autojoin_disabled`** | The leader explicitly opted OUT of auto-join (`BRIDGE_A2A_ROOM_AUTOJOIN=0`/`off`). Auto-join is ON by default since #2024 B. | Have the leader re-enable it (`agb config set-env BRIDGE_A2A_ROOM_AUTOJOIN=1` + `agb a2a daemon restart`), or use the manual peer-first path. |
+| `agb room join …` → **403 `unknown peer`** | The token is invalid/expired/revoked, or the room is not led by the target node (opaque peer-facing reply; the precise reason is in the leader's audit). | Re-mint a fresh invite on the leader and retry; confirm the leader node actually leads the room. |
 | 1:1 `send` rejected at the peer | The peer's `inbound_allowlist` doesn't include your `--to` agent, or the peer/secret isn't configured. | The allowlist is checked **on the receiver**, so confirm it there: `agb a2a peers list` on the *peer* node shows each inbound peer's `inbound_allowlist`. (`--dry-run` on your side only validates local config, not the remote allowlist.) |
 | Can't reach a peer at all | Receiver not up, firewall blocking the listen port, or stale peer address. | `agb a2a peers test <peer>` (TCP-connect probe only — no enqueue); `agb a2a net-status` for receiver liveness + per-peer state; check the host firewall on the receiver's listen port. |
 | Peer keyed on a raw IP, drifts after re-login | The peer entry has an `address` but no Tailscale identity. | `agb a2a peers list` warns on this; run `agb a2a migrate-identity --apply` to identity-key it. |
@@ -234,5 +235,4 @@ managed (iso) agent cannot pass `--as <leader>` to satisfy a leader-only verb.
 `room send` · `room talk`.
 
 Tagged **(coming, #2025)**: `a2a whois`, `a2a send --to` peer auto-resolve, the
-`peers list` / `net-status` agent-roster column. Tagged **(coming, #2024)**: a
-supported toggle + actionable rejection for room self-service auto-join.
+`peers list` / `net-status` agent-roster column.

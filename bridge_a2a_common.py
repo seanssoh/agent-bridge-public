@@ -436,6 +436,57 @@ def _allow_insecure_no_secret() -> bool:
     )
 
 
+# Issue #2024 B: the room first-contact auto-join feature gate.
+# Off-value spellings that DURABLY opt OUT of the (now default-ON) gate. These
+# are the exact stripped/lowercase tokens accepted by both the runtime resolver
+# below and the `agb config set-env` validator (ENV_KEY_TYPE_FLAG_BOOL in
+# bridge-config.py), so the durable file value and the live-env value resolve
+# identically. Kept narrow on purpose: anything NOT in this set resolves ON, so
+# the only way to be OFF is an explicit, unambiguous off-spelling.
+ROOM_AUTOJOIN_OFF_VALUES: frozenset[str] = frozenset(
+    {"0", "false", "off", "no", "disable", "disabled"}
+)
+
+
+def room_autojoin_value_enabled(value: str | None) -> bool:
+    """Resolve a single ``BRIDGE_A2A_ROOM_AUTOJOIN`` value to the gate posture.
+
+    Issue #2024 B flipped the DEFAULT from OFF to ON: an unknown peer presenting
+    a valid first-contact invite token now lands a (still leader-approved)
+    PENDING join row by default instead of a hard 403. The operator opt-out is
+    preserved — an explicit off-spelling (see ``ROOM_AUTOJOIN_OFF_VALUES``)
+    forces the gate back OFF.
+
+    Semantics (the SINGLE source of truth for both the receiver gate and the CLI
+    posture hints):
+      * ``None`` / empty / whitespace-only  -> ``True``  (the new default).
+      * an explicit off-spelling            -> ``False`` (durable opt-out).
+      * anything else (``1``/``true``/...)   -> ``True``.
+
+    This only governs WHETHER the unknown-peer bootstrap is reachable. EVERY
+    downstream gate (per-pair HMAC, addr==socket-ip, skew, durable dedupe,
+    leader-node, token TTL/revocation re-verify, rate-limit, and the human
+    leader-approval gate) is unchanged and remains the security boundary — a
+    forged/expired/revoked token is still rejected with no pending row under
+    either posture.
+    """
+    if value is None:
+        return True
+    return value.strip().lower() not in ROOM_AUTOJOIN_OFF_VALUES
+
+
+def room_autojoin_enabled() -> bool:
+    """Is the room first-contact auto-join gate ON in THIS process's env?
+
+    Reads ``BRIDGE_A2A_ROOM_AUTOJOIN`` from ``os.environ`` and resolves it via
+    :func:`room_autojoin_value_enabled` (default-ON; explicit off-spelling
+    opts out). The receiver handler calls this exactly once per unknown-peer
+    request to decide whether to enter the bootstrap path (#2024 B).
+    """
+    # noqa: iso-helper-boundary - feature env gate, not a .env file
+    return room_autojoin_value_enabled(os.environ.get("BRIDGE_A2A_ROOM_AUTOJOIN"))
+
+
 def validate_config_peer_secrets(
     cfg: dict[str, Any], *, side: str = "receiver",
 ) -> None:

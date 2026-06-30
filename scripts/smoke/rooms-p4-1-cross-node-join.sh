@@ -384,9 +384,18 @@ test_auth_preamble_unweakened() {
   # Wrong source address → 403 (remote_addr gate intact).
   res="$(deliver '{"client_ip":"10.9.9.9"}')"
   smoke_assert_contains "$res" "status=403" "auth: a wrong source address is 403 (remote_addr gate intact)"
-  # Unknown peer → 403.
+  # Unknown peer (nodeZ) under the DEFAULT-ON auto-join gate (#2024 B): the
+  # bootstrap is now reachable, but the captured signature was computed for
+  # nodeB's per-pair key, NOT nodeZ's derived key — so the HMAC check fails and
+  # the request is refused with 401 (fail-closed). This is NOT an admit path:
+  # the per-pair HMAC remains the boundary, and nothing is persisted.
   res="$(deliver '{"headers":{"X-AGB-Peer":"nodeZ"}}')"
-  smoke_assert_contains "$res" "status=403" "auth: an unknown peer is 403"
+  smoke_assert_contains "$res" "status=401" \
+    "auth: an unknown peer with a mismatched signature is 401 under default-ON (HMAC gate intact, not an admit)"
+  local rows
+  rows="$(python3 "$HELPER" pending-rows "$BRIDGE_A2A_ROOMS_DB" "$room")"
+  smoke_assert_not_contains "$rows" "nodeZ" \
+    "auth: the unknown-peer HMAC failure writes NO pending row (fail-closed under default-ON)"
 }
 
 # ---------------------------------------------------------------------------
@@ -497,7 +506,7 @@ smoke_run "T3b: a revoked (rotated) token is refused — no pending row" test_T3
 smoke_run "T4: raw token AND hash never persisted in queue/audit/staged" test_T4_no_token_or_hash_persisted_anywhere
 smoke_run "T5a: a malformed body is refused (422, no crash)" test_T5a_malformed_body_refused_no_crash
 smoke_run "T5b: a duplicate join is idempotent; id-reuse is a 409" test_T5b_duplicate_idempotent
-smoke_run "auth preamble unweakened (HMAC 401 / remote_addr 403 / unknown peer 403)" test_auth_preamble_unweakened
+smoke_run "auth preamble unweakened (HMAC 401 / remote_addr 403 / unknown peer 401 under default-ON)" test_auth_preamble_unweakened
 smoke_run "a non-leader node refuses + persists nothing" test_non_leader_node_refuses
 smoke_run "r3 #2: unmigrated P1 db (missing dedupe table) still joins (no 500)" test_upgraded_db_missing_dedupe_table
 smoke_run "r3 #1: a message_id PK race is reclassified (dup/conflict), not a 500" test_atomic_race_reclassified_not_500

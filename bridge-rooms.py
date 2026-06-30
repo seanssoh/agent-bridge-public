@@ -617,8 +617,8 @@ def _require_leader_conn(conn: Any, room_id: str,
 
 
 def _receiver_room_autojoin_enabled() -> bool:
-    """Best-effort: will the A2A receiver's effective env have
-    ``BRIDGE_A2A_ROOM_AUTOJOIN=1`` on its next (re)start?  (#2024 A.1)
+    """Best-effort: will the A2A receiver's effective env have room auto-join
+    ENABLED on its next (re)start?  (#2024 A.1; default-ON since #2024 B)
 
     Mirrors what the receiver inherits at startup: the live process env
     first, then the managed install-wide override file
@@ -626,36 +626,62 @@ def _receiver_room_autojoin_enabled() -> bool:
     receiver spawn path sources that file directly before launch (#15783,
     lib/bridge-a2a.sh:bridge_a2a_source_env_overrides), so both `agb a2a
     daemon start|restart` and a direct `bash bridge-handoff-daemon.sh start`
-    pick up the override. Returns False on any read error — the warning is
-    fail-loud (warn when in doubt)."""
+    pick up the override.
+
+    Default-ON resolution (#2024 B): the gate is ON unless an explicit
+    off-spelling (`=0` / `off` / `false`) is set. A LIVE-env value wins; if the
+    live env does not set the key, the managed-file value decides (so a durable
+    `set-env BRIDGE_A2A_ROOM_AUTOJOIN=0` correctly predicts the receiver will be
+    OFF after a restart); absent both, the default (ON) applies. The same
+    resolver as the receiver gate (`a2a.room_autojoin_value_enabled`) is used so
+    the hint and the runtime never disagree."""
     # noqa: iso-helper-boundary - feature env gate, not a .env file
-    if os.environ.get("BRIDGE_A2A_ROOM_AUTOJOIN") == "1":
-        return True
+    live = os.environ.get("BRIDGE_A2A_ROOM_AUTOJOIN")
+    if live is not None and a2a is not None:
+        return a2a.room_autojoin_value_enabled(live)
+    file_val = _managed_env_value("BRIDGE_A2A_ROOM_AUTOJOIN")
+    if a2a is not None:
+        return a2a.room_autojoin_value_enabled(file_val)
+    # a2a module unavailable (single-node): fall back to the literal-"1" sense
+    # of the old behavior so the hint never crashes.
+    return (live or file_val) == "1"
+
+
+def _managed_env_value(key: str) -> str | None:
+    """Return the value of `key` from the managed `agent-env.local.sh` override
+    file, or None if the key is absent / the file is unreadable. The managed
+    file is one `export KEY='value'` per line (bridge-config.py
+    render_env_export_line writes single-quoted values)."""
     env_file = rooms.bridge_home() / "agent-env.local.sh"
     try:
         text = env_file.read_text(encoding="utf-8")
     except OSError:
-        return False
-    # The managed file is one `export KEY='value'` per line (bridge-config.py
-    # render_env_export_line); match that exact shape for our key set to "1".
+        return None
+    prefix = f"export {key}='"
+    value: str | None = None
     for line in text.splitlines():
-        if line.strip() == "export BRIDGE_A2A_ROOM_AUTOJOIN='1'":
-            return True
-    return False
+        stripped = line.strip()
+        if stripped.startswith(prefix) and stripped.endswith("'"):
+            value = stripped[len(prefix):-1]  # last write wins (file order)
+    return value
 
 
 def _warn_if_autojoin_disabled(signed: bool) -> None:
     """Print a leader-facing warning when a first-contact (signed cross-node)
     invite is minted while the receiver's room auto-join gate is OFF, so the
-    leader knows the joiner will 403 until they enable it (#2024 A.1/A.2).
+    leader knows the joiner will 403 (#2024 A.1/A.2). Since #2024 B the gate is
+    ON by default, so this fires ONLY when the operator has explicitly opted out
+    (BRIDGE_A2A_ROOM_AUTOJOIN=0 / off / false).
 
     Only fires for SIGNED links — a legacy single-node/unsigned link is for a
     peer that already has a node-link, where the gate is not on the path."""
     if not signed or _receiver_room_autojoin_enabled():
         return
-    info("note: this leader's A2A receiver has room auto-join DISABLED — a "
+    info("note: this leader's A2A receiver has room auto-join explicitly "
+         "DISABLED (BRIDGE_A2A_ROOM_AUTOJOIN is set to an off value) — a "
          "first-contact joiner will be rejected with HTTP 403 "
-         "(code=room_autojoin_disabled) until you enable it:")
+         "(code=room_autojoin_disabled). Auto-join is ON by default; to undo "
+         "the opt-out, re-enable it:")
     info("  agb config set-env BRIDGE_A2A_ROOM_AUTOJOIN=1")
     info("  agb a2a daemon restart   # (the restart spawn re-sources the "
          "override file)")
