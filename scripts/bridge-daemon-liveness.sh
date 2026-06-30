@@ -74,6 +74,24 @@
 #   BRIDGE_DAEMON_GATEWAY_STALL_STATE_FILE       default $BRIDGE_STATE_DIR/daemon-gateway-stall.ts (cross-poll witness)
 #   BRIDGE_DAEMON_RECOVERY_RENUDGE_FILE          default $BRIDGE_STATE_DIR/daemon-recovery-renudge.env (recovery marker)
 #   BRIDGE_DAEMON_GATEWAY_STALL_DISABLE          set to 1 to skip gateway-stall detection entirely (heartbeat-only)
+#
+# Issue #2207 (never-die wave Track C) — out-of-process token lifeline. The
+# daemon owns the token lifeline (recover-due quota recovery + periodic token-
+# sync). When the daemon is DOWN/wedged, that lifeline stops and a quota-limited
+# agent stays disabled until the daemon returns — a fleet-wide quota cascade.
+# This OS-supervised watcher already survives a daemon-down window, so we fold a
+# bounded emergency token-lifeline tick into its stale-heartbeat return paths:
+# delegate recover-due + sync (+ the gated operator-global sync) to bridge-auth.sh
+# so the fleet degrades gracefully instead of stranding on dead tokens. V1 scope
+# is recover-due + propagation ONLY — NO rotation, NO usage monitor, NO active-
+# token swap (all daemon-coupled). The watcher is a DRIVER only — every credential
+# mutation stays inside bridge-auth.py (registry_lock + opt-in gates + root-fail-
+# closed). Envs:
+#   BRIDGE_DAEMON_TOKEN_LIFELINE_ENABLED         default 1 (kill-switch; set 0 to disable)
+#   BRIDGE_DAEMON_TOKEN_LIFELINE_STALE_SECONDS   default = BRIDGE_DAEMON_LIVENESS_THRESHOLD_SECONDS (600)
+#   BRIDGE_DAEMON_TOKEN_LIFELINE_INTERVAL_SECONDS default 300 (a stale host runs the lifeline at most once per interval)
+#   BRIDGE_DAEMON_TOKEN_LIFELINE_STATE_FILE      default $BRIDGE_STATE_DIR/daemon/token-lifeline.ts (interval throttle witness)
+#   BRIDGE_DAEMON_TOKEN_LIFELINE_TIMEOUT_SECONDS default 60 (per bridge-auth.sh call ceiling)
 
 set -euo pipefail
 
@@ -101,6 +119,24 @@ REPO_ROOT="$(cd -P "$SCRIPT_DIR/.." && pwd -P)"
 : "${BRIDGE_DAEMON_GATEWAY_STALL_WITNESS_TOLERANCE_SECONDS:=10}"
 : "${BRIDGE_DAEMON_RECOVERY_RENUDGE_FILE:=$BRIDGE_STATE_DIR/daemon-recovery-renudge.env}"
 : "${BRIDGE_DAEMON_GATEWAY_STALL_DISABLE:=0}"
+# Issue #2207 (never-die Track C) — out-of-process token lifeline knobs. The
+# stale threshold defaults to the SAME signal the restart trigger uses
+# (BRIDGE_DAEMON_LIVENESS_THRESHOLD_SECONDS) so the lifeline fires on exactly the
+# daemon-down windows the watcher already detects. The interval throttle is
+# SEPARATE from the restart cooldown so a refused/cooldown-suppressed restart does
+# not also suppress token recovery — the lifeline runs on its own cadence.
+: "${BRIDGE_DAEMON_TOKEN_LIFELINE_ENABLED:=1}"
+: "${BRIDGE_DAEMON_TOKEN_LIFELINE_STALE_SECONDS:=$BRIDGE_DAEMON_LIVENESS_THRESHOLD_SECONDS}"
+: "${BRIDGE_DAEMON_TOKEN_LIFELINE_INTERVAL_SECONDS:=300}"
+: "${BRIDGE_DAEMON_TOKEN_LIFELINE_STATE_FILE:=$BRIDGE_STATE_DIR/daemon/token-lifeline.ts}"
+: "${BRIDGE_DAEMON_TOKEN_LIFELINE_TIMEOUT_SECONDS:=60}"
+# bridge-auth.sh path + the agent scope the daemon syncs (mirrors the daemon's
+# BRIDGE_CLAUDE_TOKEN_SYNC_AGENTS default of `static`). BRIDGE_BASH_BIN is the
+# bash the watcher re-invokes bridge-auth.sh under (the daemon sets it; default
+# to the running interpreter, then `bash` on PATH).
+: "${BRIDGE_AUTH_SH:=$REPO_ROOT/bridge-auth.sh}"
+: "${BRIDGE_CLAUDE_TOKEN_SYNC_AGENTS:=static}"
+: "${BRIDGE_BASH_BIN:=${BASH:-bash}}"
 # Issue #2055: the upgrade's durable quiesce-intent marker. bridge-upgrade.sh
 # writes it (recording the upgrade pid + platform/label) when it disables the
 # daemon job for the #1820 reconcile window, and clears it on a successful
@@ -123,6 +159,11 @@ REPO_ROOT="$(cd -P "$SCRIPT_DIR/.." && pwd -P)"
 [[ "$BRIDGE_DAEMON_LIVENESS_COOLDOWN_SECONDS" =~ ^[0-9]+$ ]]  || BRIDGE_DAEMON_LIVENESS_COOLDOWN_SECONDS=600
 [[ "$BRIDGE_DAEMON_GATEWAY_STALL_SECONDS" =~ ^[0-9]+$ ]]      || BRIDGE_DAEMON_GATEWAY_STALL_SECONDS=300
 [[ "$BRIDGE_DAEMON_QUIESCE_MAX_AGE_SECONDS" =~ ^[0-9]+$ ]]    || BRIDGE_DAEMON_QUIESCE_MAX_AGE_SECONDS=3600
+# Issue #2207: a typo in a launchd EnvironmentVariables block must not silently
+# break the token lifeline's throttle/timeout into a hot-loop or an unbounded call.
+[[ "$BRIDGE_DAEMON_TOKEN_LIFELINE_STALE_SECONDS" =~ ^[0-9]+$ ]]    || BRIDGE_DAEMON_TOKEN_LIFELINE_STALE_SECONDS="$BRIDGE_DAEMON_LIVENESS_THRESHOLD_SECONDS"
+[[ "$BRIDGE_DAEMON_TOKEN_LIFELINE_INTERVAL_SECONDS" =~ ^[0-9]+$ ]] || BRIDGE_DAEMON_TOKEN_LIFELINE_INTERVAL_SECONDS=300
+[[ "$BRIDGE_DAEMON_TOKEN_LIFELINE_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]]  || BRIDGE_DAEMON_TOKEN_LIFELINE_TIMEOUT_SECONDS=60
 
 DAEMON_SH="$REPO_ROOT/bridge-daemon.sh"
 DAEMON_PID_FILE="${BRIDGE_DAEMON_PID_FILE:-$BRIDGE_STATE_DIR/daemon.pid}"
@@ -1098,6 +1139,209 @@ maybe_restart_on_gateway_stall() {
   return 0
 }
 
+# ── Issue #2207 (never-die wave Track C): out-of-process token lifeline ───────
+#
+# When the daemon is down/wedged, recover-due quota recovery + periodic token-
+# sync stop, so a quota-limited agent stays disabled until the daemon returns.
+# This watcher already survives that window. On a STALE heartbeat we run a
+# bounded emergency token-lifeline tick: recover-due → UNCONDITIONAL sync →
+# (gated) sync-global — delegating EVERY credential mutation to bridge-auth.sh.
+# The watcher is a driver only; registry_lock / opt-in / root-fail-closed /
+# credential-file lock all stay inside bridge-auth.py.
+
+# Bounded local timeout wrapper. The watcher deliberately does NOT source
+# bridge-lib (heavy: tmux/queue/state modules), so we cannot reuse
+# bridge_with_timeout. $1 = seconds, rest = command. rc is the command's (124 on a
+# timeout kill — caller treats any non-zero as a failed phase).
+#
+# Tiering, in order:
+#   1. timeout(1)/gtimeout(1) — preferred (GNU coreutils).
+#   2. perl `alarm` — PORTABLE bounded fallback. Stock macOS ships NO coreutils
+#      (no timeout/gtimeout) but DOES ship perl, so this keeps the emergency tick
+#      BOUNDED on a bare macOS host (Issue #2207 codex r2 finding 2 — an unwrapped
+#      exec on macOS violated the bounded-local-timeout requirement). Mirrors
+#      timeout(1): exit 124 on the deadline.
+#   3. fail-CLOSED — neither available: do NOT run unbounded. Return 124 (treated
+#      as a failed phase) so the caller audits the gap instead of risking a hang.
+token_lifeline_timeout() {
+  local secs="$1"; shift
+  [[ "$secs" =~ ^[0-9]+$ ]] || secs=60
+  local bin
+  bin="$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true)"
+  if [[ -n "$bin" ]]; then
+    "$bin" "$secs" "$@"
+    return $?
+  fi
+  if command -v perl >/dev/null 2>&1; then
+    # perl alarm()-based bound (fork+waitpid so the parent keeps the SIGALRM after
+    # the child execs the target — a plain `exec` would drop perl's handler). On
+    # the deadline the parent kills the child and exits 124 (timeout(1) parity);
+    # otherwise it propagates the child's exit status / signal.
+    BRIDGE_TL_TIMEOUT_SECS="$secs" perl -e '
+      my $s = $ENV{BRIDGE_TL_TIMEOUT_SECS} || 60;
+      my $pid = fork();
+      if (!defined $pid) { exit 127 }
+      if ($pid == 0) { exec @ARGV or exit 127 }
+      $SIG{ALRM} = sub { kill "TERM", $pid; kill "KILL", $pid; exit 124 };
+      alarm $s;
+      waitpid($pid, 0);
+      my $st = $?;
+      alarm 0;
+      exit($st & 127 ? 128 + ($st & 127) : $st >> 8);
+    ' "$@"
+    return $?
+  fi
+  # Tier 3: no bounded mechanism on PATH — fail CLOSED rather than exec unbounded.
+  return 124
+}
+
+# Interval throttle. Returns 0 (due) when the lifeline has NOT run within
+# BRIDGE_DAEMON_TOKEN_LIFELINE_INTERVAL_SECONDS — the FIRST stale poll on a fresh
+# host (no state file) is always due (fires immediately). Returns 1 (throttled)
+# otherwise. The state file is SEPARATE from the restart cooldown so a refused/
+# cooldown-suppressed restart never suppresses token recovery.
+token_lifeline_due() {
+  local interval="$BRIDGE_DAEMON_TOKEN_LIFELINE_INTERVAL_SECONDS"
+  local last now
+  [[ -f "$BRIDGE_DAEMON_TOKEN_LIFELINE_STATE_FILE" ]] || return 0
+  last="$(tr -d '[:space:]' <"$BRIDGE_DAEMON_TOKEN_LIFELINE_STATE_FILE" 2>/dev/null)"
+  [[ "$last" =~ ^[0-9]+$ ]] || return 0
+  now="$(now_ts)"
+  (( now - last >= interval ))
+}
+
+# Record the attempt timestamp — called EVEN ON FAILURE so a persistent auth
+# error does not hot-loop the lifeline every 60s poll. Best-effort.
+#
+# Belt-and-suspenders (codex r3 finding 3): NEVER write the throttle witness under
+# DRY_RUN, regardless of caller. The single caller already returns before this on
+# the DRY_RUN path, but a structural guard here makes it impossible for ANY future
+# code path (or platform-specific reordering) to arm the throttle during a dry run
+# — a DRY_RUN tick must leave ZERO throttle state on every platform/tier.
+token_lifeline_record() {
+  [[ "${BRIDGE_DAEMON_LIVENESS_DRY_RUN:-0}" == "1" ]] && return 0
+  mkdir -p "$(dirname "$BRIDGE_DAEMON_TOKEN_LIFELINE_STATE_FILE")" 2>/dev/null || true
+  printf '%s\n' "$(now_ts)" 2>/dev/null >"$BRIDGE_DAEMON_TOKEN_LIFELINE_STATE_FILE" || true
+}
+
+# The emergency tick body. Runs the same lifeline sequence the daemon runs:
+#   1. recover-due  (quota recovery; re-enables a recovered registry row)
+#   2. sync         (UNCONDITIONAL — writes .credentials.json so live sessions
+#                    re-read the recovered token; this tick also REPLACES the
+#                    daemon's periodic sync while the daemon is down, so it must
+#                    run even when recover-due reports no due tokens)
+#   3. sync-global  (ONLY when the operator opted in — same cheap exit-code gate
+#                    the daemon's bridge_daemon_global_auth_sync_tick uses)
+# Every phase is bounded by token_lifeline_timeout and audited (status only,
+# never token material). DRY_RUN emits a would-run row and mutates nothing.
+# Always returns 0 — a failed phase is audited, not fatal to the watcher.
+run_token_lifeline() {
+  local trigger="$1"        # the stale-return path that invoked us (audit detail)
+  local heartbeat_age="$2"
+  local auth_sh="$BRIDGE_AUTH_SH"
+  local tmo="$BRIDGE_DAEMON_TOKEN_LIFELINE_TIMEOUT_SECONDS"
+  local agent_scope="$BRIDGE_CLAUDE_TOKEN_SYNC_AGENTS"
+  # Issue #2207 (codex r2 finding 1): resolve recover-due's check-timeout /
+  # retry-seconds from the SAME envs the daemon uses (bridge-daemon.sh
+  # process_claude_token_recovery), with the SAME defaults, and pass both flags.
+  # Otherwise an operator's BRIDGE_CLAUDE_TOKEN_CHECK_TIMEOUT_SECONDS /
+  # _RETRY_SECONDS override silently DIVERGES while the daemon is down — the
+  # emergency tick must behave like the daemon's recover-due, not a stripped one.
+  local check_timeout="${BRIDGE_CLAUDE_TOKEN_CHECK_TIMEOUT_SECONDS:-45}"
+  local retry_seconds="${BRIDGE_CLAUDE_TOKEN_CHECK_RETRY_SECONDS:-1800}"
+  [[ "$check_timeout" =~ ^[0-9]+$ ]] || check_timeout=45
+  [[ "$retry_seconds" =~ ^[0-9]+$ ]] || retry_seconds=1800
+
+  [[ "${BRIDGE_DAEMON_TOKEN_LIFELINE_ENABLED:-1}" == "1" ]] || return 0
+  [[ -f "$auth_sh" ]] || return 0
+  command -v "$BRIDGE_BASH_BIN" >/dev/null 2>&1 || return 0
+
+  # Interval throttle — at most one lifeline per interval per stale host.
+  token_lifeline_due || return 0
+
+  if [[ "$BRIDGE_DAEMON_LIVENESS_DRY_RUN" == "1" ]]; then
+    # Issue #2207 (codex r2 finding 3): DRY_RUN must mutate NOTHING — do NOT write
+    # the throttle state file here, or a DRY_RUN tick would suppress the next REAL
+    # stale tick. The record happens only on the real (mutating) path below.
+    emit_audit daemon_liveness_token_lifeline \
+      --detail trigger="$trigger" \
+      --detail heartbeat_age_seconds="$heartbeat_age" \
+      --detail dry_run="1" \
+      --detail recover_due="would-run" \
+      --detail sync="would-run" \
+      --detail sync_global="would-run"
+    printf '[liveness] DRY_RUN — would run token lifeline (recover-due + sync%s) trigger=%s\n' \
+      "$( [[ -n "${BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC:-}" ]] && printf ' + gated sync-global' )" "$trigger"
+    return 0
+  fi
+
+  # Record the attempt BEFORE running the auth calls (record-even-on-failure) so a
+  # hanging / persistently-failing auth call cannot hot-loop the lifeline every
+  # poll. Only the REAL path records — DRY_RUN returned above without mutating.
+  token_lifeline_record
+
+  # Phase 1 — recover-due. Re-enables a recovered registry row; on its own it does
+  # NOT propagate to live sessions (that is phase 2). Same --timeout/--retry-seconds
+  # the daemon passes (flag fidelity). rc!=0 → failed/timeout.
+  local recover_status="ok"
+  token_lifeline_timeout "$tmo" \
+    "$BRIDGE_BASH_BIN" "$auth_sh" claude-token recover-due \
+    --timeout "$check_timeout" \
+    --retry-seconds "$retry_seconds" \
+    --json >/dev/null 2>&1 \
+    || recover_status="failed"
+
+  # Phase 2 — sync (UNCONDITIONAL). This is the correctness crux: recover-due
+  # alone re-enables the registry but live sessions keep the dead credential
+  # until sync writes .credentials.json. We must finish the PAIR in the same tick
+  # so the registry cannot be re-enabled without file propagation. It is also
+  # this tick's replacement for the daemon's periodic sync, so it runs even when
+  # recover-due found nothing due.
+  local sync_status="ok"
+  token_lifeline_timeout "$tmo" \
+    "$BRIDGE_BASH_BIN" "$auth_sh" claude-token sync --agents "$agent_scope" --json >/dev/null 2>&1 \
+    || sync_status="failed"
+
+  # Phase 3 — operator-global sync, gated by the SAME cheap exit-code probe the
+  # daemon's bridge_daemon_global_auth_sync_tick uses. `global-auth-sync status
+  # --check` exits 0 iff the persisted/env opt-in is EFFECTIVELY enabled. Only
+  # then do we run sync-global (which keeps the auto_rotate gate, root-fail-
+  # closed, and credential-file lock intact inside bridge-auth.py). A check
+  # failure/timeout fails safe to skipped.
+  local sync_global_status="skipped"
+  if token_lifeline_timeout "$tmo" \
+      "$BRIDGE_BASH_BIN" "$auth_sh" claude-token global-auth-sync status --check >/dev/null 2>&1; then
+    sync_global_status="ok"
+    token_lifeline_timeout "$tmo" \
+      "$BRIDGE_BASH_BIN" "$auth_sh" claude-token sync-global --json >/dev/null 2>&1 \
+      || sync_global_status="failed"
+  fi
+
+  emit_audit daemon_liveness_token_lifeline \
+    --detail trigger="$trigger" \
+    --detail heartbeat_age_seconds="$heartbeat_age" \
+    --detail agent_scope="$agent_scope" \
+    --detail recover_due="$recover_status" \
+    --detail sync="$sync_status" \
+    --detail sync_global="$sync_global_status"
+  printf '[liveness] token lifeline ran (recover_due=%s sync=%s sync_global=%s) trigger=%s\n' \
+    "$recover_status" "$sync_status" "$sync_global_status" "$trigger"
+  return 0
+}
+
+# Gate the lifeline on the SAME stale-heartbeat signal the restart trigger uses.
+# main() calls this at every stale-heartbeat return path (no-pid/not-running and
+# the restart cooldown/refused paths) — exactly when the daemon is NOT recovering
+# tokens. A fresh heartbeat means the daemon owns recovery → skip. Always best-
+# effort (returns 0); never blocks the watcher's primary restart job.
+maybe_run_token_lifeline() {
+  local trigger="$1" heartbeat_age="$2"
+  [[ "${BRIDGE_DAEMON_TOKEN_LIFELINE_ENABLED:-1}" == "1" ]] || return 0
+  (( heartbeat_age >= BRIDGE_DAEMON_TOKEN_LIFELINE_STALE_SECONDS )) || return 0
+  run_token_lifeline "$trigger" "$heartbeat_age"
+  return 0
+}
+
 main() {
   local mtime now age pid
 
@@ -1116,6 +1360,20 @@ main() {
 
   now="$(now_ts)"
   age=$(( now - mtime ))
+
+  # Issue #2207 (never-die Track C). The heartbeat may be STALE — the daemon is
+  # down/wedged, so its token lifeline (recover-due + sync) has stopped. Run the
+  # bounded emergency token-lifeline tick HERE, before BOTH the gateway-stall
+  # early-return below AND the restart/skip verdicts, so it fires on EVERY stale
+  # path — including the case where a stale heartbeat ALSO has a gateway stall
+  # whose restart is refused/failed (maybe_restart_on_gateway_stall still returns
+  # "handled" and main() returns, so a lifeline call placed after it would be
+  # skipped on exactly the daemon-not-recovering window — codex review #2207).
+  # maybe_run_token_lifeline self-gates on staleness, so on a FRESH heartbeat
+  # this is a no-op (the daemon owns recovery). It is interval-throttled,
+  # restart-cooldown-independent, and delegates every mutation to bridge-auth.sh.
+  # Best-effort: a failed/throttled tick must never block the verdicts below.
+  maybe_run_token_lifeline stale_heartbeat "$age" || true
 
   # Issue #1973 (Track C). Gateway-stall detection runs FIRST and regardless of
   # heartbeat freshness — the #1973 wedge had a FRESH heartbeat (the loop kept
