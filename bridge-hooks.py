@@ -3141,6 +3141,24 @@ def _repair_sticky_false_channel_enables(
     return sorted(corrected)
 
 
+# Issue #2216: argv-safe model token guard for the carried --agent-model. A
+# model id is letters/digits/dot/dash/underscore plus an optional `[1m]`-style
+# context suffix (e.g. `claude-opus-4-8`, `claude-fable-5[1m]`); anything else
+# (whitespace, shell metacharacters, an over-long blob) is rejected so a
+# hand-edited operator-global or roster can never inject a stray key/value into
+# the rendered settings. Mirrors bridge-cron-runner `_safe_model_effort_token`
+# and the shell-side bridge_agent_operator_global_model validation.
+_AGENT_MODEL_TOKEN_RE = re.compile(r"^[A-Za-z0-9._-]+(\[[A-Za-z0-9]+\])?$")
+
+
+def _safe_agent_model_token(value: str) -> str:
+    """Return the stripped model token if argv-safe, else '' (no injection)."""
+    text = (value or "").strip()
+    if not text or len(text) > 128 or not _AGENT_MODEL_TOKEN_RE.match(text):
+        return ""
+    return text
+
+
 def cmd_render_shared_settings(args: argparse.Namespace) -> int:
     base_path = Path(args.base_settings_file).expanduser()
     overlay_path = Path(args.overlay_settings_file).expanduser()
@@ -3241,6 +3259,23 @@ def cmd_render_shared_settings(args: argparse.Namespace) -> int:
         merged = merge_settings(operator_global_layer, managed_defaults)
     else:
         merged = dict(managed_defaults)
+    # Issue #2216: the carried per-agent `model` (passed ONLY by the
+    # dynamic→static converter as --agent-model) is layered HERE — above the
+    # operator-global #11901 inheritance, below base/overlay/preserved — so a
+    # converted role's effective `model` is the model the source dynamic agent
+    # actually ran on, not the user-class template default the operator-global
+    # might carry (`claude-fable-5`, unavailable on the static pool token). Empty
+    # / unsafe --agent-model leaves the stack untouched: every non-conversion
+    # render passes "" and the effective `model` keeps deriving from
+    # operator-global / preserved keys exactly as before (no regression for
+    # genuinely-new static agents). A later operator hand-edit to the effective
+    # `model` still wins (preserved keys, #1756, merge last). Effort is NOT
+    # written: Claude takes reasoning effort from the launch `--effort` flag, not
+    # a settings.json key (the converter bakes/materializes it on the launch
+    # side), so there is no managed effective key to set today.
+    agent_model_token = _safe_agent_model_token(getattr(args, "agent_model", "") or "")
+    if agent_model_token:
+        merged = merge_settings(merged, {"model": agent_model_token})
     merged = merge_settings(merged, base_payload)
     merged = merge_settings(merged, overlay_payload)
     if preserved:
@@ -4598,6 +4633,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--channels-csv",
         default="",
         help="The agent's resolved channels CSV (bridge_agent_channels_csv, from BRIDGE_AGENT_CHANNELS — the SSOT). Required so the renderer knows the launched channel plugin set for normally-created channel agents, whose stored launch command does NOT carry the --channels flag (the bridge composes it at launch). Managed defaults assert these plugins enabled and a stale enabledPlugins=false is repaired (#1453).",
+    )
+    render_shared_parser.add_argument(
+        "--agent-model",
+        default="",
+        help="Issue #2216: the source agent's resolved model to render INTO settings.effective.json `model` (carried-value layer that wins over the operator-global #11901 inheritance). Passed ONLY by the dynamic→static converter so a converted role boots on the model it ran on instead of the user-class template default; empty for every other render (no behavior change). Argv-safe token only; anything else is ignored.",
+    )
+    render_shared_parser.add_argument(
+        "--agent-effort",
+        default="",
+        help="Issue #2216: the source agent's resolved reasoning effort, paired with --agent-model. Currently informational/forward-compatible — Claude carries effort via the launch `--effort` flag, not a settings.json key, so it is accepted but not written into the effective file unless a future managed effort key exists. Empty for every non-conversion render.",
     )
     render_shared_parser.add_argument("--format", choices=("text", "shell"), default="text")
     render_shared_parser.set_defaults(handler=cmd_render_shared_settings)
