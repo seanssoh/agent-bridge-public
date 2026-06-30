@@ -1112,7 +1112,11 @@ bridge_cron_job_always_followup() {
 #   Darwin → `sysctl kern.memorystatus_vm_pressure_level` (Apple's calibrated
 #            tier: 1=Normal, 2=Warn, 4=Critical — the same metric Activity
 #            Monitor's "Memory Pressure" graph and jetsam use). Defer only when
-#            level >= `BRIDGE_CRON_DARWIN_PRESSURE_LEVEL` (default 2 = Warn).
+#            level >= `BRIDGE_CRON_DARWIN_PRESSURE_LEVEL` (default 4 = Critical;
+#            Warn-tier on macOS is normal-operational and chronically sticky —
+#            deferring at Warn indefinitely starves cron dispatch, the
+#            2026-06-30 11h outage. Set BRIDGE_CRON_DARWIN_PRESSURE_LEVEL=2 to
+#            restore the old behavior).
 #            `vm.swapusage` is NOT a pressure signal on macOS — the kernel uses
 #            swap as a normal tier of the memory hierarchy, so a healthy host
 #            commonly sits at 80-90%+ swap; gating on swap_pct chronically
@@ -1152,10 +1156,10 @@ bridge_check_memory_pressure() {
       fallback="${fallback%"${fallback##*[![:space:]]}"}"   # rtrim
       fallback="$(printf '%s' "$fallback" | tr '[:upper:]' '[:lower:]')"
       if [[ "$fallback" != "swap_pct" ]]; then
-        local level_raw level_limit="${BRIDGE_CRON_DARWIN_PRESSURE_LEVEL:-2}"
+        local level_raw level_limit="${BRIDGE_CRON_DARWIN_PRESSURE_LEVEL:-4}"
         level_limit="${level_limit#"${level_limit%%[![:space:]]*}"}"
         level_limit="${level_limit%"${level_limit##*[![:space:]]}"}"
-        [[ "$level_limit" == "2" || "$level_limit" == "4" ]] || level_limit=2
+        [[ "$level_limit" == "2" || "$level_limit" == "4" ]] || level_limit=4
         level_raw="$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null || true)"
         level_raw="${level_raw#"${level_raw%%[![:space:]]*}"}"
         level_raw="${level_raw%"${level_raw##*[![:space:]]}"}"

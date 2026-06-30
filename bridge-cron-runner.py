@@ -1567,13 +1567,15 @@ PRESSURE_DEFER_SECONDS = 900  # +15 min
 #   1 = Normal (no pressure)
 #   2 = Warn   (Activity Monitor "yellow")
 #   4 = Critical (Activity Monitor "red"; jetsam imminent)
-# We default to deferring only when level >= Warn (>= 2). swap_pct on
-# darwin is NOT a pressure signal — macOS uses swap as a normal tier of
-# the memory hierarchy, so a laptop sitting at 90%+ swap can be
+# We default to deferring only when level >= Critical (>= 4): Warn-tier on
+# macOS is normal-operational and chronically sticky, so default-Warn
+# deferred cron dispatch indefinitely (the 2026-06-30 11h fleet outage).
+# swap_pct on darwin is NOT a pressure signal either — macOS uses swap as a
+# normal tier of the memory hierarchy, so a laptop sitting at 90%+ swap can be
 # perfectly healthy. Operators on hosts where the kernel sysctl isn't
 # available can fall back to the legacy swap_pct probe via
 # BRIDGE_CRON_DARWIN_PRESSURE_FALLBACK=swap_pct.
-DEFAULT_DARWIN_PRESSURE_LEVEL = 2  # Warn
+DEFAULT_DARWIN_PRESSURE_LEVEL = 4  # Critical (Warn-tier on macOS is normal/sticky; default-Warn starved cron dispatch for 11h on 2026-06-30. Override with BRIDGE_CRON_DARWIN_PRESSURE_LEVEL=2 to restore.)
 
 
 def _swap_pct_limit() -> int:
