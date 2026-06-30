@@ -343,9 +343,18 @@ smoke_assert_contains "$(cat "$BRIDGE_PICKER_SWEEP_LOG")" "already attempted thi
 # backstop seam, codex review #20894).
 smoke_log "6c. default rotate fn carries the --preflight contract (static ratchet)"
 _psw_rotate_fn="$(awk '/^_psw_default_rotate_claude_token\(\)/,/^}/' "$PICKER_SWEEP")"
-smoke_assert_contains "$_psw_rotate_fn" "--preflight" "6c default rotate fn carries --preflight (no rotate onto a capped candidate)"
+# The STANDALONE boolean --preflight flag is what flips args.preflight true and
+# enters _cmd_rotate_preflight (bridge-auth.py). A bare substring check on
+# "--preflight" would still pass with only --preflight-budget/--preflight-timeout
+# present (they contain "--preflight" as a prefix), so the actual gate could be
+# dropped silently. Assert the standalone flag via a whitespace-bounded match,
+# then the two budget/timeout flags, then the daemon env-knob names so one
+# operator override still tunes both the daemon and picker paths (codex #20933).
+smoke_assert_match "$_psw_rotate_fn" "--preflight[[:space:]]" "6c default rotate fn carries the STANDALONE --preflight flag (enables _cmd_rotate_preflight; -budget/-timeout substring is not enough)"
 smoke_assert_contains "$_psw_rotate_fn" "--preflight-budget" "6c default rotate fn carries --preflight-budget"
 smoke_assert_contains "$_psw_rotate_fn" "--preflight-timeout" "6c default rotate fn carries --preflight-timeout"
+smoke_assert_contains "$_psw_rotate_fn" "BRIDGE_CLAUDE_ROTATE_PREFLIGHT_BUDGET_SECONDS" "6c default rotate fn honors the daemon's preflight-budget env knob (one override tunes both paths)"
+smoke_assert_contains "$_psw_rotate_fn" "BRIDGE_CLAUDE_ROTATE_PREFLIGHT_PER_CANDIDATE_SECONDS" "6c default rotate fn honors the daemon's per-candidate preflight-timeout env knob"
 
 
 # ---------------------------------------------------------------------------
