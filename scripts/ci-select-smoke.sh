@@ -273,6 +273,18 @@ add_required 2040-upgrade-restore-verify 2040-daemon-enabled-but-unloaded
 # EXIT-handler or liveness-discriminator edit re-runs the discriminator +
 # operator-stop-preserved + in-flight-defer + mutation gates.
 add_required 2055-interrupted-upgrade-reenable
+# Issue #2210: the --no-restart-daemon hole in the #1820 reconcile quiesce. The
+# reconcile ALWAYS boots out + disables a managed daemon for its window, so a
+# --no-restart-daemon upgrade that previously did only clear-the-marker left a
+# launchd/systemd daemon that was UP before the run booted-out and silently DOWN
+# (fleet-down). bridge-upgrade.sh now restores a RECONCILE-INDUCED bootout even
+# under --no-restart-daemon (suppressing only an *elective* restart), gated
+# STRICTLY on _UPGRADE_DAEMON_*_MANAGED set THIS run, mirroring the
+# RESTART_DAEMON==1 restore + marker discrimination (clear only on confirmed
+# recovery; else KEEP the marker + loud WARN). In the full static suite so any
+# edit to the no-restart branch / quiesce gate re-runs the restore + ★hard-guard
+# (operator-disabled job NEVER restored) + marker-discrimination + mutation gates.
+add_required 2210-norestart-reconcile-restore
 # Issue #1916: bridge_init_register_default_picker_sweep now migrates the legacy
 # text-kind picker-sweep cron to shell-kind FAIL-SAFE (recreate-first /
 # verify-before-delete) — the legacy row is deleted only after a shell row is
@@ -5231,6 +5243,11 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
         # operator-stop-preserved + in-flight-defer discriminators stay exercised
         # alongside the existing 655/1905/2040 quiesce/restore guards.
         add_required 655-upgrade-launchd-quiesce-respawn 1905-upgrade-systemd-quiesce-respawn 2040-upgrade-restore-verify 2055-interrupted-upgrade-reenable
+        # Issue #2210: --no-restart-daemon now restores a reconcile-INDUCED bootout
+        # (gated on _UPGRADE_DAEMON_*_MANAGED) instead of leaving it silently down.
+        # Pull it on every bridge-upgrade.sh move so the no-restart restore + the
+        # ★hard-guard (operator-disabled job never restored) stay exercised.
+        add_required 2210-norestart-reconcile-restore
       fi
       # Roadmap step 3 (#2217 / codex #20878): bridge-upgrade.sh propagates the tap
       # (bridge_ensure_hud_usage_tap, R1) to managed Claude agents on upgrade. Pull
