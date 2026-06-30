@@ -75,11 +75,31 @@ DETECTOR_KINDS = (
     "cold-restart-suspect",
     "abnormal-session-pane",
     "daemon-log-split",
+    "daemon-launchd-disabled-drift",
     "orphan-agent-dir",
     "missing-agent-entrypoint",
     "settings-two-tree-drift",
     "settings-multi-tree",
     "tasks-db",
+)
+
+# Issue #2205: the EXACT key set a daemon-quiesce.intent marker carries (the writer
+# is _bridge_upgrade_write_quiesce_marker in bridge-upgrade.sh). The disabled-drift
+# detector's strict-schema validation rejects a marker carrying any OTHER key — an
+# off-schema line is not the marker's content and must not authorize suppressing the
+# finding. Mirrors the watcher's pre-source allowlist in
+# scripts/bridge-daemon-liveness.sh; a future field must be added in lock-step.
+_MARKER_KNOWN_KEYS = frozenset(
+    {
+        "BRIDGE_QUIESCE_UPGRADE_PID",
+        "BRIDGE_QUIESCE_UPGRADE_PSID",
+        "BRIDGE_QUIESCE_UPGRADE_UID",
+        "BRIDGE_QUIESCE_PLATFORM",
+        "BRIDGE_QUIESCE_TARGET",
+        "BRIDGE_QUIESCE_REASON",
+        "BRIDGE_QUIESCE_TS",
+        "BRIDGE_QUIESCE_VERSION",
+    }
 )
 
 # Issue #1455: the settings detectors share a registry-derived view of an
@@ -865,6 +885,222 @@ def detect_daemon_log_split(
                 f"writing to {launchagent_log}. Set "
                 f"BRIDGE_DAEMON_LOG={launchagent_log} or run "
                 "'agent-bridge daemon status' to confirm both paths."
+            ),
+        }
+    )
+    return findings
+
+
+def _launchd_disabled_drift_evidence(
+    state_dir: Path,
+) -> dict[str, Any] | None:
+    """Issue #2205: probe whether the launchd daemon job has drifted to a
+    disabled / not-bootstrapped state WITHOUT a valid first-party
+    non-operator-disable marker.
+
+    Returns an evidence dict when an UNPROVABLE disabled-drift is present
+    (the watcher will fail-closed skip it, so the operator must see it), or
+    None when there is nothing to flag (job enabled+loaded, the daemon is
+    running, no launchagent install, a valid recovery marker is present, or
+    the disabled-state could not be read). Pure read; spawns only `launchctl`
+    query verbs (print / print-disabled), never a mutation.
+
+    The marker carve-out mirrors scripts/bridge-daemon-liveness.sh's recovery
+    predicate: only a WELL-FORMED marker whose platform=launchd AND
+    target=<label> AND recorded writer pid is DEAD is the watcher's recoverable
+    case, so it is NOT unprovable drift and we stay quiet (the watcher owns it).
+    A malformed / mismatched / missing-pid / LIVE-writer marker is NOT proof of
+    recoverability and does NOT suppress the finding — the doctor errs toward
+    MORE visibility, never less.
+    """
+    if shutil.which("launchctl") is None:
+        return None
+    # Resolve the launchd label from the installer-written marker (the same
+    # "we are launchd-managed" signal the watcher uses). Absent → not a
+    # launchd-managed install we can reason about.
+    config_path = state_dir / "launchagent.config"
+    label = ""
+    try:
+        for line in config_path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("BRIDGE_LAUNCHAGENT_LABEL="):
+                parts = shlex.split(line.split("=", 1)[1])
+                if parts:
+                    label = parts[0]
+                break
+    except (OSError, ValueError):
+        return None
+    if not label:
+        return None
+    # Only flag when the daemon is actually DOWN — an alive daemon is not a
+    # drift worth an operator's attention here.
+    if _daemon_pid_alive(state_dir):
+        return None
+    uid = str(os.getuid()) if hasattr(os, "getuid") else os.environ.get("UID", "")
+    if not uid:
+        return None
+
+    def _launchctl(args: list[str]) -> subprocess.CompletedProcess[str] | None:
+        try:
+            return subprocess.run(
+                ["launchctl", *args],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    # Disabled-state probe. `print-disabled gui/<uid>` lists labels with an
+    # explicit override; modern macOS prints `"<label>" => disabled`, legacy
+    # `=> true`. Absent line / command failure → cannot prove disabled.
+    disabled = False
+    pd = _launchctl(["print-disabled", f"gui/{uid}"])
+    if pd is not None and pd.returncode == 0:
+        pat = re.compile(
+            r'"' + re.escape(label) + r'"\s*=>\s*(?:true|disabled)'
+        )
+        disabled = bool(pat.search(pd.stdout or ""))
+    # Loaded-state probe. `print gui/<uid>/<label>` exits non-zero when the
+    # job is not bootstrapped (unloaded). An unloaded job whose KeepAlive is
+    # therefore inert is the other half of the drift.
+    pr = _launchctl(["print", f"gui/{uid}/{label}"])
+    unloaded = pr is not None and pr.returncode != 0
+    if not disabled and not unloaded:
+        return None
+
+    # Marker carve-out: stay quiet ONLY on the watcher's genuinely-recoverable
+    # case — a marker that PARSES, names THIS launchd label (platform+target
+    # match), AND records a DEAD writer pid (the watcher will re-enable it). Any
+    # weaker marker (codex r1) — unparseable, target/platform mismatch, missing
+    # / non-numeric pid, or a LIVE writer pid — is NOT proof the drift is
+    # recoverable, so it MUST NOT suppress the finding (the drift stays visible).
+    # We deliberately do not reimplement the watcher's full reuse/age teeth here;
+    # the doctor errs toward MORE visibility, never less.
+    marker_env = os.environ.get("BRIDGE_UPGRADE_QUIESCE_MARKER_FILE", "").strip()
+    marker_path = (
+        Path(marker_env).expanduser()
+        if marker_env
+        else (state_dir / "upgrade" / "daemon-quiesce.intent")
+    )
+    marker_platform = ""
+    marker_target = ""
+    marker_pid = ""
+    marker_seen = False
+    marker_well_formed = True
+    try:
+        for line in marker_path.read_text(encoding="utf-8").splitlines():
+            marker_seen = True
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            # ★ STRICT-SCHEMA validation (codex r2), mirroring the watcher's pre-source
+            # allowlist in scripts/bridge-daemon-liveness.sh: every non-comment line
+            # must be a `KEY=...` assignment whose KEY is one of the marker's OWN known
+            # fields. A line that is off-schema — an unknown key, an extra sourceable
+            # command, a malformed non-assignment line — is NOT this marker's content
+            # and so is NOT a recoverability proof. A prefix-only match (the r1 form)
+            # would let an unexpected `BRIDGE_QUIESCE_FOO=` slip through and suppress
+            # the finding; require the EXACT key set instead (fail toward visibility).
+            m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=", stripped)
+            if m is None or m.group(1) not in _MARKER_KNOWN_KEYS:
+                marker_well_formed = False
+                continue
+            if line.startswith("BRIDGE_QUIESCE_PLATFORM="):
+                p = shlex.split(line.split("=", 1)[1])
+                marker_platform = p[0] if p else ""
+            elif line.startswith("BRIDGE_QUIESCE_TARGET="):
+                t = shlex.split(line.split("=", 1)[1])
+                marker_target = t[0] if t else ""
+            elif line.startswith("BRIDGE_QUIESCE_UPGRADE_PID="):
+                v = shlex.split(line.split("=", 1)[1])
+                marker_pid = v[0] if v else ""
+    except (OSError, ValueError):
+        # Unparseable / unreadable marker → treat as no proof (report the drift).
+        marker_well_formed = False
+        marker_seen = bool(marker_platform or marker_target) or marker_seen
+
+    def _pid_dead(raw: str) -> bool:
+        try:
+            pid = int(raw)
+        except (TypeError, ValueError):
+            return False
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False  # alive (owned by another uid) — not a dead writer
+        except OSError:
+            return False
+        return False  # kill(pid,0) succeeded → writer is alive
+
+    recoverable = (
+        marker_well_formed
+        and marker_platform == "launchd"
+        and marker_target == label
+        and _pid_dead(marker_pid)
+    )
+    if recoverable:
+        # The watcher can prove + recover this; not an unprovable drift.
+        return None
+
+    return {
+        "label": label,
+        "uid": uid,
+        "launchd_disabled": disabled,
+        "launchd_unloaded": unloaded,
+        "recovery_marker_present": marker_seen,
+    }
+
+
+def detect_disabled_drift_no_marker(
+    state_dir: Path,
+    ts: str,
+) -> list[dict[str, Any]]:
+    """Issue #2205: launchd daemon job drifted to disabled/unloaded with NO
+    valid first-party non-operator-disable marker.
+
+    This is RCA cause #2 of the 2026-06-30 fleet-down: a non-operator
+    disabled-drift with no proof marker is indistinguishable from an operator
+    `agb daemon stop` by the disabled flag alone, so the liveness watcher
+    correctly fail-closes (the operator-stop-outranks invariant is sacred) and
+    the daemon stays down. The watcher cannot auto-recover it; this detector
+    makes the otherwise-silent drift VISIBLE so an operator can re-arm it by
+    hand. Report-only — never mutates launchd state.
+    """
+    findings: list[dict[str, Any]] = []
+    if not state_dir.is_dir():
+        return findings
+    evidence = _launchd_disabled_drift_evidence(state_dir)
+    if evidence is None:
+        return findings
+    label = evidence["label"]
+    uid = evidence["uid"]
+    if evidence["launchd_disabled"]:
+        drift = "disabled"
+    elif evidence["launchd_unloaded"]:
+        drift = "not bootstrapped (unloaded)"
+    else:
+        drift = "drifted"
+    findings.append(
+        {
+            "ts": ts,
+            "kind": "daemon-launchd-disabled-drift",
+            "agent": "",
+            "evidence": evidence,
+            "suggested_action": (
+                f"launchd daemon job gui/{uid}/{label} is {drift} and the "
+                "daemon is down, with NO recovery marker — the liveness "
+                "watcher fail-closes here (it cannot tell this from an "
+                "operator `agb daemon stop`). If this was NOT an intentional "
+                "stop, re-arm it: "
+                f"launchctl enable gui/{uid}/{label} && "
+                f"launchctl bootstrap gui/{uid} <plist> "
+                "(or rerun scripts/install-daemon-launchagent.sh --apply). "
+                "If it WAS intentional, no action is needed."
             ),
         }
     )
@@ -1841,6 +2077,12 @@ def main() -> int:
         (
             "daemon-log-split",
             lambda: detect_daemon_log_split(state_dir, ts),
+        ),
+        (
+            # Issue #2205: launchd daemon job disabled/unloaded with NO
+            # recovery marker — the un-recoverable half of the 06-30 outage.
+            "daemon-launchd-disabled-drift",
+            lambda: detect_disabled_drift_no_marker(state_dir, ts),
         ),
         (
             "orphan-agent-dir",

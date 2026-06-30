@@ -313,34 +313,109 @@ quiesce_live_in_flight() {
 
 QUIESCE_MARKER_PID=""
 QUIESCE_MARKER_PLATFORM=""
-interrupted_upgrade_quiesce() {
+QUIESCE_MARKER_REASON=""
+
+# ── Issue #2205: per-path non-operator-disable marker proof ───────────────────
+#
+# #2055 closed the interrupted-UPGRADE disable hole with a durable quiesce marker.
+# #2205 generalizes that marker into the proof contract for ANY first-party
+# non-operator disable: a recoverable disabled state needs a durable marker the
+# disabling code wrote IMMEDIATELY BEFORE the disable, recording platform, target,
+# a `reason` enum, the writer pid + start-identity, and a timestamp. The watcher
+# re-enables a disabled job ONLY when the marker platform+target match the job it
+# is about to recover, the marker parses, the writer is dead/reused/over-age (the
+# #2064 identity/age teeth), AND the disabled probe + cooldown/upgrade gates allow.
+# A missing marker, a parse failure, a target MISMATCH, or a LIVE writer with a
+# matching identity ⇒ fail closed (skip + audit) — the operator-stop-outranks
+# invariant is sacred, so an unprovable disabled-drift always stays down.
+#
+# `interrupted_upgrade` (the upgrade quiesce) is one reason value; a marker written
+# before #2205 carries no BRIDGE_QUIESCE_REASON field and defaults to it, so the
+# #2055 path is preserved exactly. Sets QUIESCE_MARKER_PID / QUIESCE_MARKER_PLATFORM
+# / QUIESCE_MARKER_REASON for the caller's audit detail. Pure read; no mutation.
+#
+# $1=expected platform (launchd|systemd) — the platform of the job being recovered.
+# $2=expected target (the launchd label / systemd service) — the marker must name
+#    THIS job, so a marker recorded for a DIFFERENT target can never re-enable this
+#    one (cross-target confusion guard the design mandates).
+non_operator_disable_marker() {
+  local want_platform="$1" want_target="$2"
   QUIESCE_MARKER_PID=""
   QUIESCE_MARKER_PLATFORM=""
+  QUIESCE_MARKER_REASON=""
   local marker="$BRIDGE_UPGRADE_QUIESCE_MARKER_FILE"
   [[ -f "$marker" ]] || return 1
-  local pid platform
-  pid="$(
+  # ★ Schema validation BEFORE source (codex r2): every non-blank, non-comment line
+  # must be a recognized `BRIDGE_QUIESCE_<KEY>=...` assignment from the marker's own
+  # vocabulary. A line that sources cleanly (rc=0) but is OFF-SCHEMA — an unexpected
+  # key, an arbitrary sourceable command, a corrupted half-line — is NOT this
+  # marker's content and so is NOT proof of a first-party disable. Reject the whole
+  # marker (fail closed) rather than trust the recognized early fields beside it.
+  # The allowlist is the exact key set the writer emits (bridge-upgrade.sh
+  # _bridge_upgrade_write_quiesce_marker); a future key must be added here in lock-
+  # step (an unknown key fails closed until the watcher learns it — the safe default).
+  local line stripped
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    stripped="${line#"${line%%[![:space:]]*}"}"   # ltrim
+    [[ -z "$stripped" || "$stripped" == \#* ]] && continue
+    case "$stripped" in
+      BRIDGE_QUIESCE_UPGRADE_PID=*|BRIDGE_QUIESCE_UPGRADE_PSID=*|\
+      BRIDGE_QUIESCE_UPGRADE_UID=*|BRIDGE_QUIESCE_PLATFORM=*|\
+      BRIDGE_QUIESCE_TARGET=*|BRIDGE_QUIESCE_REASON=*|\
+      BRIDGE_QUIESCE_TS=*|BRIDGE_QUIESCE_VERSION=*) ;;
+      *) return 1 ;;   # off-schema line ⇒ not a trustworthy marker ⇒ fail closed
+    esac
+  done <"$marker"
+  # ★ Checked single-source parse (codex r1): the marker is SOURCED, so malformed
+  # shell content (a truncated/corrupt marker, a half-written line) must FAIL CLOSED
+  # — never treat an unparseable marker as proof of a first-party disable. We source
+  # ONCE inside a subshell that `exit 1`s when `source` errors, emit the four fields
+  # NUL-free on three lines, and reject the whole marker on a non-zero subshell rc.
+  # (The prior per-field sources each ignored `source`'s status, so a marker with
+  # valid pid/platform/target on its early lines followed by garbage could still
+  # reach `launchctl enable` — the operator-stop hazard this closes.)
+  local record pid platform target reason
+  record="$(
     # shellcheck disable=SC1090
-    source "$marker" 2>/dev/null
-    printf '%s' "${BRIDGE_QUIESCE_UPGRADE_PID:-}"
-  )"
-  platform="$(
-    # shellcheck disable=SC1090
-    source "$marker" 2>/dev/null
-    printf '%s' "${BRIDGE_QUIESCE_PLATFORM:-}"
-  )"
+    source "$marker" 2>/dev/null || exit 1
+    printf '%s\n%s\n%s\n%s\n' \
+      "${BRIDGE_QUIESCE_UPGRADE_PID:-}" \
+      "${BRIDGE_QUIESCE_PLATFORM:-}" \
+      "${BRIDGE_QUIESCE_TARGET:-}" \
+      "${BRIDGE_QUIESCE_REASON:-interrupted_upgrade}"
+  )" || return 1
+  pid="$(printf '%s' "$record" | sed -n '1p')"
+  platform="$(printf '%s' "$record" | sed -n '2p')"
+  target="$(printf '%s' "$record" | sed -n '3p')"
+  reason="$(printf '%s' "$record" | sed -n '4p')"
   [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-  # A GENUINELY-LIVE in-flight upgrade is mid-flight running its OWN restore — defer
-  # to it (do not race), so this is NOT a recoverable interrupted disable. #2064 r3
-  # (Finding 4): "genuinely live" is identity-verified — a marker whose pid was
-  # REUSED by an unrelated live process (the upgrade was SIGKILL'd) or that has sat
-  # past the bounded age ceiling is an ORPHAN we MUST recover, not defer to forever.
+  # ★ Platform+target match: the marker must name the EXACT job we are about to
+  # re-enable. A marker recorded on the other platform, or for a different launchd
+  # label / systemd service, is NOT proof THIS job's disable was first-party — fail
+  # closed (the operator-stop default holds for the job in front of us).
+  [[ "$platform" == "$want_platform" ]] || return 1
+  [[ "$target" == "$want_target" ]] || return 1
+  # A GENUINELY-LIVE in-flight writer is mid-flight running its OWN restore — defer
+  # to it (do not race), so this is NOT a recoverable disable. #2064 r3 (Finding 4):
+  # "genuinely live" is identity-verified — a marker whose pid was REUSED by an
+  # unrelated live process (the writer was SIGKILL'd) or that has sat past the
+  # bounded age ceiling is an ORPHAN we MUST recover, not defer to forever.
   if quiesce_live_in_flight; then
     return 1
   fi
   QUIESCE_MARKER_PID="$pid"
   QUIESCE_MARKER_PLATFORM="$platform"
+  QUIESCE_MARKER_REASON="$reason"
   return 0
+}
+
+# Back-compat shim: the launchd recovery historically called
+# `interrupted_upgrade_quiesce` (no args — it implicitly meant a launchd marker).
+# #2205 routes that through the generalized proof with the launchd platform + the
+# resolved label as the expected target. Kept as a thin wrapper so the call site
+# reads clearly and the #2055 smoke's name-presence guard still matches.
+interrupted_upgrade_quiesce() {
+  non_operator_disable_marker launchd "$REBOOTSTRAP_LABEL"
 }
 
 # Clear the quiesce-intent marker after the watcher has CONFIRMED a successful
@@ -519,23 +594,26 @@ maybe_rebootstrap_launchd() {
   local disabled_state
   disabled_state="$(rebootstrap_launchd_disabled_state "$uid" "$REBOOTSTRAP_LABEL")"
   if [[ "$disabled_state" != "enabled" ]]; then
-    # Issue #2055: a disabled job is normally an operator stop (skip). The sole
-    # exception is an interrupted upgrade — its durable quiesce marker (dead
-    # upgrade pid) proves the disable was an upgrade's, not the operator's. Only
-    # then do we RE-ENABLE the job and recover it; otherwise keep the #2040
-    # fail-closed skip. We never re-enable on an `unknown` disabled-state either,
-    # because a disabled-state we cannot read could be an operator stop — but an
-    # interrupted-upgrade marker is independent proof, so recover regardless of
-    # whether print-disabled was readable.
+    # Issue #2055 / #2205: a disabled job is normally an operator stop (skip). The
+    # sole exception is a first-party non-operator disable — a durable per-path
+    # marker (dead writer pid) whose platform+target match THIS launchd label
+    # proves the disable was first-party, not the operator's. Only then do we
+    # RE-ENABLE the job and recover it; otherwise keep the #2040 fail-closed skip.
+    # We never re-enable on an `unknown` disabled-state either, because a
+    # disabled-state we cannot read could be an operator stop — but a valid
+    # matching marker is independent proof, so recover regardless of whether
+    # print-disabled was readable. `interrupted_upgrade` is one reason value; the
+    # reason is surfaced in the audit for triage.
     if interrupted_upgrade_quiesce; then
       emit_audit daemon_liveness_rebootstrap_interrupted_upgrade \
         --detail platform="launchd" \
         --detail label="$REBOOTSTRAP_LABEL" \
         --detail disabled_state="$disabled_state" \
         --detail upgrade_pid="$QUIESCE_MARKER_PID" \
+        --detail reason="$QUIESCE_MARKER_REASON" \
         --detail heartbeat_age_seconds="$age"
-      printf '[liveness] launchd job gui/%s/%s disabled by an INTERRUPTED upgrade (dead upgrade pid=%s) — re-enabling + recovering (not an operator stop).\n' \
-        "$uid" "$REBOOTSTRAP_LABEL" "$QUIESCE_MARKER_PID"
+      printf '[liveness] launchd job gui/%s/%s disabled by a first-party non-operator action (reason=%s, dead writer pid=%s) — re-enabling + recovering (not an operator stop).\n' \
+        "$uid" "$REBOOTSTRAP_LABEL" "$QUIESCE_MARKER_REASON" "$QUIESCE_MARKER_PID"
       # Issue #2064 r2 (Finding 1): do NOT consume the marker before/around the
       # best-effort re-enable. `launchctl enable` is `|| true`; if it fails the job
       # stays down, and an eagerly-cleared marker would leave the next poll with no
@@ -661,18 +739,21 @@ maybe_rebootstrap_systemd() {
       return 1
       ;;
     disabled|masked)
-      # Operator/intentional stop. SKIP + audit, never re-enable.
-      # Issue #2055/#2064 note: unlike launchd (whose upgrade quiesce `disable`s
-      # the job, masquerading as an operator stop), bridge-upgrade.sh's systemd
-      # quiesce only `stop`s the SERVICE — it never `disable`s/`mask`s it (and as
-      # of #2064 it no longer stops THIS liveness timer either). So an INTERRUPTED
-      # systemd upgrade leaves the unit enabled+inactive, which the `enabled` arm
-      # below recovers (reset-failed + start) once the live-upgrade defer clears
-      # (the SIGKILL'd upgrade's marker pid is dead → not in-flight → reap). A
-      # disabled/masked systemd unit is therefore always a genuine operator action
-      # here, and we keep the fail-closed skip — no quiesce-marker override on the
-      # systemd side is needed or wanted (it would risk fighting a real
-      # `systemctl --user disable`).
+      # Operator/intentional stop. SKIP + audit, never re-enable/unmask.
+      # Issue #2055/#2064/#2205: unlike launchd (whose upgrade quiesce `disable`s
+      # the job, masquerading as an operator stop), NO first-party Agent Bridge code
+      # `disable`s OR `mask`s the systemd daemon unit — bridge-upgrade.sh's systemd
+      # quiesce only `stop`s the SERVICE (and as of #2064 it no longer stops THIS
+      # liveness timer either). So an INTERRUPTED systemd upgrade leaves the unit
+      # enabled+inactive, which the `enabled` arm below recovers (reset-failed +
+      # start) once the live-upgrade defer clears. Because no first-party path
+      # disables/masks the unit, a disabled/masked systemd unit is ALWAYS a genuine
+      # operator action here — the #2205 per-path marker gives systemd nothing to
+      # recover (it has no first-party disabler), so this stays fail-closed
+      # alert-only (an honest boundary, see PR). ★`masked` is STRONGER than
+      # `disabled`: even a future first-party disabler must never trigger an unmask
+      # here (unmask would override a hard operator block). Fighting a real
+      # `systemctl --user disable`/`mask` is a fleet-down regression.
       emit_audit daemon_liveness_rebootstrap_skip_disabled \
         --detail platform="systemd" \
         --detail service="$svc" \

@@ -1321,16 +1321,21 @@ _bridge_upgrade_pid_start_identity() {
 }
 
 # Write the quiesce-intent marker. $1=platform (launchd|systemd), $2=label-or-
-# service. Records the OWNER upgrade pid ($$) so the watcher can tell an in-flight
-# upgrade (pid alive) from an interrupted one (pid dead). #2064 r3: ALSO records a
-# process START-IDENTITY token + the writer uid so a REUSED pid (the original
-# upgrade SIGKILL'd, the kernel handing its pid to an unrelated long-lived process)
-# cannot masquerade as an in-flight upgrade and wedge the defer forever. Best-effort:
-# a failed write must NEVER abort the upgrade (the quiesce continues; we simply lose
-# the crash-recovery hint for this run). Sets the in-process flag so the EXIT handler
-# knows a marker is outstanding.
+# service, $3=reason (optional; defaults to `interrupted_upgrade`). Records the
+# OWNER upgrade pid ($$) so the watcher can tell an in-flight upgrade (pid alive)
+# from an interrupted one (pid dead). #2064 r3: ALSO records a process
+# START-IDENTITY token + the writer uid so a REUSED pid (the original upgrade
+# SIGKILL'd, the kernel handing its pid to an unrelated long-lived process) cannot
+# masquerade as an in-flight upgrade and wedge the defer forever. #2205: the
+# `reason` enum generalizes the marker into a per-path non-operator-disable proof
+# the liveness watcher accepts for ANY first-party disable site — the upgrade
+# quiesce is one reason value (`interrupted_upgrade`, the default for back-compat
+# with markers written before #2205). Best-effort: a failed write must NEVER abort
+# the upgrade (the quiesce continues; we simply lose the crash-recovery hint for
+# this run). Sets the in-process flag so the EXIT handler knows a marker is
+# outstanding.
 _bridge_upgrade_write_quiesce_marker() {
-  local platform="$1" target="$2"
+  local platform="$1" target="$2" reason="${3:-interrupted_upgrade}"
   local marker tmp ts psid uid
   marker="$(_bridge_upgrade_quiesce_marker_path)"
   mkdir -p "$(dirname "$marker")" 2>/dev/null || { return 0; }
@@ -1342,13 +1347,14 @@ _bridge_upgrade_write_quiesce_marker() {
   # shell metacharacters is written single-quoted (defense-in-depth — the PSID token
   # is already normalized space-free, but quoting guarantees a clean source even if a
   # future identity source emits something exotic). PID/UID are numeric; PLATFORM /
-  # TARGET / TS / VERSION are bridge-controlled tokens, left bare for readability.
+  # TARGET / REASON / TS / VERSION are bridge-controlled tokens, left bare for readability.
   {
     printf 'BRIDGE_QUIESCE_UPGRADE_PID=%s\n' "$$"
     printf "BRIDGE_QUIESCE_UPGRADE_PSID='%s'\n" "$psid"
     printf 'BRIDGE_QUIESCE_UPGRADE_UID=%s\n' "$uid"
     printf 'BRIDGE_QUIESCE_PLATFORM=%s\n' "$platform"
     printf 'BRIDGE_QUIESCE_TARGET=%s\n' "$target"
+    printf 'BRIDGE_QUIESCE_REASON=%s\n' "$reason"
     printf 'BRIDGE_QUIESCE_TS=%s\n' "$ts"
     printf 'BRIDGE_QUIESCE_VERSION=%s\n' "${SOURCE_VERSION:-unknown}"
   } >"$tmp" 2>/dev/null && mv -f "$tmp" "$marker" 2>/dev/null \
