@@ -92,6 +92,7 @@ PURE_OUT="$("$BASH_BIN" -c '
   v ensure  "/private/tmp/agb-clone"       "/Users/op/.agent-bridge"            V_LEAK_ENSURE
   v restart "/tmp/agb-wt"                  "/home/op/.agent-bridge"             V_LEAK_RESTART
   v sync    "/tmp/agb-wt"                  "/home/op/.agent-bridge"             V_LEAK_SYNC
+  v reap-codex-orphans "/tmp/agb-wt"       "/opt/agb-68-fake-live/.agent-bridge" V_LEAK_REAP
   v run     "/tmp/agb-wt"                  "/tmp/tmp.AAA/sandbox"               V_ISO_HOME
   v status  "/tmp/agb-wt"                  "/opt/agb-68-fake-live/.agent-bridge" V_STATUS
   v stop    "/tmp/agb-wt"                  "/opt/agb-68-fake-live/.agent-bridge" V_STOP
@@ -122,6 +123,7 @@ smoke_assert_contains "$PURE_OUT" "V_LEAK_CRON=refuse"     "run-cron-worker is a
 smoke_assert_contains "$PURE_OUT" "V_LEAK_ENSURE=refuse"   "ensure is a mutating verb"
 smoke_assert_contains "$PURE_OUT" "V_LEAK_RESTART=refuse"  "restart is a mutating verb"
 smoke_assert_contains "$PURE_OUT" "V_LEAK_SYNC=refuse"     "sync is a mutating verb"
+smoke_assert_contains "$PURE_OUT" "V_LEAK_REAP=refuse"    "reap-codex-orphans is a gated process-killing verb (#2196)"
 # verdict — non-vacuous: each lever flips refuse->allow
 smoke_assert_contains "$PURE_OUT" "V_ISO_HOME=allow"      "transient home (isolated smoke) is allowed"
 smoke_assert_contains "$PURE_OUT" "V_STATUS=allow"        "status is not gated"

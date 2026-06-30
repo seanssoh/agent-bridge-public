@@ -410,7 +410,9 @@ bridge_foreign_checkout_verdict() {
     # followup/finalize artifacts into the live runtime, so it is the same
     # foreign-checkout class as the loop verbs (#68 codex r1). The a2a receiver
     # is the same class but is a separate entry point — tracked as a follow-up.
-    start|ensure|run|restart|sync|run-cron-worker) ;;
+    # reap-codex-orphans (#2196) SIGTERMs live processes, so a transient checkout
+    # must never drive it against a real runtime.
+    start|ensure|run|restart|sync|run-cron-worker|reap-codex-orphans) ;;
     *) printf 'allow'; return 0 ;;
   esac
   if ! bridge_path_is_transient "$src"; then
