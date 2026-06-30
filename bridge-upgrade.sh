@@ -3993,14 +3993,80 @@ if [[ $RESTART_DAEMON -eq 1 && $DRY_RUN -eq 0 ]]; then
     echo "[bridge-upgrade] WARN: restart-phase daemon restore did NOT confirm recovery (load-state: launchd=${_BRIDGE_UPGRADE_LAUNCHD_LOAD_STATE:-n/a} systemd=${_BRIDGE_UPGRADE_SYSTEMD_LOAD_STATE:-n/a}) — KEEPING the quiesce-intent marker so the standing liveness watcher recovers the orphaned daemon job." >&2
   fi
 elif [[ $DRY_RUN -eq 0 ]]; then
-  # Issue #2055: --no-restart-daemon (RESTART_DAEMON=0). The #1820 quiesce still
-  # disabled the daemon for the reconcile window, but the operator asked NOT to
-  # bring it back up — this is a DELIBERATE daemon-down end-state, not an
-  # interrupted upgrade. Clear the quiesce-intent marker so the liveness watcher
-  # leaves the (intentionally) disabled job down instead of recovering it.
-  if declare -F _bridge_upgrade_clear_quiesce_marker >/dev/null 2>&1; then
-    _bridge_upgrade_clear_quiesce_marker
+  # Issue #2210: --no-restart-daemon (RESTART_DAEMON=0). There are TWO distinct
+  # end-states here and #2055's original code conflated them:
+  #
+  #   (a) a reconcile-INDUCED bootout: the #1820 quiesce block above detected a
+  #       daemon that was UP before this run and booted it out / disabled its
+  #       managed job FOR THE RECONCILE WINDOW (set _UPGRADE_DAEMON_*_MANAGED=1
+  #       THIS run). The operator passed --no-restart-daemon to AVOID disturbing
+  #       a running daemon (e.g. the #2085 live-verify) — but the reconcile
+  #       disturbed it anyway. --no-restart-daemon must suppress an *elective*
+  #       restart, NOT license leaving a reconcile-induced bootout unrecovered.
+  #       So we restore via the SAME launchd/systemd helper the RESTART_DAEMON==1
+  #       branch uses (re-enable + bootstrap/start + verify), undoing only what
+  #       the reconcile took down.
+  #
+  #   (b) a DELIBERATE daemon-down end-state: the quiesce block did NOT manage a
+  #       daemon job this run (_UPGRADE_DAEMON_*_MANAGED both 0) — the install
+  #       had no live managed daemon to boot out (already down, plain-bash, or a
+  #       job the OPERATOR independently disabled). There is nothing reconcile
+  #       took down to restore; just clear the quiesce-intent marker so the
+  #       liveness watcher leaves the (intentionally) down job alone.
+  #
+  # ★Hard guard (#2055/#2064 invariant): restore is gated STRICTLY on
+  # _UPGRADE_DAEMON_*_MANAGED set THIS run by the quiesce block — NEVER a generic
+  # disabled-state probe. A job the operator disabled out-of-band has its MANAGED
+  # flag 0 and falls into (b), so it is never resurrected by an upgrade.
+  # BEGIN: Issue #2210 no-restart reconcile-induced bootout restore
+  if [[ "${_UPGRADE_DAEMON_SYSTEMD_MANAGED:-0}" == "1" \
+        || "${_UPGRADE_DAEMON_LAUNCHD_MANAGED:-0}" == "1" ]]; then
+    if [[ "${_UPGRADE_DAEMON_SYSTEMD_MANAGED:-0}" == "1" ]]; then
+      # Best-effort: the helper always returns 0; `|| true` is belt-and-suspenders
+      # so the upgrade can never abort here under set -e.
+      _bridge_upgrade_systemd_restart_daemon || true
+      echo "[bridge-upgrade] daemon load-state (systemd): ${_BRIDGE_UPGRADE_SYSTEMD_LOAD_STATE:-unknown} (reconcile-induced bootout restored under --no-restart-daemon, #2210)" >&2
+    else
+      _bridge_upgrade_launchd_restart_daemon || true
+      echo "[bridge-upgrade] daemon load-state (launchd): ${_BRIDGE_UPGRADE_LAUNCHD_LOAD_STATE:-unknown} (reconcile-induced bootout restored under --no-restart-daemon, #2210)" >&2
+    fi
+    # Mirror the RESTART_DAEMON==1 marker discrimination (#2055/#2064 r3): clear
+    # the quiesce-intent marker ONLY on confirmed recovery (launchd: loaded;
+    # systemd: active); otherwise KEEP it so the standing liveness watcher
+    # recovers the orphaned job. An unconditional clear after an UNVERIFIED
+    # restore strands a not-recovered daemon with no marker → silently down.
+    # NOTE (errexit): runs under `set -euo pipefail`; each branch's last
+    # statement is an unconditional assignment so a false [[ ]] never trips errexit.
+    _bridge_upgrade_norestart_recovery_confirmed=0
+    if [[ "${_UPGRADE_DAEMON_LAUNCHD_MANAGED:-0}" == "1" ]]; then
+      if [[ "${_BRIDGE_UPGRADE_LAUNCHD_LOAD_STATE:-unknown}" == "loaded" ]]; then
+        _bridge_upgrade_norestart_recovery_confirmed=1
+      fi
+    elif [[ "${_UPGRADE_DAEMON_SYSTEMD_MANAGED:-0}" == "1" ]]; then
+      if [[ "${_BRIDGE_UPGRADE_SYSTEMD_LOAD_STATE:-unknown}" == "active" ]]; then
+        _bridge_upgrade_norestart_recovery_confirmed=1
+      fi
+    fi
+    if (( _bridge_upgrade_norestart_recovery_confirmed == 1 )); then
+      if declare -F _bridge_upgrade_clear_quiesce_marker >/dev/null 2>&1; then
+        _bridge_upgrade_clear_quiesce_marker
+      fi
+    else
+      # Issue #2210 (issue option 3): the reconcile-induced restore did NOT
+      # confirm the daemon is back. Emit a loud, non-swallowed WARN (never a
+      # silent down) and KEEP the marker for the liveness watcher to recover.
+      echo "[bridge-upgrade] WARN: --no-restart-daemon: the #1820 reconcile booted out the daemon and the restore did NOT confirm recovery (load-state: launchd=${_BRIDGE_UPGRADE_LAUNCHD_LOAD_STATE:-n/a} systemd=${_BRIDGE_UPGRADE_SYSTEMD_LOAD_STATE:-n/a}) — the daemon may be DOWN. KEEPING the quiesce-intent marker so the standing liveness watcher recovers the orphaned daemon job." >&2
+    fi
+  else
+    # Issue #2055 case (b): no managed daemon job was booted out this run, so
+    # there is nothing the reconcile took down to restore. Clear the
+    # quiesce-intent marker (a harmless no-op when none was written) so the
+    # liveness watcher leaves any (intentionally) disabled job down.
+    if declare -F _bridge_upgrade_clear_quiesce_marker >/dev/null 2>&1; then
+      _bridge_upgrade_clear_quiesce_marker
+    fi
   fi
+  # END: Issue #2210 no-restart reconcile-induced bootout restore
 fi
 
 # Issue #1612 — cycle the A2A handoff receiver when --restart-daemon was
