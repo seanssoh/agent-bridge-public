@@ -1200,7 +1200,11 @@ def _clear_auth_dead_marker(marker_path: Path, active_digest: str) -> None:
         return
     if isinstance(spec, dict) and str(spec.get("_token_signal_digest") or "") == active_digest:
         try:
-            marker_path.unlink()
+            # The auth-dead marker is a controller/daemon-owned state file under
+            # BRIDGE_STATE_DIR (single-writer, not an iso-per-agent path), so the
+            # raw unlink is safe and intentionally not routed through the isolated
+            # safe wrapper — mirrors the sibling controller-owned sites in this file.
+            marker_path.unlink()  # noqa: raw-pathlib-controller-only
         except Exception:
             pass
 
