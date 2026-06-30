@@ -280,6 +280,21 @@ add_required 2205-disabled-drift-selfheal
 # edit to the no-restart branch / quiesce gate re-runs the restore + ★hard-guard
 # (operator-disabled job NEVER restored) + marker-discrimination + mutation gates.
 add_required 2210-norestart-reconcile-restore
+# Issue #2211: `upgrade --apply` interruption-safety — the apply-transactionality
+# half of the 06-30 incident. bridge-upgrade.sh now writes a DISTINCT strict-schema
+# marker (state/upgrade/apply-in-progress.json) after the backup manifest + before
+# apply-live, advances its phase at each apply barrier, and clears it after the
+# durable work-complete marker; bridge-upgrade.py owns the schema + resume/detect
+# decision (apply-marker write/clear/resolve/detect verbs). On `--apply` start a
+# pending marker drives an idempotent RESUME (reuse the original backup_root + txn,
+# skip a fresh backup) or a FAIL-CLOSED abort (malformed / different target /
+# backup-enabled with no valid backup), and status/doctor surface an interrupted-
+# apply warning (quiet on the reconcile case where a matching complete marker shows
+# the apply finished). In the full static suite so any edit to the marker schema /
+# resume-resolve / phase-advance / clear / detect surfaces re-runs the 9
+# mutation-backed acceptance gates + the behavior-invariance (no apply-sequence
+# reorder) anchor.
+add_required 2211-apply-marker-resume
 # Issue #1916: bridge_init_register_default_picker_sweep now migrates the legacy
 # text-kind picker-sweep cron to shell-kind FAIL-SAFE (recreate-first /
 # verify-before-delete) — the legacy row is deleted only after a shell row is
@@ -1895,7 +1910,12 @@ select_for_path() {
       # #2205 smoke whenever the doctor file moves so a refactor of the detector
       # registration / marker carve-out cannot silently regress the visibility of
       # the un-recoverable half of the 06-30 outage.
-      add_required 1455-settings-two-tree-doctor orphan-agent-dir agent-doctor 1786-tasksdb-doctor-verb 1803-orphan-dir-gc 1809-agents-md-backfill 2205-disabled-drift-selfheal
+      # Issue #2211: bridge-doctor.py now hosts the interrupted-apply detector
+      # (it shells to bridge-upgrade.py apply-marker --op detect). Pull the #2211
+      # smoke whenever the doctor file moves so a refactor of the detector
+      # registration / sibling-resolution cannot silently regress the
+      # interrupted-apply visibility (the upgrade-transactionality half of 06-30).
+      add_required 1455-settings-two-tree-doctor orphan-agent-dir agent-doctor 1786-tasksdb-doctor-verb 1803-orphan-dir-gc 1809-agents-md-backfill 2205-disabled-drift-selfheal 2211-apply-marker-resume
       ;;
 
     bridge-stall.py|bridge-audit.sh)

@@ -76,6 +76,7 @@ DETECTOR_KINDS = (
     "abnormal-session-pane",
     "daemon-log-split",
     "daemon-launchd-disabled-drift",
+    "interrupted-apply",
     "orphan-agent-dir",
     "missing-agent-entrypoint",
     "settings-two-tree-drift",
@@ -886,6 +887,77 @@ def detect_daemon_log_split(
                 f"BRIDGE_DAEMON_LOG={launchagent_log} or run "
                 "'agent-bridge daemon status' to confirm both paths."
             ),
+        }
+    )
+    return findings
+
+
+def detect_interrupted_apply(state_dir: Path, ts: str) -> list[dict[str, Any]]:
+    """Issue #2211: an `upgrade --apply` that was interrupted mid-run.
+
+    bridge-upgrade.py owns the strict-schema + classification (clean / interrupted
+    / reconcile / malformed) for the state/upgrade/apply-in-progress.json marker;
+    the doctor calls the sibling `apply-marker --op detect` so the warning and the
+    upgrade-start resolve never drift. We surface a finding ONLY for the operator-
+    actionable states:
+      * interrupted — version-skew risk; recovery = re-run same target / rollback.
+      * malformed   — a present-but-unvalidatable marker (fail-closed warning).
+    The quiet `reconcile` state (apply actually finished, clear didn't land) is
+    deliberately NOT a finding — it self-heals on the next upgrade invocation.
+    Read-only; any subprocess error degrades to no finding (never crashes the CLI).
+    """
+    findings: list[dict[str, Any]] = []
+    if not state_dir.is_dir():  # noqa: raw-pathlib-controller-only — read-only doctor probe of the controller-owned state dir (never an isolated agent UID); the detector degrades to no finding on any access error, so the safe-wrapper sudo escalation the lint guards against is not wanted here.
+        return findings
+    marker = state_dir / "upgrade" / "apply-in-progress.json"
+    if not marker.is_file():  # noqa: raw-pathlib-controller-only — read-only existence probe of the controller-owned apply marker under <bridge_home>/state; same rationale as the state_dir probe above.
+        return findings
+    # Resolve the target root from the state dir (state lives at <root>/state).
+    target_root = state_dir.parent
+    sibling = Path(__file__).resolve().parent / "bridge-upgrade.py"
+    if not sibling.is_file():  # noqa: raw-pathlib-controller-only — probe of a SOURCE-tree sibling script next to this doctor, not an isolated runtime path; never crosses an iso UID boundary.
+        return findings
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(sibling),
+                "apply-marker",
+                "--target-root",
+                str(target_root),
+                "--op",
+                "detect",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        detect = json.loads(proc.stdout or "{}")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return findings
+    if not isinstance(detect, dict):
+        return findings
+    state = str(detect.get("state") or "")
+    if state not in {"interrupted", "malformed"}:
+        return findings
+    evidence: dict[str, Any] = {
+        "marker": str(marker),
+        "state": state,
+    }
+    for key in ("phase", "installed_version", "target_version", "backup_root", "started_at", "reason"):
+        value = detect.get(key)
+        if value:
+            evidence[key] = value
+    warning = str(detect.get("warning") or "")
+    recovery = str(detect.get("recovery") or "")
+    findings.append(
+        {
+            "ts": ts,
+            "kind": "interrupted-apply",
+            "agent": "",
+            "evidence": evidence,
+            "suggested_action": (f"{warning} {recovery}").strip(),
         }
     )
     return findings
@@ -2100,6 +2172,12 @@ def main() -> int:
             # recovery marker — the un-recoverable half of the 06-30 outage.
             "daemon-launchd-disabled-drift",
             lambda: detect_disabled_drift_no_marker(state_dir, ts),
+        ),
+        (
+            # Issue #2211: an interrupted `upgrade --apply` left a pending
+            # apply-in-progress marker (version-skew risk) — or a malformed one.
+            "interrupted-apply",
+            lambda: detect_interrupted_apply(state_dir, ts),
         ),
         (
             "orphan-agent-dir",

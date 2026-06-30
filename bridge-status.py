@@ -11,6 +11,7 @@ import os
 import re
 import signal
 import sqlite3
+import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1135,6 +1136,74 @@ def context_pressure_fp_rate(audit_log: str, window_days: int = 7) -> tuple[int,
     return (fp_count, len(critical_task_ids))
 
 
+def interrupted_apply_warning(bridge_state_dir: str) -> str:
+    """Issue #2211: a one-line dashboard warning when an `upgrade --apply` was
+    interrupted mid-run (a pending state/upgrade/apply-in-progress.json marker
+    with no corroborating success marker), or when that marker is malformed.
+
+    A partial upgrade is a fleet-down/data-integrity signal the operator must see
+    immediately, so this renders on the DEFAULT dashboard (not gated on --full).
+    A cheap file-existence probe guards the common (healthy) case: the marker
+    only exists during/after an interrupted upgrade, so the strict classification
+    is delegated to the SSOT (`bridge-upgrade.py apply-marker --op detect`) ONLY
+    in that rare unhealthy case — keeping the dashboard fast AND keeping status,
+    doctor, and the upgrade-start resolve in lock-step (no duplicated validator
+    that could drift, e.g. an unknown-key marker the SSOT calls `malformed`
+    surfacing here as `interrupted`). Any error degrades to "" (no warning).
+    Returns "" when there is nothing to warn about (the common, healthy case).
+    """
+    if not bridge_state_dir:
+        return ""
+    state_dir = Path(bridge_state_dir).expanduser()
+    marker_path = state_dir / "upgrade" / "apply-in-progress.json"
+    if not marker_path.is_file():  # noqa: raw-pathlib-controller-only — read-only dashboard probe of a controller-owned state path; the marker lives under <bridge_home>/state, never an isolated agent UID, and a PermissionError degrades to "no warning", so the safe-wrapper sudo escalation the lint guards against is not wanted here.
+        return ""
+    target_root = state_dir.parent
+    sibling = Path(__file__).resolve().parent / "bridge-upgrade.py"
+    if not sibling.is_file():  # noqa: raw-pathlib-controller-only — probe of a SOURCE-tree sibling script next to this status renderer, never an isolated runtime path.
+        return ""
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(sibling),
+                "apply-marker",
+                "--target-root",
+                str(target_root),
+                "--op",
+                "detect",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        detect = json.loads(proc.stdout or "{}")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return ""
+    if not isinstance(detect, dict):
+        return ""
+    state = str(detect.get("state") or "")
+    # `reconcile` (apply finished, clear didn't land) + `clean` stay quiet.
+    if state == "malformed":
+        return (
+            "WARNING: a previous 'upgrade --apply' left a MALFORMED "
+            "apply-in-progress marker; run 'agent-bridge doctor' for the "
+            "recovery step (version-skew risk)."
+        )
+    if state == "interrupted":
+        target_version = str(detect.get("target_version") or "?")
+        phase = str(detect.get("phase") or "?")
+        return (
+            f"WARNING: a previous 'upgrade --apply' to {target_version} was "
+            f"INTERRUPTED at phase '{phase}' and never finalized (version-skew "
+            "risk). Recover: re-run 'agent-bridge upgrade --apply' to the SAME "
+            "target to converge it, or 'agent-bridge upgrade rollback'. See "
+            "'agent-bridge doctor' for details."
+        )
+    return ""
+
+
 def pending_upgrade_conflict_count(bridge_home: str) -> int:
     """Count `*.upgrade-conflict` files under `<BRIDGE_HOME>` excluding
     archived layers (`backups/...`). Renders as the `pending
@@ -1762,6 +1831,14 @@ def render_dashboard(args: argparse.Namespace) -> str:
         f"health warn>={fmt_age(int(datetime.now(timezone.utc).timestamp()) - args.stale_warn_seconds) if args.stale_warn_seconds > 0 else 'off'} "
         f"crit>={fmt_age(int(datetime.now(timezone.utc).timestamp()) - args.stale_critical_seconds) if args.stale_critical_seconds > 0 else 'off'}"
     )
+    # Issue #2211: an interrupted `upgrade --apply` is a fleet-down / data-
+    # integrity signal, so its warning renders on the DEFAULT dashboard (not
+    # gated on --full like the conflict count). Cheap, read-only, quiet on a
+    # healthy host (empty string → no line).
+    _interrupted_apply = interrupted_apply_warning(args.bridge_state_dir)
+    if _interrupted_apply:
+        lines.append("")
+        lines.append(_interrupted_apply)
     # The four counters below each parse the full audit log (~1.1M lines on
     # a long-lived host) or scan the filesystem. They are diagnostics, not
     # the "current state" a quick `agb status` wants, so the default human
@@ -2099,6 +2176,9 @@ def render_dashboard_json(args: argparse.Namespace) -> str:
         # count so JSON consumers (dashboard / admin-bot / smoke) can
         # observe the same number the human-facing warning line emits.
         "pending_upgrade_conflicts": pending_upgrade_conflict_count(args.bridge_home or ""),
+        # Issue #2211: interrupted-apply warning string (empty when healthy) so
+        # JSON consumers observe the same signal the default dashboard renders.
+        "interrupted_apply_warning": interrupted_apply_warning(args.bridge_state_dir),
         # Issue #1803: orphan-agent-dir count (the SSOT classifier's verdict,
         # same number the daemon GC acts on). Always emitted so a JSON consumer
         # observes accumulation before it grows back to triple digits.
