@@ -549,6 +549,16 @@ agb review complete <task-id> --reviewer reviewer --decision approved --note "No
 - **크론 스케줄링**: 매일 아침 브리핑, 주간 리포트 같은 반복 작업 실행
 - **상태 모니터링**: 에이전트 health check, stale 감지, 알림
 
+> **`upgrade --no-restart-daemon` 동작 변경.** 이 플래그는 업그레이드 끝의
+> *선택적* 데몬 재시작을 끄는 용도다. 단, 필수 layout-v2 reconcile(#1820)은
+> 데몬을 내린 상태에서 안전하게 돌아야 하므로 플래그와 무관하게 실행 중인
+> 데몬을 잠시 bootout 한다. 이제 업그레이드는 `--no-restart-daemon` 에서도
+> 이 **reconcile 가 내린 데몬은 다시 올린다** — 즉 플래그의 의미는 "데몬을
+> 절대 건드리지 않는다"가 아니라 "*elective* 재시작만 하지 않는다"이다.
+> 원래 떠 있던 데몬이 reconcile 때문에만 내려간 경우 복구되고, 이미 내려가
+> 있었거나 운영자가 직접 비활성화한 데몬은 그대로 둔다. 자세한 내용은
+> [OPERATIONS.md §"Upgrade"](./OPERATIONS.md#upgrade) 참조.
+
 ### 상태 대시보드
 
 ```bash

@@ -1116,3 +1116,36 @@ Recommended noise-reduction config:
   only; the detection above still covers the other modal classes.
 
 Regression smoke: `scripts/smoke/1181-modal-blocker-detect.sh`.
+
+## 38. `upgrade --no-restart-daemon` no longer leaves a reconcile-bootout daemon down (#2210)
+
+Behavior change, not a bug — flagged here because it is a live-session surprise
+for operators who treated `--no-restart-daemon` as *“the upgrade never touches my
+running daemon.”*
+
+Symptom (old behavior):
+
+- The mandatory layout-v2 reconcile (#1820) must run **daemon-down-safe**, so the
+  upgrader quiesces (boots out) a running launchd/systemd daemon **regardless of
+  `--restart-daemon`/`--no-restart-daemon`** — the migration is not gated on the
+  flag. Under `--no-restart-daemon` the booted-out daemon was then left **down**
+  for the rest of the session (the operator passed the flag expecting the running
+  daemon to be undisturbed, but the reconcile disturbed it anyway).
+
+Current behavior:
+
+- The upgrader now **restores a reconcile-induced bootout even under
+  `--no-restart-daemon`** (re-enable + bootstrap/start via the same launchd/systemd
+  helper the restart path uses), undoing only what the reconcile took down. The
+  summary prints `… (reconcile-induced bootout restored under --no-restart-daemon,
+  #2210)`.
+- `--no-restart-daemon` now means *“suppress the **elective** restart,”* not
+  *“never touch the daemon.”* A daemon that was already down, a plain-bash install,
+  or a job the **operator** disabled out-of-band is **never** resurrected — restore
+  is gated strictly on the reconcile having managed the job *this run*.
+- If the restore cannot confirm recovery, the upgrader emits a loud (non-swallowed)
+  WARN and keeps the quiesce-intent marker so the standing OS-level liveness
+  watcher recovers the orphaned daemon job — it never silently leaves it down.
+
+See [OPERATIONS.md §"Upgrade"](./OPERATIONS.md#upgrade) (`--no-restart-daemon` also
+restores a reconcile-induced daemon bootout).

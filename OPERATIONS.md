@@ -349,6 +349,59 @@ agb upgrade --apply
 같이 고쳤다 — `flock -w 0` 이 실제 `flock(1)` 에 거부되던 것을 `flock -n` 으로, 그리고
 `exec {fd}>>file 2>/dev/null` 가 shell stderr 를 영구히 묵음 처리하던 것을.)
 
+#### Interrupted `upgrade --apply` — detection + idempotent resume
+
+An `upgrade --apply` that is killed mid-run (machine reboot, terminal close, the
+exit-137 self-restart SIGKILL on a sudo-self systemd install, etc.) can leave the
+install **version-skewed** — some apply steps landed, others did not. The upgrader
+now writes an `apply-in-progress` marker (`state/upgrade/apply-in-progress.json`)
+after the backup manifest succeeds and **advances it through each phase**, then
+clears it once the durable `upgrade-complete.json` success marker is on disk (so a
+*normal* self-restart never looks interrupted). This makes a half-finished apply
+**detectable and idempotently resumable**:
+
+- **Status surface.** A pending marker raises a one-line dashboard **WARNING** on
+  the default `agb status` (not gated on `--full`, because a partial upgrade is a
+  fleet-down / data-integrity signal): `a previous 'upgrade --apply' to <ver> was
+  INTERRUPTED at phase '<phase>' …`, or `… left a MALFORMED apply-in-progress
+  marker …`. The classifier is the single source of truth shared by status,
+  doctor, and the upgrade-start resolve — it never drifts.
+- **Doctor finding.** `agb doctor` surfaces the **`interrupted-apply`** finding
+  (read-only) with the recovery step. Only the operator-actionable states warn:
+  `interrupted` and `malformed`. The quiet `reconcile` state (the apply actually
+  finished but the marker clear didn't land) is deliberately **not** a finding —
+  it self-heals on the next upgrade invocation.
+- **Resume / fail-closed.** Re-running `agent-bridge upgrade --apply` detects the
+  marker and resumes idempotently. The classification is **fail-closed**: a marker
+  that cannot be safely classified (e.g. it records a *different* `target_root`, or
+  is malformed) makes the upgrader **refuse to start** rather than guess — a stale
+  marker whose upgrade-complete marker proves the apply finished is archived and
+  the run proceeds normally.
+
+#### `--no-restart-daemon` also restores a reconcile-induced daemon bootout
+
+`--no-restart-daemon` suppresses the *elective* daemon restart at the end of an
+upgrade. Note one behavior an operator must be aware of: the mandatory **#1820
+layout-v2 reconcile** runs daemon-down-safe and so **quiesces (boots out) a running
+daemon regardless of `--restart-daemon`/`--no-restart-daemon`** — the migration is
+not gated on the flag. Previously, under `--no-restart-daemon`, a daemon the
+reconcile booted out was left **down**. Now the upgrader **restores a
+reconcile-induced bootout** even under `--no-restart-daemon`: it re-enables +
+bootstraps/starts the managed job via the same launchd/systemd helper the
+restart path uses, undoing only what the reconcile took down (the summary prints
+`… (reconcile-induced bootout restored under --no-restart-daemon, #2210)`).
+
+- `--no-restart-daemon` now means *“do not perform an **elective** restart”*, not
+  *“never touch the daemon”* — a daemon that was up before the run and only went
+  down because the reconcile booted it out is brought back.
+- The restore is gated **strictly** on the reconcile having managed the job *this
+  run*: a daemon that was already down, a plain-bash (non-launchd/systemd) install,
+  or a job the **operator** disabled out-of-band is **never** resurrected — it stays
+  down and the quiesce-intent marker is cleared.
+- If the restore can’t **confirm** recovery, the upgrader emits a loud (non-swallowed)
+  WARN and **keeps** the quiesce-intent marker so the standing liveness watcher
+  recovers the orphaned job — it never silently leaves the daemon down.
+
 #### migrate-agents: default-on, roster-restricted, no-downtime (#1611)
 
 `upgrade --apply` 는 migrate-agents 를 **켠 채로** 두는 것이 권장 경로다.
@@ -1054,7 +1107,67 @@ agb audit follow --action a2a_receiver_circuit_open         # A2A breaker opened
 agb audit follow --action a2a_receiver_stale_code_detected  # stale receiver caught (#1685)
 agb audit follow --action a2a_receiver_stale_code_restarted # one-shot recycle succeeded
 agb audit follow --action a2a_receiver_stale_code_restart_failed  # held (preflight/lifecycle)
+agb audit follow --action daemon_liveness_token_lifeline    # out-of-process token recovery ran (daemon-down)
+agb audit follow --action daemon_liveness_rebootstrap_success            # launchd disabled-drift re-armed
+agb audit follow --action daemon_liveness_rebootstrap_skip_unknown_disabled  # disabled-state unreadable → skipped (fail-closed)
+agb audit follow --action daemon_silence_restart_escalated  # silence-watchdog SIGKILL+re-arm escalation
 ```
+
+**Out-of-process token lifeline (daemon-down token recovery).** The OS-level
+liveness watcher (`bridge-daemon-liveness.sh`, run under launchd / a systemd
+`.timer` **outside** the daemon process tree) runs a bounded emergency token tick
+when the daemon heartbeat is stale past the threshold — so Claude-token recovery
+survives a **dead or hung daemon** instead of waiting for the daemon to come back.
+On a stale heartbeat the watcher delegates to `bridge-auth.sh` to run the daemon's
+own `claude-token recover-due` → `sync` pair (plus the operator-gated
+`sync-global`), re-enabling a recovered token and propagating it to live sessions
+via `.credentials.json`. It is a **driver only** — it runs the *same* recovery the
+daemon runs and does **no** rotation, no new policy. Each phase is bounded by a
+timeout and the whole tick is throttled to at most once per interval per stale
+host; the throttle witness is written even on failure so a persistently-failing
+auth call cannot hot-loop. Audited as `daemon_liveness_token_lifeline` (status
+only, never token material); a `--dry-run` watcher tick records a `would-run` row
+and mutates nothing.
+
+| Var | Default | Effect |
+|---|---|---|
+| `BRIDGE_DAEMON_TOKEN_LIFELINE_ENABLED` | `1` | Kill-switch — set `0` to disable the emergency token tick entirely (the watcher's restart job is unaffected). |
+| `BRIDGE_DAEMON_TOKEN_LIFELINE_STALE_SECONDS` | `BRIDGE_DAEMON_LIVENESS_THRESHOLD_SECONDS` (`600`) | Heartbeat staleness before the lifeline fires (defaults to the same threshold the restart trigger uses). |
+| `BRIDGE_DAEMON_TOKEN_LIFELINE_INTERVAL_SECONDS` | `300` | A stale host runs the lifeline at most once per this interval (the first stale poll on a fresh host fires immediately). |
+| `BRIDGE_DAEMON_TOKEN_LIFELINE_TIMEOUT_SECONDS` | `60` | Per-`bridge-auth.sh` call ceiling. |
+| `BRIDGE_DAEMON_TOKEN_LIFELINE_STATE_FILE` | `$BRIDGE_STATE_DIR/daemon/token-lifeline.ts` | Interval-throttle witness (records the last attempt timestamp). |
+
+**launchd disabled-drift self-heal.** When the liveness watcher finds a
+launchd-managed daemon job that drifted to **disabled/unloaded** while the daemon
+is down, it re-enables and re-bootstraps the job **only** when a valid matching
+per-path quiesce marker proves a *first-party, non-operator* disable (the marker's
+`platform`+`target` must match the job). An operator `agb daemon stop` is
+**preserved and never fought** — the operator-stop-outranks invariant is sacred.
+The disabled-state probe is tri-state: `disabled` → recover only with a matching
+marker; `enabled` → not a drift; `unknown` (print-disabled unreadable) → **fail
+closed**: skip, retain any marker for a later readable poll, and perform **no**
+enable (audited `daemon_liveness_rebootstrap_skip_unknown_disabled`). A recovery is
+audited `daemon_liveness_rebootstrap_success`. The other half — a launchd job
+disabled/unloaded with **no** valid marker (indistinguishable from an operator
+stop, so the watcher cannot auto-recover it) — is surfaced as the `agb doctor`
+finding **`daemon-launchd-disabled-drift`** (report-only; it never mutates launchd
+state). The finding's `suggested_action` prints the exact `launchctl enable …` /
+`launchctl bootstrap …` re-arm command (or rerun
+`scripts/install-daemon-launchagent.sh --apply`); if the stop *was* intentional,
+no action is needed.
+
+**Silence-watchdog escalation on a hung restart.** The audit-silence sibling
+supervisor (`bridge-watchdog-silence.py`) restarts the daemon when its
+`daemon_tick` heartbeat goes silent. A `restart --force` that **hangs or fails**
+(rc 124, or any non-0/non-2) no longer fails *open* (leaving a wedged daemon
+running) — it now **escalates**: on a non-launchd host it SIGKILLs the recorded
+wedged pid (a provenance-gated kill — launchd-supervised jobs are left to the OS
+init re-arm to avoid a `KeepAlive` race), then drives **one bounded** OS-init
+re-arm via the same `restart --force`. The outcome is audited
+`daemon_silence_restart_escalated` with `outcome=escalated_restarted` (a live
+daemon came back) or `outcome=escalated_failed` (escalation also failed → falls
+through to the standard restart-failed cooldown). There is no kill→re-arm loop —
+the cooldown owns retry.
 
 **One-time manual step for pre-v0.16.1 sources.** If you upgrade to v0.16.x from
 a **pre-v0.16.1** source and the always-on daemon is **not** running (so the
@@ -1827,6 +1940,12 @@ a limit window, rotate returns `skipped/all_tokens_limited` with the pool's
 one urgent "claude token pool exhausted" notification on a cooldown latch
 (`BRIDGE_CLAUDE_POOL_EXHAUSTED_NOTICE_INTERVAL_SECONDS`, default 1800)
 rather than re-alerting on every monitor pass.
+
+The 429 reset string itself (the date-anchored weekly form `resets <Mon> <day> at
+<time> (<zone>)`) is parsed **fail-closed**: a malformed date/clock or unknown
+zone yields an empty `reset_at` (the token is treated as having no stamp and stays
+eligible) instead of raising out of the recovery/probe path — a garbled reset
+message can never crash token recovery or strand a token on an un-parseable stamp.
 
 The daemon also applies a **pool-level cooldown** to the rotation *attempt*
 itself (#1789 D2): once a pass reports `all_tokens_limited`, it records the
