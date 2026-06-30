@@ -29,9 +29,12 @@
 #        one (else a stale/foreign marker re-arms an operator-stopped job).
 #   P4 — ★launchd DISABLED + marker whose PLATFORM=systemd → SKIP (platform
 #        mismatch; a systemd marker can never prove a launchd job's disable).
-#   P5 — launchd DISABLED + marker (dead writer) but print-disabled UNREADABLE →
-#        STILL recover (the marker is independent proof; fail-closed-on-unknown is
-#        overridden ONLY by a valid MATCHING marker).
+#   P5 — ★launchd UNKNOWN probe (print-disabled unreadable) + valid matching marker →
+#        SKIP + marker RETAINED (★Phase-4 r2 tri-state: a marker proves the LAST
+#        first-party action, NOT the CURRENT state — an unreadable probe cannot rule
+#        out an operator re-disable, so fail closed; never enable).
+#   MP5 — ★MUTATION: revert the tri-state split (unknown re-enters the disabled
+#        recovery) → P5's unknown+marker case re-enables (P5's guard is load-bearing).
 #   P6 — ★launchd DISABLED + MALFORMED matching marker (valid early fields, broken
 #        shell tail) → SKIP (checked single-source parse fails closed; a marker that
 #        does not fully parse is never proof — codex r1).
@@ -62,6 +65,11 @@
 #        a DEAD-writer matching marker is the watcher's recoverable case).
 #   MD5 — ★DOCTOR MUTATION: drop the dead-writer term → D5's live-writer marker
 #        suppresses (D5's guard is independently load-bearing).
+#   D6 — ★DOCTOR: launchd UNKNOWN probe (unreadable) + perfect dead-writer marker →
+#        REPORTS (★Phase-4 r2 tri-state: the watcher won't recover an unknown probe,
+#        so the doctor must surface it; only POSITIVELY-readable disabled suppresses).
+#   MD6 — ★DOCTOR MUTATION: drop the positive-readable-disabled term → D6's unknown-
+#        probe case suppresses (D6's guard is independently load-bearing).
 
 set -uo pipefail
 SMOKE_NAME="2205-disabled-drift-selfheal"
@@ -306,17 +314,46 @@ audit_has daemon_liveness_rebootstrap_skip_disabled || smoke_fail "P4 FAIL: a pl
 launchctl_called enable && smoke_fail "P4 FAIL (BLOCKER): a systemd marker must NOT re-enable a launchd job. calls=$(cat "$LAUNCHCTL_LOG")"
 smoke_log "P4 PASS: launchd disabled + systemd-PLATFORM marker → SKIP (platform mismatch fail-closed)"
 
-# ── P5: launchd DISABLED + matching marker but print-disabled UNREADABLE → recover
+# ── P5: ★launchd UNKNOWN (print-disabled unreadable) + valid matching marker → SKIP
+# (★Phase-4 r2 tri-state invariant): a marker proves the LAST first-party action was a
+# disable, NOT the CURRENT state. If we cannot READ the live disabled-state we cannot
+# rule out an operator RE-disable AFTER the marker, so we must FAIL CLOSED — skip,
+# RETAIN the marker for a later readable poll, NO enable / NO bootstrap. (Pre-r2 this
+# wrongly recovered on a valid marker regardless of probe readability — the bug
+# Phase-4 r1 rejected.)
 seed_stale_no_pid
 printf '1' >"$PRINT_RC_FILE"
 printf '2' >"$DISABLED_RC_FILE"       # print-disabled FAILS (unknown)
 printf '1' >"$BOOTSTRAP_LOADS_FILE"
 write_marker launchd "$TEST_LABEL" ensure_singleton_bootout
 run_liveness Darwin
-audit_has daemon_liveness_rebootstrap_interrupted_upgrade || smoke_fail "P5 FAIL: a valid matching marker must override fail-closed-on-unknown. audit=$(cat "$AUDIT_LOG")"
-launchctl_called enable || smoke_fail "P5 FAIL: must re-enable on a valid matching marker even when print-disabled is unknown. calls=$(cat "$LAUNCHCTL_LOG")"
-audit_has daemon_liveness_rebootstrap_success || smoke_fail "P5 FAIL: no rebootstrap_success. audit=$(cat "$AUDIT_LOG")"
-smoke_log "P5 PASS: launchd disabled + unreadable print-disabled but valid matching marker → recover (marker is independent proof)"
+audit_has daemon_liveness_rebootstrap_skip_unknown_disabled || smoke_fail "P5 FAIL: an UNKNOWN disabled-probe must fail closed (skip_unknown_disabled), even with a valid marker. audit=$(cat "$AUDIT_LOG")"
+launchctl_called enable && smoke_fail "P5 FAIL (BLOCKER): must NOT re-enable on an unreadable probe — a marker does not prove the CURRENT state. calls=$(cat "$LAUNCHCTL_LOG")"
+launchctl_called bootstrap && smoke_fail "P5 FAIL (BLOCKER): must NOT bootstrap on an unreadable probe. calls=$(cat "$LAUNCHCTL_LOG")"
+audit_has daemon_liveness_rebootstrap_interrupted_upgrade && smoke_fail "P5 FAIL: an unknown probe is not a recovery, even with a marker. audit=$(cat "$AUDIT_LOG")"
+[[ -f "$MARKER_FILE" ]] || smoke_fail "P5 FAIL: the marker must be RETAINED for a later readable poll. missing=$MARKER_FILE"
+smoke_log "P5 PASS: launchd UNKNOWN probe + valid matching marker → SKIP + marker RETAINED (a marker proves the last action, not the current state; #2205 Phase-4 r2)"
+
+# ── MP5: ★MUTATION for P5 — revert the tri-state split (make `unknown` re-enter the
+# recovery path like `disabled` did pre-r2) → P5's unknown+marker case would START
+# re-enabling. Proves the tri-state entry guard is load-bearing. Two edits revert it:
+# neuter the unknown early-return guard (never matches) AND widen the disabled test to
+# `!= enabled` so an unknown probe re-enters the marker/re-enable recovery (the old bug).
+MUTATED_SRC="$REPO_ROOT/scripts/.2205-liveness-mut-p5.$$.sh"
+sed -e 's/if \[\[ "\$disabled_state" == "unknown" \]\]; then/if false; then  # MUT unknown-guard neutered/' \
+    -e 's/if \[\[ "\$disabled_state" == "disabled" \]\]; then/if [[ "$disabled_state" != "enabled" ]]; then  # MUT widened/' \
+    "$LIVENESS_SRC" >"$MUTATED_SRC"
+grep -q 'MUT unknown-guard neutered' "$MUTATED_SRC" || smoke_fail "MP5 FAIL: mutation did not neuter the unknown guard"
+grep -q 'MUT widened' "$MUTATED_SRC" || smoke_fail "MP5 FAIL: mutation did not widen the disabled test"
+seed_stale_no_pid
+printf '1' >"$PRINT_RC_FILE"
+printf '2' >"$DISABLED_RC_FILE"       # print-disabled FAILS (unknown)
+printf '1' >"$BOOTSTRAP_LOADS_FILE"
+write_marker launchd "$TEST_LABEL" ensure_singleton_bootout
+run_liveness Darwin "$MUTATED_SRC"
+launchctl_called enable || smoke_fail "MP5 FAIL (vacuous!): with the unknown guard reverted, an unknown+marker case should re-enable, but it did not. calls=$(cat "$LAUNCHCTL_LOG")"
+rm -f "$MUTATED_SRC"; MUTATED_SRC=""
+smoke_log "MP5 PASS: MUTATION proven — reverting the tri-state split makes an unknown probe re-enable on a marker (P5's guard is load-bearing)"
 
 # ── P6: ★launchd DISABLED + MALFORMED matching marker → SKIP (checked-source parse)
 # The marker's early fields are valid+matching but its tail is broken shell. A
@@ -537,5 +574,39 @@ run_doctor "$MUTATED_DOCTOR"
 doctor_has_drift && smoke_fail "MD5 FAIL (vacuous!): with the dead-writer requirement dropped a live-writer marker should suppress, but the finding still fired. out=$(cat "$SMOKE_TMP_ROOT/doctor-out.json")"
 rm -f "$MUTATED_DOCTOR"; MUTATED_DOCTOR=""
 smoke_log "MD5 PASS: MUTATION proven — dropping the dead-writer requirement makes a live-writer marker suppress (D5's guard is independently load-bearing)"
+
+# D6 — ★launchd UNKNOWN probe (print-disabled unreadable) + unloaded + valid
+# dead-writer matching marker → the detector REPORTS (★Phase-4 r2 tri-state): the
+# watcher fails closed on an unknown probe and will NOT recover, so the doctor must
+# NOT suppress — even a perfect marker cannot prove the CURRENT state is recoverable.
+seed_stale_no_pid
+printf '1' >"$PRINT_RC_FILE"             # not loaded (unloaded=True)
+printf '2' >"$DISABLED_RC_FILE"          # print-disabled UNREADABLE (unknown)
+write_marker launchd "$TEST_LABEL" watchdog_disable   # valid DEAD-writer matching marker
+run_doctor
+doctor_has_drift || smoke_fail "D6 FAIL: an UNKNOWN disabled-probe must NOT be suppressed by a marker (the watcher won't recover it). out=$(cat "$SMOKE_TMP_ROOT/doctor-out.json")"
+smoke_log "D6 PASS: doctor reports on an UNKNOWN-probe drift even with a perfect marker (only POSITIVELY-readable disabled is the watcher's recoverable case; #2205 Phase-4 r2)"
+
+# MD6 — ★MUTATION for D6: drop the `disabled_readable and disabled` requirement from
+# the recoverable predicate → D6's unknown-probe case would START suppressing. Proves
+# the positive-readable-disabled requirement is independently load-bearing.
+MUTATED_DOCTOR="$REPO_ROOT/.2205-doctor-mut-md6.$$.py"
+python3 - "$DOCTOR_SRC" "$MUTATED_DOCTOR" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src, encoding="utf-8").read()
+needle = "        disabled_readable\n        and disabled\n        and marker_well_formed"
+assert needle in text, "positive-readable-disabled terms not found for MD6 mutation"
+text = text.replace(needle, "        True  # MUT readable+disabled dropped\n        and marker_well_formed", 1)
+open(dst, "w", encoding="utf-8").write(text)
+PY
+seed_stale_no_pid
+printf '1' >"$PRINT_RC_FILE"
+printf '2' >"$DISABLED_RC_FILE"          # unknown probe
+write_marker launchd "$TEST_LABEL" watchdog_disable   # valid dead-writer marker
+run_doctor "$MUTATED_DOCTOR"
+doctor_has_drift && smoke_fail "MD6 FAIL (vacuous!): with the positive-readable-disabled requirement dropped an unknown-probe drift should suppress, but the finding still fired. out=$(cat "$SMOKE_TMP_ROOT/doctor-out.json")"
+rm -f "$MUTATED_DOCTOR"; MUTATED_DOCTOR=""
+smoke_log "MD6 PASS: MUTATION proven — dropping the positive-readable-disabled requirement makes an unknown-probe drift suppress (D6's guard is independently load-bearing)"
 
 smoke_log "all non-operator disabled-drift self-heal tests PASS (#2205)"

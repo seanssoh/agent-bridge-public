@@ -954,9 +954,18 @@ def _launchd_disabled_drift_evidence(
     # Disabled-state probe. `print-disabled gui/<uid>` lists labels with an
     # explicit override; modern macOS prints `"<label>" => disabled`, legacy
     # `=> true`. Absent line / command failure → cannot prove disabled.
+    # ★ TRI-STATE disabled probe (#2205 Phase-4 r2), mirroring the watcher: the
+    # print-disabled result is one of disabled / enabled / UNKNOWN (the command
+    # failed → unreadable). We must NOT collapse `unknown` into `enabled` (disabled
+    # False) for the suppress decision: a recovery carve-out may suppress the finding
+    # ONLY when disabled was POSITIVELY readable as disabled (the watcher's
+    # recoverable case). When the live state is unreadable, the watcher fails closed
+    # and will NOT recover, so the doctor MUST surface the alert (never suppress).
     disabled = False
+    disabled_readable = False
     pd = _launchctl(["print-disabled", f"gui/{uid}"])
     if pd is not None and pd.returncode == 0:
+        disabled_readable = True
         pat = re.compile(
             r'"' + re.escape(label) + r'"\s*=>\s*(?:true|disabled)'
         )
@@ -1038,7 +1047,14 @@ def _launchd_disabled_drift_evidence(
         return False  # kill(pid,0) succeeded → writer is alive
 
     recoverable = (
-        marker_well_formed
+        # ★ POSITIVE-readable disabled is REQUIRED (#2205 Phase-4 r2): the watcher
+        # only re-enables on a positively-readable `disabled` probe; on an UNKNOWN
+        # (unreadable) probe it fails closed and will NOT recover. So a marker may
+        # suppress this finding ONLY when we could positively read disabled — else
+        # the drift the watcher won't touch would be hidden from the operator.
+        disabled_readable
+        and disabled
+        and marker_well_formed
         and marker_platform == "launchd"
         and marker_target == label
         and _pid_dead(marker_pid)
@@ -1051,6 +1067,7 @@ def _launchd_disabled_drift_evidence(
         "label": label,
         "uid": uid,
         "launchd_disabled": disabled,
+        "launchd_disabled_readable": disabled_readable,
         "launchd_unloaded": unloaded,
         "recovery_marker_present": marker_seen,
     }

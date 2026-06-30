@@ -360,19 +360,25 @@ audit_has daemon_liveness_rebootstrap_interrupted_upgrade && smoke_fail "I3 FAIL
 [[ -f "$MARKER_FILE" ]] || smoke_fail "I3 FAIL: marker must be PRESERVED while the upgrade is in flight. missing=$MARKER_FILE"
 smoke_log "I3 PASS: launchd disabled + LIVE-upgrade marker → DEFER as skip_disabled (no race, marker preserved)"
 
-# ── I4: launchd DISABLED + marker (dead pid) but print-disabled UNREADABLE → recover
-# The marker is independent proof; #2040's fail-closed-on-unknown is overridden
-# ONLY by a valid interrupted-upgrade marker.
+# ── I4: ★launchd UNKNOWN (print-disabled unreadable) + valid marker → SKIP, retain
+# (UPDATED by #2205 Phase-4 r2): a marker proves the LAST first-party action was a
+# disable, NOT the CURRENT state — if print-disabled is unreadable we cannot rule out
+# an operator re-disable AFTER the marker, so we must FAIL CLOSED (skip + retain the
+# marker for a later readable poll), NOT recover. The pre-#2205 contract ("a valid
+# marker overrides fail-closed-on-unknown → recover") was the exact operator-stop
+# hazard the Phase-4 review rejected. The full positive/unknown matrix lives in
+# scripts/smoke/2205-disabled-drift-selfheal.sh (P5/MP5); this guards the #2055 path.
 seed_stale_no_pid
 printf '1' >"$PRINT_RC_FILE"
 printf '2' >"$DISABLED_RC_FILE"       # print-disabled FAILS (unknown)
 printf '1' >"$BOOTSTRAP_LOADS_FILE"
 write_marker launchd "$TEST_LABEL"
 run_liveness Darwin
-audit_has daemon_liveness_rebootstrap_interrupted_upgrade || smoke_fail "I4 FAIL: a valid marker must override fail-closed-on-unknown. audit=$(cat "$AUDIT_LOG")"
-launchctl_called enable || smoke_fail "I4 FAIL: must re-enable on a valid marker even when print-disabled is unknown. calls=$(cat "$LAUNCHCTL_LOG")"
-audit_has daemon_liveness_rebootstrap_success || smoke_fail "I4 FAIL: no rebootstrap_success. audit=$(cat "$AUDIT_LOG")"
-smoke_log "I4 PASS: launchd disabled + unreadable print-disabled but valid marker → recover (marker is independent proof)"
+audit_has daemon_liveness_rebootstrap_skip_unknown_disabled || smoke_fail "I4 FAIL: an UNKNOWN probe must fail closed (skip_unknown_disabled), even with a valid marker. audit=$(cat "$AUDIT_LOG")"
+launchctl_called enable && smoke_fail "I4 FAIL (BLOCKER): must NOT re-enable on an unreadable probe — a marker does not prove the CURRENT state. calls=$(cat "$LAUNCHCTL_LOG")"
+audit_has daemon_liveness_rebootstrap_interrupted_upgrade && smoke_fail "I4 FAIL: an unknown probe is not a recovery, even with a marker. audit=$(cat "$AUDIT_LOG")"
+[[ -f "$MARKER_FILE" ]] || smoke_fail "I4 FAIL: the marker must be RETAINED for a later readable poll. missing=$MARKER_FILE"
+smoke_log "I4 PASS: launchd UNKNOWN probe + valid marker → SKIP + marker RETAINED (#2205 Phase-4 r2: a marker proves the last action, not the current state)"
 
 # ── S1: ★systemd DISABLED + marker → STILL SKIP (systemd quiesce only stops) ──
 seed_stale_no_pid

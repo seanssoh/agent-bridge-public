@@ -587,23 +587,41 @@ maybe_rebootstrap_launchd() {
   # Require the plist on disk — bootstrap needs the file, and its presence is
   # half of the "we are launchd-managed" signal.
   [[ -n "$REBOOTSTRAP_PLIST" && -f "$REBOOTSTRAP_PLIST" ]] || return 1
-  # ★ Operator-intent guard: a DISABLED job is an intentional stop. SKIP + audit,
-  # never re-enable/re-bootstrap. FAIL CLOSED on `unknown` (print-disabled
-  # unreadable) — we cannot prove the job is not operator-disabled, and the
-  # operator-stop guarantee outranks auto-recovery.
+  # ★ Operator-intent guard (TRI-STATE — #2205 Phase-4 r2): the print-disabled probe
+  # is one of `enabled` / `disabled` / `unknown`, and recovery is authorized for the
+  # POSITIVE `disabled` state ONLY.
+  #   enabled  → not a disabled-drift; fall through to the enabled-but-unloaded path.
+  #   disabled → an intentional stop UNLESS a valid matching marker proves a
+  #              first-party non-operator disable; only then re-enable + recover.
+  #   unknown  → print-disabled unreadable. ★FAIL CLOSED: a marker proves the LAST
+  #              first-party action was a disable, NOT the CURRENT state — if we
+  #              cannot read the live state we cannot rule out that the operator
+  #              re-disabled the job AFTER the marker was written. So we SKIP, RETAIN
+  #              any marker for a later readable poll, and perform NO enable / NO
+  #              bootstrap. (This is the bug Phase-4 r1 rejected: the old code treated
+  #              a valid marker as license to recover regardless of readability.)
   local disabled_state
   disabled_state="$(rebootstrap_launchd_disabled_state "$uid" "$REBOOTSTRAP_LABEL")"
-  if [[ "$disabled_state" != "enabled" ]]; then
-    # Issue #2055 / #2205: a disabled job is normally an operator stop (skip). The
-    # sole exception is a first-party non-operator disable — a durable per-path
-    # marker (dead writer pid) whose platform+target match THIS launchd label
-    # proves the disable was first-party, not the operator's. Only then do we
+  if [[ "$disabled_state" == "unknown" ]]; then
+    # Unreadable live state → cannot confirm the job is not operator-(re-)disabled.
+    # Skip + alert; never enable, never consume the marker (retain it so a later poll
+    # with a READABLE positive-disabled probe can recover a genuine first-party drift).
+    emit_audit daemon_liveness_rebootstrap_skip_unknown_disabled \
+      --detail platform="launchd" \
+      --detail label="$REBOOTSTRAP_LABEL" \
+      --detail disabled_state="$disabled_state" \
+      --detail heartbeat_age_seconds="$age"
+    printf '[liveness] launchd job gui/%s/%s disabled-state=UNKNOWN (print-disabled unreadable) — skipping (cannot confirm current state; retaining any marker for a later readable poll, NOT re-enabling).\n' \
+      "$uid" "$REBOOTSTRAP_LABEL"
+    return 0
+  fi
+  if [[ "$disabled_state" == "disabled" ]]; then
+    # Issue #2055 / #2205: a positively-disabled job is normally an operator stop
+    # (skip). The sole exception is a first-party non-operator disable — a durable
+    # per-path marker (dead writer pid) whose platform+target match THIS launchd
+    # label proves the disable was first-party, not the operator's. Only then do we
     # RE-ENABLE the job and recover it; otherwise keep the #2040 fail-closed skip.
-    # We never re-enable on an `unknown` disabled-state either, because a
-    # disabled-state we cannot read could be an operator stop — but a valid
-    # matching marker is independent proof, so recover regardless of whether
-    # print-disabled was readable. `interrupted_upgrade` is one reason value; the
-    # reason is surfaced in the audit for triage.
+    # `interrupted_upgrade` is one reason value; the reason is surfaced for triage.
     if interrupted_upgrade_quiesce; then
       emit_audit daemon_liveness_rebootstrap_interrupted_upgrade \
         --detail platform="launchd" \
@@ -621,12 +639,13 @@ maybe_rebootstrap_launchd() {
       # stays silently down forever (the #2055 hole). The marker is consumed ONLY on
       # a CONFIRMED-healthy signal — either print-disabled re-querying as a positive
       # `enabled`, OR (codex r2) the job actually being LOADED after bootstrap below.
-      # A re-query that comes back `unknown` (print-disabled unreadable) is NOT a
-      # confirmed re-enable: we still PROCEED to recover (the marker was independent
-      # proof — the I4 fail-closed-on-unknown override), but we DEFER consumption to
-      # the load-confirmation so a failed/cooldown-deferred bootstrap KEEPS the
-      # marker for the next poll. `_interrupted_marker_pending` (declared at function
-      # scope above) carries that intent.
+      # NOTE: we only reach here on a CONFIRMED positive-`disabled` probe (the
+      # #2205 Phase-4 r2 tri-state entry guard already failed closed on `unknown`),
+      # so the re-enable itself is authorized. A re-query that comes back `unknown`
+      # below affects only the consume TIMING, not the decision to enable: it is NOT
+      # a confirmed re-enable, so we DEFER consumption to the load-confirmation and a
+      # failed/cooldown-deferred bootstrap KEEPS the marker for the next poll.
+      # `_interrupted_marker_pending` (declared at function scope above) carries that.
       if [[ "$BRIDGE_DAEMON_LIVENESS_DRY_RUN" == "1" ]]; then
         clear_quiesce_marker   # no real enable to fail — preserve the latch semantics
       else
@@ -675,8 +694,8 @@ maybe_rebootstrap_launchd() {
         --detail label="$REBOOTSTRAP_LABEL" \
         --detail disabled_state="$disabled_state" \
         --detail heartbeat_age_seconds="$age"
-      printf '[liveness] launchd job gui/%s/%s disabled-state=%s — skipping re-bootstrap (operator stop / cannot confirm enabled).\n' \
-        "$uid" "$REBOOTSTRAP_LABEL" "$disabled_state"
+      printf '[liveness] launchd job gui/%s/%s is disabled with no valid first-party marker — skipping re-bootstrap (operator stop).\n' \
+        "$uid" "$REBOOTSTRAP_LABEL"
       return 0
     fi
   fi
