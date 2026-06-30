@@ -29,11 +29,12 @@ fi
 #
 # Test plan:
 #
-#   T1 — Static-source: cardintent.ts carries the §10 forbidden-key constant
-#        (FORBIDDEN_COST_KEYS_PLACEHOLDER), the findForbiddenCostKey guard, the
-#        renderOutbound seam, and the #92 vendor TODO (hash b0d6c661). Pins the
-#        contract surface so a refactor can't silently drop the guard or the
-#        TODO marker.
+#   T1 — Static-source: cardintent.ts carries the §10 vendored forbidden-key
+#        set (FORBIDDEN_COST_KEYS) hash-pinned to the crm SSOT, the findForbiddenCostKey guard, the
+#        renderOutbound seam, and the hash-pin to the crm SSOT (#92 closed:
+#        FORBIDDEN_COST_KEYS_GOLDEN_HASH 99f20d8c + the vendored .gen.json). Pins
+#        the contract surface so a refactor can't silently drop the guard or
+#        un-pin the golden.
 #
 #   T2 — Static-source: server.ts imports + calls renderOutbound() on the
 #        text-only reply path. Asserts the renderer is actually wired in (an
@@ -90,20 +91,24 @@ trap cleanup EXIT
 smoke_setup_bridge_home "$SMOKE_NAME"
 
 # ---------------------------------------------------------------------
-# T1: cardintent.ts carries the §10 guard surface + the #92 TODO.
+# T1: cardintent.ts carries the §10 guard surface + the vendored hash-pin (#92 closed).
 # ---------------------------------------------------------------------
 test_t1_cardintent_guard_surface() {
-  smoke_log "T1: cardintent.ts has the §10 forbidden-key constant + guard + renderOutbound seam + #92 TODO"
-  grep -q 'FORBIDDEN_COST_KEYS_PLACEHOLDER' "$CARDINTENT" \
-    || smoke_fail "T1: §10 forbidden-key constant FORBIDDEN_COST_KEYS_PLACEHOLDER missing"
+  smoke_log "T1: cardintent.ts has the §10 vendored forbidden-key set + hash-pin + guard + renderOutbound seam (#92 closed)"
+  grep -q 'FORBIDDEN_COST_KEYS' "$CARDINTENT" \
+    || smoke_fail "T1: §10 forbidden-key set FORBIDDEN_COST_KEYS missing"
   grep -q 'export function findForbiddenCostKey' "$CARDINTENT" \
     || smoke_fail "T1: findForbiddenCostKey guard export missing"
   grep -q 'export function renderOutbound' "$CARDINTENT" \
     || smoke_fail "T1: renderOutbound seam export missing"
-  grep -q 'TODO(#92)' "$CARDINTENT" \
-    || smoke_fail "T1: #92 vendor TODO marker missing"
-  grep -q 'b0d6c661' "$CARDINTENT" \
-    || smoke_fail "T1: #92 TODO is missing the forbidden_cost_keys.gen.json hash b0d6c661"
+  # #92 is now VENDORED (was a placeholder + TODO): the golden is hash-pinned to
+  # the crm SSOT (PR#840 @ f9f6094) — assert the pin constant + the new hash.
+  grep -q 'FORBIDDEN_COST_KEYS_GOLDEN_HASH' "$CARDINTENT" \
+    || smoke_fail "T1: §10 hash-pin constant FORBIDDEN_COST_KEYS_GOLDEN_HASH missing"
+  grep -q '99f20d8c8efca4521415a030afd954d555edf0b5b201c3d3b5797b44327fcba7' "$CARDINTENT" \
+    || smoke_fail "T1: §10 golden is not hash-pinned to the crm SSOT hash 99f20d8c"
+  [[ -f "$(dirname "$CARDINTENT")/forbidden_cost_keys.gen.json" ]] \
+    || smoke_fail "T1: vendored forbidden_cost_keys.gen.json provenance file missing"
   smoke_log "T1 PASS"
 }
 
