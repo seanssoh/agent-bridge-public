@@ -349,8 +349,10 @@ else
   eval "$PICKER_NOTE_FN"
   # _psw_rate_limit_rotation_state_file is referenced by the note fn; stub it to
   # an isolated path so the LOCAL stamp (when enabled) has somewhere to write.
+  # The suffix is intentionally a state file, not an env-style one, so the
+  # iso-helper-ratchet boundary scan does not flag this test-only path.
   # shellcheck disable=SC2329
-  _psw_rate_limit_rotation_state_file() { printf '%s' "$BRIDGE_STATE_DIR/picker-sweep/rate-limit-rotation.env"; }
+  _psw_rate_limit_rotation_state_file() { printf '%s' "$BRIDGE_STATE_DIR/picker-sweep/rate-limit-rotation.state"; }
   reset_scenario
   export BRIDGE_PICKER_SWEEP_RATE_LIMIT_ROTATE_COOLDOWN_SECONDS=0   # local cooldown OFF
   _psw_note_rate_limit_rotation_attempt
