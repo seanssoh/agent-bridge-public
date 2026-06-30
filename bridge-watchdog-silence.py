@@ -535,6 +535,229 @@ def run_daemon_command(*verb_args: str) -> tuple[int, str]:
     return result.returncode, output
 
 
+# Default launchd label/plist — mirrors bridge-lib.sh:666-667. These
+# defaults are ALWAYS resolved (the env vars are rarely exported into the
+# watchdog's environment), so the real launchd-managed gate on a default
+# install is "does the default plist exist on disk", exactly like the Bash
+# `_bridge_daemon_launchd_label` fallback (lib/bridge-daemon-control.sh:1707).
+_DEFAULT_LAUNCHAGENT_LABEL = "ai.agent-bridge.daemon"
+
+
+def _daemon_is_launchd_managed() -> bool:
+    """True only on a launchd-MANAGED macOS install (mirrors the Bash
+    ``_bridge_daemon_launchd_label`` contract in lib/bridge-daemon-control.sh).
+
+    Launchd-managed ⇔ Darwin AND a launchd label resolves, by the SAME
+    precedence the Bash uses:
+      1. installer marker ``state/launchagent.config`` exports
+         ``BRIDGE_LAUNCHAGENT_LABEL`` (→ managed), else
+      2. a resolvable label + an EXISTING plist on disk, where the label and
+         plist fall back to the bridge-lib DEFAULTS
+         (``ai.agent-bridge.daemon`` / ``$HOME/Library/LaunchAgents/<label>.plist``)
+         when the env vars are not exported — NOT only when they are. This
+         is the #2208 round-2 fix: keying solely on explicitly-exported env
+         vars misclassified a DEFAULT macOS install (plist present, env vars
+         unset) as non-launchd, which would out-of-band SIGKILL launchd's
+         own job and race KeepAlive — the exact fleet-down the hard guard
+         forbids.
+
+    A macOS *nohup* daemon (no marker, no plist on disk) is correctly NOT
+    launchd-managed — there the recorded pid is a plain process we own, so
+    the escalation MUST SIGKILL it (otherwise the re-arm's stop phase can
+    block on the same wedged pid). Linux is never launchd-managed. Kept as a
+    seam so both branches are testable without a real launchd job.
+    """
+    if sys.platform != "darwin":
+        return False
+    config_path = BRIDGE_STATE_DIR / "launchagent.config"
+    if config_path.is_file():  # noqa: raw-pathlib-controller-only — controller-owned launchagent.config
+        try:
+            for line in config_path.read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines():
+                key, _, value = line.partition("=")
+                if key.strip() == "BRIDGE_LAUNCHAGENT_LABEL" and value.strip():
+                    return True
+        except OSError:
+            pass
+    # Fall back to the bridge-lib defaults when the env vars are unset, so a
+    # default install (plist on disk, env vars never exported) resolves as
+    # launchd-managed — parity with the Bash default derivation.
+    label = (
+        os.environ.get("BRIDGE_DAEMON_LAUNCHAGENT_LABEL", "").strip()
+        or _DEFAULT_LAUNCHAGENT_LABEL
+    )
+    plist = os.environ.get("BRIDGE_DAEMON_LAUNCHAGENT_PLIST", "").strip()
+    if not plist:
+        home = os.environ.get("HOME", "").strip() or str(Path.home())
+        plist = str(Path(home) / "Library" / "LaunchAgents" / f"{label}.plist")
+    return bool(label and Path(plist).is_file())  # noqa: raw-pathlib-controller-only — controller-owned launchd plist
+
+
+def _daemon_owner_record() -> dict:
+    """Parse the daemon singleton owner record (``$PID_FILE.owner``) into a
+    ``key=value`` dict. The daemon writes (pid, cmdline, start_time,
+    generation) there under the held lock
+    (lib/bridge-daemon-control.sh::_bridge_daemon_singleton_write_owner).
+    Empty dict when absent/unreadable/undecodable (fail closed — an
+    unreadable owner record must never escape into the escalation path).
+    """
+    owner_path = Path(f"{BRIDGE_DAEMON_PID_FILE}.owner")
+    if not owner_path.is_file():  # noqa: raw-pathlib-controller-only — daemon-owned singleton .owner record
+        return {}
+    record: dict = {}
+    try:
+        for line in owner_path.read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines():
+            key, sep, value = line.partition("=")
+            if sep:
+                record[key.strip()] = value.strip()
+    except OSError:
+        return {}
+    return record
+
+
+def _proc_start_time(pid: int) -> str:
+    """Live wall-clock start time of <pid> via ``ps -o lstart=``, whitespace
+    collapsed to a single-line token (mirrors the Bash
+    ``_bridge_daemon_proc_start_time``). Empty string on any failure.
+
+    Two processes that recycle the same pid number have DIFFERENT lstart
+    values, so a recorded (pid, start_time) pair uniquely pins one process
+    GENERATION — the proof that lets us refuse to SIGKILL a recycled pid.
+    """
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "lstart="],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return ""
+    return " ".join((result.stdout or "").split())
+
+
+def _recorded_daemon_pid_provenance_ok(pid: int) -> bool:
+    """Strict provenance gate for the escalation SIGKILL — mirrors the
+    daemon singleton's evict-proof (lib/bridge-daemon-control.sh:1502-1531).
+
+    The recorded pid is the daemon's own claim, but a stale pid file can
+    outlive the daemon and get reused by an unrelated (or look-alike)
+    process. Before this watchdog — the last automated line — SIGKILLs
+    anything, require POSITIVE proof the pid is the SAME daemon generation
+    we recorded, ALL of:
+
+      1. pid alive,
+      2. live cmdline contains ``bridge-daemon.sh run`` (the daemon run
+         shape, not merely the filename — a `restart`/look-alike invocation
+         is rejected),
+      3. the owner record's recorded pid == this pid AND its recorded
+         ``start_time`` matches the live ``ps -o lstart=`` token (a recycled
+         pid has a different start time, so it is NOT the holder).
+
+    Any missing/unreadable input → fail closed (no kill). This is the exact
+    standard the singleton uses before TERM/KILLing a predecessor.
+    """
+    if not pid_alive(pid):
+        return False
+    cmdline = _watchdog_cmdline(pid)
+    if "bridge-daemon.sh run" not in cmdline:
+        return False
+    record = _daemon_owner_record()
+    recorded_pid = record.get("pid", "")
+    recorded_start = record.get("start_time", "")
+    if not recorded_pid or recorded_pid != str(pid):
+        return False
+    live_start = _proc_start_time(pid)
+    return bool(recorded_start and live_start and recorded_start == live_start)
+
+
+def _escalate_hung_restart(restart_code: int, reason_detail: dict) -> bool:
+    """Escalate a hung/failed `restart --force` (rc 124 and any non-0/non-2)
+    instead of only cooling down for ``RESTART_COOLDOWN`` seconds.
+
+    The watchdog is the last automated recovery line; a bare 300s cooldown
+    on a wedged restart leaves the daemon down for the full window. This
+    drives a harder recovery:
+
+    1. SIGKILL the recorded wedged daemon pid — but ONLY on a non-launchd
+       host. On macOS launchd installs the recorded pid is launchd's OWN
+       supervised job: an out-of-band SIGKILL would race launchd's
+       KeepAlive respawn (kill → KeepAlive relaunch → we kill the fresh
+       one). There the OS-init re-arm (`restart --force` → ``launchctl
+       kickstart -k``) already kills+respawns launchd's instance
+       atomically, so we skip the manual kill and let the re-arm own it.
+       The kill is pid-alive AND recorded-pid-provenance guarded so we can
+       never signal an unrelated/recycled pid.
+    2. Drive ONE bounded OS-init re-arm via the same `restart --force`
+       verb (launchd kickstart on macOS / stop+start on Linux). Hard
+       single-shot ceiling — we never loop kill→rearm.
+
+    Returns True when the re-arm produced a live daemon (caller records a
+    ``restarted`` outcome + cooldown), False when escalation also failed
+    (caller falls back to the existing ``restart_failed`` 300s cooldown).
+    """
+    is_launchd = _daemon_is_launchd_managed()
+    recorded_pid = daemon_recorded_pid()
+
+    killed_pid: int | None = None
+    kill_skip_reason = ""
+    if is_launchd:
+        # launchd owns the pid — never out-of-band SIGKILL (KeepAlive race).
+        kill_skip_reason = "launchd_owns_pid_rearm_handles_kill"
+    elif recorded_pid is None:
+        kill_skip_reason = "no_recorded_pid"
+    elif not _recorded_daemon_pid_provenance_ok(recorded_pid):
+        # Pid gone or cmdline no longer names the daemon → nothing safe to
+        # kill; the re-arm's own start path owns recovery.
+        kill_skip_reason = "recorded_pid_not_live_daemon"
+    else:
+        try:
+            os.kill(recorded_pid, 9)
+            killed_pid = recorded_pid
+            log.warning(
+                "escalate: SIGKILL wedged daemon pid=%s after hung restart "
+                "(exit=%s)", recorded_pid, restart_code,
+            )
+        except ProcessLookupError:
+            kill_skip_reason = "pid_vanished_before_kill"
+        except OSError as exc:
+            kill_skip_reason = f"sigkill_failed:{exc}"
+            log.warning("escalate: SIGKILL pid=%s failed: %s", recorded_pid, exc)
+
+    # ONE bounded OS-init re-arm. No retry loop — the cooldown owns the
+    # next attempt if this fails.
+    rearm_code, rearm_output = run_daemon_command("restart", "--force")
+    rearm_pid = daemon_recorded_pid() or 0
+    rearm_ok = rearm_code == 0 and rearm_pid > 0 and pid_alive(rearm_pid)
+
+    emit_audit(
+        "daemon_silence_restart_escalated",
+        {
+            "outcome": "escalated_restarted" if rearm_ok else "escalated_failed",
+            "restart_exit": restart_code,
+            "killed_pid": killed_pid if killed_pid is not None else "",
+            "kill_skipped": kill_skip_reason,
+            "launchd": "1" if is_launchd else "0",
+            "rearm_exit": rearm_code,
+            "rearm_pid": rearm_pid,
+            **reason_detail,
+        },
+    )
+    if rearm_ok:
+        log.info(
+            "escalate: daemon re-armed after hung restart (killed_pid=%s "
+            "launchd=%s new_pid=%s)",
+            killed_pid if killed_pid is not None else "-", is_launchd, rearm_pid,
+        )
+    else:
+        log.error(
+            "escalate: OS-init re-arm also failed (exit=%s):\n%s",
+            rearm_code, _indent_block(rearm_output),
+        )
+    return rearm_ok
+
+
 def attempt_restart(reason_detail: dict) -> None:
     """Restart the daemon via the single `restart` verb and emit the
     structured audit trail.
@@ -586,6 +809,36 @@ def attempt_restart(reason_detail: dict) -> None:
         return
 
     if restart_code != 0:
+        # Issue #2208: a hung restart (rc 124) — or any other non-0/non-2
+        # failure — used to write the 300s cooldown and return, parking the
+        # daemon DOWN for the full window with no harder kill or OS-init
+        # re-arm. The watchdog is the last automated recovery line, so
+        # escalate first: SIGKILL the wedged pid (non-launchd hosts only —
+        # launchd's KeepAlive owns the kill there) then drive ONE bounded
+        # `restart --force` re-arm. Only fall back to the cooldown below
+        # when the escalation also fails to bring a live daemon back.
+        #
+        # Escalation-once invariant: an UNEXPECTED exception inside
+        # _escalate_hung_restart must NOT escape attempt_restart — that
+        # would skip the cooldown write and make the supervisor loop retry
+        # next poll without the 300s gate. Treat any escape as
+        # escalation-failed and fall through to the restart_failed cooldown
+        # below, so the cooldown is always persisted exactly once.
+        escalated = False
+        try:
+            escalated = _escalate_hung_restart(restart_code, reason_detail)
+        except Exception:  # noqa: BLE001 — last automated line; never crash the loop
+            log.exception("escalate: unexpected error during hung-restart escalation")
+        if escalated:
+            new_pid = daemon_recorded_pid() or 0
+            write_cooldown(time.time(), {
+                "outcome": "restarted",
+                "via": "escalation",
+                "restart_exit": restart_code,
+                "new_pid": new_pid,
+            })
+            return
+
         # Issue #946 L3: classify which resolver die path fired (when the
         # failure was a v0.8.0 isolation hard-cut) and quote the full
         # stderr block in the watchdog log so post-mortem readers can

@@ -6263,7 +6263,14 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # from an operator stop (stay down) via the upgrade's quiesce-intent marker
       # (#2055). Pull both so a liveness-watcher move re-runs the operator-stop
       # fail-closed + interrupted-upgrade-recover gates.
-      add_required 1463-launchd-keepalive-singleton-thrash watchdog-silence-stderr-capture launch queue 1973c-liveness-recovery 2040-daemon-enabled-but-unloaded 2055-interrupted-upgrade-reenable
+      # Issue #2208: a hung `restart --force` (rc 124) used to fail OPEN
+      # (300s cooldown, no kill/re-arm). attempt_restart now escalates
+      # (SIGKILL the wedged pid on non-launchd hosts + ONE bounded
+      # `restart --force` re-arm) before the cooldown, keeping rc==2
+      # fail-closed. Pull 2208-watchdog-hung-restart-escalate on every
+      # silence-watchdog move so the escalate path + the rc==2 negative
+      # control cannot silently regress to the fail-open cooldown.
+      add_required 1463-launchd-keepalive-singleton-thrash watchdog-silence-stderr-capture 2208-watchdog-hung-restart-escalate launch queue 1973c-liveness-recovery 2040-daemon-enabled-but-unloaded 2055-interrupted-upgrade-reenable
       add_integration integration-minimal
       ;;
 
