@@ -41,7 +41,8 @@
 #   (operator-source capture/validation, optional verify-probe + scope change live in
 #    scripts/smoke/18849-operator-account-email.sh)
 #   T23 flag_one literal-"1"-only (#19234 r2) -> opt-in env override + set-env validator
-#       reject/OFF a whitespace-padded " 1 " (no .strip()); ROOM_AUTOJOIN "1" un-regressed
+#       reject/OFF a whitespace-padded " 1 " (no .strip()); ROOM_AUTOJOIN now flag_bool
+#       (#2024 B: '1'+' 1 ' both accepted, garbage rejected)
 #   T24 daemon early-skip env path (#19260)   -> bridge_daemon_global_auth_sync_tick reuses
 #       the REAL `global-auth-sync status --check` python gate: loose/unset env skip,
 #       literal "1" proceeds (no bash re-derivation that could drift from python)
@@ -474,16 +475,17 @@ test_identity_parent_swap_after_lock() {
 }
 
 # ── T23 (#19234 r2) ────────────────────────────────────────────────────
-# The opt-in env override AND the flag_one set-env validator are LITERAL "1"
-# only — neither .strip()s, so a whitespace-padded " 1 " is OFF / rejected, not
-# silently normalized. Also proves the shared flag_one tightening does NOT
-# regress BRIDGE_A2A_ROOM_AUTOJOIN (exact "1" still accepted).
+# The BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC opt-in env override AND its flag_one set-env
+# validator are LITERAL "1" only — neither .strip()s, so a whitespace-padded
+# " 1 " is OFF / rejected, not silently normalized. Also proves BRIDGE_A2A_
+# ROOM_AUTOJOIN is now FLAG_BOOL (#2024 B default-on flip): exact "1" and padded
+# " 1 " both canonicalize to "1", while garbage is still rejected.
 test_flag_one_literal_strict() {
   local out
   out="$(python3 "$HELPER" flag-strict-probes 2>&1)" \
     || smoke_fail "T23 flag-strict-probes failed: $out"
   smoke_assert_contains "$out" "OK flag-strict-probes" \
-    "T23 env override + flag_one validator are literal-1-only (no strip); ROOM_AUTOJOIN un-regressed"
+    "T23 GLOBAL_AUTH_SYNC literal-1-only (no strip); ROOM_AUTOJOIN flag_bool ('1'+' 1 ' accepted, garbage rejected)"
 }
 
 # ── T24 / T25 shared daemon-tick harness (#19260) ──────────────────────
