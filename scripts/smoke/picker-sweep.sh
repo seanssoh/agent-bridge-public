@@ -335,6 +335,27 @@ smoke_assert_eq "1" "$(count_lines "$ROTATE_LOG")" "6b only one rotate attempt p
 smoke_assert_contains "$(cat "$ROTATE_LOG")" "limited-a" "6b first rate-limit agent triggers rotation"
 smoke_assert_contains "$(cat "$BRIDGE_PICKER_SWEEP_LOG")" "already attempted this sweep" "6b second rate-limit agent skips extra rotation"
 
+# 6c. STATIC ratchet: the DEFAULT rotate fn must carry the daemon's --preflight
+# contract. The runtime tests above mock BRIDGE_PICKER_SWEEP_ROTATE_CLAUDE_TOKEN_FN
+# and never exercise the real default argv, so without this a future edit could
+# silently drop --preflight — and a rate-limit picker would then rotate onto an
+# already-capped candidate that the daemon path revalidates and rejects (#20832
+# backstop seam, codex review #20894).
+smoke_log "6c. default rotate fn carries the --preflight contract (static ratchet)"
+_psw_rotate_fn="$(awk '/^_psw_default_rotate_claude_token\(\)/,/^}/' "$PICKER_SWEEP")"
+# The STANDALONE boolean --preflight flag is what flips args.preflight true and
+# enters _cmd_rotate_preflight (bridge-auth.py). A bare substring check on
+# "--preflight" would still pass with only --preflight-budget/--preflight-timeout
+# present (they contain "--preflight" as a prefix), so the actual gate could be
+# dropped silently. Assert the standalone flag via a whitespace-bounded match,
+# then the two budget/timeout flags, then the daemon env-knob names so one
+# operator override still tunes both the daemon and picker paths (codex #20933).
+smoke_assert_match "$_psw_rotate_fn" "--preflight[[:space:]]" "6c default rotate fn carries the STANDALONE --preflight flag (enables _cmd_rotate_preflight; -budget/-timeout substring is not enough)"
+smoke_assert_contains "$_psw_rotate_fn" "--preflight-budget" "6c default rotate fn carries --preflight-budget"
+smoke_assert_contains "$_psw_rotate_fn" "--preflight-timeout" "6c default rotate fn carries --preflight-timeout"
+smoke_assert_contains "$_psw_rotate_fn" "BRIDGE_CLAUDE_ROTATE_PREFLIGHT_BUDGET_SECONDS" "6c default rotate fn honors the daemon's preflight-budget env knob (one override tunes both paths)"
+smoke_assert_contains "$_psw_rotate_fn" "BRIDGE_CLAUDE_ROTATE_PREFLIGHT_PER_CANDIDATE_SECONDS" "6c default rotate fn honors the daemon's per-candidate preflight-timeout env knob"
+
 
 # ---------------------------------------------------------------------------
 # Test 7 — Claude Code development-channels warning (post-v0.14.1 addition).
