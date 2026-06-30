@@ -5132,6 +5132,156 @@ process_orphan_dir_gc() {
   return 1
 }
 
+# Issue #2196: parse the `counts.total` out of a codex-app-server-reaper JSON
+# report. Echoes an integer (0 on any parse failure). Report is passed via env
+# to keep argv clean (no heredoc-stdin — footgun #11).
+bridge_codex_app_server_reaper_report_total() {
+  local report="${1:-}"
+  [[ -n "$report" ]] || { printf '0'; return 0; }
+  BRIDGE_CASR_REPORT="$report" python3 -c 'import os, json
+try:
+    d = json.loads(os.environ.get("BRIDGE_CASR_REPORT", "") or "{}")
+    print(int(d.get("counts", {}).get("total", 0)))
+except Exception:
+    print(0)' 2>/dev/null || printf '0'
+}
+
+# Issue #2196: shared engine for the codex app-server orphan reaper — used by
+# BOTH the daemon periodic pass (process_codex_app_server_reaper) and the
+# standalone CLI subcommand (cmd_reap_codex_orphans). Builds the live-session
+# PROTECTION set from the in-process roster (every registered codex agent's pane
+# subtree via --protect-root-pid, and its workdir via --protect-cwd), then
+# invokes lib/daemon-helpers/codex-app-server-reaper.py in $mode (scan|reap) and
+# echoes the helper's JSON report on stdout. macOS-scoped (launchd reparenting);
+# a no-op (empty output) elsewhere. Best-effort: never aborts the caller.
+bridge_codex_app_server_reaper_run() {
+  local mode="${1:-scan}"
+  local min_age="${2:-${BRIDGE_CODEX_APP_SERVER_REAPER_MIN_AGE_SECONDS:-21600}}"
+  local grace="${BRIDGE_CODEX_APP_SERVER_REAPER_GRACE_SECONDS:-5.0}"
+  local agent engine session pane_pid workdir
+  local -a args=()
+
+  [[ "$mode" == "scan" || "$mode" == "reap" ]] || mode="scan"
+  [[ "$min_age" =~ ^[0-9]+$ ]] || min_age=21600
+  # macOS-only leak: the broker is reparented to launchd (ppid==1). On Linux
+  # the python guard would skip too, but short-circuit here so we never even
+  # shell out on a non-Darwin daemon.
+  [[ "$(uname -s 2>/dev/null || true)" == "Darwin" ]] || return 0
+  bridge_require_python 2>/dev/null || return 0
+
+  args=( "$mode" --min-age-seconds "$min_age" --grace-seconds "$grace" --json )
+
+  # Live-session protection: spare every live registered codex agent's pane
+  # subtree and its workdir so a healthy patch-dev / agb-dev-codex / crm-dev-codex
+  # app-server is never a candidate. The python helper expands each root pid to
+  # its full subtree from the same ps snapshot it classifies against (race-free).
+  if [[ -n "${BRIDGE_AGENT_IDS+x}" ]] && (( ${#BRIDGE_AGENT_IDS[@]} > 0 )); then
+    for agent in "${BRIDGE_AGENT_IDS[@]}"; do
+      [[ -n "$agent" ]] || continue
+      engine="$(bridge_agent_engine "$agent" 2>/dev/null || true)"
+      [[ "$engine" == "codex" ]] || continue
+      session="$(bridge_agent_session "$agent" 2>/dev/null || true)"
+      if [[ -n "$session" ]]; then
+        pane_pid="$(bridge_tmux_session_pane_pid "$session" 2>/dev/null || true)"
+        [[ "$pane_pid" =~ ^[0-9]+$ ]] && args+=( --protect-root-pid "$pane_pid" )
+      fi
+      workdir="$(bridge_agent_workdir "$agent" 2>/dev/null || true)"
+      [[ -n "$workdir" && -d "$workdir" ]] && args+=( --protect-cwd "$workdir" )
+    done
+  fi
+
+  bridge_daemon_helper_python codex-app-server-reaper "${args[@]}" 2>/dev/null || true
+}
+
+# Issue #2196: daemon periodic pass — reap leaked codex `app-server` +
+# `app-server-broker.mjs` orphan pairs (broker reparented to launchd ppid==1,
+# NOT backed by a live codex session, older than the age floor). macOS-scoped.
+# Cadence-gated (default hourly) via bridge_daemon_pass_due so a busy 5s tick
+# never re-runs the ps scan. SCANS (observe-only) by default — the FIRST rollout
+# of an automatic process-killer is intentionally conservative: it reports leaked
+# orphan counts to the audit log without killing, so an operator can soak the
+# detection against real fleets before promoting to active reaping (operator
+# directive 2026-06-30). Promote with BRIDGE_CODEX_APP_SERVER_REAPER_MODE=reap
+# once a soak window is clean; BRIDGE_CODEX_APP_SERVER_REAPER_ENABLED=0 disables.
+# An invalid mode falls back to the SAFE mode (scan), never to reap. Returns 0
+# when it reaped/found something (cycle changed), 1 when gated/clean/non-macOS.
+process_codex_app_server_reaper() {
+  local interval="${BRIDGE_CODEX_APP_SERVER_REAPER_INTERVAL_SECONDS:-3600}"
+  local mode="${BRIDGE_CODEX_APP_SERVER_REAPER_MODE:-scan}"
+  local report total
+
+  [[ "${BRIDGE_CODEX_APP_SERVER_REAPER_ENABLED:-1}" == "1" ]] || return 1
+  [[ "$(uname -s 2>/dev/null || true)" == "Darwin" ]] || return 1
+  [[ "$mode" == "scan" || "$mode" == "reap" ]] || mode="scan"
+  [[ "$interval" =~ ^[0-9]+$ ]] || interval=3600
+  bridge_daemon_pass_due "codex_app_server_reaper" "$interval" || return 1
+
+  report="$(bridge_codex_app_server_reaper_run "$mode")"
+  [[ -n "$report" ]] || return 1
+  total="$(bridge_codex_app_server_reaper_report_total "$report")"
+  [[ "$total" =~ ^[0-9]+$ ]] || total=0
+  (( total > 0 )) || return 1
+
+  bridge_audit_log daemon codex_app_server_reaper codex \
+    --detail "mode=${mode}" --detail "total=${total}" >/dev/null 2>&1 || true
+  daemon_info "codex-app-server-reaper: ${mode} ${total} orphan member(s) (#2196)"
+  return 0
+}
+
+# Issue #2196: standalone CLI entry (hidden subcommand `daemon reap-codex-orphans`)
+# for the interim manual sweep until the plugin-side broker self-teardown lands.
+# Shares bridge_codex_app_server_reaper_run with the daemon pass, so the same
+# live-session protection applies. Usage:
+#   agb daemon reap-codex-orphans [--dry-run] [--min-age-seconds N]
+# Default REAPS; --dry-run only scans + reports. macOS-only (no-op elsewhere).
+cmd_reap_codex_orphans() {
+  local mode="reap"
+  local min_age="${BRIDGE_CODEX_APP_SERVER_REAPER_MIN_AGE_SECONDS:-21600}"
+  local report
+
+  while (( $# )); do
+    case "$1" in
+      --dry-run|--scan) mode="scan" ;;
+      --reap) mode="reap" ;;
+      --min-age-seconds) shift; min_age="${1:-21600}" ;;
+      --min-age-seconds=*) min_age="${1#*=}" ;;
+      -h|--help)
+        printf 'Usage: agb daemon reap-codex-orphans [--dry-run] [--min-age-seconds N]\n'
+        printf '  Reap leaked codex app-server + app-server-broker.mjs orphan pairs (#2196).\n'
+        printf '  --dry-run          scan + report only, never signals\n'
+        printf '  --min-age-seconds  orphan-broker age floor (default 21600 = 6h)\n'
+        return 0
+        ;;
+      *) printf 'reap-codex-orphans: unknown argument: %s\n' "$1" >&2; return 2 ;;
+    esac
+    shift || true
+  done
+  [[ "$min_age" =~ ^[0-9]+$ ]] || min_age=21600
+
+  if [[ "$(uname -s 2>/dev/null || true)" != "Darwin" ]]; then
+    printf '[codex-app-server-reaper] skipped: non-macOS host (#2196)\n'
+    return 0
+  fi
+
+  report="$(bridge_codex_app_server_reaper_run "$mode" "$min_age")"
+  if [[ -z "$report" ]]; then
+    printf '[codex-app-server-reaper] no report produced (python unavailable?)\n' >&2
+    return 0
+  fi
+  BRIDGE_CASR_REPORT="$report" python3 -c 'import os, json
+d = json.loads(os.environ.get("BRIDGE_CASR_REPORT", "") or "{}")
+c = d.get("counts", {})
+mode = "reap" if d.get("reaped") else "dry-run"
+print("[codex-app-server-reaper] %s: %d orphan member(s), ~%d KB reclaimable"
+      % (mode, c.get("total", 0), d.get("reclaimable_rss_kb", 0)))
+for cand in d.get("candidates", []):
+    print("  pid=%s ppid=%s class=%s age=%ss result=%s"
+          % (cand.get("pid"), cand.get("ppid"), cand.get("class"),
+             cand.get("age_seconds"), cand.get("result") or "-"))' 2>/dev/null \
+    || printf '%s\n' "$report"
+  return 0
+}
+
 # Issue #1809: emit ONE admin `[hygiene]` task per non-clean codex AGENTS.md
 # doc-backfill pass. Mirrors bridge_emit_orphan_gc_admin_task (admin from
 # BRIDGE_ADMIN_AGENT_ID, --force bypasses the stopped-admin gate so the task is
@@ -15666,6 +15816,16 @@ cmd_sync_cycle() {
   if process_orphan_dir_gc; then
     changed=0
   fi
+  # Issue #2196: codex app-server / app-server-broker.mjs orphan reaper. Reaps
+  # broker+app-server pairs reparented to launchd (ppid==1) that are NOT backed
+  # by a live codex session and are past the age floor — the slow ~9.3GB leak
+  # that standard health checks miss. macOS-scoped, cadence-gated (default
+  # hourly), live-session-protected. Sibling of the #1803 orphan-dir-gc reaper;
+  # placed in the same hygiene neighborhood so both share the cadence region.
+  BRIDGE_DAEMON_LAST_STEP="codex_app_server_reaper"
+  if process_codex_app_server_reaper; then
+    changed=0
+  fi
   # Issue #1809: codex AGENTS.md doc-backfill hygiene pass. Cadence-gated
   # (default daily) via bridge_daemon_pass_due, so the per-tick cost is a cheap
   # stamp check; the focused entrypoint backfill only runs once per
@@ -17237,6 +17397,16 @@ case "$CMD" in
       exit 0
     fi
     cmd_sync_cycle
+    ;;
+  reap-codex-orphans)
+    # Issue #2196 — hidden interim sweep for leaked codex app-server / broker
+    # orphan pairs (the daemon also runs this periodically). Not advertised in
+    # usage(); read-only `--dry-run`/`--help` are safe, the default reaps.
+    if daemon_args_have_help "$@"; then
+      usage
+      exit 0
+    fi
+    cmd_reap_codex_orphans "$@"
     ;;
   supp-refresh-worker)
     # Lane F internal subcommand — invoked as a detached external
