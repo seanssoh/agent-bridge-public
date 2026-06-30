@@ -3663,8 +3663,21 @@ def complete_marker_matches(target_root: Path, marker: dict[str, Any]) -> bool:
     success marker exists, is status=ok, and records the SAME target version the
     apply marker was driving. That is the "reconcile quietly" case — not a scary
     interrupted-apply warning.
+
+    FAIL-CLOSED on a corrupt complete marker (#2211 r2, patch-dev Phase-4): a
+    malformed / unreadable / non-object upgrade-complete.json means we CANNOT
+    corroborate completion, which is NOT the same as "the apply finished". It
+    must return False (no match) WITHOUT raising — so the pending apply marker
+    falls through to the fail-closed resume path / interrupted detect state,
+    never a traceback that the shell would degrade into a fresh-apply (the
+    fail-OPEN + rollback-point-loss bug). `load_json` only catches
+    FileNotFoundError, so guard the parse error class here explicitly.
     """
-    complete = load_json(upgrade_complete_marker_path(target_root), {})
+    try:
+        complete = load_json(upgrade_complete_marker_path(target_root), {})
+    except (ValueError, OSError):
+        # Corrupt/unreadable success marker: cannot corroborate completion.
+        return False
     if not isinstance(complete, dict):
         return False
     if complete.get("status") != "ok":

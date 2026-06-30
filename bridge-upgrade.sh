@@ -2941,9 +2941,36 @@ fi
 _BRIDGE_UPGRADE_RESUME_SKIP_BACKUP=0
 _BRIDGE_RESUMED_RUN_ID=""
 if [[ "$SUBCOMMAND" == "apply" && $DRY_RUN -eq 0 ]]; then
+  # ★Fail-closed on a resolver crash WHEN a pending marker exists (#2211 r2,
+  # patch-dev Phase-4). The resolver itself is now crash-proof (a corrupt
+  # complete-marker no longer raises), but defense-in-depth: if the apply-in-
+  # progress marker FILE exists and the resolver process still fails for ANY
+  # reason (rc != 0), we must NOT degrade to {"decision":"none"} — that would
+  # proceed as a NORMAL fresh apply and overwrite the original rollback point
+  # with a backup of the PARTIAL state (fail-OPEN + rollback-point loss). Gate
+  # strictly on marker PRESENCE so behavior-invariance holds: with NO pending
+  # marker the resolver returns `none` rc=0 and the normal happy path is byte-
+  # identical (no die, no backup change).
+  _apply_marker_file="$TARGET_ROOT/state/upgrade/apply-in-progress.json"
+  set +e
   _resume_decision_json="$(python3 "$SOURCE_ROOT/bridge-upgrade.py" apply-marker \
     --target-root "$TARGET_ROOT" --op resolve \
-    --target-version "${SOURCE_VERSION:-}" --target-head "${TARGET_HEAD:-}" 2>/dev/null || printf '{"decision":"none"}')"
+    --target-version "${SOURCE_VERSION:-}" --target-head "${TARGET_HEAD:-}" 2>/dev/null)"
+  _resume_resolve_rc=$?
+  set -e
+  if [[ $_resume_resolve_rc -ne 0 ]]; then
+    if [[ -f "$_apply_marker_file" ]]; then
+      _BRIDGE_UPGRADE_DIE_REASON="interrupted-apply marker present but the resolver failed (rc=${_resume_resolve_rc})"
+      _BRIDGE_UPGRADE_DIE_REMEDIATION="Inspect ${_apply_marker_file} (and state/upgrade/upgrade-complete.json); resolve/remove it, then re-run the original target — or 'agent-bridge upgrade rollback --backup-root <dir>'."
+      bridge_die "refusing to start: a pending apply-in-progress marker exists but it could not be classified (resolver rc=${_resume_resolve_rc}).
+  Proceeding as a fresh apply would overwrite the original rollback point with a backup of the PARTIAL state — refusing.
+  remediation: inspect ${_apply_marker_file} (and state/upgrade/upgrade-complete.json), resolve/remove it, then re-run the original target, or 'agent-bridge upgrade rollback --backup-root <dir>'.
+  (no mutation has occurred this run)"
+    fi
+    # No pending marker + a transient resolver failure → safe to treat as a
+    # normal fresh apply (there is no rollback point to protect).
+    _resume_decision_json='{"decision":"none"}'
+  fi
   _resume_payload_dir="$(mktemp -d "${TMPDIR:-/tmp}/bridge-upgrade-resume-json.XXXXXX")"
   printf '%s' "$_resume_decision_json" >"$_resume_payload_dir/resolve.json"
   # Read decision fields without a heredoc (footgun #11) — file-as-argv into a

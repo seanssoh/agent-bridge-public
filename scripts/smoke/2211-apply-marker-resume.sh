@@ -17,8 +17,9 @@
 # shell wiring (marker write/advance/clear + resume-resolve sites in source
 # order), all under an isolated $TMP — never touching live bridge state.
 #
-# Nine mutation-backed acceptance cases (§5 of the brief), each guarding a
-# DISTINCT mutation: revert the guard and its case fails. No vacuous asserts.
+# Ten mutation-backed acceptance cases (§5 of the brief + the Phase-4 r1
+# corrupt-complete-marker fail-closed hardening), each guarding a DISTINCT
+# mutation: revert the guard and its case fails. No vacuous asserts.
 #
 # Footgun #11: no heredoc-fed subprocess — file-as-argv / direct python3 calls
 # only. macOS Bash 3.2-safe (no associative arrays).
@@ -371,6 +372,110 @@ if [[ "$_status9" == "''" ]]; then ok; else err "status warned on a reconcile ca
 step "the reconcile archive clears the stale marker (quiet self-heal mutation)"
 AM --target-root "$C9" --op clear --archive >/dev/null
 if [[ ! -f "$C9/state/upgrade/apply-in-progress.json" ]] && ls "$C9/state/upgrade/"apply-in-progress.*.archived.json >/dev/null 2>&1; then ok; else err "reconcile did not archive the stale marker"; fi
+
+# ---------------------------------------------------------------------------
+# Case 10 — Corrupt complete marker must NOT fail OPEN (Phase-4 r1 fix).
+# A VALID pending apply-in-progress.json + a CORRUPTED upgrade-complete.json:
+#   (a) resolve must NOT rc=1 / traceback — it returns a real fail-closed
+#       decision (resume, since the complete marker cannot corroborate done);
+#   (b) the shell resume-resolution must NOT degrade a resolver failure to
+#       {"decision":"none"} when the marker is present — it bridge_die's BEFORE
+#       any mutation, so NO fresh backup overwrites the original rollback point;
+#   (c) detect + doctor + status must NOT go silent — the pending marker is
+#       surfaced as interrupted, not swallowed.
+# Mutation-backed two ways:
+#   * revert complete_marker_matches() to let the corrupt marker RAISE → (a)/(c) RED;
+#   * revert the shell marker-presence gate (blanket none-fallback) → (b) RED.
+# ---------------------------------------------------------------------------
+printf '== Case 10 — corrupt complete marker does NOT fail open (rollback preserved) ==\n'
+C10="$TMP/c10"; seed_target "$C10" "0.17.0"
+AM --target-root "$C10" --op write --phase plugin-install --transaction "txn10" \
+  --target-version "0.17.0" --target-head "deadbeef0010" --installed-version "0.16.19" \
+  --backup-enabled --backup-root "$C10/backups/upgrade-orig" --restart-daemon --restart-agents >/dev/null
+# The success marker is CORRUPT (truncated JSON) — it can neither be parsed nor
+# trusted to corroborate completion.
+printf '{"phase":"work-complete","status":"ok"' >"$C10/state/upgrade/upgrade-complete.json"
+
+step "(a) resolve does NOT rc=1 on a corrupt complete marker (no traceback)"
+_r10_out="$(AM --target-root "$C10" --op resolve --target-version "0.17.0" --target-head "deadbeef0010" 2>/dev/null)"
+_r10_rc=$?
+if [[ "$_r10_rc" -eq 0 ]]; then ok; else err "resolve rc=$_r10_rc (corrupt complete marker crashed the resolver)"; fi
+
+step "(a) resolve fail-closes toward the pending marker (resume, NOT reconcile-clear)"
+if [[ "$(decision_of "$_r10_out")" == "resume" ]]; then ok; else err "decision=$(decision_of "$_r10_out") (corrupt complete marker must not corroborate a clear)"; fi
+
+step "(c) detect does NOT rc=1 and classifies interrupted (not swallowed)"
+_d10_out="$(AM --target-root "$C10" --op detect 2>/dev/null)"
+_d10_rc=$?
+if [[ "$_d10_rc" -eq 0 && "$(state_of "$_d10_out")" == "interrupted" ]]; then ok; else err "detect rc=$_d10_rc state=$(state_of "$_d10_out")"; fi
+
+step "(c) doctor surfaces the interrupted-apply finding (not silent)"
+_doc10="$(python3 "$DOCTOR_PY" --state-dir "$C10/state" --detectors interrupted-apply --json --agent-list-json /dev/null 2>/dev/null)"
+_doc10_kind="$(printf '%s' "$_doc10" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d[0]["kind"] if d else "")' 2>/dev/null)"
+if [[ "$_doc10_kind" == "interrupted-apply" ]]; then ok; else err "doctor kind=$_doc10_kind (went silent on a corrupt complete marker)"; fi
+
+step "(c) status surfaces the interrupted warning (not silent)"
+_status10="$(python3 -c '
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("bs", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+print(m.interrupted_apply_warning(sys.argv[2]))
+' "$STATUS_PY" "$C10/state" 2>/dev/null)"
+case "$_status10" in
+  *INTERRUPTED*) ok ;;
+  *) err "status went silent on a corrupt complete marker: $_status10" ;;
+esac
+
+# (b) The shell resume-resolution must FAIL CLOSED when the resolver process
+# itself fails (rc≠0) AND the marker is present — bridge_die BEFORE any mutation,
+# never the blanket {"decision":"none"} that would authorize a fresh backup. We
+# drive the actual BEGIN/END resume-resolution block with bridge_die stubbed and
+# a python3 stub that forces `apply-marker --op resolve` to rc=1 (the corrupt-
+# marker failure mode), and assert it dies WITHOUT setting up a fresh backup.
+_resume_block="$(sed -n '/^# BEGIN: Issue #2211 interrupted-apply resume resolution$/,/^# END: Issue #2211 interrupted-apply resume resolution$/p' "$UPGRADE_SH")"
+
+step "(b) shell guard block is present in source (marker-presence gate to grep)"
+if [[ -n "$_resume_block" ]] && printf '%s' "$_resume_block" | grep -q 'apply-in-progress.json'; then ok; else err "resume-resolution block missing the apply-marker-file gate"; fi
+
+# Non-recursive python3 stub: force `--op resolve` to rc=1, pass everything else
+# through to the real interpreter (so the resolve-fields helper still parses).
+STUB10="$TMP/stub10"; mkdir -p "$STUB10"
+_realpy="$(command -v python3)"
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'for a in "$@"; do [[ "$a" == "resolve" ]] && exit 1; done\n'
+  printf 'exec %q "$@"\n' "$_realpy"
+} >"$STUB10/python3"
+chmod +x "$STUB10/python3"
+
+run_resume_block() { # $1=marker-present(0/1)
+  (
+    set -uo pipefail
+    export PATH="$STUB10:$PATH"
+    SUBCOMMAND="apply"; DRY_RUN=0
+    TARGET_ROOT="$C10"; SOURCE_VERSION="0.17.0"; TARGET_HEAD="deadbeef0010"
+    SOURCE_ROOT="$ROOT_DIR"; BACKUP_ROOT="$C10/backups/upgrade-orig"
+    bridge_die() { printf 'BRIDGE_DIE: %s\n' "$*"; exit 17; }
+    _bridge_upgrade_apply_marker_clear() { :; }
+    if [[ "$1" -eq 0 ]]; then rm -f "$C10/state/upgrade/apply-in-progress.json"; fi
+    eval "$_resume_block"
+    printf 'NO_DIE decision=%s skip_backup=%s\n' "${_resume_decision:-unset}" "${_BRIDGE_UPGRADE_RESUME_SKIP_BACKUP:-unset}"
+  )
+}
+
+# Marker present + resolver rc=1 → MUST bridge_die before any mutation.
+_present_out="$(run_resume_block 1 2>&1)"; _present_rc=$?
+step "(b) marker present + resolver failure → bridge_die before any backup (fail closed)"
+if [[ "$_present_rc" -eq 17 ]] && printf '%s' "$_present_out" | grep -q 'BRIDGE_DIE'; then ok; else err "did NOT die (rc=$_present_rc): $_present_out"; fi
+
+step "(b) the fail-closed death authorizes NO fresh backup (rollback point preserved)"
+if ! printf '%s' "$_present_out" | grep -q 'skip_backup'; then ok; else err "reached the skip_backup decision instead of dying: $_present_out"; fi
+
+# Behavior-invariance counter-anchor: NO marker + resolver rc=1 → none rc=0, no die.
+rm -f "$C10/state/upgrade/apply-in-progress.json"  # restore for a clean re-seed below
+_absent_out="$(run_resume_block 0 2>&1)"; _absent_rc=$?
+step "(b) invariant — NO marker + resolver failure → decision=none, no die (happy path intact)"
+if [[ "$_absent_rc" -eq 0 ]] && printf '%s' "$_absent_out" | grep -q 'NO_DIE decision=none'; then ok; else err "no-marker path changed (rc=$_absent_rc): $_absent_out"; fi
 
 # ---------------------------------------------------------------------------
 # Behavior-invariance anchor — the marker write is purely ADDITIVE: it sits
