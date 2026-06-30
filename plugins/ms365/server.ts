@@ -56,9 +56,11 @@ import {
 import {
   chmodSync,
   closeSync,
+  existsSync,
   mkdirSync,
   openSync,
   readdirSync,
+  realpathSync,
   readFileSync,
   renameSync,
   statSync,
@@ -67,7 +69,7 @@ import {
   writeSync,
 } from 'fs'
 import { homedir, hostname } from 'os'
-import { join } from 'path'
+import { basename, dirname, resolve, sep, join } from 'path'
 import { randomUUID } from 'crypto'
 import {
   hasChatDisclaimerBeenSent,
@@ -88,12 +90,18 @@ const STATE_DIR = process.env.MS365_STATE_DIR ?? join(homedir(), '.claude', 'cha
 const ENV_FILE = join(STATE_DIR, '.env')
 const TOKENS_DIR = join(STATE_DIR, 'tokens')
 const PENDING_DIR = join(STATE_DIR, 'pending')
+const ATTACHMENTS_DIR = process.env.MS365_ATTACHMENTS_DIR ?? join(STATE_DIR, 'attachments')
 // Issue #1343: per-UPN channel status marker. When the refresh_token is
 // permanently dead (90-day cap, revoke, consent withdrawn) we persist a
 // `token_expired` status here so `pair_status` and the operator can see
 // the channel needs re-auth, distinct from a transient network blip.
 const STATUS_DIR = join(STATE_DIR, 'status')
 const HUMAN_OUTBOUND_DISCLOSURE_FILE = join(STATE_DIR, 'human-outbound-disclosures.json')
+const DEFAULT_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
+const ATTACHMENT_MAX_BYTES = clampPositiveInt(
+  process.env.MS365_ATTACHMENT_MAX_BYTES,
+  DEFAULT_ATTACHMENT_MAX_BYTES,
+)
 
 const BRIDGE_HOME = process.env.BRIDGE_HOME ?? join(homedir(), '.agent-bridge')
 const MS365_CALLBACK_DIR =
@@ -126,6 +134,10 @@ function ensureDirs(): void {
   } catch {}
   mkdirSync(TOKENS_DIR, { recursive: true, mode: 0o700 })
   mkdirSync(PENDING_DIR, { recursive: true, mode: 0o700 })
+  mkdirSync(ATTACHMENTS_DIR, { recursive: true, mode: 0o700 })
+  try {
+    chmodSync(ATTACHMENTS_DIR, 0o700)
+  } catch {}
   // Issue #1343: status markers are not secrets (they hold no token
   // material — only a `token_expired` flag + timestamp + redacted
   // fingerprint), but they live under the per-UPN private tree, so keep
@@ -259,6 +271,12 @@ export function withOfflineAccess(scope: unknown): string {
     parts.push('offline_access')
   }
   return parts.join(' ')
+}
+
+function clampPositiveInt(raw: string | undefined, fallback: number): number {
+  if (raw === undefined) return fallback
+  const n = Number(raw)
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback
 }
 
 if (!TENANT_ID || !CLIENT_ID || !CLIENT_SECRET) {
@@ -1198,6 +1216,87 @@ async function graph(
   return data
 }
 
+async function graphBytes(
+  upn: string,
+  method: string,
+  path: string,
+  query?: Record<string, string | number | undefined>,
+  version: 'v1.0' | 'beta' = 'v1.0',
+  maxBytes?: number,
+): Promise<Buffer> {
+  const token = await getAccessToken(upn)
+  let url = `https://graph.microsoft.com/${version}${path}`
+  if (query) {
+    const qs = new URLSearchParams()
+    for (const [k, v] of Object.entries(query)) {
+      if (v != null && v !== '') qs.append(k, String(v))
+    }
+    const s = qs.toString()
+    if (s) url += (url.includes('?') ? '&' : '?') + s
+  }
+  const res = await fetch(url, {
+    method,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: 'application/octet-stream',
+    },
+  })
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    throw new Error(
+      `graph ${method} ${path} failed (${res.status}): ${scrubSecretShapedText(text || `HTTP ${res.status}`).slice(0, 500)}`,
+    )
+  }
+  // When a cap is requested, reject a declared Content-Length over the cap
+  // before reading any body, then stream with a hard running cap so an absent
+  // or falsely-small Content-Length cannot push us past the limit. This keeps
+  // the worst-case memory bounded by maxBytes (+ one chunk) rather than the
+  // full attachment size.
+  if (maxBytes != null) {
+    const declared = Number(res.headers.get('content-length') ?? '')
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      throw new Error(
+        `attachment too large (${declared} bytes > max ${maxBytes}); raise MS365_ATTACHMENT_MAX_BYTES if needed`,
+      )
+    }
+    const body = res.body
+    if (body) {
+      const reader = body.getReader()
+      const chunks: Uint8Array[] = []
+      let total = 0
+      try {
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) break
+          if (value && value.length) {
+            total += value.length
+            if (total > maxBytes) {
+              try { await reader.cancel() } catch {}
+              throw new Error(
+                `attachment too large (>${maxBytes} bytes); raise MS365_ATTACHMENT_MAX_BYTES if needed`,
+              )
+            }
+            chunks.push(value)
+          }
+        }
+      } finally {
+        try { reader.releaseLock() } catch {}
+      }
+      return Buffer.concat(chunks)
+    }
+    // No streamable body handle: fall back to arrayBuffer but still enforce
+    // the cap so the guarantee holds.
+    const buf = Buffer.from(await res.arrayBuffer())
+    if (buf.length > maxBytes) {
+      throw new Error(
+        `attachment too large (${buf.length} bytes > max ${maxBytes}); raise MS365_ATTACHMENT_MAX_BYTES if needed`,
+      )
+    }
+    return buf
+  }
+  return Buffer.from(await res.arrayBuffer())
+}
+
 // -------- MCP server -----------------------------------------------------------
 
 const mcp = new Server(
@@ -1274,6 +1373,85 @@ async function resolveConfiguredDisclaimer(upn: string, envKeys: string[]): Prom
     return resolveDisclaimerTemplate(upn, trimmed)
   }
   return ''
+}
+
+function attachmentKind(odataType: unknown): 'file' | 'reference' | 'item' | 'unknown' {
+  const t = String(odataType ?? '').toLowerCase()
+  if (t.endsWith('fileattachment')) return 'file'
+  if (t.endsWith('referenceattachment')) return 'reference'
+  if (t.endsWith('itemattachment')) return 'item'
+  return 'unknown'
+}
+
+function sanitizeAttachmentFilename(raw: unknown): string {
+  const base = basename(String(raw ?? 'attachment').replace(/\0/g, '')).trim()
+  const cleaned = base
+    .replace(/[\\/]/g, '_')
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/[<>:"|?*\x00-\x1F]/g, '_')
+    .replace(/\s+/g, ' ')
+    .replace(/^\.+$/, '')
+    .slice(0, 180)
+    .trim()
+  return cleaned || 'attachment'
+}
+
+function isPathInside(parent: string, child: string): boolean {
+  const p = resolve(parent)
+  const c = resolve(child)
+  return c === p || c.startsWith(p.endsWith(sep) ? p : `${p}${sep}`)
+}
+
+function resolveAttachmentSaveDir(raw: unknown): string {
+  const root = resolve(ATTACHMENTS_DIR)
+  // realpath the root once (it exists — ensureDirs created it) so a symlinked
+  // ATTACHMENTS_DIR normalizes consistently on both sides of every check.
+  const realRoot = realpathSync(root)
+  const s = String(raw ?? '').trim()
+  const target = s ? resolve(root, s) : root
+  // Lexical containment is a fast first gate, but path.resolve does NOT follow
+  // symlinks, so a save_dir like `escape` where `<root>/escape` is a symlink to
+  // a directory OUTSIDE the root passes this check; without the realpath gate
+  // below, mkdir/chmod/write would then follow the link out of the sandbox.
+  if (!isPathInside(root, target)) {
+    throw new Error(`save_dir must be inside the ms365 attachments directory (${root})`)
+  }
+  // Validate BEFORE any filesystem mutation. mkdirSync({recursive:true}) and
+  // chmodSync FOLLOW symlinks, so a post-mkdir realpath check is too late — it
+  // would already have created a dir or chmod'd a target THROUGH a symlinked
+  // component that points outside the root (codex r2: repro1 chmod'd /tmp/outside
+  // to 0700; repro2 `mid -> /outside2` + save_dir=`mid/newdir` created
+  // /tmp/outside2/newdir). Resolve the longest ALREADY-EXISTING ancestor of the
+  // target (which collapses any symlinked target OR intermediate component) and
+  // require it to sit inside the real root before we touch the filesystem.
+  let ancestor = target
+  while (!existsSync(ancestor)) {
+    const parent = dirname(ancestor)
+    if (parent === ancestor) break // reached filesystem root
+    ancestor = parent
+  }
+  const realAncestor = realpathSync(ancestor)
+  if (!isPathInside(realRoot, realAncestor)) {
+    throw new Error(`save_dir must resolve inside the ms365 attachments directory (${realRoot})`)
+  }
+  // The existing ancestor is inside root; any remaining components do not exist
+  // yet (so they cannot be pre-planted symlinks). Create + lock them down.
+  mkdirSync(target, { recursive: true, mode: 0o700 })
+  try {
+    chmodSync(target, 0o700)
+  } catch {}
+  // Final defense-in-depth: realpath the now-created target and re-verify it did
+  // not escape (closes any residual race on the freshly-created leaf).
+  const realTarget = realpathSync(target)
+  if (!isPathInside(realRoot, realTarget)) {
+    throw new Error(`save_dir must resolve inside the ms365 attachments directory (${realRoot})`)
+  }
+  return realTarget
+}
+
+function attachmentOutputPath(saveDir: string, name: string): string {
+  const safeName = sanitizeAttachmentFilename(name)
+  return join(saveDir, `${Date.now()}-${randomUUID()}-${safeName}`)
 }
 
 const tools: ToolDef[] = [
@@ -1539,6 +1717,123 @@ const tools: ToolDef[] = [
         body_type: data.body?.contentType,
         body: data.body?.content,
         hasAttachments: data.hasAttachments,
+      })
+    },
+  },
+  {
+    name: 'mail_attachments_list',
+    description:
+      'List attachments for a message. Pass message_id from mail_list/mail_get. Returns metadata only; use mail_attachment_get for fileAttachment downloads.',
+    schema: {
+      type: 'object',
+      required: ['message_id'],
+      properties: {
+        upn: { type: 'string' },
+        message_id: { type: 'string' },
+      },
+    },
+    handler: async args => {
+      const upn = resolveUpn(args.upn)
+      const id = String(args.message_id ?? '').trim()
+      if (!id) throw new Error('message_id is required')
+      const data = await graph(
+        upn,
+        'GET',
+        `/me/messages/${encodeURIComponent(id)}/attachments`,
+        undefined,
+        { $select: 'id,name,contentType,size,isInline' },
+      )
+      const attachments = (data?.value ?? []).map((a: any) => {
+        const type = a['@odata.type']
+        return {
+          id: a.id,
+          name: a.name ?? '',
+          contentType: a.contentType ?? null,
+          size: typeof a.size === 'number' ? a.size : null,
+          isInline: Boolean(a.isInline),
+          kind: attachmentKind(type),
+          odataType: type ?? null,
+        }
+      })
+      return textResult({ message_id: id, count: attachments.length, attachments })
+    },
+  },
+  {
+    name: 'mail_attachment_get',
+    description:
+      'Download a fileAttachment from a message into the per-agent ms365 attachments directory. referenceAttachment and itemAttachment are not downloaded in this first version.',
+    schema: {
+      type: 'object',
+      required: ['message_id', 'attachment_id'],
+      properties: {
+        upn: { type: 'string' },
+        message_id: { type: 'string' },
+        attachment_id: { type: 'string' },
+        save_dir: {
+          type: 'string',
+          description:
+            'Optional subdirectory under the ms365 attachments directory. Defaults to the root attachments dir.',
+        },
+      },
+    },
+    handler: async args => {
+      const upn = resolveUpn(args.upn)
+      const messageId = String(args.message_id ?? '').trim()
+      const attachmentId = String(args.attachment_id ?? '').trim()
+      if (!messageId) throw new Error('message_id is required')
+      if (!attachmentId) throw new Error('attachment_id is required')
+      // Resolve metadata from the list endpoint (metadata-only $select). The
+      // single-resource GET would return a fileAttachment's base64 contentBytes
+      // by default, pulling the whole payload into memory before any size guard
+      // runs. Reading size from the metadata-only listing lets us reject an
+      // oversized attachment before downloading a single byte.
+      const listData = await graph(
+        upn,
+        'GET',
+        `/me/messages/${encodeURIComponent(messageId)}/attachments`,
+        undefined,
+        { $select: 'id,name,contentType,size,isInline' },
+      )
+      const meta = (listData?.value ?? []).find((a: any) => a?.id === attachmentId)
+      if (!meta) {
+        throw new Error(`attachment ${attachmentId} not found on message ${messageId}`)
+      }
+      const kind = attachmentKind(meta['@odata.type'])
+      if (kind === 'reference' || kind === 'item') {
+        throw new Error(`attachment kind ${kind} is not downloadable yet; only fileAttachment is supported`)
+      }
+      const declaredSize = typeof meta.size === 'number' ? meta.size : null
+      if (declaredSize != null && declaredSize > ATTACHMENT_MAX_BYTES) {
+        throw new Error(
+          `attachment too large (${declaredSize} bytes > max ${ATTACHMENT_MAX_BYTES}); raise MS365_ATTACHMENT_MAX_BYTES if needed`,
+        )
+      }
+      // Download the raw bytes through $value with a hard streaming cap; never
+      // rely on Graph's base64 JSON response for the primary download path.
+      const bytes = await graphBytes(
+        upn,
+        'GET',
+        `/me/messages/${encodeURIComponent(messageId)}/attachments/${encodeURIComponent(attachmentId)}/$value`,
+        undefined,
+        'v1.0',
+        ATTACHMENT_MAX_BYTES,
+      )
+      const saveDir = resolveAttachmentSaveDir(args.save_dir)
+      const name = sanitizeAttachmentFilename(meta.name)
+      const path = attachmentOutputPath(saveDir, name)
+      writeFileSync(path, bytes, { mode: 0o600 })
+      try {
+        chmodSync(path, 0o600)
+      } catch {}
+      return textResult({
+        path,
+        name,
+        contentType: meta.contentType ?? null,
+        size: bytes.length,
+        declaredSize,
+        kind,
+        message_id: messageId,
+        attachment_id: attachmentId,
       })
     },
   },
