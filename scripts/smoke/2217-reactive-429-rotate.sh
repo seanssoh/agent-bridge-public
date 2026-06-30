@@ -20,6 +20,9 @@
 #   E — picker + daemon same tick → SINGLE rotate (shared cooldown dedup).
 #   F — out-of-scope / non-managed agent → NO rotate (alert only).
 #   G — all_tokens_limited → HOLD + one notice, no loop.
+#   I — latch-on-cooldown race: a cooldown-suppressed call must NOT pin the token
+#       picker just rotated INTO; after the cooldown clears, a genuine 429 on that
+#       token rotates once. Mutation-backed teeth.
 #   H — picker note stamps the SHARED cooldown even when its LOCAL cooldown knob
 #       is 0 (regression guard: the daemon must not re-rotate the same event
 #       after the picker's lock releases). Mutation-backed teeth.
@@ -294,6 +297,44 @@ fi
 export MOCK_ROTATE_OUTCOME=rotated   # restore
 
 # ===========================================================================
+# I — latch-on-cooldown RACE (the daemon must NOT pin a token picker just rotated
+# INTO). Interleaving: picker rotates tok-a→tok-b and writes the shared cooldown;
+# the daemon's active-digest then reads tok-b (the fresh token). The cooldown
+# correctly suppresses THIS event, but the daemon MUST NOT publish a latch for
+# tok-b — otherwise a later GENUINE tok-b 429 (after the cooldown expires) would
+# hit the Gate-5 latch and never rotate, reopening the blind spot for the
+# rotated-into token. We assert: (1) cooldown-suppressed call publishes NO latch
+# (BRIDGE_REACTIVE_ROTATE_LATCH_DIGEST stays empty → the caller leaves the
+# per-token latch untouched), and (2) after the cooldown clears, a tok-b 429 with
+# NO carried-in latch rotates ONCE. Mutation: re-adding the latch publish in the
+# cooldown branch pins tok-b and makes (2) fail (the rotate is blocked).
+# ===========================================================================
+reset_scenario
+export MOCK_ACTIVE_DIGEST="tok-b:sha256:bbbb"   # picker already rotated INTO tok-b
+# Picker writes the shared cooldown AFTER changing the active digest to tok-b.
+bridge_reactive_rotate_cooldown_note
+# Daemon reactive call under the cooldown: suppressed, and MUST NOT latch tok-b.
+bridge_daemon_reactive_429_rotate "worker-a" "claude" "$TRANSPORT_429" ""
+I_COOLDOWN_ROTATES="$(_rotate_calls)"
+I_LATCH_AFTER_COOLDOWN="$BRIDGE_REACTIVE_ROTATE_LATCH_DIGEST"
+# Caller persists the latch ONLY when the helper published one (mirrors the daemon
+# call site at bridge-daemon.sh): empty publish → the per-agent latch is untouched.
+I_PERSISTED_LATCH=""   # prior latch was empty (first detection)
+if [[ -n "$I_LATCH_AFTER_COOLDOWN" ]]; then I_PERSISTED_LATCH="$I_LATCH_AFTER_COOLDOWN"; fi
+# Cooldown window expires.
+rm -f "$BRIDGE_REACTIVE_ROTATE_COOLDOWN_FILE" 2>/dev/null || true
+printf '0' >"$ROTATE_COUNT_FILE"   # reset the rotate counter for the post-cooldown call
+# A GENUINE tok-b 429 after the cooldown clears — carry in whatever latch the
+# caller persisted. With the fix this is empty → tok-b rotates once.
+bridge_daemon_reactive_429_rotate "worker-a" "claude" "$TRANSPORT_429" "$I_PERSISTED_LATCH"
+I_POSTCOOLDOWN_ROTATES="$(_rotate_calls)"
+if (( I_COOLDOWN_ROTATES == 0 )) && [[ -z "$I_LATCH_AFTER_COOLDOWN" ]] && (( I_POSTCOOLDOWN_ROTATES == 1 )); then
+  _pass "I latch-on-cooldown race: cooldown-suppressed call published NO latch for the picker-rotated-into token (tok-b); after the cooldown cleared, a genuine tok-b 429 rotated once ($I_POSTCOOLDOWN_ROTATES) — the freshly-rotated-into token is not spuriously pinned"
+else
+  _fail "I latch-on-cooldown-race" "cooldown_rotates=$I_COOLDOWN_ROTATES latch_after_cooldown='$I_LATCH_AFTER_COOLDOWN' (expected empty) post_cooldown_rotates=$I_POSTCOOLDOWN_ROTATES (expected 0 / empty / 1)"
+fi
+
+# ===========================================================================
 # H — picker-sweep stamps the SHARED cooldown even when its LOCAL cooldown knob
 # is disabled (BRIDGE_PICKER_SWEEP_RATE_LIMIT_ROTATE_COOLDOWN_SECONDS=0). The
 # local stamp early-returns at 0, but the shared cooldown (its own default) MUST
@@ -327,7 +368,7 @@ fi
 # ===========================================================================
 printf '\n'
 if (( FAILS == 0 )); then
-  printf '[PASS] 2217-reactive-429-rotate: %d checks (%d skipped) — flag/scope/CF-transport gate + per-token latch + shared cooldown dedup (incl. picker local-cooldown=0) + all-tokens-limited hold all enforced\n' "$TOTAL" "$SKIPS"
+  printf '[PASS] 2217-reactive-429-rotate: %d checks (%d skipped) — flag/scope/CF-transport gate + per-token latch (no spurious pin on cooldown race) + shared cooldown dedup (incl. picker local-cooldown=0) + all-tokens-limited hold all enforced\n' "$TOTAL" "$SKIPS"
   exit 0
 fi
 printf '[FAIL] 2217-reactive-429-rotate: %d/%d checks failed\n' "$FAILS" "$TOTAL" >&2

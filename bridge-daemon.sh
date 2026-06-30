@@ -5869,12 +5869,17 @@ bridge_daemon_reactive_429_rotate() {
   fi
 
   # Gate 6 — shared cross-process cooldown (a prior rotate by EITHER the daemon
-  # or picker-sweep suppresses a second rotate for this event window). Latch the
-  # digest even when suppressed so we do not retry against the SAME token while
-  # the cooldown is up.
+  # or picker-sweep suppresses a second rotate for this event window).
+  #
+  # Do NOT publish the per-token latch here. The cooldown window is the correct
+  # dedupe for the rate-limit EVENT, but the active digest read above may already
+  # be a token that picker-sweep just rotated INTO (picker rotates tok-a→tok-b,
+  # then writes the cooldown; the daemon then reads tok-b). Latching tok-b would
+  # permanently pin a token this path never attempted to rotate, so a later
+  # genuine tok-b 429 would hit the Gate-5 latch and never rotate — reopening the
+  # idle/headless blind spot for the freshly-rotated-into token. The latch is
+  # published ONLY after a real rotate attempt for the CURRENT digest (below).
   if bridge_reactive_rotate_cooldown_active; then
-    BRIDGE_REACTIVE_ROTATE_LATCH_DIGEST="$active_digest"
-    BRIDGE_REACTIVE_ROTATE_LATCH_TS="$(date +%s 2>/dev/null || printf '0')"
     bridge_audit_log daemon reactive_429_rotate_skipped "${admin_agent:-daemon}" \
       --detail agent="$agent" \
       --detail reason=cooldown_active 2>/dev/null || true
