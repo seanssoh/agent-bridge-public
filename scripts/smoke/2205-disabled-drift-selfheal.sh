@@ -90,9 +90,13 @@ smoke_make_temp_root "$SMOKE_NAME"
 LIVENESS_SRC="$REPO_ROOT/scripts/bridge-daemon-liveness.sh"
 UPGRADE_SRC="$REPO_ROOT/bridge-upgrade.sh"
 DOCTOR_SRC="$REPO_ROOT/bridge-doctor.py"
+# Footgun #11 (lint-heredoc-ban C3): the doctor-source mutation transforms are
+# file-as-argv (a committed helper), NOT `python3 - <<'PY'` heredoc-stdin.
+DOCTOR_MUTATE="$SCRIPT_DIR/2205-doctor-mutate.py"
 smoke_assert_file_exists "$LIVENESS_SRC" "bridge-daemon-liveness.sh source present"
 smoke_assert_file_exists "$UPGRADE_SRC" "bridge-upgrade.sh source present"
 smoke_assert_file_exists "$DOCTOR_SRC" "bridge-doctor.py source present"
+smoke_assert_file_exists "$DOCTOR_MUTATE" "2205-doctor-mutate.py helper present"
 grep -q 'non_operator_disable_marker' "$LIVENESS_SRC" \
   || smoke_fail "#2205 generalized marker discriminator not present in $LIVENESS_SRC"
 grep -q 'BRIDGE_QUIESCE_REASON' "$UPGRADE_SRC" \
@@ -488,15 +492,9 @@ MUTATED_DOCTOR="$REPO_ROOT/.2205-doctor-mut.$$.py"
 # Neuter the marker carve-out by forcing its matching test to never hold. The
 # carve-out is the load-bearing branch that keeps the doctor quiet on a
 # watcher-recoverable drift; if removed, D2's matching-marker case must report.
-python3 - "$DOCTOR_SRC" "$MUTATED_DOCTOR" <<'PY'
-import sys
-src, dst = sys.argv[1], sys.argv[2]
-text = open(src, encoding="utf-8").read()
-needle = "    if recoverable:\n        # The watcher can prove + recover this; not an unprovable drift.\n        return None"
-assert needle in text, "carve-out branch not found for mutation"
-text = text.replace(needle, "    if False and recoverable:\n        return None")
-open(dst, "w", encoding="utf-8").write(text)
-PY
+# Transform is file-as-argv (footgun #11 / lint-heredoc-ban C3), not heredoc-stdin.
+python3 "$DOCTOR_MUTATE" carveout "$DOCTOR_SRC" "$MUTATED_DOCTOR" \
+  || smoke_fail "D3 SETUP: doctor carveout mutation failed (see helper stderr)"
 seed_stale_no_pid
 printf '1' >"$PRINT_RC_FILE"
 printf '1' >"$DISABLED_RC_FILE"
@@ -524,15 +522,8 @@ smoke_log "D4 PASS: doctor reports on an OFF-SCHEMA matching marker (an unexpect
 # marker_well_formed true unconditionally) → D4's off-schema marker would START
 # suppressing the finding. Proves the well-formedness gate is independently load-bearing.
 MUTATED_DOCTOR="$REPO_ROOT/.2205-doctor-mut-md4.$$.py"
-python3 - "$DOCTOR_SRC" "$MUTATED_DOCTOR" <<'PY'
-import sys
-src, dst = sys.argv[1], sys.argv[2]
-text = open(src, encoding="utf-8").read()
-needle = "                marker_well_formed = False\n                continue"
-assert needle in text, "well-formedness reject branch not found for MD4 mutation"
-text = text.replace(needle, "                marker_well_formed = True  # MUT\n                continue", 1)
-open(dst, "w", encoding="utf-8").write(text)
-PY
+python3 "$DOCTOR_MUTATE" wellformed "$DOCTOR_SRC" "$MUTATED_DOCTOR" \
+  || smoke_fail "MD4 SETUP: doctor wellformed mutation failed (see helper stderr)"
 seed_stale_no_pid
 printf '1' >"$PRINT_RC_FILE"
 printf '1' >"$DISABLED_RC_FILE"
@@ -557,15 +548,8 @@ smoke_log "D5 PASS: doctor reports on a LIVE-writer matching marker (only a DEAD
 # predicate → D5's LIVE-writer marker would START suppressing. Proves the dead-writer
 # requirement is independently load-bearing.
 MUTATED_DOCTOR="$REPO_ROOT/.2205-doctor-mut-md5.$$.py"
-python3 - "$DOCTOR_SRC" "$MUTATED_DOCTOR" <<'PY'
-import sys
-src, dst = sys.argv[1], sys.argv[2]
-text = open(src, encoding="utf-8").read()
-needle = "        and _pid_dead(marker_pid)\n"
-assert needle in text, "_pid_dead term not found for MD5 mutation"
-text = text.replace(needle, "        and True  # MUT _pid_dead dropped\n", 1)
-open(dst, "w", encoding="utf-8").write(text)
-PY
+python3 "$DOCTOR_MUTATE" pid_dead "$DOCTOR_SRC" "$MUTATED_DOCTOR" \
+  || smoke_fail "MD5 SETUP: doctor pid_dead mutation failed (see helper stderr)"
 seed_stale_no_pid
 printf '1' >"$PRINT_RC_FILE"
 printf '1' >"$DISABLED_RC_FILE"
@@ -591,15 +575,8 @@ smoke_log "D6 PASS: doctor reports on an UNKNOWN-probe drift even with a perfect
 # the recoverable predicate → D6's unknown-probe case would START suppressing. Proves
 # the positive-readable-disabled requirement is independently load-bearing.
 MUTATED_DOCTOR="$REPO_ROOT/.2205-doctor-mut-md6.$$.py"
-python3 - "$DOCTOR_SRC" "$MUTATED_DOCTOR" <<'PY'
-import sys
-src, dst = sys.argv[1], sys.argv[2]
-text = open(src, encoding="utf-8").read()
-needle = "        disabled_readable\n        and disabled\n        and marker_well_formed"
-assert needle in text, "positive-readable-disabled terms not found for MD6 mutation"
-text = text.replace(needle, "        True  # MUT readable+disabled dropped\n        and marker_well_formed", 1)
-open(dst, "w", encoding="utf-8").write(text)
-PY
+python3 "$DOCTOR_MUTATE" readable_disabled "$DOCTOR_SRC" "$MUTATED_DOCTOR" \
+  || smoke_fail "MD6 SETUP: doctor readable_disabled mutation failed (see helper stderr)"
 seed_stale_no_pid
 printf '1' >"$PRINT_RC_FILE"
 printf '2' >"$DISABLED_RC_FILE"          # unknown probe
