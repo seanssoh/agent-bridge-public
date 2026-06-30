@@ -17,6 +17,7 @@ Usage:
   bash $SCRIPT_DIR/bridge-auth.sh claude-token receive --request --id <id> [--agents static|all|csv] [--activate] [--account-email <addr>] [--enable-auto-rotate] --json
   bash $SCRIPT_DIR/bridge-auth.sh claude-token set --id <id> --account-email <addr> [--json]   # #18849 Part 1b-v2: operator-provided displayed-identity source (closes #2145)
   bash $SCRIPT_DIR/bridge-auth.sh claude-token list [--json]
+  bash $SCRIPT_DIR/bridge-auth.sh claude-token active-digest [--json]   # #2217 roadmap 4: NON-SECRET active-token digest (id:fingerprint) for the daemon reactive-429-rotation latch
   bash $SCRIPT_DIR/bridge-auth.sh claude-token activate <id> [--sync] [--agents static|all|csv] [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token sync [--agents static|all|csv] [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token sync-global [--json]   # #18849 Part 1: double-gated operator-global token PATCH for dynamic-vanilla Claude (default OFF)
@@ -1395,11 +1396,13 @@ case "$command" in
         done
         exec python3 "$SCRIPT_DIR/bridge-auth.py" --registry "$registry" receive "$@"
         ;;
-      list|auto-rotate|check|recover-due|classify-output|mark-quota|mark-adverse|set)
+      list|active-digest|auto-rotate|check|recover-due|classify-output|mark-quota|mark-adverse|set)
         # `set` (#18849 Part 1b-v2): operator metadata write — `--account-email`
         # is NON-SECRET, so a direct argv passthrough is safe (no sealed-tty path).
         # `mark-adverse` (#19460 Fix 1): id + status/reset/fingerprint/source are
         # NON-SECRET (fingerprint, not the raw token) → direct argv passthrough.
+        # `active-digest` (#2217 roadmap 4): read-only NON-SECRET active-token
+        # digest (id:fingerprint) for the daemon reactive-rotation latch.
         exec python3 "$SCRIPT_DIR/bridge-auth.py" --registry "$registry" "$subcommand" "$@"
         ;;
       sync)

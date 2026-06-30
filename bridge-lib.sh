@@ -1071,6 +1071,11 @@ bridge_source_module "bridge-cron.sh"
 bridge_source_module "bridge-resource-guard.sh"
 bridge_source_module "bridge-discord.sh"
 bridge_source_module "bridge-notify.sh"
+# #2217 roadmap step 4 — reactive 429 → preflighted rotation shared gate.
+# Sourced after bridge-agents.sh (bridge_agent_is_static scope predicate) and
+# bridge-notify.sh; provides the cross-process lock/cooldown + reactive gate the
+# daemon stall branch and picker-sweep both route through.
+bridge_source_module "bridge-reactive-rotate.sh"
 bridge_source_module "bridge-migration.sh"
 # Beta20 L2 Variant 3A — daemon refresh orchestration. Sourced AFTER
 # bridge-state.sh (provides bridge_daemon_pid / bridge_daemon_recorded_pid)

@@ -1759,6 +1759,39 @@ def cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_active_digest(args: argparse.Namespace) -> int:
+    """#2217 roadmap step 4: emit a non-secret digest of the ACTIVE token.
+
+    The daemon's reactive-429-rotation latch keys on (agent, active-token-digest)
+    so it rotates at most once per active token. This verb is the cheap read of
+    that digest — it NEVER prints token bytes. The digest is
+    ``<active_token_id>:<token_fingerprint>`` (the fingerprint is the existing
+    ``sha256:<12hex>...<4tail>`` non-secret form). An empty registry / no active
+    token prints an empty digest and still exits 0, so the daemon treats "no
+    digest" as "no latch key" (it will not rotate without a digest).
+    """
+    json_mode = bool(args.json)
+    digest = ""
+    active_id = ""
+    try:
+        registry = load_registry(Path(args.registry).expanduser())
+        active_id = str(registry.get("active_token_id") or "")
+        if active_id:
+            row = find_token(registry, active_id)
+            if row is not None:
+                token = str(row.get("token") or "")
+                fp = token_fingerprint(token) if token else ""
+                digest = f"{active_id}:{fp}" if fp else active_id
+    except Exception:  # noqa: BLE001 — any failure → empty digest (no latch key)
+        digest = ""
+        active_id = ""
+    if json_mode:
+        json_dump({"status": "ok", "active_token_id": active_id, "digest": digest})
+        return 0
+    print(digest)
+    return 0
+
+
 def _converge_operator_global_inline(registry_path: Path) -> dict[str, Any]:
     """#2164: converge the operator-global credential on the active registry token
     synchronously, AT an active-token-mutation source (``cmd_rotate`` /
@@ -7420,6 +7453,12 @@ def build_parser() -> argparse.ArgumentParser:
     list_parser = sub.add_parser("list")
     list_parser.add_argument("--json", action="store_true")
     list_parser.set_defaults(handler=cmd_list)
+
+    # #2217 roadmap step 4: non-secret active-token digest for the daemon's
+    # reactive-429-rotation latch. Read-only; never prints token bytes.
+    active_digest_parser = sub.add_parser("active-digest")
+    active_digest_parser.add_argument("--json", action="store_true")
+    active_digest_parser.set_defaults(handler=cmd_active_digest)
 
     # #18849 Part 1b-v2 (closes #2145): set per-token operator metadata. Today
     # the operator-provided account email — the BINDING displayed-identity source.

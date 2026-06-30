@@ -5761,6 +5761,12 @@ bridge_note_stall_state() {
   # Issue #329 Track D: matched_line_hash is the stable dedup key. Persist it
   # alongside excerpt_hash so a daemon restart resumes the cap correctly.
   local matched_line_hash="${14:-}"
+  # #2217 roadmap step 4: the reactive-429-rotation latch. Stored in THIS
+  # per-agent stall state (NOT a new file) so a rotate fires at most once per
+  # (agent, active-token-digest) and survives a daemon restart — re-seeing the
+  # same stuck pane on the same token across ticks does not re-rotate.
+  local reactive_rotate_token_digest="${15:-}"
+  local last_reactive_rotate_ts="${16:-0}"
   local state_file
 
   state_file="$(bridge_agent_stall_state_file "$agent")"
@@ -5779,6 +5785,8 @@ STALL_LAST_NUDGE_TS=$(printf '%q' "$last_nudge_ts")
 STALL_ESCALATED_TS=$(printf '%q' "$escalated_ts")
 STALL_TASK_ID=$(printf '%q' "$task_id")
 STALL_MATCHED_PATTERN=$(printf '%q' "$matched_pattern")
+STALL_REACTIVE_ROTATE_TOKEN_DIGEST=$(printf '%q' "$reactive_rotate_token_digest")
+STALL_LAST_REACTIVE_ROTATE_TS=$(printf '%q' "$last_reactive_rotate_ts")
 EOF
 }
 
@@ -5791,6 +5799,166 @@ bridge_send_stall_nudge() {
 
   text="$(bridge_notification_text "stall detected" "$(bridge_stall_nudge_message "$classification")" "" normal)"
   bridge_tmux_send_and_submit "$session" "$engine" "$text" "$agent"
+}
+
+# #2217 roadmap step 4 — reactive inference/picker 429 → preflighted rotation.
+# Called from the `rate_limit` stall branch BEFORE the retry-nudge. Decides
+# whether to rotate the managed Claude token in response to a REAL provider 429
+# in the agent's pane (the ground-truth cap signal the edge-throttled
+# /api/oauth/usage probe cannot see). Reuses the EXISTING preflighted rotator
+# (no second rotator); routes through the shared lock/cooldown
+# (lib/bridge-reactive-rotate.sh) so a same-tick picker-sweep + daemon co-fire
+# cannot double-rotate one event.
+#
+# Args: <agent> <engine> <excerpt> <latch_digest>
+#   <latch_digest> is the per-agent latched active-token digest from prior ticks
+#   (empty on first detection). Re-seeing the SAME active token must not re-rotate.
+# Sets globals (read by the caller to update the per-agent latch):
+#   BRIDGE_REACTIVE_ROTATE_DID_ROTATE   — 1 iff a rotate was attempted+committed
+#   BRIDGE_REACTIVE_ROTATE_LATCH_DIGEST — the active-token digest to latch on
+#                                         (empty = leave the latch untouched)
+#   BRIDGE_REACTIVE_ROTATE_LATCH_TS     — timestamp to record with the latch
+# Always returns 0 (best-effort; never aborts the stall scan).
+bridge_daemon_reactive_429_rotate() {
+  local agent="$1"
+  local engine="$2"
+  local excerpt="$3"
+  local latch_digest="$4"
+  local admin_agent="${BRIDGE_ADMIN_AGENT_ID:-}"
+  local rotation_agent_scope="${BRIDGE_CLAUDE_TOKEN_SYNC_AGENTS:-static}"
+  # Mirror the usage path's rotation-eligible scope (#17927 P2): an EXPLICIT-EMPTY
+  # BRIDGE_USAGE_ROTATION_AGENTS restricts rotation to controller sentinels, so an
+  # in-pane agent is then NOT eligible (alert only) — `-` preserves empty.
+  local rotation_eligible_scope="${BRIDGE_USAGE_ROTATION_AGENTS-${BRIDGE_CLAUDE_TOKEN_SYNC_AGENTS:-static}}"
+  local active_digest="" rotate_json="" rotation_status_row=""
+  local rotation_status="" rotation_reason="" rotation_from="" rotation_to=""
+  local rotation_sync_status="" rotation_soonest_reset=""
+
+  BRIDGE_REACTIVE_ROTATE_DID_ROTATE=0
+  BRIDGE_REACTIVE_ROTATE_LATCH_DIGEST=""
+  BRIDGE_REACTIVE_ROTATE_LATCH_TS=0
+
+  # Gate 1 — feature flag (default OFF / canary-first).
+  bridge_reactive_rotate_feature_enabled || return 0
+  # Gate 2 — Claude engine only (the rotator manages the Claude OAuth pool).
+  [[ "$engine" == "claude" ]] || return 0
+  # Gate 3 — reactive trigger gate (CF/edge exclusion + transport-qualified 429).
+  # The classifier stays AS-IS for retry/nudge; this stricter gate is reactive-only.
+  bridge_reactive_429_gate_passes "$excerpt" || return 0
+  # Gate 4 — scope eligibility. An out-of-scope / non-managed pane ALERTS only
+  # (the surrounding stall branch still nudges/escalates) — never rotates.
+  if ! bridge_reactive_rotate_agent_eligible "$agent" "$rotation_eligible_scope"; then
+    bridge_audit_log daemon reactive_429_rotate_skipped "${admin_agent:-daemon}" \
+      --detail agent="$agent" \
+      --detail reason=out_of_scope \
+      --detail scope="$rotation_eligible_scope" 2>/dev/null || true
+    return 0
+  fi
+
+  # Read the active-token digest (non-secret). No digest → no latch key → do not
+  # rotate (fail-safe: we never rotate without a stable latch).
+  active_digest="$(bridge_with_timeout 5 daemon_auth_active_digest \
+    "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token active-digest 2>/dev/null || true)"
+  active_digest="${active_digest%$'\n'}"
+  [[ -n "$active_digest" ]] || return 0
+
+  # Gate 5 — per-(agent, active-token-digest) latch. Re-seeing the same stuck
+  # pane on the SAME active token across ticks must NOT re-rotate.
+  if [[ -n "$latch_digest" && "$latch_digest" == "$active_digest" ]]; then
+    return 0
+  fi
+
+  # Gate 6 — shared cross-process cooldown (a prior rotate by EITHER the daemon
+  # or picker-sweep suppresses a second rotate for this event window).
+  #
+  # Do NOT publish the per-token latch here. The cooldown window is the correct
+  # dedupe for the rate-limit EVENT, but the active digest read above may already
+  # be a token that picker-sweep just rotated INTO (picker rotates tok-a→tok-b,
+  # then writes the cooldown; the daemon then reads tok-b). Latching tok-b would
+  # permanently pin a token this path never attempted to rotate, so a later
+  # genuine tok-b 429 would hit the Gate-5 latch and never rotate — reopening the
+  # idle/headless blind spot for the freshly-rotated-into token. The latch is
+  # published ONLY after a real rotate attempt for the CURRENT digest (below).
+  if bridge_reactive_rotate_cooldown_active; then
+    bridge_audit_log daemon reactive_429_rotate_skipped "${admin_agent:-daemon}" \
+      --detail agent="$agent" \
+      --detail reason=cooldown_active 2>/dev/null || true
+    return 0
+  fi
+
+  # Gate 7 — shared cross-process lock. If picker-sweep (or another daemon path)
+  # holds it, defer — the holder owns this event; do not double-rotate.
+  if ! bridge_reactive_rotate_lock_acquire; then
+    bridge_audit_log daemon reactive_429_rotate_skipped "${admin_agent:-daemon}" \
+      --detail agent="$agent" \
+      --detail reason=lock_held 2>/dev/null || true
+    return 0
+  fi
+
+  # Critical section — reuse the EXISTING preflighted rotator. No --limited-until
+  # (a pane is not an authoritative reset source). --if-auto-enabled enforces the
+  # registry auto_rotate_enabled gate inside bridge-auth.py, so an install with
+  # rotation disabled refuses here even with the feature flag on.
+  rotate_json="$(bridge_with_timeout "${BRIDGE_CLAUDE_ROTATE_TIMEOUT_SECONDS:-30}" daemon_reactive_token_rotate \
+    "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token rotate \
+    --if-auto-enabled \
+    --preflight \
+    --preflight-budget "${BRIDGE_CLAUDE_ROTATE_PREFLIGHT_BUDGET_SECONDS:-15}" \
+    --preflight-timeout "${BRIDGE_CLAUDE_ROTATE_PREFLIGHT_PER_CANDIDATE_SECONDS:-6}" \
+    --sync \
+    --agents "$rotation_agent_scope" \
+    --reason "reactive-429:${agent}" \
+    --json 2>/dev/null || true)"
+  bridge_reactive_rotate_cooldown_note
+  bridge_reactive_rotate_lock_release
+
+  rotation_status_row="$(bridge_with_timeout 5 reactive_rotation_status_parse python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" rotation-status-parse "$rotate_json" || true)"
+  IFS=$'\t' read -r rotation_status rotation_reason rotation_from rotation_to rotation_sync_status rotation_soonest_reset <<<"$rotation_status_row"
+  [[ "$rotation_status" == "-" ]] && rotation_status=""
+  [[ "$rotation_reason" == "-" ]] && rotation_reason=""
+  [[ "$rotation_from" == "-" ]] && rotation_from=""
+  [[ "$rotation_to" == "-" ]] && rotation_to=""
+  [[ "$rotation_sync_status" == "-" ]] && rotation_sync_status=""
+  [[ "$rotation_soonest_reset" == "-" ]] && rotation_soonest_reset=""
+
+  # Latch on the PRE-rotation active digest regardless of outcome: a success
+  # changes the active token (next tick's digest differs → latch naturally
+  # clears), a refusal/hold leaves it the same (we must not re-rotate it).
+  BRIDGE_REACTIVE_ROTATE_LATCH_DIGEST="$active_digest"
+  BRIDGE_REACTIVE_ROTATE_LATCH_TS="$(date +%s 2>/dev/null || printf '0')"
+
+  case "${rotation_status}:${rotation_reason}" in
+    rotated:*)
+      BRIDGE_REACTIVE_ROTATE_DID_ROTATE=1
+      bridge_clear_claude_pool_exhausted
+      bridge_audit_log daemon reactive_429_rotated "${admin_agent:-daemon}" \
+        --detail agent="$agent" \
+        --detail from="$rotation_from" \
+        --detail to="$rotation_to" \
+        --detail sync="${rotation_sync_status:-unknown}" 2>/dev/null || true
+      ;;
+    skipped:all_tokens_limited)
+      # HOLD — every enabled token is inside a known 429 window. One operator
+      # notice on the existing pool-exhausted cooldown latch; never a loop.
+      bridge_note_claude_pool_exhausted "$rotation_soonest_reset"
+      if bridge_daemon_pass_due claude_pool_exhausted_notice "${BRIDGE_CLAUDE_POOL_EXHAUSTED_NOTICE_INTERVAL_SECONDS:-1800}" \
+        && bridge_agent_has_notify_transport "${admin_agent:-}"; then
+        bridge_notify_send "$admin_agent" "claude token pool exhausted" \
+          "Reactive 429 rotation for ${agent} held: all enabled Claude tokens are rate-limited (#2217). soonest_reset=${rotation_soonest_reset:-unknown}." \
+          "" urgent "${BRIDGE_DAEMON_NOTIFY_DRY_RUN:-0}" >/dev/null 2>&1 || true
+      fi
+      bridge_audit_log daemon reactive_429_rotate_held "${admin_agent:-daemon}" \
+        --detail agent="$agent" \
+        --detail reason=all_tokens_limited 2>/dev/null || true
+      ;;
+    *)
+      bridge_audit_log daemon reactive_429_rotate_incomplete "${admin_agent:-daemon}" \
+        --detail agent="$agent" \
+        --detail status="${rotation_status:-unknown}" \
+        --detail reason="${rotation_reason:-}" 2>/dev/null || true
+      ;;
+  esac
+  return 0
 }
 
 process_stall_reports() {
@@ -5827,6 +5995,9 @@ process_stall_reports() {
   local task_id=""
   local matched_pattern=""
   local matched_line_hash=""
+  # #2217 roadmap step 4: the reactive-429-rotation latch (per (agent,token-digest)).
+  local active_reactive_rotate_token_digest=""
+  local last_reactive_rotate_ts=0
   local scan_interval="${BRIDGE_STALL_SCAN_INTERVAL_SECONDS:-30}"
   local explicit_idle="${BRIDGE_STALL_EXPLICIT_IDLE_SECONDS:-30}"
   local unknown_idle="${BRIDGE_STALL_UNKNOWN_IDLE_SECONDS:-900}"
@@ -5885,10 +6056,12 @@ process_stall_reports() {
     escalated_ts=0
     task_id=""
     matched_pattern=""
+    active_reactive_rotate_token_digest=""
+    last_reactive_rotate_ts=0
 
     if [[ -f "$state_file" ]]; then
       if daemon_source_state_file "$state_file" "stall/$agent" 1 "STALL_LAST_SCAN_TS" \
-          "STALL_ACTIVE_CLASSIFICATION STALL_ACTIVE_EXCERPT_HASH STALL_ACTIVE_MATCHED_LINE_HASH STALL_FIRST_DETECTED_TS STALL_LAST_DETECTED_TS STALL_NUDGE_COUNT STALL_LAST_NUDGE_TS STALL_ESCALATED_TS STALL_TASK_ID STALL_MATCHED_PATTERN"; then
+          "STALL_ACTIVE_CLASSIFICATION STALL_ACTIVE_EXCERPT_HASH STALL_ACTIVE_MATCHED_LINE_HASH STALL_FIRST_DETECTED_TS STALL_LAST_DETECTED_TS STALL_NUDGE_COUNT STALL_LAST_NUDGE_TS STALL_ESCALATED_TS STALL_TASK_ID STALL_MATCHED_PATTERN STALL_REACTIVE_ROTATE_TOKEN_DIGEST STALL_LAST_REACTIVE_ROTATE_TS"; then
         had_state=1
       fi
       active_classification="${STALL_ACTIVE_CLASSIFICATION:-}"
@@ -5902,6 +6075,8 @@ process_stall_reports() {
       escalated_ts="${STALL_ESCALATED_TS:-0}"
       task_id="${STALL_TASK_ID:-}"
       matched_pattern="${STALL_MATCHED_PATTERN:-}"
+      active_reactive_rotate_token_digest="${STALL_REACTIVE_ROTATE_TOKEN_DIGEST:-}"
+      last_reactive_rotate_ts="${STALL_LAST_REACTIVE_ROTATE_TS:-0}"
     fi
     [[ "$first_detected_ts" =~ ^[0-9]+$ ]] || first_detected_ts=0
     [[ "$last_detected_ts" =~ ^[0-9]+$ ]] || last_detected_ts=0
@@ -6092,6 +6267,20 @@ process_stall_reports() {
         fi
       fi
     else
+      # #2217 roadmap step 4: a managed Claude `rate_limit` stall is a REAL
+      # provider 429 in the pane. Decide reactive rotation BEFORE the retry-nudge
+      # so the nudge lands on the FRESH token. Best-effort + heavily gated
+      # (feature flag, scope, CF/transport gate, per-token latch, shared
+      # lock/cooldown) inside the helper; a no-rotate decision is a no-op here.
+      if [[ "$classification" == "rate_limit" ]]; then
+        bridge_daemon_reactive_429_rotate "$agent" "$engine" "$excerpt" \
+          "$active_reactive_rotate_token_digest" || true
+        if [[ -n "$BRIDGE_REACTIVE_ROTATE_LATCH_DIGEST" ]]; then
+          active_reactive_rotate_token_digest="$BRIDGE_REACTIVE_ROTATE_LATCH_DIGEST"
+          last_reactive_rotate_ts="$BRIDGE_REACTIVE_ROTATE_LATCH_TS"
+          changed=0
+        fi
+      fi
       if (( nudge_count < max_nudges )) && (( nudge_count == 0 || now_ts - last_nudge_ts >= retry_seconds )); then
         if bridge_send_stall_nudge "$agent" "$session" "$engine" "$classification" >/dev/null 2>&1; then
           nudge_count=$((nudge_count + 1))
@@ -6147,7 +6336,7 @@ process_stall_reports() {
       fi
     fi
 
-    bridge_note_stall_state "$agent" "$classification" "$excerpt_hash" "$first_detected_ts" "$last_detected_ts" "$now_ts" "$idle" "$claimed" "$nudge_count" "$last_nudge_ts" "$escalated_ts" "$task_id" "$matched_pattern" "$matched_line_hash"
+    bridge_note_stall_state "$agent" "$classification" "$excerpt_hash" "$first_detected_ts" "$last_detected_ts" "$now_ts" "$idle" "$claimed" "$nudge_count" "$last_nudge_ts" "$escalated_ts" "$task_id" "$matched_pattern" "$matched_line_hash" "$active_reactive_rotate_token_digest" "$last_reactive_rotate_ts"
   done < "$_summary_tmp"
 
   return "$changed"
