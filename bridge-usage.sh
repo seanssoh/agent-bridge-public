@@ -234,6 +234,11 @@ shift || true
 claude_usage_cache="${BRIDGE_CLAUDE_USAGE_CACHE:-$HOME/.claude/plugins/claude-hud/.usage-cache.json}"
 codex_sessions_dir="${BRIDGE_CODEX_SESSIONS_DIR:-$HOME/.codex/sessions}"
 usage_state_file="${BRIDGE_USAGE_MONITOR_STATE_FILE:-$BRIDGE_STATE_DIR/usage/monitor-state.json}"
+# #2171 PR-B2 Part2: the auth-dead marker the native probe stamps on a 401 /
+# origin-403 and the daemon nudge fanout reads for deterministic active-dead
+# recover. Controller-state file (NOT the per-agent usage cache); the daemon
+# resolves the SAME default path. Single env contract shared with bridge-daemon.sh.
+claude_auth_dead_marker="${BRIDGE_CLAUDE_AUTH_DEAD_MARKER:-$BRIDGE_STATE_DIR/usage/claude-active-auth-dead.json}"
 rotation_threshold="${BRIDGE_CLAUDE_TOKEN_ROTATION_PERCENT:-99}"
 # Separate weekly preemptive warn threshold. Fires for the 7-day window before
 # rotation_threshold to allow proactive rotation/escalation.
@@ -707,6 +712,11 @@ bridge_usage_native_probe() {
 
   probe_args=(probe --cache-path "$cache_path" --registry-path "$registry_path")
   [[ -n "$ua_version" ]] && probe_args+=(--user-agent-version "$ua_version")
+  # #2171 PR-B2 Part2: hand the probe the auth-dead marker path so a 401 /
+  # origin-403 on the active token stamps the token-free marker the daemon nudge
+  # fanout consumes (and a later clean read clears it). Registry-only signal —
+  # the probe self-gates the write to the registry's active token.
+  [[ -n "$claude_auth_dead_marker" ]] && probe_args+=(--auth-dead-marker "$claude_auth_dead_marker")
   # Issue #1468 §5 (observability): ask the probe for its token-free `--json`
   # result so we can emit a `usage_probe` audit row on a 429 near-limit signal
   # or a probe failure (the path was previously a silent best-effort `exit 0`,

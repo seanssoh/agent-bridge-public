@@ -1571,6 +1571,148 @@ bridge_claude_pool_rotate_suppressed() {
   return 1
 }
 
+# #2171 PR-B2 Part2 (incident #19460 M4 fleet-down): is this nudge candidate a
+# Claude agent the managed-token rotation actually covers? The recover gate fires
+# only for the rotatable pool — a codex agent or a Claude agent outside the sync
+# scope must keep its blind-nudge behavior. Mirrors the `--agents static|all|csv`
+# selector shape the reactive rotate already uses. An explicit-empty scope means
+# "controller sentinels only" → no named agent qualifies.
+bridge_daemon_claude_recover_scope_match() {
+  local agent="$1"
+  local scope="$2"
+  case "$scope" in
+    all)
+      return 0
+      ;;
+    static)
+      bridge_agent_is_static "$agent"
+      ;;
+    "")
+      return 1
+      ;;
+    *)
+      local IFS=','
+      local entry
+      for entry in $scope; do
+        [[ "$entry" == "$agent" ]] && return 0
+      done
+      return 1
+      ;;
+  esac
+}
+
+# #2171 PR-B2 Part2: deterministic active-dead recover, consumed by the nudge
+# fanout BEFORE a blind keystroke. Detection is Option B ONLY — the usage probe
+# is the sole auth-dead marker writer; this does ZERO network, it READS +
+# identity-validates the marker, then (on a fresh, registry-bound match) stamps
+# the dead token + rotates the pool via the EXISTING reactive shapes. Returns 0
+# = proceed to nudge (no signal, or recovered onto a fresh live token); 1 =
+# SUPPRESS this agent's futile nudge (pool exhausted / across-pass cooldown).
+bridge_daemon_claude_active_dead_recover() {
+  local marker="$1"
+  local registry="$2"
+  local scope="$3"
+  local admin_agent="${BRIDGE_ADMIN_AGENT_ID:-}"
+  local max_age="${BRIDGE_CLAUDE_AUTH_DEAD_MARKER_MAX_AGE_SECONDS:-300}"
+
+  # Across-pass pool cooldown (reuse #1789 D2): a prior pass already found the
+  # whole pool saturated, so every token is dead/limited — a nudge is futile and
+  # a re-rotate would just thrash the registry lock + sync fanout. Suppress.
+  if bridge_claude_pool_rotate_suppressed; then
+    return 1
+  fi
+
+  # Read-only Option-B gate: consume ONLY when the marker is fresh AND still binds
+  # to the registry's CURRENT active token (id + display fingerprint + 16-char
+  # digest). Stale / replaced / unreadable / absent → no-signal → nudge normally.
+  local verdict_line=""
+  verdict_line="$(bridge_with_timeout 5 daemon_authdead_marker_check python3 "$SCRIPT_DIR/bridge-usage-probe.py" auth-dead-marker-check \
+    --registry-path "$registry" --marker-path "$marker" --max-age "$max_age" 2>/dev/null || true)"
+  local adv_verdict adv_id adv_fp adv_http adv_reason
+  IFS=$'\t' read -r adv_verdict adv_id adv_fp adv_http adv_reason <<<"$verdict_line"
+  [[ "$adv_verdict" == "-" ]] && adv_verdict=""
+  [[ "$adv_id" == "-" ]] && adv_id=""
+  [[ "$adv_fp" == "-" ]] && adv_fp=""
+  [[ "$adv_http" == "-" ]] && adv_http=""
+  # No fresh, identity-matched auth-dead signal → never suppress; nudge normally.
+  [[ "$adv_verdict" == "consume" ]] || return 0
+  [[ -n "$adv_id" && -n "$adv_fp" ]] || return 0
+
+  # #19460 deterministic stamp: mark the dead active token auth_failed WITHOUT a
+  # probe so the cascade skips it on this + later selections. Fingerprint-guarded
+  # (never stamps a since-replaced token); auth_failed NEVER permanently disables
+  # (TTL-bounded adverse freshness) so a refreshed credential can still recover.
+  local -a mark_args=(claude-token mark-adverse "$adv_id" --status auth_failed --fingerprint "$adv_fp" --source nudge:active-dead --json)
+  [[ -n "$adv_http" ]] && mark_args+=(--api-error-status "$adv_http")
+  bridge_with_timeout 10 daemon_authdead_mark_adverse "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" "${mark_args[@]}" >/dev/null 2>&1 || true
+
+  # Reuse the EXISTING reactive rotate shape (no second rotator): --if-auto-enabled
+  # gate, --preflight live-probe (Part1 — a dead/limited candidate is never synced
+  # fleet-wide), the global budget, and the --sync fanout. The raised ceiling
+  # absorbs a full budgeted ring (Part1).
+  local rotate_json=""
+  rotate_json="$(bridge_with_timeout "${BRIDGE_CLAUDE_ROTATE_TIMEOUT_SECONDS:-30}" daemon_authdead_rotate "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token rotate \
+    --if-auto-enabled \
+    --preflight \
+    --preflight-budget "${BRIDGE_CLAUDE_ROTATE_PREFLIGHT_BUDGET_SECONDS:-15}" \
+    --preflight-timeout "${BRIDGE_CLAUDE_ROTATE_PREFLIGHT_PER_CANDIDATE_SECONDS:-6}" \
+    --sync \
+    --agents "$scope" \
+    --reason "active_dead_recover:${adv_http:-401}" \
+    --json 2>/dev/null || true)"
+  local rotation_status_row=""
+  rotation_status_row="$(bridge_with_timeout 5 daemon_authdead_rotation_parse python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" rotation-status-parse "$rotate_json" || true)"
+  local rotation_status rotation_reason rotation_from rotation_to rotation_sync_status rotation_soonest_reset
+  IFS=$'\t' read -r rotation_status rotation_reason rotation_from rotation_to rotation_sync_status rotation_soonest_reset <<<"$rotation_status_row"
+  [[ "$rotation_status" == "-" ]] && rotation_status=""
+  [[ "$rotation_reason" == "-" ]] && rotation_reason=""
+  [[ "$rotation_from" == "-" ]] && rotation_from=""
+  [[ "$rotation_to" == "-" ]] && rotation_to=""
+  [[ "$rotation_sync_status" == "-" ]] && rotation_sync_status=""
+  [[ "$rotation_soonest_reset" == "-" ]] && rotation_soonest_reset=""
+
+  if [[ -n "$admin_agent" ]]; then
+    bridge_audit_log daemon claude_token_rotation "$admin_agent" \
+      --detail status="$rotation_status" \
+      --detail reason="$rotation_reason" \
+      --detail from="$rotation_from" \
+      --detail to="$rotation_to" \
+      --detail sync_status="$rotation_sync_status" \
+      --detail agent_scope="$scope" \
+      --detail rotation_trigger="active_dead_recover" \
+      --detail http_status="${adv_http:-}" \
+      --detail soonest_reset="$rotation_soonest_reset" >/dev/null 2>&1 || true
+  fi
+
+  case "$rotation_status:$rotation_reason" in
+    rotated:*)
+      # Fresh, live-probed token synced to the scope — re-arm the #1789 gate and
+      # let the nudge proceed (the recovered session now resolves the new token).
+      bridge_clear_claude_pool_exhausted
+      return 0
+      ;;
+    skipped:all_tokens_limited)
+      # Every enabled token is dead/limited — a nudge is futile. Arm the #1789 D2
+      # cooldown (stops across-pass thrash) and reuse the EXISTING pool-exhausted
+      # operator notice on its own latch (no new notifier). Suppress the nudge.
+      bridge_note_claude_pool_exhausted "$rotation_soonest_reset"
+      if [[ -n "$admin_agent" ]] \
+          && bridge_daemon_pass_due claude_pool_exhausted_notice "${BRIDGE_CLAUDE_POOL_EXHAUSTED_NOTICE_INTERVAL_SECONDS:-1800}" \
+          && bridge_agent_has_notify_transport "$admin_agent"; then
+        bridge_notify_send "$admin_agent" "claude token pool exhausted" \
+          "All enabled Claude tokens are rate-limited; rotation is paused instead of cycling a saturated pool (#1789). soonest_reset=${rotation_soonest_reset:-unknown}. Sessions may hit limit errors until a window resets." \
+          "" "urgent" "${BRIDGE_DAEMON_NOTIFY_DRY_RUN:-0}" >/dev/null 2>&1 || true
+      fi
+      return 1
+      ;;
+    *)
+      # no_alternate_token / error / auto-rotate-disabled (--if-auto-enabled
+      # no-op): best-effort — do NOT suppress, let the nudge proceed.
+      return 0
+      ;;
+  esac
+}
+
 bridge_usage_due() {
   local interval="${BRIDGE_USAGE_MONITOR_INTERVAL_SECONDS:-300}"
   local file=""
@@ -15395,6 +15537,15 @@ cmd_sync_cycle() {
   _nudge_tmp="$(mktemp)"
   # shellcheck disable=SC2064
   trap "rm -f -- '$_nudge_tmp'" RETURN
+  # #2171 PR-B2 Part2: auth-dead recover state, resolved once per tick. The marker
+  # path + the registry path share the SAME env contract bridge-usage.sh writes
+  # under; the recover runs at most once per tick (the *_tick latch) and its
+  # suppress verdict is reused across every eligible candidate in the same tick.
+  local _authdead_marker="${BRIDGE_CLAUDE_AUTH_DEAD_MARKER:-$BRIDGE_STATE_DIR/usage/claude-active-auth-dead.json}"
+  local _authdead_registry="${BRIDGE_CLAUDE_TOKEN_REGISTRY:-$BRIDGE_RUNTIME_SECRETS_DIR/claude-oauth-tokens.json}"
+  local _authdead_scope="${BRIDGE_CLAUDE_TOKEN_SYNC_AGENTS:-static}"
+  local _authdead_recovered_tick=0
+  local _authdead_suppress_nudge=0
 
   # #946 L1 (r2): per-tick stale-source-checkout drift detector. Runs
   # FIRST so the cycle never silently fans out [Errno 2] from helper
@@ -15806,6 +15957,33 @@ cmd_sync_cycle() {
       bridge_daemon_nudge_defer_and_maybe_escalate \
         "$agent" "${nudge_key%%,*}" session_dead "$queued" "$nudge_key" || true
       continue
+    fi
+
+    # #2171 PR-B2 Part2 (incident #19460 M4 fleet-down): deterministic active-dead
+    # recover BEFORE a blind nudge. When the controller's active Claude token is
+    # auth-dead (the usage probe's Option-B marker), a keystroke to a Claude
+    # rotation-eligible agent just burns a turn against a 401. The marker file's
+    # ABSENCE is the overwhelmingly-common fast path (no work). Gate ONLY Claude +
+    # rotation-eligible agents (a codex / out-of-scope agent keeps blind-nudge).
+    # The recover runs at most ONCE per tick and the suppress verdict is reused:
+    # after a successful rotate the active id changes so the marker stops matching,
+    # and the #1789 D2 cooldown stops across-pass re-rotate thrash.
+    if [[ -f "$_authdead_marker" ]] \
+        && [[ "$(bridge_agent_engine "$agent")" == "claude" ]] \
+        && bridge_daemon_claude_recover_scope_match "$agent" "$_authdead_scope"; then
+      if [[ "$_authdead_recovered_tick" -eq 0 ]]; then
+        _authdead_recovered_tick=1
+        if bridge_daemon_claude_active_dead_recover "$_authdead_marker" "$_authdead_registry" "$_authdead_scope"; then
+          _authdead_suppress_nudge=0
+        else
+          _authdead_suppress_nudge=1
+        fi
+      fi
+      if [[ "$_authdead_suppress_nudge" -eq 1 ]]; then
+        # Pool exhausted / across-pass cooldown — the nudge is futile. Skip it and
+        # rely on the EXISTING #1789 pool-exhausted escalation (no new notifier).
+        continue
+      fi
     fi
 
     if nudge_agent_session "$agent" "$session" "$queued" "$claimed" "$idle" "$nudge_key"; then

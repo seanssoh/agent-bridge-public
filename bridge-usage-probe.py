@@ -138,6 +138,34 @@ def _read_active_token_from_registry(registry_path: Path) -> str | None:
     return None
 
 
+def _read_active_token_identity(registry_path: Path) -> tuple[str, str | None]:
+    """Read ``(active_token_id, token)`` from the rotation registry.
+
+    #2171 PR-B2 Part2: the auth-dead marker binds to the registry's ACTIVE token
+    id (not just the token), and the fanout validator recomputes the current id +
+    fingerprint + digest from this same source. Read-only; mirrors
+    ``_read_active_token_from_registry`` but also surfaces the id. Returns
+    ``("", None)`` when the registry is absent/unreadable or has no active row."""
+    try:
+        payload = json.loads(registry_path.read_text(encoding="utf-8"))
+    except Exception:
+        return "", None
+    if not isinstance(payload, dict):
+        return "", None
+    active_id = str(payload.get("active_token_id") or "")
+    rows = payload.get("tokens")
+    if not active_id or not isinstance(rows, list):
+        return "", None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("id") or "") == active_id:
+            token = row.get("token")
+            if isinstance(token, str) and token.strip():
+                return active_id, token.strip()
+    return active_id, None
+
+
 def _read_token_from_fd(fd: int) -> str | None:
     """Read a bare OAT from a deliberately-inherited file descriptor.
 
@@ -667,6 +695,25 @@ def _token_signal_digest(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
 
 
+def _display_fingerprint(token: str) -> str:
+    """Mirror ``bridge-auth.py:token_fingerprint`` — the registry's DISPLAY form.
+
+    #2171 PR-B2 Part2: the auth-dead marker carries the display fingerprint so the
+    daemon fanout can bind the marker to the registry's CURRENT active token AND
+    pass the SAME value to ``bridge-auth.sh claude-token mark-adverse --fingerprint``
+    (whose stale-token guard recomputes ``token_fingerprint(row token)`` under the
+    lock). This MUST stay byte-for-byte identical to ``bridge-auth.py``'s
+    ``token_fingerprint`` (``sha256:<12hex>...<tail4>``) — a single-char drift makes
+    the fanout's fingerprint gate (or the mark-adverse guard) miss and the recover
+    goes silently inert. Deliberately NOT ``_token_signal_digest`` (the 16-char,
+    tail-free cache key). Empty token → empty (no match)."""
+    if not token:
+        return ""
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    tail = token[-4:] if len(token) >= 4 else token
+    return f"sha256:{digest[:12]}...{tail}"
+
+
 def _signal_reset_at(retry_after: float | None, now: float) -> str:
     """Derive the synthetic window ``reset_at`` from a 429 Retry-After.
 
@@ -1102,6 +1149,130 @@ def _clear_signal_state(cache_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Auth-dead marker (#2171 PR-B2 Part2) — the SOLE writer of the active-token
+# auth-death signal the daemon nudge fanout consumes for deterministic recover.
+# Option B: this probe (the only component that actually talks to the endpoint)
+# classifies a 401 / origin-served 403 as auth-death and STAMPS a token-free
+# marker; the fanout does ZERO network — it only READS + identity-validates this
+# marker. Kept SEPARATE from `.usage-cache.json` (a real-quota 429 stays on the
+# existing synthetic-signal path; this marker is auth-death only).
+# --------------------------------------------------------------------------- #
+DEFAULT_AUTH_DEAD_MARKER_MAX_AGE_SECONDS = 300
+AUTH_DEAD_MARKER_SOURCE = "usage-probe"
+
+
+def _write_auth_dead_marker(
+    marker_path: Path, *, active_token_id: str, token: str, http_status: int, now: float
+) -> None:
+    """Stamp the token-free auth-dead marker for the registry's active token.
+
+    Fields (all token-FREE — fingerprint/digest are one-way, the display form's
+    4-char tail is the same non-secret tail bridge-auth already logs):
+    ``active_token_id`` + display ``token_fingerprint`` + ``_token_signal_digest``
+    (16-char) + ``http_status`` + ``source`` + ``written_at``. Best-effort: a
+    write failure must never crash the probe (it always degrades + exits 0)."""
+    payload = {
+        "active_token_id": active_token_id,
+        "token_fingerprint": _display_fingerprint(token),
+        "_token_signal_digest": _token_signal_digest(token),
+        "http_status": int(http_status),
+        "source": AUTH_DEAD_MARKER_SOURCE,
+        "written_at": datetime.fromtimestamp(int(now), tz=timezone.utc).isoformat(),
+    }
+    try:
+        _atomic_write_json(marker_path, payload)
+    except Exception:
+        pass
+
+
+def _clear_auth_dead_marker(marker_path: Path, active_digest: str) -> None:
+    """Remove the marker when the CURRENT active token reads cleanly again.
+
+    Guard on the digest so a clean read only clears a marker that blames the
+    token that just succeeded (a stale marker for a since-rotated token is left
+    for the fanout's own active-id mismatch to reject + a later probe to clear).
+    Best-effort; never raises."""
+    if not active_digest:
+        return
+    try:
+        spec = json.loads(marker_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if isinstance(spec, dict) and str(spec.get("_token_signal_digest") or "") == active_digest:
+        try:
+            # The auth-dead marker is a controller/daemon-owned state file under
+            # BRIDGE_STATE_DIR (single-writer, not an iso-per-agent path), so the
+            # raw unlink is safe and intentionally not routed through the isolated
+            # safe wrapper — mirrors the sibling controller-owned sites in this file.
+            marker_path.unlink()  # noqa: raw-pathlib-controller-only
+        except Exception:
+            pass
+
+
+def auth_dead_marker_verdict(
+    marker_path: Path, registry_path: Path, max_age_seconds: float, now: float
+) -> dict[str, str]:
+    """Read-only fanout gate: decide whether the marker may drive a recover.
+
+    Consumes the marker ONLY when it is FRESH **and** every identity field still
+    matches the registry's CURRENT active token (id + display fingerprint +
+    16-char digest). A stale/unreadable/absent marker, or any drift after an
+    active/token replacement, returns ``no-signal`` with a reason — the caller
+    then nudges normally (NEVER suppressed). Zero network; token bytes stay in
+    this process (only the non-secret id/fingerprint/http_status are returned)."""
+    def no_signal(reason: str) -> dict[str, str]:
+        return {"verdict": "no-signal", "reason": reason}
+
+    try:
+        spec = json.loads(marker_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return no_signal("marker_absent")
+    except Exception:
+        return no_signal("marker_unreadable")
+    if not isinstance(spec, dict):
+        return no_signal("marker_unreadable")
+
+    active_id, token = _read_active_token_identity(registry_path)
+    if not active_id or not token:
+        return no_signal("no_active_token")
+
+    written_raw = str(spec.get("written_at") or "")
+    try:
+        # Python <3.11's fromisoformat rejects a trailing `Z`; normalize it to the
+        # explicit UTC offset (same compat shim as the _written_at parse above).
+        written_epoch = datetime.fromisoformat(
+            written_raw.replace("Z", "+00:00")
+        ).timestamp()
+    except (TypeError, ValueError):
+        return no_signal("no_written_at")
+    age = now - written_epoch
+    if age < 0 or age > max_age_seconds:
+        return no_signal("stale")
+
+    current_fp = _display_fingerprint(token)
+    current_digest = _token_signal_digest(token)
+    # Explicit None check: a present-but-falsy marker id (e.g. 0 / "") must NOT be
+    # coalesced into the empty string and then mismatch-compared — treat any
+    # non-string/missing id as an outright mismatch so it never spuriously binds.
+    marker_active_id = spec.get("active_token_id")
+    if not isinstance(marker_active_id, str) or marker_active_id != active_id:
+        return no_signal("active_id_mismatch")
+    if str(spec.get("token_fingerprint") or "") != current_fp:
+        return no_signal("fingerprint_mismatch")
+    if str(spec.get("_token_signal_digest") or "") != current_digest:
+        return no_signal("digest_mismatch")
+
+    return {
+        "verdict": "consume",
+        "reason": "match",
+        "active_token_id": active_id,
+        "fingerprint": current_fp,
+        "http_status": str(spec.get("http_status") or ""),
+        "source": str(spec.get("source") or ""),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Orchestration
 # --------------------------------------------------------------------------- #
 def run_probe(
@@ -1120,6 +1291,7 @@ def run_probe(
     now: float | None = None,
     http_get=_http_get_usage,
     log=None,
+    auth_dead_marker: Path | None = None,
 ) -> dict[str, Any]:
     """Refresh the native usage cache when due; otherwise serve stale.
 
@@ -1327,6 +1499,27 @@ def run_probe(
             cache_path, active_digest, now,
             outcome="failure", base_seconds=cooldown_seconds,
         )
+        # #2171 PR-B2 Part2: a 401 or an origin-served 403 on the active token is
+        # AUTH-DEATH (an edge-blocked 403 already diverged to CLASSIFICATION_EDGE_
+        # BLOCKED above; a malformed 429 / transport error stays unmarked). Stamp
+        # the token-free auth-dead marker — but ONLY when the probed token IS the
+        # registry's active token (the recover lane is registry-only), so the
+        # fanout's id+fingerprint+digest gate can bind it deterministically.
+        if (
+            auth_dead_marker is not None
+            and registry_path is not None
+            and last_http_error is not None
+            and last_http_error.status in (401, 403)
+        ):
+            active_id, active_token = _read_active_token_identity(registry_path)
+            if active_id and active_token and active_token == token:
+                _write_auth_dead_marker(
+                    auth_dead_marker,
+                    active_token_id=active_id,
+                    token=active_token,
+                    http_status=last_http_error.status,
+                    now=now,
+                )
         result: dict[str, Any] = {"status": "degraded", "cache_path": str(cache_path)}
         if last_http_error is not None:
             result["http_status"] = last_http_error.status
@@ -1379,6 +1572,11 @@ def run_probe(
     # and clear this token's cooldown/backoff streak (it is healthy again).
     _clear_signal_state(cache_path)
     clear_token_cooldown(cache_path, active_digest)
+    # #2171 PR-B2 Part2: a clean reading means the active token is healthy again —
+    # drop any auth-dead marker that blamed it so a transient 401 that recovered
+    # before the next fanout tick can never drive a spurious recover/rotation.
+    if auth_dead_marker is not None:
+        _clear_auth_dead_marker(auth_dead_marker, active_digest)
     return {
         "status": "written",
         "cache_path": str(cache_path),
@@ -1421,6 +1619,10 @@ def build_parser() -> argparse.ArgumentParser:
     probe.add_argument("--max-age", type=float, default=None)
     probe.add_argument("--cooldown", type=float, default=None)
     probe.add_argument("--http-timeout", type=float, default=None)
+    # #2171 PR-B2 Part2: the SOLE auth-dead marker file. Absent ⇒ no marker is
+    # written (back-compat / non-registry installs); the daemon wrapper supplies
+    # the controller-state path on every probe.
+    probe.add_argument("--auth-dead-marker", default=None)
     probe.add_argument("--json", action="store_true")
     probe.set_defaults(handler=cmd_probe)
 
@@ -1435,6 +1637,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     digest.add_argument("--registry-path", required=True)
     digest.set_defaults(handler=cmd_active_token_digest)
+
+    # #2171 PR-B2 Part2: read-only fanout gate. The daemon nudge loop calls this
+    # to decide whether a fresh auth-dead marker still binds to the registry's
+    # CURRENT active token (consume) or has gone stale/mismatched (no-signal —
+    # nudge normally). Zero network; emits only token-free id/fingerprint fields.
+    adm = sub.add_parser(
+        "auth-dead-marker-check",
+        help="validate the auth-dead marker against the registry's active token",
+    )
+    adm.add_argument("--registry-path", required=True)
+    adm.add_argument("--marker-path", required=True)
+    adm.add_argument("--max-age", type=float, default=None)
+    adm.add_argument("--json", action="store_true")
+    adm.set_defaults(handler=cmd_auth_dead_marker_check)
 
     return parser
 
@@ -1467,6 +1683,9 @@ def cmd_probe(args: argparse.Namespace) -> int:
         else _env_float("BRIDGE_USAGE_PROBE_HTTP_TIMEOUT", DEFAULT_HTTP_TIMEOUT_SECONDS)
     )
     token_file = Path(args.token_file).expanduser() if args.token_file else None
+    auth_dead_marker = (
+        Path(args.auth_dead_marker).expanduser() if args.auth_dead_marker else None
+    )
 
     result = run_probe(
         cache_path=cache_path,
@@ -1481,6 +1700,7 @@ def cmd_probe(args: argparse.Namespace) -> int:
         http_timeout=http_timeout,
         retry_after_cap=DEFAULT_RETRY_AFTER_CAP_SECONDS,
         log=lambda m: print(m, file=sys.stderr),
+        auth_dead_marker=auth_dead_marker,
     )
     if args.json:
         print(json.dumps(result, ensure_ascii=True))
@@ -1500,6 +1720,49 @@ def cmd_active_token_digest(args: argparse.Namespace) -> int:
     token = _read_active_token_from_registry(Path(args.registry_path).expanduser())
     if token:
         print(_token_signal_digest(token))
+    return 0
+
+
+def cmd_auth_dead_marker_check(args: argparse.Namespace) -> int:
+    """Print the fanout gate verdict for the auth-dead marker.
+
+    Default output is one stable TSV line the daemon parses directly:
+    ``verdict<TAB>active_token_id<TAB>fingerprint<TAB>http_status<TAB>reason``
+    with ``-`` for empty fields (so adjacent-tab collapse never shifts columns).
+    ``--json`` emits the full dict for tests. Always exits 0 (best-effort gate —
+    any failure degrades to ``no-signal`` and the caller nudges normally)."""
+    max_age = (
+        args.max_age
+        if args.max_age is not None
+        else _env_float(
+            "BRIDGE_CLAUDE_AUTH_DEAD_MARKER_MAX_AGE_SECONDS",
+            DEFAULT_AUTH_DEAD_MARKER_MAX_AGE_SECONDS,
+        )
+    )
+    verdict = auth_dead_marker_verdict(
+        Path(args.marker_path).expanduser(),
+        Path(args.registry_path).expanduser(),
+        max_age,
+        time.time(),
+    )
+    if args.json:
+        print(json.dumps(verdict, ensure_ascii=True))
+    else:
+        def field(name: str) -> str:
+            value = str(verdict.get(name) or "")
+            return value if value else "-"
+
+        print(
+            "\t".join(
+                (
+                    field("verdict"),
+                    field("active_token_id"),
+                    field("fingerprint"),
+                    field("http_status"),
+                    field("reason"),
+                )
+            )
+        )
     return 0
 
 
