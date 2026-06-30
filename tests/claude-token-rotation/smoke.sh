@@ -1137,6 +1137,18 @@ if mod.parse_reset_at("resets Jul 1,12pm (UTC)", ref) != "2026-07-01T12:00:00+00
 for bad in ("resets Jul 1 at 12pm (Mars/Phobos)", "resets Jul 1 at 12pm (Not_A_Zone)"):
     if mod.parse_reset_at(bad, ref) != "":
         raise SystemExit(f"unknown tz should yield '' for {bad!r}")
+
+# #2204: malformed date-anchored weekly strings must FAIL CLOSED ("") instead of
+# raising out of the probe. ``Jul 32``/``Jul 0`` trip the static day guard;
+# ``Feb 30`` overflows the month specifically and is caught by the try/except
+# (a static bound cannot reject it). (LTS v0.16.21 never-die backport: scoped to
+# the #2204 date-anchored set; the #17927 bare-clock assertions are not on the
+# LTS line — parse_reset_at has no bare-clock branch here — so they are omitted.)
+for bad in ("resets Jul 32 at 12pm (UTC)", "resets Feb 30 at 12pm (UTC)",
+            "resets Jul 1 at 13pm (UTC)", "resets Jul 1 at 12:60pm (UTC)",
+            "resets Jul 0 at 12pm (UTC)"):
+    if mod.parse_reset_at(bad, ref) != "":
+        raise SystemExit(f"malformed date-anchored weekly must yield '' (no raise) for {bad!r}")
 PY
 [[ $? -eq 0 ]] || fail "parse_reset_at named-tz / fallback unit cases failed (#17927 G1)"
 pass "parse_reset_at parses the named-tz weekly reset, keeps legacy forms, falls back on unknown tz"
