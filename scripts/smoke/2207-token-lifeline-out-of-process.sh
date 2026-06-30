@@ -273,6 +273,11 @@ step_t6_failure_bounded_audited() {
 step_t7_dry_run_no_mutation() {
   smoke_log "T7: DRY_RUN=1 → would-run audit, NO real auth call"
   life_setup
+  local state_file="$LIFE_STATE_DIR/token-lifeline.ts"
+  # HERMETIC (codex r3 hypothesis B): explicitly clear the throttle state file so
+  # the ONLY possible writer before the real tick below is the DRY_RUN tick
+  # itself — no prior case's timestamp can leak in and throttle the real tick.
+  rm -f "$state_file"
   BRIDGE_DAEMON_LIVENESS_DRY_RUN=1 life_run 900
   # No shim invocation at all under DRY_RUN.
   if [[ -s "$AUTH_LOG" ]]; then
@@ -286,14 +291,21 @@ step_t7_dry_run_no_mutation() {
     || smoke_fail "T7: DRY_RUN did not log the would-run line"
   # codex r2 finding 3: DRY_RUN must mutate NOTHING — the throttle state file must
   # NOT be written, or a DRY_RUN tick would suppress the next REAL stale tick.
-  if [[ -e "$LIFE_STATE_DIR/token-lifeline.ts" ]]; then
-    smoke_fail "T7: DRY_RUN wrote the throttle state file token-lifeline.ts — it would suppress the next real tick (codex r2 finding 3)"
+  if [[ -e "$state_file" ]]; then
+    smoke_fail "T7: DRY_RUN wrote the throttle state file token-lifeline.ts — it would suppress the next real tick (codex r2 finding 3) [$(ls -la "$state_file" 2>&1)]"
   fi
+  # CI-visible diagnostics (codex r3): record the throttle-witness state + the
+  # watcher output right before the real tick so a CI failure shows WHETHER the
+  # throttle came from the DRY_RUN tick or a leak. Logged unconditionally.
+  smoke_log "T7 diag: pre-real-tick state_file=$([[ -e "$state_file" ]] && printf 'EXISTS[%s]' "$(ls -la "$state_file" 2>&1)" || printf ABSENT) now=$(date +%s)"
   # And prove it does NOT suppress a subsequent REAL tick: a real run right after
   # the DRY_RUN must actually invoke the auth shim (throttle was never armed).
+  : >"$AUTH_LOG"   # isolate the real-tick auth calls from the (empty) DRY_RUN log
   BRIDGE_DAEMON_LIVENESS_DRY_RUN=0 life_run 900
-  [[ "$(auth_count 'recover-due')" == "1" ]] \
-    || smoke_fail "T7: a real tick after a DRY_RUN was throttled — DRY_RUN must not arm the throttle (log: $(cat "$AUTH_LOG"))"
+  if [[ "$(auth_count 'recover-due')" != "1" ]]; then
+    smoke_log "T7 diag FAIL-CTX: state_file=$([[ -e "$state_file" ]] && printf 'EXISTS[%s]' "$(cat "$state_file" 2>&1)" || printf ABSENT) auth_log=[$(cat "$AUTH_LOG")] liveness_out=[$(cat "$LIFE_STATE_DIR/liveness.out")]"
+    smoke_fail "T7: a real tick after a DRY_RUN was throttled — DRY_RUN must not arm the throttle (recover-due count=$(auth_count 'recover-due'))"
+  fi
   smoke_log "T7: OK — DRY_RUN audits but mutates nothing (state file absent; real tick not suppressed)"
 }
 

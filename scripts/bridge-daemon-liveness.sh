@@ -1212,7 +1212,14 @@ token_lifeline_due() {
 
 # Record the attempt timestamp — called EVEN ON FAILURE so a persistent auth
 # error does not hot-loop the lifeline every 60s poll. Best-effort.
+#
+# Belt-and-suspenders (codex r3 finding 3): NEVER write the throttle witness under
+# DRY_RUN, regardless of caller. The single caller already returns before this on
+# the DRY_RUN path, but a structural guard here makes it impossible for ANY future
+# code path (or platform-specific reordering) to arm the throttle during a dry run
+# — a DRY_RUN tick must leave ZERO throttle state on every platform/tier.
 token_lifeline_record() {
+  [[ "${BRIDGE_DAEMON_LIVENESS_DRY_RUN:-0}" == "1" ]] && return 0
   mkdir -p "$(dirname "$BRIDGE_DAEMON_TOKEN_LIFELINE_STATE_FILE")" 2>/dev/null || true
   printf '%s\n' "$(now_ts)" 2>/dev/null >"$BRIDGE_DAEMON_TOKEN_LIFELINE_STATE_FILE" || true
 }
