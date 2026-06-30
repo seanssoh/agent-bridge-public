@@ -80,6 +80,10 @@ if [[ -z "$BASH_PATH" ]]; then
   exit 1
 fi
 
+# Issue #2206: there is no launchd OOM-score equivalent (macOS has no
+# /proc/self/oom_score_adj and the plist has no OOMScoreAdjust key), so OOM
+# protection is Linux-only. On macOS the daemon instead relies on the separate
+# launchd-drift self-heal + memory-pressure guard; do not invent a plist key here.
 PLIST_CONTENT="$(cat <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

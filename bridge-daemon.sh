@@ -16551,6 +16551,30 @@ bridge_daemon_consume_recovery_marker_renudge() {
   return 0
 }
 
+# Issue #2206: protect the daemon from the OOM killer on Linux when it is NOT
+# under systemd (the systemd unit sets OOMScoreAdjust=-800 declaratively; this
+# is the plain-bash / launchd-supervised equivalent). Writing a negative
+# oom_score_adj makes the daemon a *last* OOM victim so a leaked managed child
+# driving memory pressure cannot take the daemon — and the in-daemon reapers /
+# token-lifeline that ride its tick — down first.
+#
+# Best-effort and non-fatal by contract:
+#   - Linux-only (the /proc/self/oom_score_adj interface does not exist on
+#     macOS; launchd has no oom_score equivalent — see install-daemon-launchagent.sh).
+#   - Silently no-ops on EPERM (unprivileged containers / iso-v2 UIDs cannot
+#     lower their own score) or any write failure. MUST NOT abort startup.
+#   - Idempotent: re-running simply rewrites the same value.
+bridge_daemon_protect_from_oom() {
+  [[ "$(uname -s 2>/dev/null)" == "Linux" ]] || return 0
+  local target="${BRIDGE_DAEMON_OOM_SCORE_ADJ:--800}"
+  local proc_file="/proc/self/oom_score_adj"
+  [[ -w "$proc_file" ]] || return 0
+  if printf '%s\n' "$target" 2>/dev/null >"$proc_file"; then
+    daemon_log_event "oom: set oom_score_adj=${target} (#2206)" 2>/dev/null || true
+  fi
+  return 0
+}
+
 cmd_run() {
   local cycle_status
 
@@ -16601,6 +16625,11 @@ cmd_run() {
     echo "$$" >"$BRIDGE_DAEMON_PID_FILE"
   fi
   BRIDGE_DAEMON_LAST_STEP="startup"
+
+  # Issue #2206: best-effort OOM protection for the plain-bash / launchd path
+  # (the systemd unit sets OOMScoreAdjust declaratively). Linux-only,
+  # non-fatal — never blocks startup.
+  bridge_daemon_protect_from_oom || true
 
   # Issue #1955: one-line self-diagnosis WARN when this daemon is
   # unsupervised (orphaned, no launchd/systemd job) or running from a
