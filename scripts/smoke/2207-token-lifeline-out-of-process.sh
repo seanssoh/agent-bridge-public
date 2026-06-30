@@ -100,21 +100,47 @@ life_setup() {
 # (0 = fresh, >threshold = stale). Extra env (AUTH_*_RC / DRY_RUN / interval) is
 # passed through the caller's environment. The gateway status command is a fixed
 # idle stub so the gateway-stall path never interferes with the heartbeat verdict.
+# Back-date a heartbeat file to `now - hb_age` seconds, PORTABLY across BSD/mac
+# and GNU/Linux. $1 = file, $2 = age seconds. The watcher reads the file's MTIME
+# (via `stat`), so the heartbeat is only "stale" if the mtime actually moves back.
+#
+# Portability trap (the T12 Linux-red root cause): `date -r N` means two different
+# things — BSD/mac: "interpret epoch N"; GNU/Linux: "use the mtime of FILE named
+# N" (which fails for an integer). So we must try GNU `touch -d @epoch` (and
+# `date -d @epoch` for the BSD `touch -t` stamp) explicitly, not via `date -r`.
+# We then ASSERT the mtime took within tolerance — a silently-failed back-date
+# would otherwise leave a FRESH heartbeat and make a "stale" case wrongly pass as
+# fresh (exactly what made T12 green on mac, red on Linux).
+set_heartbeat_mtime() {
+  local hb_file="$1" hb_age="$2"
+  local now mtime got
+  now="$(date +%s)"
+  mtime=$(( now - hb_age ))
+  printf '%s\n' "$mtime" >"$hb_file"
+  # GNU coreutils touch: -d @EPOCH. Try it first (Linux/CI path).
+  if ! touch -d "@$mtime" "$hb_file" 2>/dev/null; then
+    # BSD/mac touch: -t [[CC]YY]MMDDhhmm[.SS] from a BSD `date -r EPOCH`.
+    touch -t "$(date -r "$mtime" +%Y%m%d%H%M.%S 2>/dev/null)" "$hb_file" 2>/dev/null || true
+  fi
+  # Verify the back-date actually took (within 5s) — fail loudly otherwise so a
+  # platform where neither form works can never masquerade a fresh heartbeat as
+  # stale (or vice-versa).
+  # Read the mtime back PORTABLY. GNU coreutils: `stat -c %Y`; BSD/mac: `stat -f %m`.
+  # (Order matters: `stat -f` on GNU means "filesystem status" and prints garbage,
+  # so we MUST try the platform-correct form and sanitize the result to digits.)
+  got="$(stat -c %Y "$hb_file" 2>/dev/null || stat -f %m "$hb_file" 2>/dev/null || true)"
+  got="${got//[^0-9]/}"; [[ -n "$got" ]] || got=0
+  local delta=$(( got - mtime )); (( delta < 0 )) && delta=$(( -delta ))
+  (( delta <= 5 )) || smoke_fail "set_heartbeat_mtime: could not back-date $hb_file to age=${hb_age}s (wanted mtime=$mtime, got=$got) — heartbeat staleness would be wrong on this platform"
+}
+
 life_run() {
   local hb_age="$1"; shift || true
   local hb_file="$LIFE_STATE_DIR/daemon.heartbeat"
   # Deliberate test-fixture filename (the #1973 recovery-marker path the watcher
   # writes on a restart); not a real iso-helper boundary callsite.
   local renudge_file="$LIFE_STATE_DIR/recovery.env"  # noqa: iso-helper-boundary
-  local now mtime
-  now="$(date +%s)"
-  mtime=$(( now - hb_age ))
-  printf '%s\n' "$mtime" >"$hb_file"
-  if date -r "$mtime" >/dev/null 2>&1; then
-    touch -t "$(date -r "$mtime" +%Y%m%d%H%M.%S 2>/dev/null)" "$hb_file" 2>/dev/null || true
-  elif touch -d "@$mtime" "$hb_file" 2>/dev/null; then
-    :
-  fi
+  set_heartbeat_mtime "$hb_file" "$hb_age"
   env \
     BRIDGE_HOME="$BRIDGE_HOME" \
     BRIDGE_STATE_DIR="$LIFE_STATE_DIR" \
@@ -459,12 +485,12 @@ step_t12_bounded_fail_closed() {
     smoke_skip "T12 setup: could not strip perl from the test PATH" && return 0
   fi
   local hb_file="$LIFE_STATE_DIR/daemon.heartbeat"
-  local now mtime start end
-  now="$(date +%s)"; mtime=$(( now - 900 ))
-  printf '%s\n' "$mtime" >"$hb_file"
-  if date -r "$mtime" >/dev/null 2>&1; then
-    touch -t "$(date -r "$mtime" +%Y%m%d%H%M.%S 2>/dev/null)" "$hb_file" 2>/dev/null || true
-  fi
+  local start end
+  # Use the PORTABLE back-dater (the inline `date -r` form here was the Linux-red
+  # root cause: on GNU it stat'd a file named by the epoch, failed, and left the
+  # heartbeat FRESH → main() returned daemon_liveness_ok and the lifeline never
+  # ran → no fail-closed audit). set_heartbeat_mtime verifies the mtime took.
+  set_heartbeat_mtime "$hb_file" 900
   start="$(date +%s)"
   PATH="$minbin" env \
     BRIDGE_HOME="$BRIDGE_HOME" \
