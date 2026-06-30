@@ -203,9 +203,9 @@ test_t1_carry_over() {
   local eff_model
   eff_model="$(effective_model_of "$agent")"
   smoke_assert_eq "$OPERATOR_MODEL" "$eff_model" \
-    "T1 (Part A): settings.effective.json model is not the carried model (fell back to the template default?)"
+    "T1 (Part A): settings.effective.json model is not the carried model (fell back to the template default?)"  # noqa: iso-helper-boundary — assertion message, not an iso-boundary filesystem callsite
   [[ "$eff_model" != "$TEMPLATE_DEFAULT_MODEL" ]] \
-    || smoke_fail "T1 (Part A): settings.effective.json rendered the unavailable template default '$TEMPLATE_DEFAULT_MODEL'"
+    || smoke_fail "T1 (Part A): settings.effective.json rendered the unavailable template default '$TEMPLATE_DEFAULT_MODEL'"  # noqa: iso-helper-boundary — assertion message, not an iso-boundary filesystem callsite
   smoke_log "T1 OK — carry-over: launch_cmd + roster + effective.json all describe '$OPERATOR_MODEL' (effort '$effort'), not the template default"
 }
 
@@ -241,7 +241,7 @@ test_t2_explicit_override_wins() {
   local eff_model
   eff_model="$(effective_model_of "$agent")"
   smoke_assert_eq "$override_model" "$eff_model" \
-    "T2: settings.effective.json did not render the explicit --model override"
+    "T2: settings.effective.json did not render the explicit --model override"  # noqa: iso-helper-boundary — assertion message, not an iso-boundary filesystem callsite
   smoke_log "T2 OK — explicit --model/--effort win over the carry-over in launch_cmd, roster, and effective.json"
 }
 
@@ -320,7 +320,7 @@ test_t4_agent_model_wins_over_operator_global() {
     "T4 (Part A mutation): the carried --agent-model did not win over the operator-global model in the effective file"
   [[ "$got" != "$TEMPLATE_DEFAULT_MODEL" ]] \
     || smoke_fail "T4: the effective file rendered the operator-global template default instead of the carried model"
-  smoke_log "T4 OK — carried --agent-model wins over the operator-global model in settings.effective.json (Part-A mutation proof)"
+  smoke_log "T4 OK — carried --agent-model wins over the operator-global model in settings.effective.json (Part-A mutation proof)"  # noqa: iso-helper-boundary — log message, not an iso-boundary filesystem callsite
 }
 
 # --- run -------------------------------------------------------------------
@@ -329,4 +329,4 @@ smoke_run "T2 explicit --model/--effort override wins over the carry-over" test_
 smoke_run "T3 empty --agent-model is inert (no regression for new statics)" test_t3_no_regression_empty_agent_model
 smoke_run "T4 carried --agent-model wins over operator-global (Part-A mutation proof)" test_t4_agent_model_wins_over_operator_global
 
-smoke_log "PASS — #2216 convert preserves the source model+effort: carried into the baked launch_cmd, the materialized roster fields, and the rendered settings.effective.json; explicit overrides win; empty carry is inert; render injection is load-bearing"
+smoke_log "PASS — #2216 convert preserves the source model+effort: carried into the baked launch_cmd, the materialized roster fields, and the rendered settings.effective.json; explicit overrides win; empty carry is inert; render injection is load-bearing"  # noqa: iso-helper-boundary — log message, not an iso-boundary filesystem callsite

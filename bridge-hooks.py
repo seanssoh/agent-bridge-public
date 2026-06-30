@@ -4637,7 +4637,7 @@ def build_parser() -> argparse.ArgumentParser:
     render_shared_parser.add_argument(
         "--agent-model",
         default="",
-        help="Issue #2216: the source agent's resolved model to render INTO settings.effective.json `model` (carried-value layer that wins over the operator-global #11901 inheritance). Passed ONLY by the dynamic→static converter so a converted role boots on the model it ran on instead of the user-class template default; empty for every other render (no behavior change). Argv-safe token only; anything else is ignored.",
+        help="Issue #2216: the source agent's resolved model to render INTO settings.effective.json `model` (carried-value layer that wins over the operator-global #11901 inheritance). Passed ONLY by the dynamic→static converter so a converted role boots on the model it ran on instead of the user-class template default; empty for every other render (no behavior change). Argv-safe token only; anything else is ignored.",  # noqa: iso-helper-boundary — argparse help string, not an iso-boundary filesystem callsite
     )
     render_shared_parser.add_argument(
         "--agent-effort",
