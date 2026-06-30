@@ -160,6 +160,41 @@ _assert_dead "orphan app-server (spaced EOL) OEA" "$OEA"
 kill "${_pids5[@]}" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
+# Regression guard for the codex Phase-4 r2 finding (#20580): a live agent
+# workdir whose name itself contains a flag-like segment (e.g. ".../live --flag")
+# must NOT truncate at its own embedded " --flag". The earlier `(?=\s+--|\s*$)`
+# lookahead stopped at the FIRST " --", parsing the live broker's --cwd as
+# "/.../live" and mis-matching the protected "/.../live --flag" → the LIVE broker
+# would be KILLED. CWD_RE now stops only at a KNOWN broker flag (--pid-file /
+# --endpoint / --cwd), and a raw-substring net spares any broker whose command
+# contains a protected workdir verbatim. A non-protected orphan with its own
+# flag-like cwd must still reap (the substring-spare must not over-spare).
+smoke_log "B6: flag-like cwd — live workdir containing ' --flag' spared, non-protected flag-like orphan reaped"
+FLAG_LIVE_WD="$SMOKE_TMP_ROOT/live --flag"      # NOTE: embedded flag-like segment
+FLAG_GONE_WD="$SMOKE_TMP_ROOT/gone --x"         # flag-like + never created (gone)
+mkdir -p "$FLAG_LIVE_WD"
+sleep 600 & LBF=$!   # live broker, flag-like protected --cwd (the #20580 scenario)
+sleep 600 & LBFA=$!  # its app-server child
+sleep 600 & OFB=$!   # orphan broker, non-protected flag-like --cwd -> reap
+sleep 600 & OFA=$!   # its app-server child
+_pids6=("$LBF" "$LBFA" "$OFB" "$OFA")
+disown "${_pids6[@]}" 2>/dev/null || true
+SNAP6="$SMOKE_TMP_ROOT/ps6.txt"
+{
+  printf '%s 1 90000 64000 %s --cwd %s --pid-file /tmp/l/b.pid\n' "$LBF" "$BROKER_CMD" "$FLAG_LIVE_WD"
+  printf '%s %s 90000 63000 %s\n'                                  "$LBFA" "$LBF" "$APP_CMD"
+  printf '%s 1 90000 64000 %s --cwd %s --pid-file /tmp/o/b.pid\n'  "$OFB" "$BROKER_CMD" "$FLAG_GONE_WD"
+  printf '%s %s 90000 63000 %s\n'                                  "$OFA" "$OFB" "$APP_CMD"
+} >"$SNAP6"
+python3 "$REAPER_PY" reap --platform any --ps-snapshot "$SNAP6" \
+  --protect-cwd "$FLAG_LIVE_WD" --grace-seconds 3 --json >/dev/null
+_assert_alive "live broker with flag-like protected cwd LBF" "$LBF"
+_assert_alive "live app-server (flag-like cwd) LBFA" "$LBFA"
+_assert_dead "orphan broker non-protected flag-like cwd OFB" "$OFB"
+_assert_dead "orphan app-server (flag-like) OFA" "$OFA"
+kill "${_pids6[@]}" 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
 smoke_log "D: daemon wires the periodic pass + standalone subcommand; #68 gates the verb"
 grep -q 'process_codex_app_server_reaper' "$DAEMON_SH" || \
   smoke_fail "bridge-daemon.sh does not define/wire the periodic reaper pass"

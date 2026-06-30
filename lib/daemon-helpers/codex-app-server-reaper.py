@@ -106,14 +106,20 @@ CODEX_BROKER_RE = re.compile(r"(?:^|/)app-server-broker\.mjs(?:\s|$)")
 CODEX_APP_SERVER_RE = re.compile(r"(?:^|/)codex\s+app-server\b")
 
 # --cwd <path> extractor. The path MAY contain spaces (an agent workdir like
-# "/Users/op/Live Project"), so capture up to the NEXT ` --<flag>` token or
-# end-of-string rather than the first whitespace. A `\S+` capture truncates a
-# spaced path and would DEFEAT the cwd-based live-session protection — a live
-# broker whose workdir has a space would parse to a non-matching prefix and be
-# misclassified as an orphan, then killed (codex Phase-4 finding). The
-# openai-codex broker argv is `... serve --cwd <path> [--pid-file <p>]
-# [--endpoint <e>]`, so a following ` --<flag>` is the reliable right delimiter.
-CWD_RE = re.compile(r"--cwd(?:=|\s+)(.+?)(?=\s+--|\s*$)")
+# "/Users/op/Live Project") AND flag-like segments (e.g. "/Users/op/x --y"), so
+# capture up to the NEXT KNOWN broker flag or end-of-string — NOT the first
+# whitespace and NOT any ` --<token>`. A `\S+` capture truncates a spaced path;
+# stopping at any ` --` truncates a path whose own name contains ` --foo`
+# (codex Phase-4 r2 finding: `--cwd /tmp/live --flag --pid-file …` parsed to
+# `/tmp/live`, mis-matching the protected `/tmp/live --flag` → a LIVE broker
+# would be killed). The openai-codex broker argv is
+# `... serve --cwd <path> [--pid-file <p>] [--endpoint <e>]`, so the reliable
+# right delimiter is the next KNOWN broker flag (--pid-file / --endpoint /
+# --cwd), which a workdir name is overwhelmingly unlikely to contain.
+KNOWN_BROKER_FLAGS = ("pid-file", "endpoint", "cwd")
+CWD_RE = re.compile(
+    r"--cwd(?:=|\s+)(.+?)(?=\s+--(?:" + "|".join(KNOWN_BROKER_FLAGS) + r")\b|\s*$)"
+)
 
 
 @dataclass(frozen=True)
@@ -381,6 +387,16 @@ def classify_orphans(
             continue
         if _cwd_protected(cwd, protect_cwds):
             # --cwd is at/under a live codex agent workdir — spare.
+            continue
+        if any(base and base in proc.command for base in protect_cwds):
+            # DEFENSE-IN-DEPTH (codex Phase-4 r2): a live agent's broker is
+            # always launched with `--cwd <its-workdir>`, so its workdir string
+            # is necessarily a substring of the command. If the structured
+            # CWD_RE parse above ever mis-bounds a pathological workdir (e.g. a
+            # name literally containing ` --pid-file`), this raw-substring net
+            # still spares the live broker. Over-sparing a coincidental orphan
+            # whose dead workdir happens to contain a live workdir string is the
+            # SAFE direction for a process-killer; the periodic pass retries.
             continue
         broker_candidates.append(
             Candidate(
