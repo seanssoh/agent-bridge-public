@@ -480,8 +480,20 @@ _psw_default_rotate_claude_token() {
     local agent="$1"
     local scope="${BRIDGE_PICKER_SWEEP_TOKEN_ROTATE_AGENTS:-${BRIDGE_CLAUDE_TOKEN_SYNC_AGENTS:-static}}"
 
+    # Match the daemon's preflighted rotation contract (bridge-daemon.sh usage
+    # pass): WITHOUT --preflight this picker-driven rotate can hand the active
+    # slot to a candidate that is itself rate-limited (the daemon path would
+    # revalidate + reject it), so a rate-limit picker could rotate onto another
+    # capped token. The same env knobs as the daemon are honored so a single
+    # operator override tunes both paths (codex design #20878). No --limited-until
+    # here: the picker has no authoritative reset time, and fabricating a long one
+    # would wrongly park the just-rotated token — let preflight + pool-exhausted
+    # handling gate candidate quota evidence instead.
     bash "$BRIDGE_HOME/bridge-auth.sh" claude-token rotate \
         --if-auto-enabled \
+        --preflight \
+        --preflight-budget "${BRIDGE_CLAUDE_ROTATE_PREFLIGHT_BUDGET_SECONDS:-15}" \
+        --preflight-timeout "${BRIDGE_CLAUDE_ROTATE_PREFLIGHT_PER_CANDIDATE_SECONDS:-6}" \
         --sync \
         --agents "$scope" \
         --reason "picker-sweep-rate-limit:${agent}" \
