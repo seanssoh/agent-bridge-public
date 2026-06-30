@@ -3680,6 +3680,27 @@ AGENT_CONVERT_HELP
   [[ $model_present -eq 1 ]] && res_model="$model_flag"
   [[ $effort_present -eq 1 ]] && res_effort="$effort_flag"
 
+  # Issue #2216: carry the source agent's RESOLVED/effective model, not just the
+  # per-agent roster field. A dynamic-vanilla Claude agent runs on the
+  # operator-global ~/.claude model (the #1890 passthrough) and records NO
+  # BRIDGE_AGENT_MODEL — so cur_model is empty and, without this, the converted
+  # static role falls through to the user-class template default
+  # (`claude-fable-5`, unavailable on the static pool token → the agent boots
+  # but every turn fails). When no explicit --model was passed AND the roster
+  # carried no model, resolve the operator-global model the agent was actually
+  # inheriting so the baked launch_cmd + materialized roster field + rendered
+  # settings.effective.json all describe a working model. Explicit --model and a
+  # pre-existing roster model both still win (res_model already non-empty).
+  #
+  # Effort is intentionally NOT fabricated here: it is carried via cur_effort
+  # (the roster BRIDGE_AGENT_EFFORT, set by `agent update --effort` or a
+  # template default) when present, and otherwise left empty so the converted
+  # role keeps the account-default effort the vanilla agent was actually running
+  # on — synthesizing one would CHANGE behavior, not preserve it.
+  if [[ $model_present -ne 1 && -z "$res_model" ]]; then
+    res_model="$(bridge_agent_operator_global_model 2>/dev/null || true)"
+  fi
+
   # --- derive source/target config dirs (§0.1 step 2, read-only) -----------
   # Track A computes the target as-if-static (independent of source=), so we
   # do NOT require a pre-flipped roster. rc 3 = iso-effective target → MVP
@@ -3856,7 +3877,9 @@ print("  (dry-run — nothing was changed)")
       || bridge_warn "convert: identity materialize for '$agent' was a no-op or failed (non-fatal; existing workdir identity preserved)."
   fi
   if declare -F bridge_link_claude_settings_to_shared >/dev/null 2>&1; then
-    bridge_link_claude_settings_to_shared "$workdir" "$baked_launch_cmd" "$agent" >/dev/null 2>&1 \
+    # #2216: thread the carried model+effort so settings.effective.json renders
+    # the model the source agent ran on (not the template default).
+    bridge_link_claude_settings_to_shared "$workdir" "$baked_launch_cmd" "$agent" "$res_model" "$res_effort" >/dev/null 2>&1 \
       || _convert_fail "could not render the single-tree settings for '$agent' (#1455)."
   fi
   if declare -F bridge_ensure_auto_memory_isolation >/dev/null 2>&1; then
@@ -4016,9 +4039,11 @@ sys.exit(0 if os.path.realpath(wd_link) == os.path.realpath(eff) else 1)
   fi
 
   # Post-flip best-effort settings re-render so the static-class managed
-  # defaults (autoCompactWindow) land; non-fatal and idempotent.
+  # defaults (autoCompactWindow) land; non-fatal and idempotent. #2216: carry
+  # the resolved model+effort so the post-flip effective file renders the same
+  # working model the source dynamic agent ran on.
   if declare -F bridge_link_claude_settings_to_shared >/dev/null 2>&1; then
-    bridge_link_claude_settings_to_shared "$workdir" "$baked_launch_cmd" "$agent" >/dev/null 2>&1 || true
+    bridge_link_claude_settings_to_shared "$workdir" "$baked_launch_cmd" "$agent" "$res_model" "$res_effort" >/dev/null 2>&1 || true
   fi
 
   rm -f "$manifest_file"
