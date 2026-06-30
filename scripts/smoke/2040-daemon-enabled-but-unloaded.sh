@@ -266,10 +266,13 @@ printf '1' >"$PRINT_RC_FILE"          # not loaded
 printf '2' >"$DISABLED_RC_FILE"       # print-disabled FAILS (unknown)
 printf '1' >"$BOOTSTRAP_LOADS_FILE"
 run_liveness Darwin
-audit_has daemon_liveness_rebootstrap_skip_disabled || smoke_fail "L6 FAIL: no skip_disabled audit on unreadable print-disabled. audit=$(cat "$AUDIT_LOG")"
+# #2205 Phase-4 r2: the unreadable-probe skip now emits the more specific
+# `skip_unknown_disabled` action (was `skip_disabled`); behavior is unchanged
+# (fail-closed SKIP, never bootstrap).
+audit_has daemon_liveness_rebootstrap_skip_unknown_disabled || smoke_fail "L6 FAIL: no skip_unknown_disabled audit on unreadable print-disabled. audit=$(cat "$AUDIT_LOG")"
 grep -q '"disabled_state": "unknown"' "$AUDIT_LOG" || smoke_fail "L6 FAIL: disabled_state must be 'unknown' (fail-closed). audit=$(cat "$AUDIT_LOG")"
 launchctl_called bootstrap && smoke_fail "L6 FAIL: must NOT bootstrap when disabled-state is unknown. calls=$(cat "$LAUNCHCTL_LOG")"
-smoke_log "L6 PASS: print-disabled unreadable → fail-closed SKIP (disabled_state=unknown, NO bootstrap)"
+smoke_log "L6 PASS: print-disabled unreadable → fail-closed SKIP (disabled_state=unknown, skip_unknown_disabled, NO bootstrap)"
 
 # ── S1: systemd ENABLED + INACTIVE → re-start ─────────────────────────────────
 seed_stale_no_pid

@@ -256,6 +256,18 @@ add_required 2040-upgrade-restore-verify 2040-daemon-enabled-but-unloaded
 # EXIT-handler or liveness-discriminator edit re-runs the discriminator +
 # operator-stop-preserved + in-flight-defer + mutation gates.
 add_required 2055-interrupted-upgrade-reenable
+# Issue #2205: the residual disabled-drift hole #2055 left. The #2055 marker is
+# now GENERALIZED into a per-path non-operator-disable proof carrying a `reason`
+# enum, and the liveness watcher (scripts/bridge-daemon-liveness.sh) only
+# re-enables a disabled launchd job when the marker's platform+target MATCH the
+# job it is about to recover (the cross-target/cross-platform tooth the #2055 code
+# lacked); a missing/mismatched/live-writer marker stays fail-closed (operator-stop
+# outranks). bridge-doctor.py surfaces an UNPROVABLE disabled-drift (no matching
+# marker) as `daemon-launchd-disabled-drift` so the otherwise-silent half of the
+# 06-30 outage is visible. In the full static suite so any liveness-discriminator
+# or doctor edit re-runs the recover + cross-target/platform-mismatch + operator-
+# stop + doctor + mutation gates.
+add_required 2205-disabled-drift-selfheal
 # Issue #2210: the --no-restart-daemon hole in the #1820 reconcile quiesce. The
 # reconcile ALWAYS boots out + disables a managed daemon for its window, so a
 # --no-restart-daemon upgrade that previously did only clear-the-marker left a
@@ -1878,7 +1890,12 @@ select_for_path() {
       # smoke whenever the doctor file moves so a refactor of the detector
       # registration / registry-consumer set / engine scoping cannot silently
       # regress the codex-only flagging.
-      add_required 1455-settings-two-tree-doctor orphan-agent-dir agent-doctor 1786-tasksdb-doctor-verb 1803-orphan-dir-gc 1809-agents-md-backfill
+      # Issue #2205: bridge-doctor.py now hosts the daemon-launchd-disabled-drift
+      # detector (an unprovable disabled-drift with no recovery marker). Pull the
+      # #2205 smoke whenever the doctor file moves so a refactor of the detector
+      # registration / marker carve-out cannot silently regress the visibility of
+      # the un-recoverable half of the 06-30 outage.
+      add_required 1455-settings-two-tree-doctor orphan-agent-dir agent-doctor 1786-tasksdb-doctor-verb 1803-orphan-dir-gc 1809-agents-md-backfill 2205-disabled-drift-selfheal
       ;;
 
     bridge-stall.py|bridge-audit.sh)
@@ -5069,6 +5086,11 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
         # operator-stop-preserved + in-flight-defer discriminators stay exercised
         # alongside the existing 655/1905/2040 quiesce/restore guards.
         add_required 655-upgrade-launchd-quiesce-respawn 1905-upgrade-systemd-quiesce-respawn 2040-upgrade-restore-verify 2055-interrupted-upgrade-reenable
+        # Issue #2205: the marker writer now records a `reason` enum (back-compat
+        # default interrupted_upgrade). Pull the disabled-drift self-heal smoke on
+        # every bridge-upgrade.sh move so the reason field + the generalized
+        # per-path marker proof stay exercised alongside the #2055 lifecycle.
+        add_required 2205-disabled-drift-selfheal
         # Issue #2210: --no-restart-daemon now restores a reconcile-INDUCED bootout
         # (gated on _UPGRADE_DAEMON_*_MANAGED) instead of leaving it silently down.
         # Pull it on every bridge-upgrade.sh move so the no-restart restore + the
