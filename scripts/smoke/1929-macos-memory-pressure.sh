@@ -11,11 +11,16 @@
 #
 # Fix (#1929 / #397): the Darwin branch now reads Apple's calibrated pressure
 # tier `sysctl kern.memorystatus_vm_pressure_level` (1=Normal, 2=Warn,
-# 4=Critical) and DEFERS only when level >= BRIDGE_CRON_DARWIN_PRESSURE_LEVEL
-# (default 2). The legacy swap-percent probe stays available as an explicit
-# fallback (BRIDGE_CRON_DARWIN_PRESSURE_FALLBACK=swap_pct) and fires
-# automatically when the sysctl is unreadable, so a host always has *some*
-# signal. Linux (/proc/meminfo MemAvailable) is unchanged.
+# 4=Critical) and DEFERS only when level >= BRIDGE_CRON_DARWIN_PRESSURE_LEVEL.
+# The default is 4 (Critical) as of the 2026-06-30 fix: the Warn tier on macOS
+# is normal-operational and chronically STICKY, so an earlier default of 2
+# (Warn) deferred cron dispatch indefinitely on a single transient spike (an
+# 11h fleet-wide cron outage on 2026-06-30). Operators who want the old
+# warn-deferring behavior set BRIDGE_CRON_DARWIN_PRESSURE_LEVEL=2. The legacy
+# swap-percent probe stays available as an explicit fallback
+# (BRIDGE_CRON_DARWIN_PRESSURE_FALLBACK=swap_pct) and fires automatically when
+# the sysctl is unreadable, so a host always has *some* signal. Linux
+# (/proc/meminfo MemAvailable) is unchanged.
 #
 # This smoke sources lib/bridge-cron.sh in isolation and stubs `uname` +
 # `sysctl` (and, for the Linux assertion, /proc/meminfo) on PATH so it is fully
@@ -136,19 +141,21 @@ used_pct_ge_80="$(awk '
 # ---------------------------------------------------------------------------
 # Part C — the guard still fires on GENUINE pressure
 # ---------------------------------------------------------------------------
-smoke_log "C1: Warn pressure (level=2) -> DEFER (guard still works when real)"
-assert_verdict "$(probe STUB_LEVEL=2)" "DEFER" "C1 warn-defers"
+smoke_log "C1: Warn (level=2) -> HEALTHY by default (macOS Warn is normal-operational; the 2026-06-30 fix)"
+assert_verdict "$(probe STUB_LEVEL=2)" "HEALTHY" "C1 warn-healthy-by-default"
 
 smoke_log "C2: Critical pressure (level=4) -> DEFER"
 assert_verdict "$(probe STUB_LEVEL=4)" "DEFER" "C2 critical-defers"
 
-smoke_log "C3: BRIDGE_CRON_DARWIN_PRESSURE_LEVEL=4 raises threshold — level=2 -> HEALTHY"
-assert_verdict "$(probe STUB_LEVEL=2 BRIDGE_CRON_DARWIN_PRESSURE_LEVEL=4)" \
-  "HEALTHY" "C3 threshold-override"
+smoke_log "C3: BRIDGE_CRON_DARWIN_PRESSURE_LEVEL=2 restores warn-defers — level=2 -> DEFER"
+assert_verdict "$(probe STUB_LEVEL=2 BRIDGE_CRON_DARWIN_PRESSURE_LEVEL=2)" \
+  "DEFER" "C3 opt-back-to-warn"
 
-smoke_log "C4: bad BRIDGE_CRON_DARWIN_PRESSURE_LEVEL clamps to default(2) — level=2 -> DEFER"
+smoke_log "C4: bad BRIDGE_CRON_DARWIN_PRESSURE_LEVEL clamps to default(4) — level=2 -> HEALTHY, level=4 -> DEFER"
 assert_verdict "$(probe STUB_LEVEL=2 BRIDGE_CRON_DARWIN_PRESSURE_LEVEL=99)" \
-  "DEFER" "C4 bad-threshold-clamps"
+  "HEALTHY" "C4a bad-clamps-to-4-healthy"
+assert_verdict "$(probe STUB_LEVEL=4 BRIDGE_CRON_DARWIN_PRESSURE_LEVEL=99)" \
+  "DEFER" "C4b bad-clamps-to-4-defers-at-critical"
 
 smoke_log "C5: malformed-but-readable level + 85% swap -> HEALTHY (no swap fallback, level parses as 0)"
 # A non-empty sysctl read means the kernel signal IS reachable; a garbled value
@@ -178,8 +185,11 @@ assert_verdict \
   "HEALTHY" "D4 legacy-limit-override"
 
 smoke_log "D5: env knobs are whitespace/case normalized (match the Python contract)"
-# Padded level value still reads as Warn -> DEFER (level_raw is trimmed).
-assert_verdict "$(probe 'STUB_LEVEL= 2 ')" "DEFER" "D5a padded-level-warn"
+# Padded level value still reads as Critical -> DEFER (level_raw is trimmed).
+# Use level=4 (the default-defer tier) so the assertion stays NON-VACUOUS: an
+# UNtrimmed ' 4 ' fails the ^[0-9]+$ numeric test, parses as level 0, and would
+# read HEALTHY — only a correctly trimmed '4' reaches the Critical defer here.
+assert_verdict "$(probe 'STUB_LEVEL= 4 ')" "DEFER" "D5a padded-level-critical"
 # Padded + mixed-case fallback opt-in still selects swap_pct -> DEFER at 85%.
 assert_verdict "$(probe STUB_LEVEL=1 'BRIDGE_CRON_DARWIN_PRESSURE_FALLBACK=  Swap_Pct  ')" \
   "DEFER" "D5b padded-mixedcase-fallback"
