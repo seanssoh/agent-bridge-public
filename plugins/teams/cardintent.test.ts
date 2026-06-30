@@ -22,7 +22,10 @@ import {
   devStatusDeeplink,
   extractLastCardIntentFence,
   findForbiddenCostKey,
-  FORBIDDEN_COST_KEYS_PLACEHOLDER,
+  FORBIDDEN_COST_KEYS,
+  FORBIDDEN_COST_FIELD_KEYS,
+  FORBIDDEN_COST_KEYS_GOLDEN_HASH,
+  KOREAN_TERM_ORIGIN,
   isAllowedDeeplink,
   isDetailLayout,
   quoteResultDeeplink,
@@ -754,10 +757,10 @@ describe('submit rejected (Phase 1a)', () => {
 
 describe('§10 forbidden cost keys (mutation-proof)', () => {
   test('findForbiddenCostKey flags a card carrying a forbidden key', () => {
-    // Sanity: the placeholder list is non-empty (revert it → this fails).
-    expect(FORBIDDEN_COST_KEYS_PLACEHOLDER.length).toBeGreaterThan(0)
-    const dirty = JSON.stringify({ data: { unitCost: 1200 } })
-    expect(findForbiddenCostKey(dirty)).toBe('unitCost')
+    // Sanity: the vendored §10 set is non-empty (revert it → this fails).
+    expect(FORBIDDEN_COST_KEYS.length).toBeGreaterThan(0)
+    const dirty = JSON.stringify({ data: { realCost: 1200 } })
+    expect(findForbiddenCostKey(dirty)).toBe('realCost')
   })
 
   test('findForbiddenCostKey returns null for a clean card', () => {
@@ -769,7 +772,7 @@ describe('§10 forbidden cost keys (mutation-proof)', () => {
     // Smuggle a forbidden cost key through a rendered Row.value — it lands in the
     // card's price cell text and must trip the §10 golden over the card bytes.
     const intent: any = validListIntent()
-    intent.sections[0].rows[2].value = 'unitCost 1,200'
+    intent.sections[0].rows[2].value = 'realCost 1,200'
     const out = renderOutbound(fence(intent))
     // §10 guard MUST reject → no attachment, text-only graceful, fence stripped.
     // (Revert the findForbiddenCostKey check in renderOutbound → this fails:
@@ -836,7 +839,7 @@ describe('§10 visible-text fail-closed (mutation-proof)', () => {
     // Card carries a forbidden key (rejected → no attachment) and the prose ALSO
     // carries a forbidden term → text must be the §10 fallback, not the leak.
     const intent: any = validListIntent()
-    intent.sections[0].rows[2].value = 'unitCost 1,200'
+    intent.sections[0].rows[2].value = 'realCost 1,200'
     const out = renderOutbound('마진은 30%입니다.\n\n' + fence(intent))
     expect(out.attachments.length).toBe(0) // card rejected (existing behavior)
     expect(out.warning).toContain('forbidden cost key')
@@ -885,12 +888,61 @@ describe('§10 visible-text fail-closed (mutation-proof)', () => {
     expect(out.warning).toBeUndefined()
   })
 
-  test('Korean + literal contract terms are on the forbidden list; 제시가 hit, labels clean', () => {
-    for (const term of ['제시가', '원가', '마진', '공헌이익', '영업이익', '네고율', '회수율', '작업장명', '임률', '고객요청가', 'manufacturingCostSuggested', 'standardCost']) {
-      expect(FORBIDDEN_COST_KEYS_PLACEHOLDER).toContain(term)
+  test('Korean + literal contract terms are on the forbidden list; 제시사유 hit, 제시가 allowed, labels clean', () => {
+    // #20704 alignment: 제시가 (suggestedPrice) is now sales-ALLOWED → must NOT be
+    // forbidden (and dropping it stops the allowed 가공비제시가, which contains
+    // 제시가 as a substring, from false-tripping). 제시사유 (mSuggestedReason) is
+    // forbidden. The remaining Korean cost terms stay forbidden.
+    for (const term of ['제시사유', '원가', '마진', '공헌이익', '영업이익', '네고율', '회수율', '작업장명', '임률', '고객요청가', 'manufacturingCostSuggested', 'standardCost']) {
+      expect(FORBIDDEN_COST_KEYS).toContain(term)
     }
-    expect(FORBIDDEN_COST_KEYS_PLACEHOLDER).not.toContain('내용물 견적')
-    expect(FORBIDDEN_COST_KEYS_PLACEHOLDER).not.toContain('가공비 견적')
+    expect(FORBIDDEN_COST_KEYS).not.toContain('제시가')
+    // The two §10-allowed sales price fields must NOT trip the scan.
+    expect(findForbiddenCostKey('suggestedPrice')).toBeNull()
+    expect(findForbiddenCostKey('manufacturingSuggestedPrice')).toBeNull()
+    expect(findForbiddenCostKey('제시가')).toBeNull()
+    expect(findForbiddenCostKey('가공비제시가')).toBeNull()
+    // mSuggestedReason (the forbidden field key, the Korean visible term) trips.
+    expect(findForbiddenCostKey(JSON.stringify({ x: 'mSuggestedReason' }))).toBe('mSuggestedReason')
+    expect(findForbiddenCostKey('제시사유 없음')).toBe('제시사유')
+    expect(FORBIDDEN_COST_KEYS).not.toContain('내용물 견적')
+    expect(FORBIDDEN_COST_KEYS).not.toContain('가공비 견적')
+  })
+
+  test('§10 field-name set is hash-pinned to the crm SSOT golden (drift fails CI)', async () => {
+    // Reproduce the crm `BuildForbiddenCostKeys` hash (cosmax-crm-cli
+    // contract/adaptivecard/keys.go): sha256( "forbidden\n" + join(sorted
+    // forbidden,"\n") + "\n" + "allow\n" + join(sorted allow,"\n") + "\n" ).
+    // Recomputing over the INLINED field keys ∪ the 2 operator-approved allow
+    // keys must reproduce the pinned hash — any drift in the inlined list (or the
+    // allow assumption) fails here. Uses the global Web Crypto so the test stays
+    // free of fs/crypto-module imports (the bun-test seed-safety contract).
+    const allow = ['manufacturingSuggestedPrice', 'suggestedPrice']
+    const forbidden = [...FORBIDDEN_COST_FIELD_KEYS].sort()
+    let buf = 'forbidden\n'
+    for (const k of forbidden) buf += k + '\n'
+    buf += 'allow\n'
+    for (const k of [...allow].sort()) buf += k + '\n'
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(buf))
+    const hex = Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('')
+    expect(hex).toBe(FORBIDDEN_COST_KEYS_GOLDEN_HASH)
+    expect(hex).toBe('99f20d8c8efca4521415a030afd954d555edf0b5b201c3d3b5797b44327fcba7')
+  })
+
+  test('visible Korean layer is DERIVED from the golden — every term origin is a forbidden field (crm-dev #20652 consistency guard)', () => {
+    // The Korean visible-text layer is teams-owned, NOT in the crm hash. To stop
+    // the two layers silently diverging, every Korean term records the crm
+    // forbidden FIELD it is the rendering of (KOREAN_TERM_ORIGIN); that origin
+    // field MUST still be in the vendored golden. If crm ever un-forbids a field,
+    // this fails and forces the Korean term to be re-evaluated.
+    const field = new Set(FORBIDDEN_COST_FIELD_KEYS)
+    for (const [term, origin] of Object.entries(KOREAN_TERM_ORIGIN)) {
+      expect(field.has(origin)).toBe(true)
+      // and the term itself is actually on the active scan list
+      expect(FORBIDDEN_COST_KEYS).toContain(term)
+    }
+    // 제시가 is NOT mapped (its field suggestedPrice is sales-ALLOWED, not forbidden).
+    expect(KOREAN_TERM_ORIGIN['제시가']).toBeUndefined()
   })
 })
 

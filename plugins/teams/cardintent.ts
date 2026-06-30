@@ -138,44 +138,122 @@ export type DevReqAutofillIntent = {
 // ---------------------------------------------------------------------------
 // §10 forbidden cost keys.
 //
-// Contract-derived PLACEHOLDER. The authoritative list is shipped by crm-dev
-// as cosmax-crm-cli `forbidden_cost_keys.gen.json` and must be hash-pinned.
-// TODO(#92): vendor cosmax-crm-cli forbidden_cost_keys.gen.json hash b0d6c661
-// + hash-pin (replace this placeholder with the generated, version-pinned set).
+// VENDORED from cosmax-crm-cli `contract/adaptivecard/forbidden_cost_keys.gen.json`
+// (the §10 SSOT), PR#840 @ f9f6094 on crm `main` — operator-approved 2-key
+// allowlist (#20704: `suggestedPrice` + `manufacturingSuggestedPrice` are the
+// ONLY sales-permitted price fields; `mSuggestedReason` is forbidden). The
+// field-name set below is the golden's `forbidden` array, INLINED so this module
+// stays dependency-free; cardintent.test.ts hash-pins it by recomputing the crm
+// digest (sha256 over sorted forbidden∪allow) over this INLINED exported list
+// plus the explicit two-key allowlist and asserting it === the golden's hash ===
+// FORBIDDEN_COST_KEYS_GOLDEN_HASH — so ANY drift in this inlined list fails CI.
+// (The vendored .gen.json is committed as the byte-for-byte SSOT provenance; the
+// test does not read it — it recomputes over the inlined list, which is the
+// runtime source of truth.) Closes #92.
 //
-// These are raw internal cost-component keys that must NEVER reach Teams: if any
-// appears anywhere in the rendered Adaptive Card JSON bytes we reject the card
-// and fall back to text-only. The check is on the SERIALIZED bytes, so the key
-// is caught whether it leaks via a Row.value, an action payload, a label, or any
-// other nested position.
-export const FORBIDDEN_COST_KEYS_PLACEHOLDER: readonly string[] = [
-  'unitCost',
-  'unit_cost',
-  'rawMaterialCost',
-  'raw_material_cost',
-  'materialCost',
-  'material_cost',
-  'laborCost',
-  'labor_cost',
-  'processingCostInternal',
-  'processing_cost_internal',
-  'marginRate',
-  'margin_rate',
-  'markupRate',
-  'markup_rate',
+// These keys must NEVER reach Teams: if any appears anywhere in the rendered
+// Adaptive Card JSON bytes we reject the card and fall back to text-only. The
+// check is on the SERIALIZED bytes, so the key is caught whether it leaks via a
+// Row.value, an action payload, a label, or any other nested position.
+export const FORBIDDEN_COST_KEYS_GOLDEN_HASH =
+  '99f20d8c8efca4521415a030afd954d555edf0b5b201c3d3b5797b44327fcba7'
+
+// Field-name keys — the vendored crm SSOT (hash-pinned above). Exported so the
+// test can recompute the crm hash over this set ∪ the allow keys and assert it
+// equals FORBIDDEN_COST_KEYS_GOLDEN_HASH (drift-guard; the test uses the global
+// Web Crypto `crypto.subtle`, so no fs/crypto-module import is needed).
+export const FORBIDDEN_COST_FIELD_KEYS: readonly string[] = [
+  'activityPrice',
+  'actualPurchasedUnitPrice',
+  'actualPurchasedUnitPriceNew',
+  'calcError',
+  'capa',
   'costBreakdown',
-  'cost_breakdown',
-  'internalCost',
-  'internal_cost',
-  'supplierCost',
-  'supplier_cost',
-  'landedCost',
-  'landed_cost',
-  // Korean/literal contract terms (the role-internal cost language that must
-  // NEVER reach Teams in the card OR the visible text). Note: `내용물 견적` and
-  // `가공비 견적` are the ALLOWED viewer-facing price labels and are deliberately
-  // NOT in this list.
-  '제시가',
+  'customerRequested',
+  'customerRequestedManu',
+  'decisionLogs',
+  'erpUnitPrice',
+  'expectedProfitRate',
+  'fixedDirectIndirect',
+  'fixedDirectIndirectExpenses',
+  'fixedFacilityExpenses',
+  'fixedLaborCosts',
+  'freeText',
+  'inputEffort',
+  'inputEffortC',
+  'inputEffortM',
+  'inputEffortP',
+  'mFixedDirectIndirectExpenses',
+  'mFixedFacilityExpenses',
+  'mFixedLaborCosts',
+  'mOutsourcingProcessCost',
+  'mSuggestedReason',
+  'mTotalFixedCost',
+  'mTotalVariableCost',
+  'mVariableFacilityExpenses',
+  'mVariableLaborCosts',
+  'mWorkplaceC',
+  'mWorkplaceM',
+  'mWorkplaceP',
+  'machineTimeC',
+  'machineTimeM',
+  'machineTimeP',
+  'manufacturingCostBreakdown',
+  'manufacturingCostSuggested',
+  'manufacturingCostSuggestedPrice',
+  'maxKg',
+  'negotiationRate',
+  'operatingProfitRate',
+  'outsourcingCost',
+  'outsourcingCostC',
+  'outsourcingCostP',
+  'outsourcingCostTotal',
+  'pricingTiers',
+  'quotedCost',
+  'realCost',
+  'realRecoveryRatePct',
+  'recoveryOfFixedCost',
+  'recoveryOfFixedCostB',
+  'recoveryRatePct',
+  'salesAndManagementCost',
+  'salesManagementCost',
+  'salesManagementCostVariable',
+  'sgaBasis',
+  'stages',
+  'standardCost',
+  'totalCost',
+  'totalFixedCost',
+  'totalVariableCost',
+  'unitPrice',
+  'variableFacilityExpenses',
+  'variableLaborCosts',
+  'workingHourC',
+  'workingHourM',
+  'workingHourP',
+  'workplaceC',
+  'workplaceM',
+  'workplaceP',
+]
+
+// Visible Korean cost terms — a teams-renderer VISIBLE-TEXT layer that the crm
+// field-name golden does NOT cover (the golden is JSON field names only). Aligned
+// to the same #20704 decision: `제시가` (suggestedPrice) is now sales-allowed so it
+// is REMOVED (and removing it also stops the allowed `가공비제시가` from
+// false-tripping on the `제시가` substring); `제시사유` (mSuggestedReason) is
+// forbidden and ADDED here for the visible-text scan (the field key is already in
+// the golden).
+//
+// GOVERNANCE (crm-dev #20652, owner decision): this layer is intentionally
+// teams-OWNED and NOT folded into the crm hash-pinned golden. The field-name
+// golden is the by-construction security SSOT (the renderer's allowlist
+// projection never serializes a raw cost VALUE, so a Korean label cannot leak a
+// number); Korean cost words are open-ended fuzzy synonyms that would make a
+// closed, hash-pinned golden brittle; and display-text validation is the
+// renderer's layer, not the crm data SSOT's. Each term below is DERIVED from a
+// crm forbidden field (the visible Korean rendering of it) — KOREAN_TERM_ORIGIN
+// records that correspondence and a test asserts every term's origin field is in
+// the vendored golden, so the two layers cannot silently diverge.
+const FORBIDDEN_COST_KOREAN_TERMS: readonly string[] = [
   '원가',
   '마진',
   '공헌이익',
@@ -185,8 +263,30 @@ export const FORBIDDEN_COST_KEYS_PLACEHOLDER: readonly string[] = [
   '작업장명',
   '임률',
   '고객요청가',
-  'manufacturingCostSuggested',
-  'standardCost',
+  '제시사유',
+]
+
+// Provenance for the visible Korean layer: each visible term → the crm forbidden
+// FIELD key it is the Korean rendering of. The consistency test (crm-dev #20652
+// alternative) asserts every origin field is present in the vendored golden, so a
+// Korean term can never outlive the removal of its underlying forbidden field.
+export const KOREAN_TERM_ORIGIN: Readonly<Record<string, string>> = {
+  '원가': 'realCost',
+  '마진': 'expectedProfitRate',
+  '공헌이익': 'recoveryOfFixedCost',
+  '영업이익': 'operatingProfitRate',
+  '네고율': 'negotiationRate',
+  '회수율': 'recoveryRatePct',
+  '작업장명': 'workplaceP',
+  '임률': 'activityPrice',
+  '고객요청가': 'customerRequested',
+  '제시사유': 'mSuggestedReason',
+}
+
+// The §10 scan set = vendored field-name SSOT ∪ teams visible Korean terms.
+export const FORBIDDEN_COST_KEYS: readonly string[] = [
+  ...FORBIDDEN_COST_FIELD_KEYS,
+  ...FORBIDDEN_COST_KOREAN_TERMS,
 ]
 
 // ---------------------------------------------------------------------------
@@ -1118,7 +1218,7 @@ export function buildDevStatusCard(intent: DevStatusIntent): AcElement {
 // anywhere (value, label, payload field name or value) trips the guard.
 export function findForbiddenCostKey(
   cardJson: string,
-  forbidden: readonly string[] = FORBIDDEN_COST_KEYS_PLACEHOLDER,
+  forbidden: readonly string[] = FORBIDDEN_COST_KEYS,
 ): string | null {
   for (const key of forbidden) {
     if (cardJson.includes(key)) return key
@@ -1154,7 +1254,7 @@ export function renderOutbound(
   text: string,
   opts: { forbidden?: readonly string[] } = {},
 ): RenderOutbound {
-  const forbidden = opts.forbidden ?? FORBIDDEN_COST_KEYS_PLACEHOLDER
+  const forbidden = opts.forbidden ?? FORBIDDEN_COST_KEYS
   // No fence → existing path, byte-for-byte unchanged.
   let fence: FenceMatch | null = null
   try {

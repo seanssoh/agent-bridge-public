@@ -26,7 +26,7 @@
       "name": "teams",
       "source": "./plugins/teams",
       "description": "Microsoft Teams channel for Claude Code with Agent Bridge access control and setup integration.",
-      "version": "0.1.8",
+      "version": "0.1.9",
       "category": "messaging",
       "tags": [
         "teams",
