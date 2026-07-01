@@ -423,6 +423,16 @@ bridge_link_claude_settings_to_shared() {
   # managed default). When omitted (legacy callers), fall back to the
   # install-wide render so the helper remains backwards-compatible.
   local agent="${3-}"
+  # Issue #2216: optional per-agent model/effort to render INTO
+  # settings.effective.json as the carried-value layer. Only the dynamic→static
+  # converter passes these (the source agent's resolved model+effort); every
+  # other caller leaves them empty, so the renderer injects nothing and the
+  # effective `model` keeps deriving from operator-global (#11901) / preserved
+  # keys (#1756) exactly as before — no behavior change for genuinely-new
+  # static agents. Without this, a converted role's effective `model` falls
+  # through to the user-class template default (#2216 render gap).
+  local agent_model="${4-}"
+  local agent_effort="${5-}"
   # Issue #1981 (SAFETY) — operator-global hijack guard. This MUST sit FIRST,
   # before ANY link/render side effect (before the #11901 operator-global thread,
   # before the #1945 F7 deferral + iso-UID render, before the #1766 group-publish,
@@ -650,7 +660,9 @@ bridge_link_claude_settings_to_shared() {
         --operator-global-settings-file "$operator_global_file" \
         --launch-cmd "$launch_cmd" \
         --agent-class "$agent_class" \
-        --channels-csv "$channels_csv" >/dev/null; then
+        --channels-csv "$channels_csv" \
+        --agent-model "$agent_model" \
+        --agent-effort "$agent_effort" >/dev/null; then
       bridge_warn "isolation v2 (#1945): shared settings render failed for '$agent'"
       rm -rf "$_eff_stage_root"
       return 1
@@ -681,7 +693,9 @@ bridge_link_claude_settings_to_shared() {
       --operator-global-settings-file "$operator_global_file" \
       --launch-cmd "$launch_cmd" \
       --agent-class "$agent_class" \
-      --channels-csv "$channels_csv" >/dev/null
+      --channels-csv "$channels_csv" \
+      --agent-model "$agent_model" \
+      --agent-effort "$agent_effort" >/dev/null
   fi
   # Issue #1766: the per-agent effective file just rendered (the link target
   # the workdir `.claude/settings.json` symlink points at) is controller-owned

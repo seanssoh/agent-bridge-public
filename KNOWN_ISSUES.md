@@ -1116,3 +1116,36 @@ Recommended noise-reduction config:
   only; the detection above still covers the other modal classes.
 
 Regression smoke: `scripts/smoke/1181-modal-blocker-detect.sh`.
+
+## 38. Dynamic→static conversion crosses the config-dir split — use `agent convert` (#2061)
+
+A **dynamic** vanilla Claude agent reads the operator-global `~/.claude`; a
+**static** agent reads an isolated `<agent-home>/.claude` (the config-dir split
+of #35). So converting a dynamic Claude agent to static by hand
+(`stop → create → update --set-launch-cmd → restart`) **silently strands** the
+agent's transcripts (`projects/<cwd>/*.jsonl`) and accumulated auto-memory
+(`projects/<cwd>/memory/`) under the operator home: the converted agent boots
+"empty" (resume picker shows nothing, `MEMORY.md` loads empty) with no warning.
+
+Sanctioned path:
+
+- `agent-bridge agent convert <agent> --to static` is the config-dir-aware
+  converter (OPERATIONS.md "Converting a dynamic agent to static"). It migrates
+  the agent's workdir + descendant cwds (transcripts + auto-memory) into the
+  target config dir — surfacing any outside-workdir cwd the agent used as an
+  `--include-cwd` candidate (migrated only when confirmed) — with a **manifest +
+  `--dry-run` + on-disk backup**, pins a **transcript-validated** resume id, and
+  flips the roster (the last state-stranding step) through the audited writer so
+  a partial failure never leaves a static-but-empty role.
+
+MVP scope (do not expect the rest yet):
+
+- **Shared-mode (macOS / non-iso target) only.** Converting *into* a Linux
+  iso-effective identity is **fail-closed** (rejected with a clear message) as a
+  fast-follow.
+- `--carry-session live|none`, `--start hold|auto` (default `hold`), `--dry-run`,
+  and the on-disk backup + documented manual-restore path ship in MVP.
+- A first-class `--rollback` verb, `--keep-config-dir operator`, and an explicit
+  `--carry-session <id>` are **deferred fast-follows — not yet available**.
+
+See also KNOWN_ISSUES #35 (the underlying dynamic-vs-static config-dir behavior).

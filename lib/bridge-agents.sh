@@ -5991,6 +5991,43 @@ bridge_agent_operator_home_dir() {
   printf '%s' "$controller_home"
 }
 
+# Issue #2216: resolve the model a DYNAMIC agent is actually running on — i.e.
+# the operator-global `~/.claude/settings.json` `model` field a dynamic-vanilla
+# Claude agent inherits (the #1890 passthrough), which is NOT recorded in any
+# per-agent roster field. Used by the dynamic→static converter so a converted
+# role boots on the same working model it had, instead of the empty
+# BRIDGE_AGENT_MODEL falling through to the user-class template default
+# (`claude-fable-5`, unavailable on the static pool token). Prints the model
+# token on stdout (empty when no operator home / no settings file / no `model`
+# key); all probe failures degrade to empty (never fatal). The token is
+# validated argv-safe before it is emitted so a hand-edited global cannot inject
+# a stray flag into the baked launch command.
+bridge_agent_operator_global_model() {
+  local operator_home=""
+  operator_home="$(bridge_agent_operator_home_dir 2>/dev/null || true)"
+  [[ -n "$operator_home" ]] || return 0
+  local settings_file="$operator_home/.claude/settings.json"
+  [[ -f "$settings_file" ]] || return 0
+  python3 -c '
+import json, re, sys
+try:
+    payload = json.loads(open(sys.argv[1], encoding="utf-8").read())
+except Exception:
+    sys.exit(0)
+if not isinstance(payload, dict):
+    sys.exit(0)
+model = payload.get("model")
+if not isinstance(model, str):
+    sys.exit(0)
+model = model.strip()
+# argv-safe token only (mirrors bridge-cron-runner _safe_model_effort_token):
+# letters, digits, dot, dash, underscore, plus the optional [1m]-style context
+# suffix the operator may append. Anything else degrades to empty.
+if model and len(model) <= 128 and re.match(r"^[A-Za-z0-9._-]+(\[[A-Za-z0-9]+\])?$", model):
+    sys.stdout.write(model)
+' "$settings_file" 2>/dev/null || true
+}
+
 bridge_agent_claude_home_dir() {
   local agent="$1"
   local os_user=""

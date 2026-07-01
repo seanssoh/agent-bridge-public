@@ -1091,6 +1091,12 @@ bridge_source_module "bridge-wave.sh"
 # Sourced last because it consumes helpers from bridge-agents.sh and
 # bridge-core.sh (`bridge_admin_agent_id`, `bridge_require_python`).
 bridge_source_module "bridge-agent-update.sh"
+# FR #2061 Track A: the pure, roster-free config-dir migration engine that the
+# Track B `agent convert` verb (run_convert in bridge-agent.sh) calls into.
+# Sourced after bridge-agents.sh because its resolve helper consumes the same
+# bridge_agent_is_dynamic_vanilla_claude / bridge_agent_operator_home_dir /
+# bridge_agent_claude_config_dir predicates the launch + resume paths use.
+bridge_source_module "bridge-agent-convert.sh"
 
 # Per-call re-validation of BRIDGE_SCRIPT_DIR (#946 L1) — the
 # `bridge_resolve_script_dir_check` / `_or_die` helpers used by every
