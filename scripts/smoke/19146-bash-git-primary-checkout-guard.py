@@ -335,6 +335,29 @@ def main() -> int:
         f'alias g="git -C {P} reset --hard"; g',
         True,
     )
+    # codex Phase-4 F1/C6: an interpreter payload whose leader stays UNRESOLVED
+    # after single-level substitution (`$g` is not a known const, or `g=git` but
+    # single-level leaves the `$g` in the value) must be re-read through the
+    # destructive-shape reader — SYMMETRIC with the direct-leader `…; $cmd` twin
+    # (`2159 F1 nested`). The literal-`git` payload text check cannot see `$g`.
+    expect(
+        "2159 eval unresolved-$leader payload (codex F1)",
+        WT,
+        f'cmd="$g -C {P} reset"; eval "$cmd"',
+        True,
+    )
+    expect(
+        "2159 eval unresolved-$leader, g=git single-level (codex F1b)",
+        WT,
+        f'g=git; cmd="$g -C {P} reset"; eval "$cmd"',
+        True,
+    )
+    expect(
+        "2159 sh -c unresolved-$leader payload",
+        WT,
+        f'cmd="$g -C {P} reset --hard"; sh -c "$cmd"',
+        True,
+    )
 
     # ---- ALLOW: canonical-safe shape (over-block regression = 0) -------------
     expect("worktree bare reset --hard", WT, "git reset --hard", False)
@@ -414,6 +437,22 @@ def main() -> int:
         False,
     )
     expect("2159 allow concrete non-git leader", WT, "TOOL=make; $TOOL build", False)
+    # #2159 interpreter over-block-0 (codex F1 fix): the resolved-payload re-read
+    # must NOT deny a non-destructive unresolved-leader payload, a non-git leader
+    # even when it carries `-C <primary>`, nor a lone runtime-bound `$var`.
+    expect(
+        "2159 allow eval unresolved-$leader non-destructive",
+        WT,
+        'cmd="$g status"; eval "$cmd"',
+        False,
+    )
+    expect(
+        "2159 allow sh -c non-git leader with -C primary",
+        WT,
+        f'cmd="make -C {P} build"; sh -c "$cmd"',
+        False,
+    )
+    expect("2159 allow eval lone unknown var", WT, 'eval "$undef"', False)
 
     # ---- ALLOW: operator structural exemption (cwd = primary repo root) ------
     expect("operator cd-primary reset", P, f"cd {P} && git reset --hard", False)

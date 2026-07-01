@@ -8570,6 +8570,38 @@ def _const_substitute_known_vars(text: str, var_consts: dict[str, str]) -> str:
     return pat.sub(_repl, text)
 
 
+def _interpreter_payload_command_str(real_tokens: list[str]) -> str | None:
+    """Return the inner command STRING an interpreter stage will execute
+    (`sh -c "<cmd>"`, `bash -lc "<cmd>"`, `eval <cmd>`, `xargs <cmd>`), or None.
+
+    Used by #2159 to re-read a var-hidden interpreter payload through the
+    destructive-shape reader, so an UNRESOLVED-leader payload
+    (`cmd='$g -C <primary> reset'; eval "$cmd"`) is denied SYMMETRICALLY with
+    its direct-leader twin (`cmd='$g -C <primary> reset'; $cmd`). The plain
+    literal-`git`-substring payload check misses the unresolved-leader form
+    because no `git` token survives the single-level value substitution (codex
+    F1/C6 interpreter gap). `eval`/`xargs` carry the command as positional args;
+    every other interpreter leaf is a `-c` shell whose payload is the arg after
+    the (possibly combined, e.g. `-lc`) `c` short-flag."""
+    if not real_tokens:
+        return None
+    leaf = real_tokens[0].rsplit("/", 1)[-1]
+    if leaf in ("eval", "xargs"):
+        rest = real_tokens[1:]
+        return " ".join(rest) if rest else None
+    if leaf in _BASH_GIT_INTERPRETER_LEAVES:  # a `-c` shell (sh/bash/zsh/…)
+        for i in range(1, len(real_tokens)):
+            tok = real_tokens[i]
+            if tok == "-c" or (
+                tok.startswith("-")
+                and not tok.startswith("--")
+                and "c" in tok[1:]
+            ):
+                return real_tokens[i + 1] if i + 1 < len(real_tokens) else None
+        return None
+    return None
+
+
 def _emit_bash_git_guard_denied_audit(
     agent: str,
     *,
@@ -8737,6 +8769,38 @@ def _bash_git_primary_checkout_guard_reason(
                 # `sh -c "$cmd"` — resolve the known var inside the payload text
                 # and re-run the destructive-git-mention check.
                 if info.get("interpreter"):
+                    # codex F1/C6: RE-READ the resolved payload through the same
+                    # destructive-shape reader the direct-leader path uses, so a
+                    # payload whose leader stays UNRESOLVED after single-level
+                    # substitution (`cmd='$g -C <primary> reset'; eval "$cmd"`)
+                    # is denied symmetrically with its `…; $cmd` twin — the
+                    # literal-`git` text check below cannot see a `$g` leader.
+                    # ADDITIVE: only ever returns DENY (F1 deny-monotonic).
+                    payload_cmd = _interpreter_payload_command_str(
+                        info.get("real_tokens") or []
+                    )
+                    if payload_cmd is not None:
+                        try:
+                            p_toks = shlex.split(
+                                _const_substitute_known_vars(payload_cmd, var_consts),
+                                posix=True,
+                                comments=False,
+                            )
+                        except ValueError:
+                            p_toks = []
+                        if p_toks and (
+                            p_toks[0].rsplit("/", 1)[-1] == "git"
+                            or "$" in p_toks[0]
+                            or "`" in p_toks[0]
+                        ) and _foreign_stage_git_destructive_shape(p_toks):
+                            _emit_bash_git_guard_denied_audit(
+                                agent,
+                                text=text,
+                                tool_input=tool_input,
+                                worktree=wt_real,
+                                sub_reason="const_tracking_interpreter_shape",
+                            )
+                            return BASH_GIT_PRIMARY_CHECKOUT_DENY_REASON
                     resolved_raw = _const_substitute_known_vars(raw, var_consts)
                     if resolved_raw != raw and _text_mentions_destructive_git(
                         resolved_raw
