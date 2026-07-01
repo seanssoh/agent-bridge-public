@@ -96,6 +96,15 @@ def main() -> int:
     SUB = str(sub)
     LINK = str(link_primary)
     BWT = str(bridge_wt)
+    # A primary-checkout path string with NO "git" substring. SMOKE_TMP_ROOT (and
+    # thus P/WT) contains "git" via the smoke name, which silently satisfies the
+    # cheap `"git" not in text` prefilter for EVERY case — masking whether a deny
+    # comes from the guard logic or the fixture path (codex #2241 r2 finding).
+    # NOGIT_P lets the const-tracking cases prove the "git" literal comes ONLY
+    # from the command's own token (value / g=git), never the path. It is a bare
+    # string (the const-tracking deny is path-realpath-independent), so it need
+    # not exist on disk.
+    NOGIT_P = "/tmp/ab-primary-checkout/x"
 
     # Ensure the bridge-workdir env cover is OFF for every non-bridge case so the
     # operator/worktree cwd checks are decided purely by cwd.
@@ -288,6 +297,83 @@ def main() -> int:
     expect("switch via cd-primary", WT, f"cd {P} && git switch main", True)
     expect("restore via env wrapper", WT, f"env GIT_DIR={P}/.git git restore .", True)
 
+    # ---- DENY: #2159 same-command const-tracking — the escape vector is hidden
+    # ENTIRELY inside a variable VALUE / alias BODY / eval-or-shell payload, so
+    # the USING stage carries no literal git/-C/verb token. Resolved single-level
+    # then re-read through the indirection reader (deny-monotonic: never turns a
+    # pre-existing deny into an allow).
+    expect(
+        "2159 var value = full invocation",
+        WT,
+        f'g="git -C {P} reset"; $g --hard',
+        True,
+    )
+    expect(
+        "2159 F1 nested: cmd value holds $g -C primary reset",
+        WT,
+        f'g="git"; cmd="$g -C {P} reset"; $cmd',
+        True,
+    )
+    expect(
+        "2159 eval of const string",
+        WT,
+        f'cmd="git -C {P} reset --hard"; eval "$cmd"',
+        True,
+    )
+    expect(
+        "2159 sh -c of const string (interp breadth)",
+        WT,
+        f'cmd="git -C {P} reset --hard"; sh -c "$cmd"',
+        True,
+    )
+    expect(
+        "2159 zsh -c of const string (2nd interp leaf)",
+        WT,
+        f'cmd="git -C {P} reset --hard"; zsh -c "$cmd"',
+        True,
+    )
+    expect(
+        "2159 bash -c of const string",
+        WT,
+        f'cmd="git -C {P} reset"; bash -c "$cmd"',
+        True,
+    )
+    expect(
+        "2159 alias body = full invocation",
+        WT,
+        f'alias g="git -C {P} reset --hard"; g',
+        True,
+    )
+    # codex Phase-4 r2 F1/C6: an interpreter payload whose leader stays
+    # UNRESOLVED after single-level substitution (`g=git; cmd="$g -C … reset"`,
+    # single-level leaves the `$g` in the value) must be re-read through the
+    # destructive-shape reader — SYMMETRIC with the direct-leader `…; $cmd` twin
+    # (`2159 F1 nested`). The literal-`git` payload text check cannot see `$g`.
+    # ★NOGIT_P (no "git" in the PATH): the same-command `g=git` is what carries
+    # the "git" past the cheap prefilter, so the deny is proven reachable by the
+    # guard logic, NOT by a fixture-path substring (codex r2 test-honesty fix).
+    expect(
+        "2159 eval unresolved-$leader reachable via g=git (non-git path)",
+        WT,
+        f'g=git; cmd="$g -C {NOGIT_P} reset"; eval "$cmd"',
+        True,
+    )
+    expect(
+        "2159 sh -c unresolved-$leader reachable via g=git (non-git path)",
+        WT,
+        f'g=git; cmd="$g -C {NOGIT_P} reset --hard"; sh -c "$cmd"',
+        True,
+    )
+    # Value-hidden git denied with NO "git" in the path — the "git" literal lives
+    # only in the assigned VALUE, so this proves the #2159 core residual closes
+    # path-substring-independently (not via the SMOKE_TMP_ROOT "git" artifact).
+    expect(
+        "2159 value-hidden git denied via non-git path (prefilter via value)",
+        WT,
+        f'g="git -C {NOGIT_P} reset"; $g',
+        True,
+    )
+
     # ---- ALLOW: canonical-safe shape (over-block regression = 0) -------------
     expect("worktree bare reset --hard", WT, "git reset --hard", False)
     expect("worktree bare checkout file", WT, "git checkout .", False)
@@ -339,6 +425,67 @@ def main() -> int:
         "r3 allow status && make reset (literal leader, git present)",
         WT,
         "git status && make reset",
+        False,
+    )
+    # #2159 over-block-0: const-tracking must NOT resolve a `gitfoo` leaf as git
+    # (F2 exact-token, #1709 substring-bypass lineage), must NOT persist a per-
+    # command env PREFIX into a later `$NAME` (C1), and must leave a resolved-git
+    # -but-non-destructive / concrete-non-git leader ALLOWED.
+    expect(
+        "2159 allow gitfoo value (exact-token, not 'git'-substring)",
+        WT,
+        f'g="gitfoo -C {P} reset"; $g',
+        False,
+    )
+    expect("2159 allow $g=gitfoo non-destructive", WT, "g=gitfoo; $g status", False)
+    expect(
+        "2159 allow env-prefix not persisted (C1)",
+        WT,
+        "NAME=git ls; $NAME status",
+        False,
+    )
+    expect("2159 allow resolved-git non-destructive", WT, 'g="git status"; $g', False)
+    expect(
+        "2159 allow eval non-destructive payload",
+        WT,
+        'cmd="git status"; eval "$cmd"',
+        False,
+    )
+    expect("2159 allow concrete non-git leader", WT, "TOOL=make; $TOOL build", False)
+    # #2159 interpreter over-block-0 (codex F1 fix): the resolved-payload re-read
+    # must NOT deny a non-destructive unresolved-leader payload, a non-git leader
+    # even when it carries `-C <primary>`, nor a lone runtime-bound `$var`.
+    expect(
+        "2159 allow eval unresolved-$leader non-destructive",
+        WT,
+        'cmd="$g status"; eval "$cmd"',
+        False,
+    )
+    expect(
+        "2159 allow sh -c non-git leader with -C primary",
+        WT,
+        f'cmd="make -C {P} build"; sh -c "$cmd"',
+        False,
+    )
+    expect("2159 allow eval lone unknown var", WT, 'eval "$undef"', False)
+    # ★codex r2 DOCUMENTED BOUNDARY (accepted residual): a payload with NO
+    # in-command `git` at all (leader `$g` never assigned a literal `git` this
+    # command, path free of "git") is dropped by the cheap `"git" not in text`
+    # prefilter → ALLOW. At runtime `$g` is empty (harmless); binding `g=git`
+    # out-of-band needs a persisted shell export the confined harness does not
+    # carry across Bash calls, so this is non-exploitable, not a reachable
+    # bypass. Asserted with NOGIT_P so it is a GENUINE prefilter drop, not the
+    # false-DENY the SMOKE_TMP_ROOT "git" artifact previously produced.
+    expect(
+        "2159 boundary: no-literal-git unresolved leader = prefilter drop",
+        WT,
+        f'cmd="$g -C {NOGIT_P} reset"; eval "$cmd"',
+        False,
+    )
+    expect(
+        "2159 boundary: no-literal-git sh -c unresolved leader = prefilter drop",
+        WT,
+        f'cmd="$g -C {NOGIT_P} reset --hard"; sh -c "$cmd"',
         False,
     )
 

@@ -8055,6 +8055,15 @@ _BASH_ALIAS_DEF_RE = re.compile(
 _BASH_DESTRUCTIVE_GIT_TOKENS = _GIT_WORKTREE_DESTRUCTIVE | frozenset(
     {"stash", "branch", "worktree", "reflog", "gc"}
 )
+# Issue #2159 (#19146 follow-up) — same-command const-tracking. A `NAME=value`
+# assignment token (the value already shlex-dequoted) whose value can hold an
+# ENTIRE hidden git invocation (`g="git -C <primary> reset"`), and a bare
+# `$NAME` / `${NAME}` leader reference that resolves to it. Both are matched as
+# WHOLE tokens (exact, never substring — a `gitfoo` leaf must not resolve as
+# git; see #1709 lineage) so the substitution stays deny-monotonic and cannot
+# over-block a legit `$TOOL run` / `make reset`.
+_CONST_ASSIGN_TOKEN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.DOTALL)
+_CONST_BARE_VAR_RE = re.compile(r"^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$")
 
 
 def _bash_token_has_unresolved_expansion(tok: str) -> bool:
@@ -8374,11 +8383,26 @@ def _foreign_stage_git_destructive_shape(real_tokens: list[str]) -> bool:
          that reading 2's verb parse could not flag) — `$(command -v git) -C
          <primary> $v` word-splits into a primary-checkout reset at runtime.
          Requiring the redirect flag keeps a benign `$NPM run $sub` (no escape
-         vector) ALLOWED. Residual (#19146 follow-up): an escape vector hidden
-         ENTIRELY inside a variable value (`g="git -C <primary> reset"; $g`,
-         `eval "$cmd"`, `alias g="git -C <primary> reset"`) has no literal
-         redirect/verb token to scan and needs same-command value resolution
-         (const-tracking); these pre-existing indirection shapes stay open here."""
+         vector) ALLOWED. The value-hidden classes (`g="git -C <primary>
+         reset"; $g`, `cmd="…"; eval "$cmd"`, `alias g="git -C <primary>
+         reset"; g`) carry no literal redirect/verb token here; #2159 closes
+         them one level UP, in `_bash_git_primary_checkout_guard_reason`, which
+         resolves the same-command constant and re-reads the substituted tokens
+         through THIS function — but ONLY when the literal string `git` survives
+         somewhere in the command text (the value / alias body / eval payload
+         carries it), because the cheap `"git" not in text` prefilter short-
+         circuits the whole guard first. A leader hidden with NO in-command
+         `git` at all (`cmd="$g -C <primary> reset"; eval "$cmd"` where `g` is
+         never assigned a literal `git` in the same command) is dropped at that
+         prefilter: at runtime `$g` expands to empty (harmless), and binding
+         `g=git` out-of-band would require a persisted shell export that the
+         confined tool harness does not carry across Bash calls — so this is a
+         non-exploitable accepted residual, not a reachable bypass. Accepted
+         residual (containment-not-sandbox, fail-open + advisory): the cheap-
+         prefilter literal-`git` boundary above, multi-level chained
+         indirection, cross-statement string assembly, ANSI-C `$'…'`, and
+         IFS/word-split divergence between a single static substitution and the
+         Bash runtime stay open by design."""
     if not real_tokens:
         return False
     verb, vargs, _hg, _hr, verb_unresolved = _parse_git_invocation(real_tokens)
@@ -8460,6 +8484,133 @@ def _bash_collect_definition_names(joined: str) -> set[str]:
         for m in rx.finditer(joined):
             names.add(m.group(1))
     return names
+
+
+def _bash_bare_var_name(tok: str) -> str | None:
+    """Return NAME iff *tok* is a WHOLE bare variable reference `$NAME` /
+    `${NAME}`, else None. A partial reference (`$gfoo`, `pre$g`, `$g/x`) is not
+    a clean leader substitution and returns None (stays with the pre-existing
+    indirection handling)."""
+    m = _CONST_BARE_VAR_RE.match(tok)
+    return m.group(1) if m else None
+
+
+def _bash_update_stage_consts(
+    raw: str, var_consts: dict[str, str], alias_consts: dict[str, str]
+) -> None:
+    """Seed the same-command const maps from a definition stage (#2159).
+
+    A variable is seeded ONLY from a PURE assignment stage (every token is
+    `NAME=value`, no command word) — a per-command env PREFIX (`NAME=git cmd`)
+    is NOT seeded, because Bash binds it only for that one command and it does
+    not persist into a later `$NAME` (codex C1). An `alias NAME=body` stage
+    seeds the alias body. Values are already shlex-dequoted."""
+    try:
+        toks = shlex.split(raw, posix=True, comments=False)
+    except ValueError:
+        return
+    if not toks:
+        return
+    if toks[0].rsplit("/", 1)[-1] == "alias":
+        for t in toks[1:]:
+            if t.startswith("-"):
+                continue  # alias flags (`alias -p`, `-g`, …)
+            m = _CONST_ASSIGN_TOKEN_RE.match(t)
+            if m:
+                alias_consts[m.group(1)] = m.group(2)
+        return
+    pairs: dict[str, str] = {}
+    for t in toks:
+        m = _CONST_ASSIGN_TOKEN_RE.match(t)
+        if not m:
+            return  # a command word is present → not a pure assignment stage
+        pairs[m.group(1)] = m.group(2)
+    var_consts.update(pairs)
+
+
+def _const_resolve_leader_tokens(
+    real_tokens: list[str],
+    var_consts: dict[str, str],
+    alias_consts: dict[str, str],
+) -> list[str] | None:
+    """Single-level substitute a same-command constant into the STAGE LEADER,
+    returning the resolved token list (value tokens + the trailing args), or
+    None when nothing resolves.
+
+    A `$NAME` / `${NAME}` leader resolves from *var_consts*; a bare alias-name
+    leader resolves from *alias_consts*. Exactly one level (the resolved value
+    is NOT re-substituted) — a value that itself still holds an indirection
+    (`cmd="$g -C <primary> reset"`) is handled by the caller re-reading the
+    resolved tokens through the existing indirection reader, so a deny is only
+    ever ADDED, never removed (codex F1 deny-monotonic). Fails open (None) on a
+    shlex-ambiguous value so it can never false-flag."""
+    if not real_tokens:
+        return None
+    leader = real_tokens[0]
+    name = _bash_bare_var_name(leader)
+    if name is not None:
+        val = var_consts.get(name)
+    else:
+        val = alias_consts.get(leader)
+    if val is None:
+        return None
+    try:
+        value_toks = shlex.split(val, posix=True, comments=False)
+    except ValueError:
+        return None
+    if not value_toks:
+        return None
+    return value_toks + real_tokens[1:]
+
+
+def _const_substitute_known_vars(text: str, var_consts: dict[str, str]) -> str:
+    """Single-level substitute the KNOWN same-command vars into *text* — used
+    to resolve an interpreter payload (`eval "$cmd"`, `sh -c "$cmd"`) whose git
+    invocation is hidden in a variable value. Only names present in *var_consts*
+    are replaced (an unknown / runtime-bound `$var` stays opaque). One
+    left-to-right pass so an inserted value is not re-scanned (single-level)."""
+    if not var_consts:
+        return text
+    alt = "|".join(re.escape(n) for n in sorted(var_consts, key=len, reverse=True))
+    pat = re.compile(r"\$\{(" + alt + r")\}|\$(" + alt + r")(?![A-Za-z0-9_])")
+
+    def _repl(m: re.Match[str]) -> str:
+        nm = m.group(1) or m.group(2)
+        return var_consts.get(nm, m.group(0))
+
+    return pat.sub(_repl, text)
+
+
+def _interpreter_payload_command_str(real_tokens: list[str]) -> str | None:
+    """Return the inner command STRING an interpreter stage will execute
+    (`sh -c "<cmd>"`, `bash -lc "<cmd>"`, `eval <cmd>`, `xargs <cmd>`), or None.
+
+    Used by #2159 to re-read a var-hidden interpreter payload through the
+    destructive-shape reader, so an UNRESOLVED-leader payload
+    (`cmd='$g -C <primary> reset'; eval "$cmd"`) is denied SYMMETRICALLY with
+    its direct-leader twin (`cmd='$g -C <primary> reset'; $cmd`). The plain
+    literal-`git`-substring payload check misses the unresolved-leader form
+    because no `git` token survives the single-level value substitution (codex
+    F1/C6 interpreter gap). `eval`/`xargs` carry the command as positional args;
+    every other interpreter leaf is a `-c` shell whose payload is the arg after
+    the (possibly combined, e.g. `-lc`) `c` short-flag."""
+    if not real_tokens:
+        return None
+    leaf = real_tokens[0].rsplit("/", 1)[-1]
+    if leaf in ("eval", "xargs"):
+        rest = real_tokens[1:]
+        return " ".join(rest) if rest else None
+    if leaf in _BASH_GIT_INTERPRETER_LEAVES:  # a `-c` shell (sh/bash/zsh/…)
+        for i in range(1, len(real_tokens)):
+            tok = real_tokens[i]
+            if tok == "-c" or (
+                tok.startswith("-")
+                and not tok.startswith("--")
+                and "c" in tok[1:]
+            ):
+                return real_tokens[i + 1] if i + 1 < len(real_tokens) else None
+        return None
+    return None
 
 
 def _emit_bash_git_guard_denied_audit(
@@ -8566,6 +8717,12 @@ def _bash_git_primary_checkout_guard_reason(
         cur_real = _bash_confined_start_cwd_real(payload)
         contained = _bash_realpath_contained(cur_real, wt_real)
         foreign_seen = False
+        # #2159 — same-command constant maps, built incrementally in stage order
+        # (define-before-use). `var_consts` = pure `NAME=value` assignments (used
+        # via a `$NAME` leader / interpreter payload); `alias_consts` = alias
+        # bodies (used via a bare alias-name leader).
+        var_consts: dict[str, str] = {}
+        alias_consts: dict[str, str] = {}
 
         for stage in stages:
             if not stage.strip():
@@ -8593,6 +8750,85 @@ def _bash_git_primary_checkout_guard_reason(
             if kind == "foreign":
                 foreign_seen = True
                 raw = info["raw"]
+                # #2159 same-command const-tracking (ADDITIVE / deny-monotonic):
+                # resolve a `$NAME` / bare-alias leader whose value hides a git
+                # invocation, then RE-READ the resolved tokens through the
+                # existing indirection reader. Only a resolved-git leaf (EXACT
+                # token, never a `gitfoo` substring — #1709 lineage) or a still-
+                # indirected leader (`cmd="$g -C <primary> reset"; $cmd`) is
+                # flagged, so a `$TOOL run` / `make reset` whose leader resolves
+                # to a concrete non-git command is NOT over-blocked. Never turns
+                # a pre-existing deny into an allow (codex F1).
+                subst = _const_resolve_leader_tokens(
+                    info.get("real_tokens") or [], var_consts, alias_consts
+                )
+                if subst is not None:
+                    sub_leaf = subst[0].rsplit("/", 1)[-1]
+                    if (
+                        sub_leaf == "git" or "$" in subst[0] or "`" in subst[0]
+                    ) and _foreign_stage_git_destructive_shape(subst):
+                        _emit_bash_git_guard_denied_audit(
+                            agent,
+                            text=text,
+                            tool_input=tool_input,
+                            worktree=wt_real,
+                            sub_reason="const_tracking_leader",
+                        )
+                        return BASH_GIT_PRIMARY_CHECKOUT_DENY_REASON
+                # Interpreter payload const-tracking (codex C6, full interpreter
+                # leaf set): `cmd="git -C <primary> reset"; eval "$cmd"` /
+                # `sh -c "$cmd"` — resolve the known var inside the payload text
+                # and re-run the destructive-git-mention check.
+                if info.get("interpreter"):
+                    # codex F1/C6: RE-READ the resolved payload through the same
+                    # destructive-shape reader the direct-leader path uses, so a
+                    # payload whose leader stays UNRESOLVED after single-level
+                    # substitution (`g=git; cmd='$g -C <primary> reset'; eval
+                    # "$cmd"`) is denied symmetrically with its `…; $cmd` twin —
+                    # the literal-`git` text check below cannot see a `$g`
+                    # leader. Reachable here because a same-command `git`/`g=git`
+                    # keeps the cheap `"git" not in text` prefilter from short-
+                    # circuiting; a payload with NO in-command `git` is the
+                    # documented prefilter boundary (see
+                    # `_foreign_stage_git_destructive_shape` docstring).
+                    # ADDITIVE: only ever returns DENY (F1 deny-monotonic).
+                    payload_cmd = _interpreter_payload_command_str(
+                        info.get("real_tokens") or []
+                    )
+                    if payload_cmd is not None:
+                        try:
+                            p_toks = shlex.split(
+                                _const_substitute_known_vars(payload_cmd, var_consts),
+                                posix=True,
+                                comments=False,
+                            )
+                        except ValueError:
+                            p_toks = []
+                        if p_toks and (
+                            p_toks[0].rsplit("/", 1)[-1] == "git"
+                            or "$" in p_toks[0]
+                            or "`" in p_toks[0]
+                        ) and _foreign_stage_git_destructive_shape(p_toks):
+                            _emit_bash_git_guard_denied_audit(
+                                agent,
+                                text=text,
+                                tool_input=tool_input,
+                                worktree=wt_real,
+                                sub_reason="const_tracking_interpreter_shape",
+                            )
+                            return BASH_GIT_PRIMARY_CHECKOUT_DENY_REASON
+                    resolved_raw = _const_substitute_known_vars(raw, var_consts)
+                    if resolved_raw != raw and _text_mentions_destructive_git(
+                        resolved_raw
+                    ):
+                        _emit_bash_git_guard_denied_audit(
+                            agent,
+                            text=text,
+                            tool_input=tool_input,
+                            worktree=wt_real,
+                            sub_reason="const_tracking_interpreter",
+                        )
+                        return BASH_GIT_PRIMARY_CHECKOUT_DENY_REASON
                 # Interpreter indirection (`bash -c '… git reset …'`, `eval`,
                 # `xargs git`) hides the destructive git from stage analysis.
                 if info.get("interpreter") and _text_mentions_destructive_git(raw):
@@ -8627,6 +8863,9 @@ def _bash_git_primary_checkout_guard_reason(
                         sub_reason="command_name_indirection",
                     )
                     return BASH_GIT_PRIMARY_CHECKOUT_DENY_REASON
+                # Seed same-command constants (pure `NAME=value` assignments /
+                # alias bodies) for LATER stages, AFTER this stage's own checks.
+                _bash_update_stage_consts(raw, var_consts, alias_consts)
                 continue
             if kind != "git":
                 continue
