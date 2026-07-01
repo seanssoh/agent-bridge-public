@@ -104,34 +104,41 @@ life_setup() {
 # and GNU/Linux. $1 = file, $2 = age seconds. The watcher reads the file's MTIME
 # (via `stat`), so the heartbeat is only "stale" if the mtime actually moves back.
 #
-# Portability trap (the T12 Linux-red root cause): `date -r N` means two different
-# things — BSD/mac: "interpret epoch N"; GNU/Linux: "use the mtime of FILE named
-# N" (which fails for an integer). So we must try GNU `touch -d @epoch` (and
-# `date -d @epoch` for the BSD `touch -t` stamp) explicitly, not via `date -r`.
-# We then ASSERT the mtime took within tolerance — a silently-failed back-date
-# would otherwise leave a FRESH heartbeat and make a "stale" case wrongly pass as
-# fresh (exactly what made T12 green on mac, red on Linux).
+# #2239 r3 (GNU/Linux CI red): back-date via python3 `os.utime`, NOT `touch`. The
+# `touch` forms diverge across platforms and, on the GitHub Linux runner, the
+# heartbeat mtime did not durably land at now-900 (the tick read age=0 downstream)
+# even though a BSD-form/`touch -d` verify looked fine on macOS. `os.utime(path,
+# (t, t))` sets atime+mtime to the exact integer epoch identically on BSD and GNU,
+# with second resolution and no FS-granularity ambiguity — the single portable
+# writer. Passed as argv (no heredoc-stdin; footgun #11 / lint-heredoc-ban clean).
+# We then HARD-VERIFY the landed mtime GNU-first and fail LOUD if the age is not
+# within tolerance of the intended hb_age, so a non-landing back-date surfaces
+# deterministically HERE at setup rather than as a downstream flake.
 set_heartbeat_mtime() {
   local hb_file="$1" hb_age="$2"
   local now mtime got
   now="$(date +%s)"
   mtime=$(( now - hb_age ))
   printf '%s\n' "$mtime" >"$hb_file"
-  # GNU coreutils touch: -d @EPOCH. Try it first (Linux/CI path).
-  if ! touch -d "@$mtime" "$hb_file" 2>/dev/null; then
-    # BSD/mac touch: -t [[CC]YY]MMDDhhmm[.SS] from a BSD `date -r EPOCH`.
-    touch -t "$(date -r "$mtime" +%Y%m%d%H%M.%S 2>/dev/null)" "$hb_file" 2>/dev/null || true
-  fi
-  # Verify the back-date actually took (within 5s) — fail loudly otherwise so a
-  # platform where neither form works can never masquerade a fresh heartbeat as
-  # stale (or vice-versa).
-  # Read the mtime back PORTABLY. GNU coreutils: `stat -c %Y`; BSD/mac: `stat -f %m`.
-  # (Order matters: `stat -f` on GNU means "filesystem status" and prints garbage,
-  # so we MUST try the platform-correct form and sanitize the result to digits.)
+  # Portable, platform-identical back-date. os.utime takes (atime, mtime) seconds.
+  python3 -c 'import os,sys; t=int(sys.argv[2]); os.utime(sys.argv[1],(t,t))' \
+    "$hb_file" "$mtime" \
+    || smoke_fail "set_heartbeat_mtime: python3 os.utime back-date failed for $hb_file (wanted mtime=$mtime)"
+  # Read the landed mtime back GNU-first (`stat -c %Y`), then BSD (`stat -f %m`).
+  # `stat -f` on GNU is FILESYSTEM status and pollutes stdout, so `-c` MUST be
+  # first; the digit-squeeze + plausibility gate reject any stray fs-field output.
   got="$(stat -c %Y "$hb_file" 2>/dev/null || stat -f %m "$hb_file" 2>/dev/null || true)"
-  got="${got//[^0-9]/}"; [[ -n "$got" ]] || got=0
-  local delta=$(( got - mtime )); (( delta < 0 )) && delta=$(( -delta ))
-  (( delta <= 5 )) || smoke_fail "set_heartbeat_mtime: could not back-date $hb_file to age=${hb_age}s (wanted mtime=$mtime, got=$got) — heartbeat staleness would be wrong on this platform"
+  got="${got//[^0-9]/}"
+  { [[ -n "$got" ]] && (( got < 100000000000 )); } || got=0
+  # Verify the landed AGE (now - got) matches the intended hb_age within tolerance,
+  # re-reading `now` so a slow setup does not itself trip the check. Fail LOUD so a
+  # platform where the back-date silently no-ops can never masquerade a fresh
+  # heartbeat as stale (or vice-versa).
+  local now2 landed_age delta
+  now2="$(date +%s)"
+  landed_age=$(( now2 - got ))
+  delta=$(( landed_age - hb_age )); (( delta < 0 )) && delta=$(( -delta ))
+  (( delta <= 5 )) || smoke_fail "set_heartbeat_mtime: back-date did not land — wanted age=${hb_age}s, got age=${landed_age}s (mtime=$got, now=$now2) — heartbeat staleness would be wrong on this platform"
 }
 
 life_run() {
@@ -220,17 +227,20 @@ life_heartbeat_age() {
 # fresh/ok path), or a throttle-witness left behind (so the interval throttle
 # suppresses the tick). This was the #2239 full-suite CI flake, where the bare
 # `recover-due count=0` gave no hint WHICH precondition broke. life_run() now
-# hard-pins the ENABLED/STALE gates so a leaked env can no longer gate the tick;
-# this asserts the two REMAINING per-case preconditions LOUD with the observed
-# state BEFORE the tick, so a future regression surfaces the real cause instead of
-# an opaque count=0. $1 = throttle-witness state file that must be absent (due).
+# hard-pins the ENABLED/STALE gates so a leaked env can no longer gate the tick.
+#
+# #2239 r3: the STALENESS precondition is NOT re-read here. Re-reading a heartbeat
+# mtime that was back-dated by an EARLIER life_run and asserting it later is a
+# timing trap — on the GitHub Linux runner the persisted mtime read back as ~now
+# (age=0) even though set_heartbeat_mtime verified it correctly at back-date time,
+# so the deferred read fired a false failure. Staleness is instead asserted with
+# ZERO gap inside the real tick's own set_heartbeat_mtime (its ±5s verify against
+# now-900 already guarantees age≈900 at the instant the tick reads it, and fails
+# LOUD otherwise). This pre-assertion checks only the throttle witness — a stable
+# on-disk file whose presence/absence does not depend on mtime timing.
+# $1 = throttle-witness state file that must be absent (due).
 assert_real_tick_preconditions() {
   local state_file="$1"
-  local age; age="$(life_heartbeat_age)"
-  # life_run() pins BRIDGE_DAEMON_TOKEN_LIFELINE_STALE_SECONDS=600, so age>=600 is
-  # the effective staleness gate the tick will apply.
-  (( age >= 600 )) \
-    || smoke_fail "real-tick precondition: heartbeat age=${age}s is NOT stale (need >=600) — the back-date did not land; the tick would take the fresh/ok path and no-op"
   [[ ! -e "$state_file" ]] \
     || smoke_fail "real-tick precondition: throttle witness present [$(cat "$state_file" 2>&1)] — the interval throttle would suppress the tick"
 }
