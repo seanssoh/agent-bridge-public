@@ -4,6 +4,19 @@ All notable changes to Agent Bridge are documented here. This project adheres
 loosely to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and tracks
 version bumps via the `VERSION` file.
 
+## [0.16.21] — 2026-07-01 (LTS · never-die wave backport — 데몬 절대 안 죽음 defense-in-depth)
+
+**v0.16.21 — the daemon "never-die" hardening wave is backported to the LTS line**, the new `lts` / Latest head (supersedes `v0.16.20`). After the 06-30 M4 fleet-down incident (#2209 RCA), the daemon could go silently DOWN and stay down across five distinct failure classes: a hung restart failed open, launchd unloaded+disabled drift had no self-heal, the token lifeline died with the daemon (fleet quota-cascade), an interrupted upgrade left version skew + partial state, and a `--no-restart-daemon` reconcile could boot the daemon out. This backports the same six-fix defense-in-depth wave shipped on `v0.17.0-beta8` (mainline) — a **fleet-host-down regression** class that qualifies for LTS backport. **Scope: never-die only** — the v0.17 auto-rotate roadmap, the dynamic→static converter, and §10 lighting stay mainline (features are not LTS-backported). The F#2222 test was scoped to its **#2204 date-anchored assertions** (the LTS line has no #17927 bare-clock branch, so those main-only assertions were omitted); the `parse_reset_at` fail-closed fix + all six fixes re-verified on the v0.16 line. Each fix carried a codex / patch-dev `implement-ok` on mainline.
+
+### Daemon never-die wave (#2209 — 06-30 fleet-down RCA, backport)
+
+- **daemon: escalate the silence-watchdog on a hung restart instead of failing open (#2208 / #2224).** A restart that hangs (rc124 → 300s cooldown) no longer silently swallows without escalation.
+- **daemon: self-heal non-operator launchd disabled-drift via per-path markers (#2205 / #2225).** Runtime detection + self-heal for the unloaded+disabled drift class.
+- **daemon: out-of-process token lifeline — recover-due + sync survive daemon-down (#2207 / #2227).** The token rotation / recover-due / sync lifeline no longer dies with the daemon.
+- **upgrade: restore reconcile-induced daemon bootout under `--no-restart-daemon` (#2210 / #2223).** A layout-v2 reconcile bootout no longer leaves the daemon silently DOWN.
+- **upgrade: atomic apply-in-progress marker + idempotent resume (#2211 / #2228).** `upgrade --apply` is now atomic / resumable — an interruption mid-run no longer leaves version skew + partial state.
+- **auth: fail closed on a malformed date-anchored weekly reset stamp (#2222).** `parse_reset_at`'s date-anchored branch fails closed (`""`) on malformed input like the bare-clock branch. Backport test scoped to the #2204 date-anchored set.
+
 ## [0.16.20] — 2026-06-29 (LTS · #2182 teams plugin-cache fresh-build race hotfix)
 
 **v0.16.20 — the #2182 fleet-critical plugin-cache fresh-build race is closed on the LTS line**, the new `lts` / Latest head (supersedes `v0.16.19`). On an upgrade that bumped a channel plugin's version (teams `0.1.1→0.1.2` on `v0.16.19`), an agent that did **not** already have that cached version fresh-built its per-agent plugin cache on launch — and a race partially copied the `@azure` dependency (8-11/12, non-deterministic). The required-contract check then found `node_modules/@azure/core-client/package.json` missing, aborted the launch with `criticality=channel-required`, and the verify-retry loop **reused the partial cache** instead of rebuilding it → the agent was left `stopped` (a **permanent wedge**). This is a straight cherry-pick of the `main` fix (PR #2184); the smoke (T1-T6) and the called helpers were re-verified green on the v0.16 line.
