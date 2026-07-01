@@ -70,6 +70,11 @@ REPO_ROOT="$SMOKE_REPO_ROOT"
 BOOTSTRAP="$REPO_ROOT/bootstrap-memory-system.sh"
 smoke_assert_file_exists "$BOOTSTRAP" "T0: bootstrap-memory-system.sh present in repo root"
 
+# report-query helper (file-as-argv; no heredoc-stdin so the heredoc-ban
+# ratchet stays green). Prints one field from a bootstrap-memory report JSON.
+RECON_HELPER="$SCRIPT_DIR/2090-cron-reconcile-helpers/report-query.py"
+smoke_assert_file_exists "$RECON_HELPER" "T0: report-query.py helper present"
+
 BRIDGE_BASH_BIN="${BRIDGE_BASH_BIN:-$(command -v bash)}"
 export BRIDGE_BASH_BIN
 
@@ -191,50 +196,19 @@ latest_report() {
 }
 
 # report_status <report> <step-substr> — prints the `status` for the record
-# whose `step` contains <step-substr>. Reads the JSON via python (argv, no
-# heredoc-stdin).
+# whose `step` contains <step-substr>. Delegates to the file-as-argv helper.
 report_status() {
-  python3 - "$1" "$2" <<'PY'
-import json, sys
-report, step_sub = sys.argv[1], sys.argv[2]
-try:
-    data = json.load(open(report, encoding="utf-8"))
-except Exception:
-    sys.exit(0)
-for r in data.get("records", []):
-    if step_sub in (r.get("step") or ""):
-        print(r.get("status") or "")
-        break
-PY
+  python3 "$RECON_HELPER" status "$1" "$2"
 }
 
 # report_note <report> <step-substr> — prints the `note` for the matching record.
 report_note() {
-  python3 - "$1" "$2" <<'PY'
-import json, sys
-report, step_sub = sys.argv[1], sys.argv[2]
-try:
-    data = json.load(open(report, encoding="utf-8"))
-except Exception:
-    sys.exit(0)
-for r in data.get("records", []):
-    if step_sub in (r.get("step") or ""):
-        print(r.get("note") or "")
-        break
-PY
+  python3 "$RECON_HELPER" note "$1" "$2"
 }
 
+# report_field <report> <field> — prints a top-level report field.
 report_field() {
-  python3 - "$1" "$2" <<'PY'
-import json, sys
-report, field = sys.argv[1], sys.argv[2]
-try:
-    data = json.load(open(report, encoding="utf-8"))
-except Exception:
-    sys.exit(0)
-val = data.get(field)
-print("true" if val is True else "false" if val is False else ("" if val is None else val))
-PY
+  python3 "$RECON_HELPER" field "$1" "$2"
 }
 
 # ============================================================================
