@@ -8,8 +8,11 @@
 # this file pins the unit invariants for the #2163 additions.
 #
 #   F3 — `_bridge_home_is_test_temp` now inspects BRIDGE_HOME *plus* every
-#        explicitly-set runtime-identity anchor (BRIDGE_RUNTIME_CONFIG_FILE /
-#        BRIDGE_STATE_DIR / BRIDGE_RUNTIME_ROOT). A confined fixer that spoofs
+#        explicitly-set runtime-identity anchor (config landing:
+#        BRIDGE_RUNTIME_CONFIG_FILE / BRIDGE_STATE_DIR / BRIDGE_RUNTIME_ROOT /
+#        BRIDGE_AGENT_ENV_LOCAL_FILE; OAuth registry: BRIDGE_CLAUDE_TOKEN_REGISTRY
+#        / BRIDGE_RUNTIME_SECRETS_DIR; cred-state: BRIDGE_AUTH_CRED_STATE_FILE).
+#        A confined fixer that spoofs
 #        BRIDGE_HOME=/tmp/x so the predicate reads "sandbox" (and the
 #        BRIDGE_GUARD_ADMIN_ROSTER_JSON seam trusts a forged admin roster)
 #        while another anchor still points at the LIVE runtime no longer
@@ -41,15 +44,21 @@ import pathlib
 import sys
 
 # Runtime-identity anchors the F3 predicate must consider (kept local so this
-# smoke pins the intended set independently of the module constant). The last
-# two are the OAuth token-registry anchors (#2163 patch r1 BREAK2).
+# smoke pins the intended set independently of the module constant):
+#   - config landing: RUNTIME_CONFIG_FILE / STATE_DIR / RUNTIME_ROOT +
+#     AGENT_ENV_LOCAL_FILE (the `config set-env` write target)
+#   - OAuth token-registry (#2163 patch r1 BREAK2): CLAUDE_TOKEN_REGISTRY /
+#     RUNTIME_SECRETS_DIR
+#   - cred-state (#2163 codex r2): AUTH_CRED_STATE_FILE
 _ANCHORS = (
     "BRIDGE_HOME",
     "BRIDGE_RUNTIME_CONFIG_FILE",
     "BRIDGE_STATE_DIR",
     "BRIDGE_RUNTIME_ROOT",
+    "BRIDGE_AGENT_ENV_LOCAL_FILE",
     "BRIDGE_CLAUDE_TOKEN_REGISTRY",
     "BRIDGE_RUNTIME_SECRETS_DIR",
+    "BRIDGE_AUTH_CRED_STATE_FILE",
 )
 
 # A path that is NOT under any fixed temp root — stands in for the LIVE runtime.
@@ -143,6 +152,19 @@ def _indirection_cases() -> list[tuple[str, "str | None"]]:
         ("agent-bridge auth claude-token add sk-ant-oLITERAL", None),
         # a token-free request verb is not a mutation.
         ("agent-bridge auth claude-token receive", None),
+        # #2163 codex-r2/CI regression — a shell running a SCRIPT FILE
+        # (`bash <wrapper>.sh <verb>`) is the DIRECT sanctioned wrapper
+        # invocation, NOT `-c` indirection. `_interpreter_payload_command_str`
+        # returns None for a script-file argv (no `-c`), so these MUST NOT flag —
+        # this is exactly the 1358 admin-credential-routine sanctioned shape whose
+        # false-DENY reddened shard 3/3 before the interpreter-branch fix.
+        ("bash bridge-auth.sh claude-token add --stdin --id pool-a", None),
+        ("bash bridge-auth.sh claude-token add --stdin --id pool-a "
+         "--enable-auto-rotate", None),
+        ("/bin/bash bridge-auth.sh claude-token rotate --note x", None),
+        ("sh bridge-auth.sh claude-token sync", None),
+        # symmetric: a config-wrapper SCRIPT invocation is likewise not indirection.
+        ("bash bridge-config.py config set --path /x", None),
         # config reads, and unrelated commands that merely CONTAIN the
         # substrings "auth"/"config"/"$" (the #1690 false-positive class).
         ("agb config get foo", None),
@@ -366,11 +388,32 @@ def _run_f3(module, tmp_root: str, failures: list[str]) -> int:
         ("tilde spoof via BRIDGE_RUNTIME_SECRETS_DIR",
          {"BRIDGE_HOME": home_tmp,
           "BRIDGE_RUNTIME_SECRETS_DIR": "~/.agent-bridge/secrets"}, False),
-        # all anchors temp (incl. the registry pair) ⇒ sandbox.
+        # #2163 codex r2 — the cred-state anchor (bridge-auth.py writes the
+        # cred-state file at BRIDGE_AUTH_CRED_STATE_FILE with expanduser
+        # precedence, reached from `claude-token sync`/`global-auth-sync`) plus
+        # the config `set-env` write target BRIDGE_AGENT_ENV_LOCAL_FILE. Live abs
+        # + tilde variants MUST be not-sandbox (False).
+        ("spoof via BRIDGE_AUTH_CRED_STATE_FILE",
+         {"BRIDGE_HOME": home_tmp,
+          "BRIDGE_AUTH_CRED_STATE_FILE": f"{_LIVE_ROOT}/state/auth/cred-state.json"},
+         False),
+        ("tilde spoof via BRIDGE_AUTH_CRED_STATE_FILE",
+         {"BRIDGE_HOME": home_tmp,
+          "BRIDGE_AUTH_CRED_STATE_FILE": "~/.agent-bridge/state/auth/cred-state.json"},
+         False),
+        ("spoof via BRIDGE_AGENT_ENV_LOCAL_FILE",
+         {"BRIDGE_HOME": home_tmp,
+          "BRIDGE_AGENT_ENV_LOCAL_FILE": f"{_LIVE_ROOT}/agent-env.local.sh"}, False),
+        ("tilde spoof via BRIDGE_AGENT_ENV_LOCAL_FILE",
+         {"BRIDGE_HOME": home_tmp,
+          "BRIDGE_AGENT_ENV_LOCAL_FILE": "~/.agent-bridge/agent-env.local.sh"}, False),
+        # all anchors temp (incl. registry pair + cred-state + env-local) ⇒ sandbox.
         ("all-temp incl token-registry anchors",
          {"BRIDGE_HOME": home_tmp,
           "BRIDGE_CLAUDE_TOKEN_REGISTRY": f"{tmp_root}/reg.json",
-          "BRIDGE_RUNTIME_SECRETS_DIR": f"{tmp_root}/secrets"}, True),
+          "BRIDGE_RUNTIME_SECRETS_DIR": f"{tmp_root}/secrets",
+          "BRIDGE_AUTH_CRED_STATE_FILE": f"{tmp_root}/state/auth/cred-state.json",
+          "BRIDGE_AGENT_ENV_LOCAL_FILE": f"{tmp_root}/agent-env.local.sh"}, True),
         # prod home (not temp) ⇒ not sandbox even with no anchors.
         ("prod home", {"BRIDGE_HOME": _LIVE_ROOT}, False),
         # tilde-spelled prod home ⇒ not sandbox (BRIDGE_HOME is expanduser'd by

@@ -427,20 +427,33 @@ def _fixed_temp_roots() -> list[str]:
 
 # #2163 F3 — the runtime-identity env anchors that, together with BRIDGE_HOME,
 # determine WHERE a config/auth mutation actually lands. The sandbox predicate
-# must consider all of them, not BRIDGE_HOME alone (see `_bridge_home_is_test_temp`).
-# The last two are the OAuth token-registry anchors (#2163 patch r1 BREAK2): the
-# registry file is `$BRIDGE_CLAUDE_TOKEN_REGISTRY` (direct override) else
-# `$BRIDGE_RUNTIME_SECRETS_DIR/claude-oauth-tokens.json` — exactly the two vars
-# this hook's own `claude_credential_paths()` resolves it from. Omitting them
-# left a split-root spoof where the config anchors point at /tmp (predicate
-# reads "sandbox") while the token registry is repointed LIVE, landing a
-# forged-admin token mutation in the live registry.
+# must consider ALL of them, not BRIDGE_HOME alone (see `_bridge_home_is_test_temp`):
+# every var here is a `Path(explicit).expanduser()` override that a runtime writer
+# resolves independently of BRIDGE_HOME, so any one left off the set reopens a
+# split-root spoof (config anchors → /tmp so the predicate reads "sandbox" while
+# THIS var is repointed LIVE, landing a forged-admin mutation on the live tree).
+#   - CONFIG landing anchors (#1738 surface): BRIDGE_RUNTIME_CONFIG_FILE /
+#     BRIDGE_STATE_DIR / BRIDGE_RUNTIME_ROOT (bridge-config.py) and
+#     BRIDGE_AGENT_ENV_LOCAL_FILE — the `config set-env` write target
+#     (bridge-config.py `agent_env_local_path` returns `Path(explicit).expanduser()`,
+#     defaulting to `$BRIDGE_HOME/agent-env.local.sh`; an explicit LIVE override
+#     while BRIDGE_HOME is temp lands the set-env write on the live tree).
+#   - OAuth token-registry anchors (#2163 patch r1 BREAK2): BRIDGE_CLAUDE_TOKEN_REGISTRY
+#     (direct override) else BRIDGE_RUNTIME_SECRETS_DIR/claude-oauth-tokens.json —
+#     exactly the two vars this hook's own `claude_credential_paths()` resolves from.
+#   - Cred-state anchor (#2163 codex r2): BRIDGE_AUTH_CRED_STATE_FILE — bridge-auth.py
+#     gives it explicit expanduser precedence and `stamp_cred_generation`
+#     (reached from `claude-token sync`/`global-auth-sync`) writes the cred-state
+#     file there, so a temp-BRIDGE_HOME + live BRIDGE_AUTH_CRED_STATE_FILE spoof
+#     landed a forged-admin cred-generation stamp on the live tree.
 _RUNTIME_IDENTITY_ENV_VARS = (
     "BRIDGE_RUNTIME_CONFIG_FILE",
     "BRIDGE_STATE_DIR",
     "BRIDGE_RUNTIME_ROOT",
+    "BRIDGE_AGENT_ENV_LOCAL_FILE",
     "BRIDGE_CLAUDE_TOKEN_REGISTRY",
     "BRIDGE_RUNTIME_SECRETS_DIR",
+    "BRIDGE_AUTH_CRED_STATE_FILE",
 )
 
 
@@ -5817,6 +5830,15 @@ def _stage_reaches_auth_token_mutation(stage: str) -> bool:
     `receive`, a bare `auth claude-token` read) applies ONLY when NO mutation
     verb is present. An unresolved `$` that could expand to the action/verb IS
     flagged (the real argv is hidden).
+
+    Accepted residual (#2163 patch r2, non-blocking): a glob char-class spelling
+    of the verb (`agb auth claude-token ad[d] …`) does NOT substring-match `add`
+    and so is not flagged here. It is an accepted-residual class, same as #2159's
+    out-of-band `$g` binding: for the glob to actually reach the mutation the
+    shell must expand `ad[d]` against a planted cwd file literally named `add`
+    (else it is passed through verbatim and argparse rejects the subcommand) — a
+    deliberate multi-step file-plant, outside this containment-not-sandbox layer's
+    fail-open-advisory remit.
     """
     flat = _SHELL_QUOTE_ESCAPE_RE.sub("", stage)
     has_gas = "global-auth-sync" in flat
@@ -5899,18 +5921,25 @@ def _config_mutation_via_indirection(text: str) -> str | None:
             continue
         leaf = toks[0].rsplit("/", 1)[-1]
         if leaf in _BASH_GIT_INTERPRETER_LEAVES:
-            # `eval '<payload>'` / `bash -c '<payload>'` / `sh -c '<payload>'`
-            # and the full interpreter-leaf set (#2163 C6 — zsh/ksh/mksh/dash/
-            # ash/fish + xargs, reusing `_BASH_GIT_INTERPRETER_LEAVES`; widens
-            # the #1738 config gate too, additive-stricter). The payload is a
-            # later token; if ANY token in the stage reaches a protected-mutation
-            # surface, the verb is run through a nested interpreter → deny.
-            payload = " ".join(toks[1:])
-            kind = _stage_protected_mutation_kind(payload) or _stage_protected_mutation_kind(stage)
-            if kind == "config":
-                return f"config_mutation_via_{leaf}"
-            if kind == "auth":
-                return f"auth_token_mutation_via_{leaf}"
+            # A genuine command-STRING interpretation is indirection: `eval <cmd>`,
+            # `xargs <cmd>`, or a `-c`/`-lc` shell (#2163 C6 — the full interpreter
+            # set zsh/ksh/mksh/dash/ash/fish + xargs, reusing
+            # `_BASH_GIT_INTERPRETER_LEAVES`, symmetric with the git guard). But a
+            # shell running a SCRIPT FILE (`bash bridge-auth.sh claude-token add`,
+            # `sh bridge-config.py config set`) is the DIRECT sanctioned wrapper
+            # invocation, NOT indirection — the wrapper's own caller-trust gate
+            # owns it (#2163 patch/1358 sanctioned admin shape). So extract the
+            # actual interpreted command via `_interpreter_payload_command_str`
+            # (the `-c`/eval/xargs command string, or None for a script-file
+            # invocation) and only flag when a real command string is present and
+            # reaches a protected-mutation surface — never on `bash <wrapper>.sh`.
+            payload = _interpreter_payload_command_str(toks)
+            if payload is not None:
+                kind = _stage_protected_mutation_kind(payload)
+                if kind == "config":
+                    return f"config_mutation_via_{leaf}"
+                if kind == "auth":
+                    return f"auth_token_mutation_via_{leaf}"
         # Unresolved command-position `$var` around the verb surface. `$` only
         # survives shlex when it was inside single quotes or escaped; a bare
         # `$V` would already have been (not) expanded by shlex into the literal
