@@ -952,6 +952,39 @@ if [[ $DRY_RUN -eq 0 ]]; then
   unset _bundled_chan_csv
 fi
 
+# Issue #1191 (fix shape (b)): per-`agent start` Node.js version gate.
+# Warn NON-FATALLY when a to-be-loaded bundled plugin declares
+# engines.node and the host node is missing/too old, so the operator sees
+# a clear "plugin X requires node >= Y" diagnostic AT START instead of a
+# confusing downstream SyntaxError-in-logs when the plugin MCP spawns on a
+# stock Node 12 host. Runs on `--dry-run` too (unlike the bun provisioner
+# above) so the warning surfaces in the dry-run preflight report. This
+# gate never blocks or fails the start.
+if declare -F bridge_warn_plugins_node_engines >/dev/null 2>&1; then
+  _node_gate_csv="$(bridge_agent_channels_csv "$AGENT" 2>/dev/null || true)"
+  if [[ "$_node_gate_csv" == *plugin:* ]]; then
+    _node_gate_required=""
+    _IFS_save="$IFS"
+    IFS=','
+    for _tok in $_node_gate_csv; do
+      _tok="${_tok// /}"
+      [[ "$_tok" == plugin:*@agent-bridge ]] || continue
+      _name="${_tok#plugin:}"
+      _name="${_name%@agent-bridge}"
+      if [[ -f "$BRIDGE_SCRIPT_DIR/plugins/$_name/package.json" ]]; then
+        _node_gate_required="${_node_gate_required:+$_node_gate_required,}$_name"
+      fi
+    done
+    IFS="$_IFS_save"
+    unset _IFS_save _tok _name
+    if [[ -n "$_node_gate_required" ]]; then
+      bridge_warn_plugins_node_engines "$_node_gate_required" || true
+    fi
+    unset _node_gate_required
+  fi
+  unset _node_gate_csv
+fi
+
 if bridge_isolation_disabled_by_env; then
   bridge_warn "BRIDGE_DISABLE_ISOLATION=1 — skipping v2 isolation prep for '$AGENT' (security boundary disabled, agent will run as controller UID without sudo wrap or per-agent env file)"
 elif bridge_agent_linux_user_isolation_effective "$AGENT"; then
