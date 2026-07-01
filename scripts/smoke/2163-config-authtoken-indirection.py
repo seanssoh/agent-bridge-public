@@ -149,6 +149,18 @@ def _indirection_cases() -> list[tuple[str, "str | None"]]:
          "config_mutation_via_bash"),
         ("bash -c -o pipefail -x 'agb auth claude-token rotate'",
          "auth_token_mutation_via_bash"),
+        # #2163 codex r5 — the c-flag itself may be spelled with a `+` prefix
+        # (`+c` / `+lc`): bash/sh/zsh/ksh/dash all run the operand for
+        # `<sh> +c '<cmd>'`. The detector recognizes BOTH `-`/`+` prefixes, so
+        # these reach the fail-closed operand join and MUST deny.
+        ("bash +c 'agb auth claude-token rotate'",
+         "auth_token_mutation_via_bash"),
+        ("sh +c 'agent-bridge auth claude-token activate default'",
+         "auth_token_mutation_via_sh"),
+        ("zsh +lc 'agb config set-env K=V'", "config_mutation_via_zsh"),
+        ("dash +c +x 'agb auth claude-token rotate'",
+         "auth_token_mutation_via_dash"),
+        ("ksh +c 'agb auth claude-token add x'", "auth_token_mutation_via_ksh"),
         # ---- C4b auth-token DENY via unresolved command-position $var ----
         ("agb auth claude-token $V", "auth_token_mutation_via_unresolved_var"),
         ("$C auth claude-token add x", "auth_token_mutation_via_unresolved_var"),
@@ -193,6 +205,11 @@ def _indirection_cases() -> list[tuple[str, "str | None"]]:
          "--enable-auto-rotate", None),
         ("/bin/bash bridge-auth.sh claude-token rotate --note x", None),
         ("sh bridge-auth.sh claude-token sync", None),
+        # `+c` detection must not over-block a benign command string, and a
+        # non-c `+`-option (`+x`) must NOT be mistaken for the command flag (it's
+        # a script-file invocation → deferred to the wrapper gate).
+        ("bash +c 'echo hi'", None),
+        ("bash +x bridge-auth.sh claude-token add --stdin", None),
         # symmetric: a config-wrapper SCRIPT invocation is likewise not indirection.
         ("bash bridge-config.py config set --path /x", None),
         # config reads, and unrelated commands that merely CONTAIN the

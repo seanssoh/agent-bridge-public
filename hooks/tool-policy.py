@@ -8785,8 +8785,12 @@ def _interpreter_payload_command_str(real_tokens: list[str]) -> str | None:
     if leaf in _BASH_GIT_INTERPRETER_LEAVES:  # a `-c` shell (sh/bash/zsh/…)
         for i in range(1, len(real_tokens)):
             tok = real_tokens[i]
-            if tok == "-c" or (
-                tok.startswith("-")
+            # The command-string flag may be spelled with EITHER a `-` or a `+`
+            # prefix, possibly combined (`-c`/`+c`/`-lc`/`+lc`): bash/sh/zsh/ksh/
+            # dash all run the operand for `<sh> +c '<cmd>'` (#2163 codex r5). Both
+            # prefixes, single `c` or a c-bearing cluster, count — never `--long`.
+            if tok in ("-c", "+c") or (
+                (tok.startswith("-") or tok.startswith("+"))
                 and not tok.startswith("--")
                 and "c" in tok[1:]
             ):
