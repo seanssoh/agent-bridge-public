@@ -393,9 +393,20 @@ step_t7_dry_run_no_mutation() {
   # broken precondition instead of the opaque `recover-due count=0`. The heartbeat
   # still carries the DRY_RUN tick's back-date; life_run() re-back-dates it below.
   assert_real_tick_preconditions "$state_file"
+  # #2239 INSTR (TEMPORARY CI diag — remove once root-caused): capture the heartbeat
+  # age the DRY_RUN tick LEFT behind + any leaked daemon/liveness process, right
+  # before the real tick re-back-dates. Tests whether the DRY_RUN tick spawned an
+  # async writer (leaked-daemon hypothesis) that clobbers the real tick's back-date.
+  local _hb_instr="$LIFE_STATE_DIR/daemon.heartbeat"
+  smoke_log "T7 INSTR pre-real-tick: hb_age_gnu=$(( $(date +%s) - $(stat -c %Y "$_hb_instr" 2>/dev/null || echo 0) ))s procs=[$(ps -eo pid,ppid,command 2>/dev/null | grep -iE 'bridge-daemon|daemon-liveness' | grep -v grep | tr '\n' ';')]"
   BRIDGE_DAEMON_LIVENESS_DRY_RUN=0 life_run 900
   if [[ "$(auth_count 'recover-due')" != "1" ]]; then
     smoke_log "T7 diag FAIL-CTX: hb_age=$(life_heartbeat_age)s enabled=${BRIDGE_DAEMON_TOKEN_LIFELINE_ENABLED:-<unset>} stale_gate=${BRIDGE_DAEMON_TOKEN_LIFELINE_STALE_SECONDS:-<unset>} state_file=$([[ -e "$state_file" ]] && printf 'EXISTS[%s]' "$(cat "$state_file" 2>&1)" || printf ABSENT) auth_log=[$(cat "$AUTH_LOG")] liveness_out=[$(cat "$LIFE_STATE_DIR/liveness.out")]"
+    # #2239 INSTR (TEMPORARY): dump the REAL tick's audit rows — daemon_liveness_ok
+    # carries the exact heartbeat_age_seconds main() computed (fresh path), vs
+    # skip_not_running (stale) vs a token_lifeline row (ran). Decisive for WHY count=0.
+    smoke_log "T7 INSTR FAIL: audit=[$(cat "$LIFE_STATE_DIR/audit.jsonl" 2>&1 | tr '\n' '|')]"
+    smoke_log "T7 INSTR FAIL: post-tick hb_age_gnu=$(( $(date +%s) - $(stat -c %Y "$_hb_instr" 2>/dev/null || echo 0) ))s procs=[$(ps -eo pid,ppid,command 2>/dev/null | grep -iE 'bridge-daemon|daemon-liveness' | grep -v grep | tr '\n' ';')]"
     smoke_fail "T7: a real tick after a DRY_RUN was throttled — DRY_RUN must not arm the throttle (recover-due count=$(auth_count 'recover-due'))"
   fi
   smoke_log "T7: OK — DRY_RUN audits but mutates nothing (state file absent; real tick not suppressed)"
