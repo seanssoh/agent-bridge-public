@@ -4,6 +4,32 @@ All notable changes to Agent Bridge are documented here. This project adheres
 loosely to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and tracks
 version bumps via the `VERSION` file.
 
+## [0.17.0-beta8] — 2026-07-01 (mainline · beta · never-die wave — 데몬 절대 안 죽음 defense-in-depth + 동적→정적 converter FR#2061 in-beta QA)
+
+**v0.17.0-beta8 — the daemon "never-die" hardening wave, the operator's #1 priority after the 06-30 M4 fleet-down incident**, on top of beta7's rotation *core* fix. The 06-30 RCA (#2209 umbrella) found the daemon could go silently DOWN and stay down across five distinct failure classes: a hung restart failed open, launchd unloaded+disabled drift had no self-heal, the token lifeline died with the daemon (fleet quota-cascade), an interrupted upgrade left version skew + partial state, and a `--no-restart-daemon` reconcile could boot the daemon out. This beta lands the **six-fix defense-in-depth wave** that closes each of those, bundled with the **first-class dynamic→static agent converter (FR#2061 + #2216)** — shipped for **in-beta QA** per operator direction (live-QA #20517 moves to the beta channel) — plus the auto-rotate roadmap (#2217, 5 steps) and standalone reliability fixes already landed on main. This is a **mainline beta (prerelease)**: the **`v0.16.20` LTS stays the `lts` / Latest head** and production installs tracking `lts` are unaffected; a **`v0.16.21` LTS fast-follow will backport the never-die wave only** (features stay mainline). The bundled integration (never-die + converter + main) passed a full-branch codex `implement-ok` on the combination surface and green CI; each underlying fix carried its own codex / patch-dev review.
+
+### Daemon never-die wave (#2209 — operator #1, 06-30 fleet-down RCA)
+
+- **daemon: escalate the silence-watchdog on a hung restart instead of failing open (#2208 / Track A #2224).** A restart that hangs (rc124 → 300s cooldown) no longer silently swallows without escalation.
+- **daemon: self-heal non-operator launchd disabled-drift via per-path markers (#2205 / Track B #2225).** Runtime detection + self-heal for the unloaded+disabled drift class that previously had no recovery path.
+- **daemon: out-of-process token lifeline — recover-due + sync survive daemon-down (#2207 / Track C #2227).** The token rotation / recover-due / sync lifeline no longer dies with the daemon, closing the fleet quota-cascade.
+- **upgrade: restore reconcile-induced daemon bootout under `--no-restart-daemon` (#2210 / Track D #2223).** A layout-v2 reconcile bootout no longer leaves the daemon silently DOWN when `--no-restart-daemon` is set.
+- **upgrade: atomic apply-in-progress marker + idempotent resume (#2211 / Track E #2228).** `upgrade --apply` is now atomic / resumable — an interruption mid-run no longer leaves version skew + partial state.
+- **auth: fail closed on a malformed date-anchored weekly reset stamp (#2222 / Track F).** A malformed weekly-reset stamp fails closed instead of mis-parsing into a wrong window.
+- Fast-follow: the **PR-B2 Part2 daemon `active-dead-recover` smoke harness** completion is tracked separately (**#2233**, non-blocker; the WIP `b8dd699e` is inherited-on-main from #2176, a harness gap not a functional regression).
+
+### Agent lifecycle — dynamic→static converter (FR#2061 + #2216, in-beta QA)
+
+- **agent: first-class `agent convert` verb + config-dir-aware state migration (#2061).** Track A (config-dir migration engine `lib/bridge-agent-convert.sh`), Track B (the `agent convert` verb + §0.1 last-flip transaction), Track C (`--carry-session` resume-id pin). The live-QA gate (#20517) moves to in-beta testing per operator direction.
+- **agent: preserve source model + effort on dynamic→static conversion (#2216).** Conversion no longer drops the source model / effort (which had rendered the unavailable `claude-fable-5` default and required a manual re-set).
+
+### Auto-rotate roadmap (#2217) + standalone reliability
+
+- **auto-rotate roadmap #2217 (5 steps):** usage-probe content-age freshness gate (#2214), picker-sweep `--preflight` contract (#2215), hud-tap universality ratchet (#2218), reactive inference/picker `429` → preflighted rotation (#2219 — **ships flag-OFF**; `BRIDGE_REACTIVE_429_ROTATE_ENABLED` stays a canary gate, cut-independent), cross-layer auto-rotate decision-chain integration smoke (#2221).
+- **auth: synchronously converge operator-global creds on `rotate` / `activate --sync` (#2183).**
+- **memory: stop the memory-daily backfill self-perpetuating on zero-activity (#2229).**
+- **plugin-cache: verify must descend within-marketplace symlinked-dir deps (#2191).**
+
 ## [0.17.0-beta7] — 2026-06-28 (mainline · beta · #2171 M4 fleet-down rotation regression 회귀 픽스 *core* — live-preflight + 데몬 enablement + 측정 prefilter + 키체인 self-heal)
 
 **v0.17.0-beta7 — the M4 fleet-down rotation regression is closed at candidate selection time**, on top of beta6's inert `mark-adverse` primitive. The M4 incident (#19460): reactive Claude-token rotation re-picked a stale/limited candidate when the usage probe degraded (403/edge-blocked), and the whole fleet went dark. This beta lands the **core** of the hybrid fix (#2171) — four PRs that make the daemon's rotation actually verify a candidate is live before committing it, prefer a measured-fresh candidate, and stop a macOS keychain shadow from silently re-authing a session onto a dead personal token. **Each PR carried a patch-dev `implement-ok` + green Linux CI; PR-D's keychain reconcile went four adversarial review rounds closing a fail-open class at every IO layer.** The remaining **PR-B2 Part2 (daemon `active_dead_recover` for the 401/403 auth-dead marker + blind-nudge suppression) is deferred to a fast-follow** (its authoring fixer died on a transient rate-limit with an unverified harness; the WIP is preserved as draft PR #2176). A **planned `v0.16.19` LTS fast-follow will backport this core** once its release PR lands and verifies green on the LTS line — until then the **`v0.16.18` LTS stays the `lts` / Latest head** and production installs tracking `lts` are unaffected; this mainline beta is a **prerelease**. **`Closes #2171`** (core fix; Part2 + LTS backport tracked as fast-follows).
