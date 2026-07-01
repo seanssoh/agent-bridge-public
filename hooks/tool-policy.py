@@ -8388,10 +8388,21 @@ def _foreign_stage_git_destructive_shape(real_tokens: list[str]) -> bool:
          reset"; g`) carry no literal redirect/verb token here; #2159 closes
          them one level UP, in `_bash_git_primary_checkout_guard_reason`, which
          resolves the same-command constant and re-reads the substituted tokens
-         through THIS function. Accepted residual (containment-not-sandbox, fail-
-         open + advisory): multi-level chained indirection, cross-statement
-         string assembly, ANSI-C `$'…'`, and IFS/word-split divergence between a
-         single static substitution and the Bash runtime stay open by design."""
+         through THIS function — but ONLY when the literal string `git` survives
+         somewhere in the command text (the value / alias body / eval payload
+         carries it), because the cheap `"git" not in text` prefilter short-
+         circuits the whole guard first. A leader hidden with NO in-command
+         `git` at all (`cmd="$g -C <primary> reset"; eval "$cmd"` where `g` is
+         never assigned a literal `git` in the same command) is dropped at that
+         prefilter: at runtime `$g` expands to empty (harmless), and binding
+         `g=git` out-of-band would require a persisted shell export that the
+         confined tool harness does not carry across Bash calls — so this is a
+         non-exploitable accepted residual, not a reachable bypass. Accepted
+         residual (containment-not-sandbox, fail-open + advisory): the cheap-
+         prefilter literal-`git` boundary above, multi-level chained
+         indirection, cross-statement string assembly, ANSI-C `$'…'`, and
+         IFS/word-split divergence between a single static substitution and the
+         Bash runtime stay open by design."""
     if not real_tokens:
         return False
     verb, vargs, _hg, _hr, verb_unresolved = _parse_git_invocation(real_tokens)
@@ -8772,9 +8783,14 @@ def _bash_git_primary_checkout_guard_reason(
                     # codex F1/C6: RE-READ the resolved payload through the same
                     # destructive-shape reader the direct-leader path uses, so a
                     # payload whose leader stays UNRESOLVED after single-level
-                    # substitution (`cmd='$g -C <primary> reset'; eval "$cmd"`)
-                    # is denied symmetrically with its `…; $cmd` twin — the
-                    # literal-`git` text check below cannot see a `$g` leader.
+                    # substitution (`g=git; cmd='$g -C <primary> reset'; eval
+                    # "$cmd"`) is denied symmetrically with its `…; $cmd` twin —
+                    # the literal-`git` text check below cannot see a `$g`
+                    # leader. Reachable here because a same-command `git`/`g=git`
+                    # keeps the cheap `"git" not in text` prefilter from short-
+                    # circuiting; a payload with NO in-command `git` is the
+                    # documented prefilter boundary (see
+                    # `_foreign_stage_git_destructive_shape` docstring).
                     # ADDITIVE: only ever returns DENY (F1 deny-monotonic).
                     payload_cmd = _interpreter_payload_command_str(
                         info.get("real_tokens") or []

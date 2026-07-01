@@ -96,6 +96,15 @@ def main() -> int:
     SUB = str(sub)
     LINK = str(link_primary)
     BWT = str(bridge_wt)
+    # A primary-checkout path string with NO "git" substring. SMOKE_TMP_ROOT (and
+    # thus P/WT) contains "git" via the smoke name, which silently satisfies the
+    # cheap `"git" not in text` prefilter for EVERY case — masking whether a deny
+    # comes from the guard logic or the fixture path (codex #2241 r2 finding).
+    # NOGIT_P lets the const-tracking cases prove the "git" literal comes ONLY
+    # from the command's own token (value / g=git), never the path. It is a bare
+    # string (the const-tracking deny is path-realpath-independent), so it need
+    # not exist on disk.
+    NOGIT_P = "/tmp/ab-primary-checkout/x"
 
     # Ensure the bridge-workdir env cover is OFF for every non-bridge case so the
     # operator/worktree cwd checks are decided purely by cwd.
@@ -335,27 +344,33 @@ def main() -> int:
         f'alias g="git -C {P} reset --hard"; g',
         True,
     )
-    # codex Phase-4 F1/C6: an interpreter payload whose leader stays UNRESOLVED
-    # after single-level substitution (`$g` is not a known const, or `g=git` but
+    # codex Phase-4 r2 F1/C6: an interpreter payload whose leader stays
+    # UNRESOLVED after single-level substitution (`g=git; cmd="$g -C … reset"`,
     # single-level leaves the `$g` in the value) must be re-read through the
     # destructive-shape reader — SYMMETRIC with the direct-leader `…; $cmd` twin
     # (`2159 F1 nested`). The literal-`git` payload text check cannot see `$g`.
+    # ★NOGIT_P (no "git" in the PATH): the same-command `g=git` is what carries
+    # the "git" past the cheap prefilter, so the deny is proven reachable by the
+    # guard logic, NOT by a fixture-path substring (codex r2 test-honesty fix).
     expect(
-        "2159 eval unresolved-$leader payload (codex F1)",
+        "2159 eval unresolved-$leader reachable via g=git (non-git path)",
         WT,
-        f'cmd="$g -C {P} reset"; eval "$cmd"',
+        f'g=git; cmd="$g -C {NOGIT_P} reset"; eval "$cmd"',
         True,
     )
     expect(
-        "2159 eval unresolved-$leader, g=git single-level (codex F1b)",
+        "2159 sh -c unresolved-$leader reachable via g=git (non-git path)",
         WT,
-        f'g=git; cmd="$g -C {P} reset"; eval "$cmd"',
+        f'g=git; cmd="$g -C {NOGIT_P} reset --hard"; sh -c "$cmd"',
         True,
     )
+    # Value-hidden git denied with NO "git" in the path — the "git" literal lives
+    # only in the assigned VALUE, so this proves the #2159 core residual closes
+    # path-substring-independently (not via the SMOKE_TMP_ROOT "git" artifact).
     expect(
-        "2159 sh -c unresolved-$leader payload",
+        "2159 value-hidden git denied via non-git path (prefilter via value)",
         WT,
-        f'cmd="$g -C {P} reset --hard"; sh -c "$cmd"',
+        f'g="git -C {NOGIT_P} reset"; $g',
         True,
     )
 
@@ -453,6 +468,26 @@ def main() -> int:
         False,
     )
     expect("2159 allow eval lone unknown var", WT, 'eval "$undef"', False)
+    # ★codex r2 DOCUMENTED BOUNDARY (accepted residual): a payload with NO
+    # in-command `git` at all (leader `$g` never assigned a literal `git` this
+    # command, path free of "git") is dropped by the cheap `"git" not in text`
+    # prefilter → ALLOW. At runtime `$g` is empty (harmless); binding `g=git`
+    # out-of-band needs a persisted shell export the confined harness does not
+    # carry across Bash calls, so this is non-exploitable, not a reachable
+    # bypass. Asserted with NOGIT_P so it is a GENUINE prefilter drop, not the
+    # false-DENY the SMOKE_TMP_ROOT "git" artifact previously produced.
+    expect(
+        "2159 boundary: no-literal-git unresolved leader = prefilter drop",
+        WT,
+        f'cmd="$g -C {NOGIT_P} reset"; eval "$cmd"',
+        False,
+    )
+    expect(
+        "2159 boundary: no-literal-git sh -c unresolved leader = prefilter drop",
+        WT,
+        f'cmd="$g -C {NOGIT_P} reset --hard"; sh -c "$cmd"',
+        False,
+    )
 
     # ---- ALLOW: operator structural exemption (cwd = primary repo root) ------
     expect("operator cd-primary reset", P, f"cd {P} && git reset --hard", False)
