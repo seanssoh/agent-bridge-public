@@ -4774,7 +4774,15 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # writes today's distribution-report-<date>.md). Pull
       # 1613-wiki-mention-fence-indent so the paired scanner regression
       # rides along whenever the bootstrap entry moves.
-      add_required H-bootstrap-memory-iso-rebuild J-beta4-workflow-docs 1359-cron-create-iso-staging 1399-bootstrap-memory-no-admin 1613-wiki-mention-fence-indent
+      #
+      # Issue #2090: bootstrap-memory-system.sh's cron-conflict path gains
+      # an opt-in `--reconcile` flag that adopts the shipped default cadence
+      # for a wiki-* / memory-daily-<agent> cron whose live schedule drifted.
+      # 2090-cron-reconcile-adopt-defaults mutation-proves both the
+      # non-destructive default (no flag ⇒ conflict, no cron update) and the
+      # adopt path (with flag ⇒ reconciled, `cron update <id> --schedule`),
+      # so a future edit to either conflict site re-runs the guarantee.
+      add_required H-bootstrap-memory-iso-rebuild J-beta4-workflow-docs 1359-cron-create-iso-staging 1399-bootstrap-memory-no-admin 1613-wiki-mention-fence-indent 2090-cron-reconcile-adopt-defaults
       add_integration integration-minimal
       ;;
 

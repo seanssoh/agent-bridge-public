@@ -145,6 +145,18 @@ BACKFILL_HISTORY_DAYS=""
 # canonical jittered minute via `agb cron update`. Without it, conflict
 # rows surface a hint suggesting --re-jitter so the operator opts in.
 RE_JITTER=0
+# Issue #2090: opt-in convergence of same-family crons whose live schedule
+# has drifted from the cadence shipped in the current version. Default OFF.
+# Effective only with --apply. When a wiki-* or memory-daily-<agent> cron
+# exists on a DIFFERENT schedule/tz than the shipped default, bootstrap
+# normally refuses to overwrite it (records `conflict`, notes drift) so an
+# operator's deliberate schedule is never clobbered silently. With
+# --reconcile the operator explicitly opts in to adopt the shipped default:
+# each drifted same-family job is updated in place via `agb cron update`
+# (verb-atomic — no delete/recreate window) and the `existing → want` diff
+# is surfaced. Without it, the conflict rows still print the same diff so
+# the operator can see what --reconcile would change before opting in.
+RECONCILE=0
 while (( $# > 0 )); do
   case "$1" in
     --dry-run) MODE="dry-run" ;;
@@ -157,9 +169,10 @@ while (( $# > 0 )); do
       shift
       ;;
     --re-jitter) RE_JITTER=1 ;;
+    --reconcile) RECONCILE=1 ;;
     -h|--help)
       cat <<EOF
-usage: $(basename "$0") [--apply|--dry-run|--check] [--agent <name>] [--stale-days N] [--backfill-history N] [--re-jitter]
+usage: $(basename "$0") [--apply|--dry-run|--check] [--agent <name>] [--stale-days N] [--backfill-history N] [--re-jitter] [--reconcile]
 
 Steps:
   1. PreCompact hook per active claude agent.
@@ -181,6 +194,16 @@ Flags:
                 jittered minute computed from the agent name. Default
                 OFF — without it, conflict rows surface a hint instead
                 of mutating the cron. Issue #729.
+  --reconcile   (apply only) Adopt the shipped default cadence for any
+                wiki-* or memory-daily-<agent> cron whose live schedule/tz
+                has drifted from the current default. Each drifted job is
+                updated in place (\`agb cron update\`, verb-atomic) and the
+                \`existing → want\` diff is printed. Default OFF — without
+                it a same-family job on a different schedule is left
+                untouched and only recorded as a conflict (with the same
+                diff), so nothing changes unless you opt in. Broader than
+                --re-jitter, which only remediates the same-minute
+                memory-daily fan-out. Issue #2090.
 
 JSON report written to \$BRIDGE_STATE_ROOT/bootstrap-memory/report-<stamp>.json
 The report includes a top-level \`memory_daily_simultaneous_fire_max\`
@@ -199,6 +222,15 @@ done
 # misuse early rather than silently ignoring the flag.
 if (( RE_JITTER == 1 )) && [[ "$MODE" != "apply" ]]; then
   echo "bootstrap-memory: --re-jitter requires --apply (current mode: $MODE)" >&2
+  exit 2
+fi
+
+# Issue #2090: --reconcile mutates live crons, so like --re-jitter it is
+# meaningful only in --apply mode. --dry-run / --check already surface the
+# drift diff in their conflict rows (read-only), so gating the mutation flag
+# to --apply keeps those modes purely reportative.
+if (( RECONCILE == 1 )) && [[ "$MODE" != "apply" ]]; then
+  echo "bootstrap-memory: --reconcile requires --apply (current mode: $MODE)" >&2
   exit 2
 fi
 
@@ -804,7 +836,8 @@ step_cron_one() {
   local found
   found="$(cron_lookup "$title" || true)"
   if [[ -n "$found" ]]; then
-    local existing_sched existing_tz
+    local existing_id existing_sched existing_tz
+    existing_id="$(printf '%s' "$found" | awk -F'\t' '{print $1}')"
     existing_sched="$(printf '%s' "$found" | awk -F'\t' '{print $2}')"
     existing_tz="$(printf '%s' "$found" | awk -F'\t' '{print $3}')"
     # Cron list may return several shapes across bridge-cron versions:
@@ -926,7 +959,36 @@ step_cron_one() {
       fi
       return 0
     fi
-    record "$BRIDGE_ADMIN_AGENT" "cron:$title" "conflict" "existing=$existing_sched tz=$effective_existing_tz want=$sched tz=$tz — refusing"
+    # Issue #2090 — opt-in convergence. The live schedule/tz has drifted
+    # from the shipped default and none of the managed-migration branches
+    # above matched (so this is either an operator override or a cadence
+    # change we do not auto-migrate). With --reconcile the operator has
+    # explicitly asked to adopt the shipped default: update the job in place
+    # (verb-atomic; no delete/recreate window) and record the diff. Without
+    # the flag we fall through to the non-destructive conflict path below,
+    # which prints the same `existing → want` diff so the operator can see
+    # what --reconcile would change before opting in.
+    if [[ "$RECONCILE" == "1" && "$MODE" == "apply" && -n "$existing_id" ]]; then
+      if "$BRIDGE_AGB" cron update "$existing_id" \
+            --schedule "$sched" \
+            --tz "$tz" \
+            >/dev/null 2>&1; then
+        record "$BRIDGE_ADMIN_AGENT" "cron:$title" "reconciled" \
+          "id=$existing_id $existing_sched tz=$effective_existing_tz → $sched tz=$tz reason=#2090-adopt-default"
+        printf '[%s] reconcile cron:%s — adopted shipped default: %s tz=%s → %s tz=%s\n' \
+          "$MODE" "$title" "$existing_sched" "$effective_existing_tz" "$sched" "$tz"
+        return 0
+      fi
+      record "$BRIDGE_ADMIN_AGENT" "cron:$title" "reconcile-failed" \
+        "id=$existing_id $existing_sched tz=$effective_existing_tz → $sched tz=$tz"
+      note_drift
+      return 0
+    fi
+    local reconcile_hint=""
+    if [[ "$RECONCILE" != "1" ]]; then
+      reconcile_hint=" hint=run-with---reconcile-to-adopt-shipped-default"
+    fi
+    record "$BRIDGE_ADMIN_AGENT" "cron:$title" "conflict" "existing=$existing_sched tz=$effective_existing_tz want=$sched tz=$tz — refusing$reconcile_hint"
     note_drift
     return 0
   fi
@@ -1270,6 +1332,30 @@ PY
       fi
     fi
 
+    # Issue #2090 — opt-in convergence. Broader than --re-jitter: adopt the
+    # shipped default (canonical jittered `<minute> 3 * * *`) for ANY drifted
+    # memory-daily-<agent> cron, not only the same-minute collapse signature.
+    # The operator opting in with --reconcile has explicitly asked to converge
+    # to the shipped cadence, so we update in place (verb-atomic) rather than
+    # refuse. Without the flag we fall through to the non-destructive conflict
+    # path below (which prints the same diff).
+    if [[ "$RECONCILE" == "1" && "$MODE" == "apply" && -n "$existing_id" ]]; then
+      if "$BRIDGE_AGB" cron update "$existing_id" \
+            --schedule "$sched" \
+            --tz "$tz" \
+            >/dev/null 2>&1; then
+        record "$agent" "cron:$title" "reconciled" \
+          "id=$existing_id $existing_sched tz=$effective_existing_tz → $sched tz=$tz reason=#2090-adopt-default"
+        printf '[%s] reconcile cron:%s — adopted shipped default: %s tz=%s → %s tz=%s\n' \
+          "$MODE" "$title" "$existing_sched" "$effective_existing_tz" "$sched" "$tz"
+        return 0
+      fi
+      record "$agent" "cron:$title" "reconcile-failed" \
+        "id=$existing_id $existing_sched tz=$effective_existing_tz → $sched tz=$tz"
+      note_drift
+      return 0
+    fi
+
     # Conflict refused. Surface the --re-jitter hint when the conflict
     # shape is plausibly a jitter regression (daily-3am, wrong minute) so
     # operators learn about the recovery path without reading docs. The
@@ -1311,6 +1397,14 @@ PY
           hint=" hint=skipped-single-minute-cron-not-collapsed simultaneous=$hint_simultaneous"
         fi
       fi
+    fi
+
+    # Issue #2090: the drift is adoptable via --reconcile for ANY shape (not
+    # just the re-jitter collapse signature). Surface that path when the
+    # operator has not opted in, so the generic-override conflict rows learn
+    # about the converge-to-default option too.
+    if [[ "$RECONCILE" != "1" ]]; then
+      hint+=" hint=run-with---reconcile-to-adopt-shipped-default"
     fi
 
     record "$agent" "cron:$title" "conflict" \
@@ -1744,12 +1838,13 @@ fi
 # -----------------------------------------------------------------------------
 # emit JSON report
 # -----------------------------------------------------------------------------
-"$BRIDGE_PYTHON" - "$RECORD_FILE" "$MODE" "$DRIFT" "$REPORT" "$MEMORY_DAILY_SIMULTANEOUS_FIRE_MAX" "$RE_JITTER" <<'PY'
+"$BRIDGE_PYTHON" - "$RECORD_FILE" "$MODE" "$DRIFT" "$REPORT" "$MEMORY_DAILY_SIMULTANEOUS_FIRE_MAX" "$RE_JITTER" "$RECONCILE" <<'PY'
 import json, sys, datetime, pathlib
-record_file, mode, drift_str, out_path, simul_max_str, rejitter_str = sys.argv[1:7]
+record_file, mode, drift_str, out_path, simul_max_str, rejitter_str, reconcile_str = sys.argv[1:8]
 drift = int(drift_str)
 simul_max = int(simul_max_str)
 re_jitter = bool(int(rejitter_str))
+reconcile = bool(int(reconcile_str))
 records = []
 with open(record_file, encoding="utf-8") as f:
     for line in f:
@@ -1767,6 +1862,9 @@ payload = {
     # Claude session spawns. Operators run with --re-jitter to remediate.
     "memory_daily_simultaneous_fire_max": simul_max,
     "re_jitter_requested": re_jitter,
+    # Issue #2090 — set when --reconcile was passed. Reconciled same-family
+    # crons appear as records with status "reconciled" (existing → want).
+    "reconcile_requested": reconcile,
     "record_count": len(records),
     "records": records,
 }

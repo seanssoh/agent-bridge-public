@@ -11904,6 +11904,12 @@ bash "$REPO_ROOT/scripts/smoke/1792-cron-scope-fence.sh"
 log "running 1826-cron-at-naive-tz smoke (issue #1826)"
 bash "$REPO_ROOT/scripts/smoke/1826-cron-at-naive-tz.sh"
 
+# Issue #2090 — opt-in `--reconcile` adopts the shipped default cadence for a
+# wiki-* or memory-daily-<agent> cron whose live schedule has drifted from the
+# version default; without the flag the drifted job stays untouched (conflict).
+log "running 2090-cron-reconcile-adopt-defaults smoke (issue #2090)"
+bash "$REPO_ROOT/scripts/smoke/2090-cron-reconcile-adopt-defaults.sh"
+
 # Issue #544 PR1 — curated bin/agb shim for isolated agents.
 log "running isolated-bin-agb smoke (issue #544 PR1)"
 log "isolated-bin-agb covers shim env-source/delegation/fallback only — live PATH injection requires isolate+restart"
