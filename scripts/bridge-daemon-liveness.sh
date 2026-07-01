@@ -74,6 +74,24 @@
 #   BRIDGE_DAEMON_GATEWAY_STALL_STATE_FILE       default $BRIDGE_STATE_DIR/daemon-gateway-stall.ts (cross-poll witness)
 #   BRIDGE_DAEMON_RECOVERY_RENUDGE_FILE          default $BRIDGE_STATE_DIR/daemon-recovery-renudge.env (recovery marker)
 #   BRIDGE_DAEMON_GATEWAY_STALL_DISABLE          set to 1 to skip gateway-stall detection entirely (heartbeat-only)
+#
+# Issue #2207 (never-die wave Track C) — out-of-process token lifeline. The
+# daemon owns the token lifeline (recover-due quota recovery + periodic token-
+# sync). When the daemon is DOWN/wedged, that lifeline stops and a quota-limited
+# agent stays disabled until the daemon returns — a fleet-wide quota cascade.
+# This OS-supervised watcher already survives a daemon-down window, so we fold a
+# bounded emergency token-lifeline tick into its stale-heartbeat return paths:
+# delegate recover-due + sync (+ the gated operator-global sync) to bridge-auth.sh
+# so the fleet degrades gracefully instead of stranding on dead tokens. V1 scope
+# is recover-due + propagation ONLY — NO rotation, NO usage monitor, NO active-
+# token swap (all daemon-coupled). The watcher is a DRIVER only — every credential
+# mutation stays inside bridge-auth.py (registry_lock + opt-in gates + root-fail-
+# closed). Envs:
+#   BRIDGE_DAEMON_TOKEN_LIFELINE_ENABLED         default 1 (kill-switch; set 0 to disable)
+#   BRIDGE_DAEMON_TOKEN_LIFELINE_STALE_SECONDS   default = BRIDGE_DAEMON_LIVENESS_THRESHOLD_SECONDS (600)
+#   BRIDGE_DAEMON_TOKEN_LIFELINE_INTERVAL_SECONDS default 300 (a stale host runs the lifeline at most once per interval)
+#   BRIDGE_DAEMON_TOKEN_LIFELINE_STATE_FILE      default $BRIDGE_STATE_DIR/daemon/token-lifeline.ts (interval throttle witness)
+#   BRIDGE_DAEMON_TOKEN_LIFELINE_TIMEOUT_SECONDS default 60 (per bridge-auth.sh call ceiling)
 
 set -euo pipefail
 
@@ -101,6 +119,24 @@ REPO_ROOT="$(cd -P "$SCRIPT_DIR/.." && pwd -P)"
 : "${BRIDGE_DAEMON_GATEWAY_STALL_WITNESS_TOLERANCE_SECONDS:=10}"
 : "${BRIDGE_DAEMON_RECOVERY_RENUDGE_FILE:=$BRIDGE_STATE_DIR/daemon-recovery-renudge.env}"
 : "${BRIDGE_DAEMON_GATEWAY_STALL_DISABLE:=0}"
+# Issue #2207 (never-die Track C) — out-of-process token lifeline knobs. The
+# stale threshold defaults to the SAME signal the restart trigger uses
+# (BRIDGE_DAEMON_LIVENESS_THRESHOLD_SECONDS) so the lifeline fires on exactly the
+# daemon-down windows the watcher already detects. The interval throttle is
+# SEPARATE from the restart cooldown so a refused/cooldown-suppressed restart does
+# not also suppress token recovery — the lifeline runs on its own cadence.
+: "${BRIDGE_DAEMON_TOKEN_LIFELINE_ENABLED:=1}"
+: "${BRIDGE_DAEMON_TOKEN_LIFELINE_STALE_SECONDS:=$BRIDGE_DAEMON_LIVENESS_THRESHOLD_SECONDS}"
+: "${BRIDGE_DAEMON_TOKEN_LIFELINE_INTERVAL_SECONDS:=300}"
+: "${BRIDGE_DAEMON_TOKEN_LIFELINE_STATE_FILE:=$BRIDGE_STATE_DIR/daemon/token-lifeline.ts}"
+: "${BRIDGE_DAEMON_TOKEN_LIFELINE_TIMEOUT_SECONDS:=60}"
+# bridge-auth.sh path + the agent scope the daemon syncs (mirrors the daemon's
+# BRIDGE_CLAUDE_TOKEN_SYNC_AGENTS default of `static`). BRIDGE_BASH_BIN is the
+# bash the watcher re-invokes bridge-auth.sh under (the daemon sets it; default
+# to the running interpreter, then `bash` on PATH).
+: "${BRIDGE_AUTH_SH:=$REPO_ROOT/bridge-auth.sh}"
+: "${BRIDGE_CLAUDE_TOKEN_SYNC_AGENTS:=static}"
+: "${BRIDGE_BASH_BIN:=${BASH:-bash}}"
 # Issue #2055: the upgrade's durable quiesce-intent marker. bridge-upgrade.sh
 # writes it (recording the upgrade pid + platform/label) when it disables the
 # daemon job for the #1820 reconcile window, and clears it on a successful
@@ -123,6 +159,11 @@ REPO_ROOT="$(cd -P "$SCRIPT_DIR/.." && pwd -P)"
 [[ "$BRIDGE_DAEMON_LIVENESS_COOLDOWN_SECONDS" =~ ^[0-9]+$ ]]  || BRIDGE_DAEMON_LIVENESS_COOLDOWN_SECONDS=600
 [[ "$BRIDGE_DAEMON_GATEWAY_STALL_SECONDS" =~ ^[0-9]+$ ]]      || BRIDGE_DAEMON_GATEWAY_STALL_SECONDS=300
 [[ "$BRIDGE_DAEMON_QUIESCE_MAX_AGE_SECONDS" =~ ^[0-9]+$ ]]    || BRIDGE_DAEMON_QUIESCE_MAX_AGE_SECONDS=3600
+# Issue #2207: a typo in a launchd EnvironmentVariables block must not silently
+# break the token lifeline's throttle/timeout into a hot-loop or an unbounded call.
+[[ "$BRIDGE_DAEMON_TOKEN_LIFELINE_STALE_SECONDS" =~ ^[0-9]+$ ]]    || BRIDGE_DAEMON_TOKEN_LIFELINE_STALE_SECONDS="$BRIDGE_DAEMON_LIVENESS_THRESHOLD_SECONDS"
+[[ "$BRIDGE_DAEMON_TOKEN_LIFELINE_INTERVAL_SECONDS" =~ ^[0-9]+$ ]] || BRIDGE_DAEMON_TOKEN_LIFELINE_INTERVAL_SECONDS=300
+[[ "$BRIDGE_DAEMON_TOKEN_LIFELINE_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]]  || BRIDGE_DAEMON_TOKEN_LIFELINE_TIMEOUT_SECONDS=60
 
 DAEMON_SH="$REPO_ROOT/bridge-daemon.sh"
 DAEMON_PID_FILE="${BRIDGE_DAEMON_PID_FILE:-$BRIDGE_STATE_DIR/daemon.pid}"
@@ -313,34 +354,109 @@ quiesce_live_in_flight() {
 
 QUIESCE_MARKER_PID=""
 QUIESCE_MARKER_PLATFORM=""
-interrupted_upgrade_quiesce() {
+QUIESCE_MARKER_REASON=""
+
+# ── Issue #2205: per-path non-operator-disable marker proof ───────────────────
+#
+# #2055 closed the interrupted-UPGRADE disable hole with a durable quiesce marker.
+# #2205 generalizes that marker into the proof contract for ANY first-party
+# non-operator disable: a recoverable disabled state needs a durable marker the
+# disabling code wrote IMMEDIATELY BEFORE the disable, recording platform, target,
+# a `reason` enum, the writer pid + start-identity, and a timestamp. The watcher
+# re-enables a disabled job ONLY when the marker platform+target match the job it
+# is about to recover, the marker parses, the writer is dead/reused/over-age (the
+# #2064 identity/age teeth), AND the disabled probe + cooldown/upgrade gates allow.
+# A missing marker, a parse failure, a target MISMATCH, or a LIVE writer with a
+# matching identity ⇒ fail closed (skip + audit) — the operator-stop-outranks
+# invariant is sacred, so an unprovable disabled-drift always stays down.
+#
+# `interrupted_upgrade` (the upgrade quiesce) is one reason value; a marker written
+# before #2205 carries no BRIDGE_QUIESCE_REASON field and defaults to it, so the
+# #2055 path is preserved exactly. Sets QUIESCE_MARKER_PID / QUIESCE_MARKER_PLATFORM
+# / QUIESCE_MARKER_REASON for the caller's audit detail. Pure read; no mutation.
+#
+# $1=expected platform (launchd|systemd) — the platform of the job being recovered.
+# $2=expected target (the launchd label / systemd service) — the marker must name
+#    THIS job, so a marker recorded for a DIFFERENT target can never re-enable this
+#    one (cross-target confusion guard the design mandates).
+non_operator_disable_marker() {
+  local want_platform="$1" want_target="$2"
   QUIESCE_MARKER_PID=""
   QUIESCE_MARKER_PLATFORM=""
+  QUIESCE_MARKER_REASON=""
   local marker="$BRIDGE_UPGRADE_QUIESCE_MARKER_FILE"
   [[ -f "$marker" ]] || return 1
-  local pid platform
-  pid="$(
+  # ★ Schema validation BEFORE source (codex r2): every non-blank, non-comment line
+  # must be a recognized `BRIDGE_QUIESCE_<KEY>=...` assignment from the marker's own
+  # vocabulary. A line that sources cleanly (rc=0) but is OFF-SCHEMA — an unexpected
+  # key, an arbitrary sourceable command, a corrupted half-line — is NOT this
+  # marker's content and so is NOT proof of a first-party disable. Reject the whole
+  # marker (fail closed) rather than trust the recognized early fields beside it.
+  # The allowlist is the exact key set the writer emits (bridge-upgrade.sh
+  # _bridge_upgrade_write_quiesce_marker); a future key must be added here in lock-
+  # step (an unknown key fails closed until the watcher learns it — the safe default).
+  local line stripped
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    stripped="${line#"${line%%[![:space:]]*}"}"   # ltrim
+    [[ -z "$stripped" || "$stripped" == \#* ]] && continue
+    case "$stripped" in
+      BRIDGE_QUIESCE_UPGRADE_PID=*|BRIDGE_QUIESCE_UPGRADE_PSID=*|\
+      BRIDGE_QUIESCE_UPGRADE_UID=*|BRIDGE_QUIESCE_PLATFORM=*|\
+      BRIDGE_QUIESCE_TARGET=*|BRIDGE_QUIESCE_REASON=*|\
+      BRIDGE_QUIESCE_TS=*|BRIDGE_QUIESCE_VERSION=*) ;;
+      *) return 1 ;;   # off-schema line ⇒ not a trustworthy marker ⇒ fail closed
+    esac
+  done <"$marker"
+  # ★ Checked single-source parse (codex r1): the marker is SOURCED, so malformed
+  # shell content (a truncated/corrupt marker, a half-written line) must FAIL CLOSED
+  # — never treat an unparseable marker as proof of a first-party disable. We source
+  # ONCE inside a subshell that `exit 1`s when `source` errors, emit the four fields
+  # NUL-free on three lines, and reject the whole marker on a non-zero subshell rc.
+  # (The prior per-field sources each ignored `source`'s status, so a marker with
+  # valid pid/platform/target on its early lines followed by garbage could still
+  # reach `launchctl enable` — the operator-stop hazard this closes.)
+  local record pid platform target reason
+  record="$(
     # shellcheck disable=SC1090
-    source "$marker" 2>/dev/null
-    printf '%s' "${BRIDGE_QUIESCE_UPGRADE_PID:-}"
-  )"
-  platform="$(
-    # shellcheck disable=SC1090
-    source "$marker" 2>/dev/null
-    printf '%s' "${BRIDGE_QUIESCE_PLATFORM:-}"
-  )"
+    source "$marker" 2>/dev/null || exit 1
+    printf '%s\n%s\n%s\n%s\n' \
+      "${BRIDGE_QUIESCE_UPGRADE_PID:-}" \
+      "${BRIDGE_QUIESCE_PLATFORM:-}" \
+      "${BRIDGE_QUIESCE_TARGET:-}" \
+      "${BRIDGE_QUIESCE_REASON:-interrupted_upgrade}"
+  )" || return 1
+  pid="$(printf '%s' "$record" | sed -n '1p')"
+  platform="$(printf '%s' "$record" | sed -n '2p')"
+  target="$(printf '%s' "$record" | sed -n '3p')"
+  reason="$(printf '%s' "$record" | sed -n '4p')"
   [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-  # A GENUINELY-LIVE in-flight upgrade is mid-flight running its OWN restore — defer
-  # to it (do not race), so this is NOT a recoverable interrupted disable. #2064 r3
-  # (Finding 4): "genuinely live" is identity-verified — a marker whose pid was
-  # REUSED by an unrelated live process (the upgrade was SIGKILL'd) or that has sat
-  # past the bounded age ceiling is an ORPHAN we MUST recover, not defer to forever.
+  # ★ Platform+target match: the marker must name the EXACT job we are about to
+  # re-enable. A marker recorded on the other platform, or for a different launchd
+  # label / systemd service, is NOT proof THIS job's disable was first-party — fail
+  # closed (the operator-stop default holds for the job in front of us).
+  [[ "$platform" == "$want_platform" ]] || return 1
+  [[ "$target" == "$want_target" ]] || return 1
+  # A GENUINELY-LIVE in-flight writer is mid-flight running its OWN restore — defer
+  # to it (do not race), so this is NOT a recoverable disable. #2064 r3 (Finding 4):
+  # "genuinely live" is identity-verified — a marker whose pid was REUSED by an
+  # unrelated live process (the writer was SIGKILL'd) or that has sat past the
+  # bounded age ceiling is an ORPHAN we MUST recover, not defer to forever.
   if quiesce_live_in_flight; then
     return 1
   fi
   QUIESCE_MARKER_PID="$pid"
   QUIESCE_MARKER_PLATFORM="$platform"
+  QUIESCE_MARKER_REASON="$reason"
   return 0
+}
+
+# Back-compat shim: the launchd recovery historically called
+# `interrupted_upgrade_quiesce` (no args — it implicitly meant a launchd marker).
+# #2205 routes that through the generalized proof with the launchd platform + the
+# resolved label as the expected target. Kept as a thin wrapper so the call site
+# reads clearly and the #2055 smoke's name-presence guard still matches.
+interrupted_upgrade_quiesce() {
+  non_operator_disable_marker launchd "$REBOOTSTRAP_LABEL"
 }
 
 # Clear the quiesce-intent marker after the watcher has CONFIRMED a successful
@@ -512,30 +628,51 @@ maybe_rebootstrap_launchd() {
   # Require the plist on disk — bootstrap needs the file, and its presence is
   # half of the "we are launchd-managed" signal.
   [[ -n "$REBOOTSTRAP_PLIST" && -f "$REBOOTSTRAP_PLIST" ]] || return 1
-  # ★ Operator-intent guard: a DISABLED job is an intentional stop. SKIP + audit,
-  # never re-enable/re-bootstrap. FAIL CLOSED on `unknown` (print-disabled
-  # unreadable) — we cannot prove the job is not operator-disabled, and the
-  # operator-stop guarantee outranks auto-recovery.
+  # ★ Operator-intent guard (TRI-STATE — #2205 Phase-4 r2): the print-disabled probe
+  # is one of `enabled` / `disabled` / `unknown`, and recovery is authorized for the
+  # POSITIVE `disabled` state ONLY.
+  #   enabled  → not a disabled-drift; fall through to the enabled-but-unloaded path.
+  #   disabled → an intentional stop UNLESS a valid matching marker proves a
+  #              first-party non-operator disable; only then re-enable + recover.
+  #   unknown  → print-disabled unreadable. ★FAIL CLOSED: a marker proves the LAST
+  #              first-party action was a disable, NOT the CURRENT state — if we
+  #              cannot read the live state we cannot rule out that the operator
+  #              re-disabled the job AFTER the marker was written. So we SKIP, RETAIN
+  #              any marker for a later readable poll, and perform NO enable / NO
+  #              bootstrap. (This is the bug Phase-4 r1 rejected: the old code treated
+  #              a valid marker as license to recover regardless of readability.)
   local disabled_state
   disabled_state="$(rebootstrap_launchd_disabled_state "$uid" "$REBOOTSTRAP_LABEL")"
-  if [[ "$disabled_state" != "enabled" ]]; then
-    # Issue #2055: a disabled job is normally an operator stop (skip). The sole
-    # exception is an interrupted upgrade — its durable quiesce marker (dead
-    # upgrade pid) proves the disable was an upgrade's, not the operator's. Only
-    # then do we RE-ENABLE the job and recover it; otherwise keep the #2040
-    # fail-closed skip. We never re-enable on an `unknown` disabled-state either,
-    # because a disabled-state we cannot read could be an operator stop — but an
-    # interrupted-upgrade marker is independent proof, so recover regardless of
-    # whether print-disabled was readable.
+  if [[ "$disabled_state" == "unknown" ]]; then
+    # Unreadable live state → cannot confirm the job is not operator-(re-)disabled.
+    # Skip + alert; never enable, never consume the marker (retain it so a later poll
+    # with a READABLE positive-disabled probe can recover a genuine first-party drift).
+    emit_audit daemon_liveness_rebootstrap_skip_unknown_disabled \
+      --detail platform="launchd" \
+      --detail label="$REBOOTSTRAP_LABEL" \
+      --detail disabled_state="$disabled_state" \
+      --detail heartbeat_age_seconds="$age"
+    printf '[liveness] launchd job gui/%s/%s disabled-state=UNKNOWN (print-disabled unreadable) — skipping (cannot confirm current state; retaining any marker for a later readable poll, NOT re-enabling).\n' \
+      "$uid" "$REBOOTSTRAP_LABEL"
+    return 0
+  fi
+  if [[ "$disabled_state" == "disabled" ]]; then
+    # Issue #2055 / #2205: a positively-disabled job is normally an operator stop
+    # (skip). The sole exception is a first-party non-operator disable — a durable
+    # per-path marker (dead writer pid) whose platform+target match THIS launchd
+    # label proves the disable was first-party, not the operator's. Only then do we
+    # RE-ENABLE the job and recover it; otherwise keep the #2040 fail-closed skip.
+    # `interrupted_upgrade` is one reason value; the reason is surfaced for triage.
     if interrupted_upgrade_quiesce; then
       emit_audit daemon_liveness_rebootstrap_interrupted_upgrade \
         --detail platform="launchd" \
         --detail label="$REBOOTSTRAP_LABEL" \
         --detail disabled_state="$disabled_state" \
         --detail upgrade_pid="$QUIESCE_MARKER_PID" \
+        --detail reason="$QUIESCE_MARKER_REASON" \
         --detail heartbeat_age_seconds="$age"
-      printf '[liveness] launchd job gui/%s/%s disabled by an INTERRUPTED upgrade (dead upgrade pid=%s) — re-enabling + recovering (not an operator stop).\n' \
-        "$uid" "$REBOOTSTRAP_LABEL" "$QUIESCE_MARKER_PID"
+      printf '[liveness] launchd job gui/%s/%s disabled by a first-party non-operator action (reason=%s, dead writer pid=%s) — re-enabling + recovering (not an operator stop).\n' \
+        "$uid" "$REBOOTSTRAP_LABEL" "$QUIESCE_MARKER_REASON" "$QUIESCE_MARKER_PID"
       # Issue #2064 r2 (Finding 1): do NOT consume the marker before/around the
       # best-effort re-enable. `launchctl enable` is `|| true`; if it fails the job
       # stays down, and an eagerly-cleared marker would leave the next poll with no
@@ -543,12 +680,13 @@ maybe_rebootstrap_launchd() {
       # stays silently down forever (the #2055 hole). The marker is consumed ONLY on
       # a CONFIRMED-healthy signal — either print-disabled re-querying as a positive
       # `enabled`, OR (codex r2) the job actually being LOADED after bootstrap below.
-      # A re-query that comes back `unknown` (print-disabled unreadable) is NOT a
-      # confirmed re-enable: we still PROCEED to recover (the marker was independent
-      # proof — the I4 fail-closed-on-unknown override), but we DEFER consumption to
-      # the load-confirmation so a failed/cooldown-deferred bootstrap KEEPS the
-      # marker for the next poll. `_interrupted_marker_pending` (declared at function
-      # scope above) carries that intent.
+      # NOTE: we only reach here on a CONFIRMED positive-`disabled` probe (the
+      # #2205 Phase-4 r2 tri-state entry guard already failed closed on `unknown`),
+      # so the re-enable itself is authorized. A re-query that comes back `unknown`
+      # below affects only the consume TIMING, not the decision to enable: it is NOT
+      # a confirmed re-enable, so we DEFER consumption to the load-confirmation and a
+      # failed/cooldown-deferred bootstrap KEEPS the marker for the next poll.
+      # `_interrupted_marker_pending` (declared at function scope above) carries that.
       if [[ "$BRIDGE_DAEMON_LIVENESS_DRY_RUN" == "1" ]]; then
         clear_quiesce_marker   # no real enable to fail — preserve the latch semantics
       else
@@ -597,8 +735,8 @@ maybe_rebootstrap_launchd() {
         --detail label="$REBOOTSTRAP_LABEL" \
         --detail disabled_state="$disabled_state" \
         --detail heartbeat_age_seconds="$age"
-      printf '[liveness] launchd job gui/%s/%s disabled-state=%s — skipping re-bootstrap (operator stop / cannot confirm enabled).\n' \
-        "$uid" "$REBOOTSTRAP_LABEL" "$disabled_state"
+      printf '[liveness] launchd job gui/%s/%s is disabled with no valid first-party marker — skipping re-bootstrap (operator stop).\n' \
+        "$uid" "$REBOOTSTRAP_LABEL"
       return 0
     fi
   fi
@@ -661,18 +799,21 @@ maybe_rebootstrap_systemd() {
       return 1
       ;;
     disabled|masked)
-      # Operator/intentional stop. SKIP + audit, never re-enable.
-      # Issue #2055/#2064 note: unlike launchd (whose upgrade quiesce `disable`s
-      # the job, masquerading as an operator stop), bridge-upgrade.sh's systemd
-      # quiesce only `stop`s the SERVICE — it never `disable`s/`mask`s it (and as
-      # of #2064 it no longer stops THIS liveness timer either). So an INTERRUPTED
-      # systemd upgrade leaves the unit enabled+inactive, which the `enabled` arm
-      # below recovers (reset-failed + start) once the live-upgrade defer clears
-      # (the SIGKILL'd upgrade's marker pid is dead → not in-flight → reap). A
-      # disabled/masked systemd unit is therefore always a genuine operator action
-      # here, and we keep the fail-closed skip — no quiesce-marker override on the
-      # systemd side is needed or wanted (it would risk fighting a real
-      # `systemctl --user disable`).
+      # Operator/intentional stop. SKIP + audit, never re-enable/unmask.
+      # Issue #2055/#2064/#2205: unlike launchd (whose upgrade quiesce `disable`s
+      # the job, masquerading as an operator stop), NO first-party Agent Bridge code
+      # `disable`s OR `mask`s the systemd daemon unit — bridge-upgrade.sh's systemd
+      # quiesce only `stop`s the SERVICE (and as of #2064 it no longer stops THIS
+      # liveness timer either). So an INTERRUPTED systemd upgrade leaves the unit
+      # enabled+inactive, which the `enabled` arm below recovers (reset-failed +
+      # start) once the live-upgrade defer clears. Because no first-party path
+      # disables/masks the unit, a disabled/masked systemd unit is ALWAYS a genuine
+      # operator action here — the #2205 per-path marker gives systemd nothing to
+      # recover (it has no first-party disabler), so this stays fail-closed
+      # alert-only (an honest boundary, see PR). ★`masked` is STRONGER than
+      # `disabled`: even a future first-party disabler must never trigger an unmask
+      # here (unmask would override a hard operator block). Fighting a real
+      # `systemctl --user disable`/`mask` is a fleet-down regression.
       emit_audit daemon_liveness_rebootstrap_skip_disabled \
         --detail platform="systemd" \
         --detail service="$svc" \
@@ -998,6 +1139,209 @@ maybe_restart_on_gateway_stall() {
   return 0
 }
 
+# ── Issue #2207 (never-die wave Track C): out-of-process token lifeline ───────
+#
+# When the daemon is down/wedged, recover-due quota recovery + periodic token-
+# sync stop, so a quota-limited agent stays disabled until the daemon returns.
+# This watcher already survives that window. On a STALE heartbeat we run a
+# bounded emergency token-lifeline tick: recover-due → UNCONDITIONAL sync →
+# (gated) sync-global — delegating EVERY credential mutation to bridge-auth.sh.
+# The watcher is a driver only; registry_lock / opt-in / root-fail-closed /
+# credential-file lock all stay inside bridge-auth.py.
+
+# Bounded local timeout wrapper. The watcher deliberately does NOT source
+# bridge-lib (heavy: tmux/queue/state modules), so we cannot reuse
+# bridge_with_timeout. $1 = seconds, rest = command. rc is the command's (124 on a
+# timeout kill — caller treats any non-zero as a failed phase).
+#
+# Tiering, in order:
+#   1. timeout(1)/gtimeout(1) — preferred (GNU coreutils).
+#   2. perl `alarm` — PORTABLE bounded fallback. Stock macOS ships NO coreutils
+#      (no timeout/gtimeout) but DOES ship perl, so this keeps the emergency tick
+#      BOUNDED on a bare macOS host (Issue #2207 codex r2 finding 2 — an unwrapped
+#      exec on macOS violated the bounded-local-timeout requirement). Mirrors
+#      timeout(1): exit 124 on the deadline.
+#   3. fail-CLOSED — neither available: do NOT run unbounded. Return 124 (treated
+#      as a failed phase) so the caller audits the gap instead of risking a hang.
+token_lifeline_timeout() {
+  local secs="$1"; shift
+  [[ "$secs" =~ ^[0-9]+$ ]] || secs=60
+  local bin
+  bin="$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true)"
+  if [[ -n "$bin" ]]; then
+    "$bin" "$secs" "$@"
+    return $?
+  fi
+  if command -v perl >/dev/null 2>&1; then
+    # perl alarm()-based bound (fork+waitpid so the parent keeps the SIGALRM after
+    # the child execs the target — a plain `exec` would drop perl's handler). On
+    # the deadline the parent kills the child and exits 124 (timeout(1) parity);
+    # otherwise it propagates the child's exit status / signal.
+    BRIDGE_TL_TIMEOUT_SECS="$secs" perl -e '
+      my $s = $ENV{BRIDGE_TL_TIMEOUT_SECS} || 60;
+      my $pid = fork();
+      if (!defined $pid) { exit 127 }
+      if ($pid == 0) { exec @ARGV or exit 127 }
+      $SIG{ALRM} = sub { kill "TERM", $pid; kill "KILL", $pid; exit 124 };
+      alarm $s;
+      waitpid($pid, 0);
+      my $st = $?;
+      alarm 0;
+      exit($st & 127 ? 128 + ($st & 127) : $st >> 8);
+    ' "$@"
+    return $?
+  fi
+  # Tier 3: no bounded mechanism on PATH — fail CLOSED rather than exec unbounded.
+  return 124
+}
+
+# Interval throttle. Returns 0 (due) when the lifeline has NOT run within
+# BRIDGE_DAEMON_TOKEN_LIFELINE_INTERVAL_SECONDS — the FIRST stale poll on a fresh
+# host (no state file) is always due (fires immediately). Returns 1 (throttled)
+# otherwise. The state file is SEPARATE from the restart cooldown so a refused/
+# cooldown-suppressed restart never suppresses token recovery.
+token_lifeline_due() {
+  local interval="$BRIDGE_DAEMON_TOKEN_LIFELINE_INTERVAL_SECONDS"
+  local last now
+  [[ -f "$BRIDGE_DAEMON_TOKEN_LIFELINE_STATE_FILE" ]] || return 0
+  last="$(tr -d '[:space:]' <"$BRIDGE_DAEMON_TOKEN_LIFELINE_STATE_FILE" 2>/dev/null)"
+  [[ "$last" =~ ^[0-9]+$ ]] || return 0
+  now="$(now_ts)"
+  (( now - last >= interval ))
+}
+
+# Record the attempt timestamp — called EVEN ON FAILURE so a persistent auth
+# error does not hot-loop the lifeline every 60s poll. Best-effort.
+#
+# Belt-and-suspenders (codex r3 finding 3): NEVER write the throttle witness under
+# DRY_RUN, regardless of caller. The single caller already returns before this on
+# the DRY_RUN path, but a structural guard here makes it impossible for ANY future
+# code path (or platform-specific reordering) to arm the throttle during a dry run
+# — a DRY_RUN tick must leave ZERO throttle state on every platform/tier.
+token_lifeline_record() {
+  [[ "${BRIDGE_DAEMON_LIVENESS_DRY_RUN:-0}" == "1" ]] && return 0
+  mkdir -p "$(dirname "$BRIDGE_DAEMON_TOKEN_LIFELINE_STATE_FILE")" 2>/dev/null || true
+  printf '%s\n' "$(now_ts)" 2>/dev/null >"$BRIDGE_DAEMON_TOKEN_LIFELINE_STATE_FILE" || true
+}
+
+# The emergency tick body. Runs the same lifeline sequence the daemon runs:
+#   1. recover-due  (quota recovery; re-enables a recovered registry row)
+#   2. sync         (UNCONDITIONAL — writes .credentials.json so live sessions
+#                    re-read the recovered token; this tick also REPLACES the
+#                    daemon's periodic sync while the daemon is down, so it must
+#                    run even when recover-due reports no due tokens)
+#   3. sync-global  (ONLY when the operator opted in — same cheap exit-code gate
+#                    the daemon's bridge_daemon_global_auth_sync_tick uses)
+# Every phase is bounded by token_lifeline_timeout and audited (status only,
+# never token material). DRY_RUN emits a would-run row and mutates nothing.
+# Always returns 0 — a failed phase is audited, not fatal to the watcher.
+run_token_lifeline() {
+  local trigger="$1"        # the stale-return path that invoked us (audit detail)
+  local heartbeat_age="$2"
+  local auth_sh="$BRIDGE_AUTH_SH"
+  local tmo="$BRIDGE_DAEMON_TOKEN_LIFELINE_TIMEOUT_SECONDS"
+  local agent_scope="$BRIDGE_CLAUDE_TOKEN_SYNC_AGENTS"
+  # Issue #2207 (codex r2 finding 1): resolve recover-due's check-timeout /
+  # retry-seconds from the SAME envs the daemon uses (bridge-daemon.sh
+  # process_claude_token_recovery), with the SAME defaults, and pass both flags.
+  # Otherwise an operator's BRIDGE_CLAUDE_TOKEN_CHECK_TIMEOUT_SECONDS /
+  # _RETRY_SECONDS override silently DIVERGES while the daemon is down — the
+  # emergency tick must behave like the daemon's recover-due, not a stripped one.
+  local check_timeout="${BRIDGE_CLAUDE_TOKEN_CHECK_TIMEOUT_SECONDS:-45}"
+  local retry_seconds="${BRIDGE_CLAUDE_TOKEN_CHECK_RETRY_SECONDS:-1800}"
+  [[ "$check_timeout" =~ ^[0-9]+$ ]] || check_timeout=45
+  [[ "$retry_seconds" =~ ^[0-9]+$ ]] || retry_seconds=1800
+
+  [[ "${BRIDGE_DAEMON_TOKEN_LIFELINE_ENABLED:-1}" == "1" ]] || return 0
+  [[ -f "$auth_sh" ]] || return 0
+  command -v "$BRIDGE_BASH_BIN" >/dev/null 2>&1 || return 0
+
+  # Interval throttle — at most one lifeline per interval per stale host.
+  token_lifeline_due || return 0
+
+  if [[ "$BRIDGE_DAEMON_LIVENESS_DRY_RUN" == "1" ]]; then
+    # Issue #2207 (codex r2 finding 3): DRY_RUN must mutate NOTHING — do NOT write
+    # the throttle state file here, or a DRY_RUN tick would suppress the next REAL
+    # stale tick. The record happens only on the real (mutating) path below.
+    emit_audit daemon_liveness_token_lifeline \
+      --detail trigger="$trigger" \
+      --detail heartbeat_age_seconds="$heartbeat_age" \
+      --detail dry_run="1" \
+      --detail recover_due="would-run" \
+      --detail sync="would-run" \
+      --detail sync_global="would-run"
+    printf '[liveness] DRY_RUN — would run token lifeline (recover-due + sync%s) trigger=%s\n' \
+      "$( [[ -n "${BRIDGE_CLAUDE_GLOBAL_AUTH_SYNC:-}" ]] && printf ' + gated sync-global' )" "$trigger"
+    return 0
+  fi
+
+  # Record the attempt BEFORE running the auth calls (record-even-on-failure) so a
+  # hanging / persistently-failing auth call cannot hot-loop the lifeline every
+  # poll. Only the REAL path records — DRY_RUN returned above without mutating.
+  token_lifeline_record
+
+  # Phase 1 — recover-due. Re-enables a recovered registry row; on its own it does
+  # NOT propagate to live sessions (that is phase 2). Same --timeout/--retry-seconds
+  # the daemon passes (flag fidelity). rc!=0 → failed/timeout.
+  local recover_status="ok"
+  token_lifeline_timeout "$tmo" \
+    "$BRIDGE_BASH_BIN" "$auth_sh" claude-token recover-due \
+    --timeout "$check_timeout" \
+    --retry-seconds "$retry_seconds" \
+    --json >/dev/null 2>&1 \
+    || recover_status="failed"
+
+  # Phase 2 — sync (UNCONDITIONAL). This is the correctness crux: recover-due
+  # alone re-enables the registry but live sessions keep the dead credential
+  # until sync writes .credentials.json. We must finish the PAIR in the same tick
+  # so the registry cannot be re-enabled without file propagation. It is also
+  # this tick's replacement for the daemon's periodic sync, so it runs even when
+  # recover-due found nothing due.
+  local sync_status="ok"
+  token_lifeline_timeout "$tmo" \
+    "$BRIDGE_BASH_BIN" "$auth_sh" claude-token sync --agents "$agent_scope" --json >/dev/null 2>&1 \
+    || sync_status="failed"
+
+  # Phase 3 — operator-global sync, gated by the SAME cheap exit-code probe the
+  # daemon's bridge_daemon_global_auth_sync_tick uses. `global-auth-sync status
+  # --check` exits 0 iff the persisted/env opt-in is EFFECTIVELY enabled. Only
+  # then do we run sync-global (which keeps the auto_rotate gate, root-fail-
+  # closed, and credential-file lock intact inside bridge-auth.py). A check
+  # failure/timeout fails safe to skipped.
+  local sync_global_status="skipped"
+  if token_lifeline_timeout "$tmo" \
+      "$BRIDGE_BASH_BIN" "$auth_sh" claude-token global-auth-sync status --check >/dev/null 2>&1; then
+    sync_global_status="ok"
+    token_lifeline_timeout "$tmo" \
+      "$BRIDGE_BASH_BIN" "$auth_sh" claude-token sync-global --json >/dev/null 2>&1 \
+      || sync_global_status="failed"
+  fi
+
+  emit_audit daemon_liveness_token_lifeline \
+    --detail trigger="$trigger" \
+    --detail heartbeat_age_seconds="$heartbeat_age" \
+    --detail agent_scope="$agent_scope" \
+    --detail recover_due="$recover_status" \
+    --detail sync="$sync_status" \
+    --detail sync_global="$sync_global_status"
+  printf '[liveness] token lifeline ran (recover_due=%s sync=%s sync_global=%s) trigger=%s\n' \
+    "$recover_status" "$sync_status" "$sync_global_status" "$trigger"
+  return 0
+}
+
+# Gate the lifeline on the SAME stale-heartbeat signal the restart trigger uses.
+# main() calls this at every stale-heartbeat return path (no-pid/not-running and
+# the restart cooldown/refused paths) — exactly when the daemon is NOT recovering
+# tokens. A fresh heartbeat means the daemon owns recovery → skip. Always best-
+# effort (returns 0); never blocks the watcher's primary restart job.
+maybe_run_token_lifeline() {
+  local trigger="$1" heartbeat_age="$2"
+  [[ "${BRIDGE_DAEMON_TOKEN_LIFELINE_ENABLED:-1}" == "1" ]] || return 0
+  (( heartbeat_age >= BRIDGE_DAEMON_TOKEN_LIFELINE_STALE_SECONDS )) || return 0
+  run_token_lifeline "$trigger" "$heartbeat_age"
+  return 0
+}
+
 main() {
   local mtime now age pid
 
@@ -1016,6 +1360,20 @@ main() {
 
   now="$(now_ts)"
   age=$(( now - mtime ))
+
+  # Issue #2207 (never-die Track C). The heartbeat may be STALE — the daemon is
+  # down/wedged, so its token lifeline (recover-due + sync) has stopped. Run the
+  # bounded emergency token-lifeline tick HERE, before BOTH the gateway-stall
+  # early-return below AND the restart/skip verdicts, so it fires on EVERY stale
+  # path — including the case where a stale heartbeat ALSO has a gateway stall
+  # whose restart is refused/failed (maybe_restart_on_gateway_stall still returns
+  # "handled" and main() returns, so a lifeline call placed after it would be
+  # skipped on exactly the daemon-not-recovering window — codex review #2207).
+  # maybe_run_token_lifeline self-gates on staleness, so on a FRESH heartbeat
+  # this is a no-op (the daemon owns recovery). It is interval-throttled,
+  # restart-cooldown-independent, and delegates every mutation to bridge-auth.sh.
+  # Best-effort: a failed/throttled tick must never block the verdicts below.
+  maybe_run_token_lifeline stale_heartbeat "$age" || true
 
   # Issue #1973 (Track C). Gateway-stall detection runs FIRST and regardless of
   # heartbeat freshness — the #1973 wedge had a FRESH heartbeat (the loop kept

@@ -1144,6 +1144,16 @@ for bad in ("resets Jul 1 at 12pm (Mars/Phobos)", "resets Jul 1 at 12pm (Not_A_Z
     if mod.parse_reset_at(bad, ref) != "":
         raise SystemExit(f"unknown tz should yield '' for {bad!r}")
 
+# #2204: malformed date-anchored weekly strings must FAIL CLOSED ("") instead of
+# raising out of the probe, exactly like the bare-clock malformed set below.
+# ``Jul 32``/``Jul 0`` trip the static day guard; ``Feb 30`` overflows the month
+# specifically and is caught by the try/except (a static bound cannot reject it).
+for bad in ("resets Jul 32 at 12pm (UTC)", "resets Feb 30 at 12pm (UTC)",
+            "resets Jul 1 at 13pm (UTC)", "resets Jul 1 at 12:60pm (UTC)",
+            "resets Jul 0 at 12pm (UTC)"):
+    if mod.parse_reset_at(bad, ref) != "":
+        raise SystemExit(f"malformed date-anchored weekly must yield '' (no raise) for {bad!r}")
+
 # Session-limit (5h) 429 carries a BARE clock with no date —
 # ``You've hit your session limit · resets 12:10pm (Asia/Seoul)``. The
 # date-anchored weekly regex never matches it (a digit right after ``resets``
