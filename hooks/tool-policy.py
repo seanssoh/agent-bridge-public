@@ -425,25 +425,63 @@ def _fixed_temp_roots() -> list[str]:
     return roots
 
 
+# #2163 F3 — the runtime-identity env anchors that, together with BRIDGE_HOME,
+# determine WHERE a config/auth mutation actually lands. The sandbox predicate
+# must consider all of them, not BRIDGE_HOME alone (see `_bridge_home_is_test_temp`).
+_RUNTIME_IDENTITY_ENV_VARS = (
+    "BRIDGE_RUNTIME_CONFIG_FILE",
+    "BRIDGE_STATE_DIR",
+    "BRIDGE_RUNTIME_ROOT",
+)
+
+
+def _realpath_under_roots(path: str, roots: list[str]) -> bool:
+    """True iff *path* canonicalizes (``os.path.realpath``) to, or under, one of
+    the already-canonicalized fixed temp *roots*. Fail-closed (False) on OSError."""
+    try:
+        real = os.path.realpath(path)
+    except OSError:
+        return False
+    for root in roots:
+        if real == root or real.startswith(root.rstrip("/") + "/"):
+            return True
+    return False
+
+
 def _bridge_home_is_test_temp() -> bool:
-    """True iff the resolved bridge home sits under a FIXED OS temp root.
+    """True iff the resolved bridge home AND every explicitly-set runtime-identity
+    anchor sit under a FIXED OS temp root.
 
     Used to gate the ``BRIDGE_GUARD_ADMIN_ROSTER_JSON`` seam so it is honored
     only inside the smoke sandbox; a production session ignores the env var.
 
+    #2163 F3 — ALL-ENV, not ``BRIDGE_HOME`` alone. A confined fixer could set
+    ``BRIDGE_HOME=/tmp/x`` (so this predicate reads "sandbox" and the seam trusts
+    a forged admin roster) while ``BRIDGE_RUNTIME_CONFIG_FILE`` /
+    ``BRIDGE_STATE_DIR`` / ``BRIDGE_RUNTIME_ROOT`` still point at the LIVE
+    runtime — then forge admin and mutate the live config/token (the split-root
+    spoof; patch's v0.16.5 ``BRIDGE_STATE_DIR``-override-leak class). So ANY
+    EXPLICITLY-SET runtime-identity anchor (``_RUNTIME_IDENTITY_ENV_VARS``) that
+    resolves OUTSIDE a fixed temp root makes this return False (not sandbox). An
+    UNSET/empty anchor derives from ``BRIDGE_HOME`` (already checked), so a pure
+    sandbox with defaults still qualifies (over-block-0).
+
     The trusted roots are fixed (``_fixed_temp_roots``); no env var (notably
-    ``$TMPDIR``) can repoint them at a production path. Both the candidate home
-    and the roots are canonicalized with ``os.path.realpath`` and containment
-    is required.
+    ``$TMPDIR``) can repoint them at a production path. Every candidate and the
+    roots are canonicalized with ``os.path.realpath`` and containment required.
     """
+    roots = _fixed_temp_roots()
     try:
         home = os.path.realpath(str(bridge_home_dir()))
     except (OSError, RuntimeError):
         return False
-    for root in _fixed_temp_roots():
-        if home == root or home.startswith(root.rstrip("/") + "/"):
-            return True
-    return False
+    if not _realpath_under_roots(home, roots):
+        return False
+    for var in _RUNTIME_IDENTITY_ENV_VARS:
+        val = os.environ.get(var, "").strip()
+        if val and not _realpath_under_roots(val, roots):
+            return False
+    return True
 
 
 def _controller_roster_admin_agreement(agent: str) -> bool:
@@ -5597,23 +5635,28 @@ def _config_set_env_check(
     return True, None
 
 
-# Issue #1738 — interim defense-in-depth indirection gate for BOTH config
-# mutation verbs (`config set` / `config set-env`).
+# Issue #1738 (config) + #2163 C4b/C6 (auth-token) — interim defense-in-depth
+# indirection gate for BOTH the config mutation verbs (`config set` /
+# `config set-env`) AND the credential-mutation verbs (`auth claude-token
+# add/activate/sync/rotate`, `global-auth-sync enable/disable`).
 #
 # This gate is DEFENSE-IN-DEPTH, NOT the close criterion. The durable fix is
 # wrapper-side (bridge-config.py derives identity from process ancestry vs the
 # controller-published pane binding, never from env). But a static hook can
 # still cheaply deny the indirection shapes the literal-spelling recognizers
 # (`_is_config_set_wrapper`, `_config_set_env_attempt_present`) cannot resolve:
-# a mutation verb hidden behind `eval` / `bash -c` / `sh -c`, or behind an
-# unresolved command-position `$var` around the verb. We DENY those uniformly.
+# a mutation verb hidden behind a nested interpreter (`eval` / `bash -c` /
+# `sh -c` and the rest of `_BASH_GIT_INTERPRETER_LEAVES` — zsh/ksh/mksh/dash/
+# ash/fish + xargs, #2163 C6), or behind an unresolved command-position `$var`
+# around the verb. We DENY those uniformly. The leaf set is shared with the
+# git-guard interpreter recognizer (`_BASH_GIT_INTERPRETER_LEAVES`, defined
+# later in the file) so the two indirection gates stay symmetric.
 #
-# We deliberately ACCEPT false denials for legitimately-scripted `bash -c`
-# config mutation — privileged config writes should use the direct wrapper
+# We deliberately ACCEPT false denials for legitimately-scripted nested-shell
+# config / auth mutation — privileged writes should use the direct wrapper
 # shape, not a nested shell. We do NOT add brace-normalization: the issue's own
 # analysis (PR #1736 r6) shows brace forms are non-exploitable against argparse
 # and are closed naturally by the wrapper identity fix.
-_INDIRECTION_SHELL_LEAVES = frozenset({"eval", "bash", "sh"})
 
 # The direct config-CLI command leaves. The unresolved-`$` indirection branch
 # below only fires when the stage's actual command IS one of these (a config
@@ -5734,17 +5777,68 @@ def _stage_reaches_config_mutation(stage: str) -> bool:
     return ("set" in flat) or ("--path" in flat) or ("$" in flat)
 
 
+# #2163 C4b — auth-token / credential MUTATION verbs. `receive` (a token-free
+# request) is NOT a mutation. `global-auth-sync status` is READ-ONLY (C4a) and
+# must NOT be flagged; only `enable` / `disable` mutate.
+_AUTH_TOKEN_MUTATION_VERBS = ("add", "activate", "sync", "rotate")
+
+
+def _stage_reaches_auth_token_mutation(stage: str) -> bool:
+    """True iff *stage* mentions an auth-token / credential MUTATION surface
+    (#2163 C4b). Substring recognition over the quote/escape-stripped stage —
+    broad on purpose so the indirection gate fails closed, mirroring
+    `_stage_reaches_config_mutation`.
+
+    C4a read-only carve-out: `auth claude-token global-auth-sync status` is a
+    READ and is NOT flagged; only `enable` / `disable` mutate. An unresolved `$`
+    that could expand to the action / verb IS flagged (the real argv is hidden).
+    """
+    flat = _SHELL_QUOTE_ESCAPE_RE.sub("", stage)
+    if "global-auth-sync" in flat:
+        if ("enable" in flat) or ("disable" in flat):
+            return True
+        # `status` alone = read-only (C4a). A `$` hiding the action → mutation.
+        if ("status" not in flat) and ("$" in flat):
+            return True
+        return False
+    if ("auth" in flat) and ("claude-token" in flat):
+        if any(v in flat for v in _AUTH_TOKEN_MUTATION_VERBS):
+            return True
+        # A `$` could hide the mutating verb (`agb auth claude-token $V`).
+        if "$" in flat:
+            return True
+        return False
+    return False
+
+
+def _stage_protected_mutation_kind(stage: str) -> str | None:
+    """Which protected-mutation surface *stage* reaches: ``"config"`` (#1738),
+    ``"auth"`` (#2163 C4b), or None. Config takes precedence when both match so
+    the existing config reason strings / audit verb are preserved."""
+    if _stage_reaches_config_mutation(stage):
+        return "config"
+    if _stage_reaches_auth_token_mutation(stage):
+        return "auth"
+    return None
+
+
 def _config_mutation_via_indirection(text: str) -> str | None:
-    """Return an indirection reason iff a config mutation is hidden behind
-    `eval` / `bash -c` / `sh -c`, or an unresolved command-position `$var`
-    around the verb — else None.
+    """Return an indirection reason iff a protected mutation — a config
+    `set`/`set-env` (#1738) OR an auth-token mutation (#2163 C4b: `auth
+    claude-token add/activate/sync/rotate`, `global-auth-sync enable/disable`)
+    — is hidden behind `eval` / a `-c` shell / an unresolved command-position
+    `$var` around the verb — else None.
 
     Recognizes per separator-split stage. A stage whose FIRST token (after a
-    leading `VAR=` env-assignment strip) is `eval` / `bash` / `sh` AND whose
-    remaining argument text reaches the config-mutation surface is an
-    indirection attempt. Separately, a stage that reaches the config-mutation
-    surface AND carries an unresolved `$` immediately around the verb / path /
-    assignment is also flagged (a `$var` the static hook cannot expand).
+    leading `VAR=` env-assignment strip) is an interpreter leaf
+    (`_BASH_GIT_INTERPRETER_LEAVES` — eval / bash / sh / zsh / ksh / … / xargs,
+    #2163 C6) AND whose remaining argument text reaches a protected-mutation
+    surface is an indirection attempt. Separately, a stage that reaches a
+    protected-mutation surface AND carries an unresolved `$` immediately around
+    the verb / path / assignment / action is also flagged (a `$var` the static
+    hook cannot expand). The reason string names both the surface (`config` vs
+    `auth_token`) and the leaf, so the audit verb + deny message can diverge.
+    Config takes precedence when a stage names both surfaces.
     """
     joined = text.replace("\\\r\n", "").replace("\\\n", "")
     for stage in _COMMAND_OPERATOR_RE.split(joined):
@@ -5752,9 +5846,12 @@ def _config_mutation_via_indirection(text: str) -> str | None:
         try:
             toks = shlex.split(scan, posix=True, comments=False)
         except ValueError:
-            # Unparseable stage that mentions the mutation surface — fail closed.
-            if _stage_reaches_config_mutation(stage):
+            # Unparseable stage that mentions a protected-mutation surface — fail closed.
+            kind = _stage_protected_mutation_kind(stage)
+            if kind == "config":
                 return "unparseable_config_mutation_stage"
+            if kind == "auth":
+                return "unparseable_auth_token_mutation_stage"
             continue
         # Dissolve any `env -S '<packed cmd>'` / `--split-string=` payload into
         # its component tokens (mirrors `_config_set_env_attempt_present`) so a
@@ -5771,34 +5868,40 @@ def _config_mutation_via_indirection(text: str) -> str | None:
         if not toks:
             continue
         leaf = toks[0].rsplit("/", 1)[-1]
-        if leaf in _INDIRECTION_SHELL_LEAVES:
-            # `eval '<payload>'` / `bash -c '<payload>'` / `sh -c '<payload>'`.
-            # The payload is a later token; if ANY token in the stage reaches
-            # the config-mutation surface, the verb is being run through a
-            # nested interpreter → deny.
+        if leaf in _BASH_GIT_INTERPRETER_LEAVES:
+            # `eval '<payload>'` / `bash -c '<payload>'` / `sh -c '<payload>'`
+            # and the full interpreter-leaf set (#2163 C6 — zsh/ksh/mksh/dash/
+            # ash/fish + xargs, reusing `_BASH_GIT_INTERPRETER_LEAVES`; widens
+            # the #1738 config gate too, additive-stricter). The payload is a
+            # later token; if ANY token in the stage reaches a protected-mutation
+            # surface, the verb is run through a nested interpreter → deny.
             payload = " ".join(toks[1:])
-            if _stage_reaches_config_mutation(payload) or _stage_reaches_config_mutation(stage):
+            kind = _stage_protected_mutation_kind(payload) or _stage_protected_mutation_kind(stage)
+            if kind == "config":
                 return f"config_mutation_via_{leaf}"
+            if kind == "auth":
+                return f"auth_token_mutation_via_{leaf}"
         # Unresolved command-position `$var` around the verb surface. `$` only
         # survives shlex when it was inside single quotes or escaped; a bare
         # `$V` would already have been (not) expanded by shlex into the literal
         # `$V` token. Either way an unexpanded `$` next to the config verb means
         # the real argv is hidden from the literal recognizers.
-        if (
-            (leaf in _CONFIG_CLI_LEAVES or "$" in toks[0])
-            and _stage_reaches_config_mutation(stage)
-            and "$" in scan
-        ):
-            # Flag ONLY when the command is the config CLI itself (`agb` /
-            # `agent-bridge`, with a `$var` hiding the verb / path / assignment)
-            # OR the command word is itself an unresolved `$var` (the CLI hidden,
-            # e.g. `$C config set …`). A `$` elsewhere in a NON-config command
-            # (e.g. `awk '{print $1}' lib/system_config_paths.py` — "config" in
-            # the filename, `$1` in the awk program) is NOT indirection. The
-            # `$`-adjacency stays conservative: any `$` in such a config-CLI
+        if (leaf in _CONFIG_CLI_LEAVES or "$" in toks[0]) and "$" in scan:
+            # Flag ONLY when the command is the config/auth CLI itself (`agb` /
+            # `agent-bridge`, with a `$var` hiding the verb / path / assignment /
+            # action) OR the command word is itself an unresolved `$var` (the CLI
+            # hidden, e.g. `$C config set …` / `$C auth claude-token add`). A `$`
+            # elsewhere in a NON-protected command (e.g. `awk '{print $1}'
+            # lib/system_config_paths.py` — "config" in the filename, `$1` in the
+            # awk program) is NOT indirection (kind is None → no deny). The
+            # `$`-adjacency stays conservative: any `$` in such a config/auth-CLI
             # stage is treated as indirection (privileged writes must use literal
             # argv). Accepts a false deny for `agb config set --change x=$(date)`.
-            return "config_mutation_via_unresolved_var"
+            kind = _stage_protected_mutation_kind(stage)
+            if kind == "config":
+                return "config_mutation_via_unresolved_var"
+            if kind == "auth":
+                return "auth_token_mutation_via_unresolved_var"
     return None
 
 
@@ -5809,10 +5912,17 @@ def _emit_config_mutation_via_indirection_audit(
     tool_input: dict[str, Any] | None,
     reason: str,
 ) -> None:
-    """Audit row for a config mutation denied at the interim indirection gate."""
+    """Audit row for a config / auth-token mutation denied at the interim
+    indirection gate. The credential-bearing ``sample`` / ``summary`` are always
+    redacted (#2163 — no plaintext token/secret in the audit trail)."""
+    verb = (
+        "auth claude-token"
+        if reason.startswith("auth_token_mutation")
+        else "config set/set-env"
+    )
     detail: dict[str, Any] = {
         "tool": "Bash",
-        "verb": "config set/set-env",
+        "verb": verb,
         "reason": reason,
         "sample": _redact_credential_token_values(truncate_text(text, 240)),
     }
@@ -9104,17 +9214,25 @@ def protected_alias_reason(
     # they just tried to call. Letting the wrapper through here only
     # delegates audit responsibility to the wrapper itself; non-operator
     # callers still get rejected at bridge-config.py.
-    # Issue #1738 (defense-in-depth): deny a config mutation hidden behind
-    # `eval` / `bash -c` / `sh -c` or an unresolved command-position `$var`
-    # around the verb. Runs BEFORE the `_is_config_set_wrapper` carve-out so an
-    # indirection shape can never be mistaken for the sanctioned literal wrapper
-    # invocation. The durable boundary is wrapper-side (bridge-config.py process
-    # ancestry); this only narrows the static-hook window.
+    # Issue #1738 (config) + #2163 C4b (auth-token): deny a protected mutation
+    # hidden behind `eval` / a `-c` shell / an unresolved command-position
+    # `$var` around the verb. Runs BEFORE the `_is_config_set_wrapper` carve-out
+    # so an indirection shape can never be mistaken for the sanctioned literal
+    # wrapper invocation. The durable boundary is wrapper-side (bridge-config.py
+    # process ancestry); this only narrows the static-hook window.
     indirection_reason = _config_mutation_via_indirection(text)
     if indirection_reason is not None:
         _emit_config_mutation_via_indirection_audit(
             agent, text=text, tool_input=tool_input, reason=indirection_reason
         )
+        if indirection_reason.startswith("auth_token_mutation"):
+            return (
+                "agent-bridge auth claude-token mutation (add / activate / sync "
+                "/ rotate / global-auth-sync enable|disable) reached through "
+                "eval / bash -c / sh -c / unresolved $var indirection is not "
+                "allowed — run the wrapper directly with literal argv "
+                "(issue #2163). `global-auth-sync status` (read-only) is allowed."
+            )
         return (
             "agent-bridge config set / set-env reached through eval / bash -c / "
             "sh -c / unresolved $var indirection is not allowed — run the "
