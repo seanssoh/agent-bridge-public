@@ -86,6 +86,22 @@ AUTH_LOG="$SMOKE_TMP_ROOT/auth.log"
 } >"$AUTH_SHIM"
 chmod +x "$AUTH_SHIM"
 
+# #2239 r4: stub the daemon binary the liveness watcher's restart/rebootstrap path
+# invokes (`bash "$DAEMON_SH" restart --force`). Without this, the smoke's live
+# daemon.pid=$$ makes daemon_pid_alive() (kill -0 only, no identity check) treat
+# the test's own shell as a live daemon, so every stale tick ran the REAL
+# bridge-daemon.sh restart and leaked orphaned `bridge-daemon run` loops that kept
+# refreshing the heartbeat — the #2239 T7 flake. The stub logs the call (so a
+# restart is still observable) and exits 0 WITHOUT spawning anything.
+DAEMON_SHIM="$STUB_DIR/bridge-daemon.sh"
+DAEMON_LOG="$SMOKE_TMP_ROOT/daemon-restart.log"
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'printf "cmd: %%s\\n" "$*" >>"%s"\n' "$DAEMON_LOG"
+  printf 'exit 0\n'
+} >"$DAEMON_SHIM"
+chmod +x "$DAEMON_SHIM"
+
 # Per-case state dir + a live-looking pid file (our own pid is alive).
 LIFE_STATE_DIR=""
 life_setup() {
@@ -104,34 +120,41 @@ life_setup() {
 # and GNU/Linux. $1 = file, $2 = age seconds. The watcher reads the file's MTIME
 # (via `stat`), so the heartbeat is only "stale" if the mtime actually moves back.
 #
-# Portability trap (the T12 Linux-red root cause): `date -r N` means two different
-# things — BSD/mac: "interpret epoch N"; GNU/Linux: "use the mtime of FILE named
-# N" (which fails for an integer). So we must try GNU `touch -d @epoch` (and
-# `date -d @epoch` for the BSD `touch -t` stamp) explicitly, not via `date -r`.
-# We then ASSERT the mtime took within tolerance — a silently-failed back-date
-# would otherwise leave a FRESH heartbeat and make a "stale" case wrongly pass as
-# fresh (exactly what made T12 green on mac, red on Linux).
+# #2239 r3 (GNU/Linux CI red): back-date via python3 `os.utime`, NOT `touch`. The
+# `touch` forms diverge across platforms and, on the GitHub Linux runner, the
+# heartbeat mtime did not durably land at now-900 (the tick read age=0 downstream)
+# even though a BSD-form/`touch -d` verify looked fine on macOS. `os.utime(path,
+# (t, t))` sets atime+mtime to the exact integer epoch identically on BSD and GNU,
+# with second resolution and no FS-granularity ambiguity — the single portable
+# writer. Passed as argv (no heredoc-stdin; footgun #11 / lint-heredoc-ban clean).
+# We then HARD-VERIFY the landed mtime GNU-first and fail LOUD if the age is not
+# within tolerance of the intended hb_age, so a non-landing back-date surfaces
+# deterministically HERE at setup rather than as a downstream flake.
 set_heartbeat_mtime() {
   local hb_file="$1" hb_age="$2"
   local now mtime got
   now="$(date +%s)"
   mtime=$(( now - hb_age ))
   printf '%s\n' "$mtime" >"$hb_file"
-  # GNU coreutils touch: -d @EPOCH. Try it first (Linux/CI path).
-  if ! touch -d "@$mtime" "$hb_file" 2>/dev/null; then
-    # BSD/mac touch: -t [[CC]YY]MMDDhhmm[.SS] from a BSD `date -r EPOCH`.
-    touch -t "$(date -r "$mtime" +%Y%m%d%H%M.%S 2>/dev/null)" "$hb_file" 2>/dev/null || true
-  fi
-  # Verify the back-date actually took (within 5s) — fail loudly otherwise so a
-  # platform where neither form works can never masquerade a fresh heartbeat as
-  # stale (or vice-versa).
-  # Read the mtime back PORTABLY. GNU coreutils: `stat -c %Y`; BSD/mac: `stat -f %m`.
-  # (Order matters: `stat -f` on GNU means "filesystem status" and prints garbage,
-  # so we MUST try the platform-correct form and sanitize the result to digits.)
+  # Portable, platform-identical back-date. os.utime takes (atime, mtime) seconds.
+  python3 -c 'import os,sys; t=int(sys.argv[2]); os.utime(sys.argv[1],(t,t))' \
+    "$hb_file" "$mtime" \
+    || smoke_fail "set_heartbeat_mtime: python3 os.utime back-date failed for $hb_file (wanted mtime=$mtime)"
+  # Read the landed mtime back GNU-first (`stat -c %Y`), then BSD (`stat -f %m`).
+  # `stat -f` on GNU is FILESYSTEM status and pollutes stdout, so `-c` MUST be
+  # first; the digit-squeeze + plausibility gate reject any stray fs-field output.
   got="$(stat -c %Y "$hb_file" 2>/dev/null || stat -f %m "$hb_file" 2>/dev/null || true)"
-  got="${got//[^0-9]/}"; [[ -n "$got" ]] || got=0
-  local delta=$(( got - mtime )); (( delta < 0 )) && delta=$(( -delta ))
-  (( delta <= 5 )) || smoke_fail "set_heartbeat_mtime: could not back-date $hb_file to age=${hb_age}s (wanted mtime=$mtime, got=$got) — heartbeat staleness would be wrong on this platform"
+  got="${got//[^0-9]/}"
+  { [[ -n "$got" ]] && (( got < 100000000000 )); } || got=0
+  # Verify the landed AGE (now - got) matches the intended hb_age within tolerance,
+  # re-reading `now` so a slow setup does not itself trip the check. Fail LOUD so a
+  # platform where the back-date silently no-ops can never masquerade a fresh
+  # heartbeat as stale (or vice-versa).
+  local now2 landed_age delta
+  now2="$(date +%s)"
+  landed_age=$(( now2 - got ))
+  delta=$(( landed_age - hb_age )); (( delta < 0 )) && delta=$(( -delta ))
+  (( delta <= 5 )) || smoke_fail "set_heartbeat_mtime: back-date did not land — wanted age=${hb_age}s, got age=${landed_age}s (mtime=$got, now=$now2) — heartbeat staleness would be wrong on this platform"
 }
 
 life_run() {
@@ -156,9 +179,14 @@ life_run() {
     BRIDGE_DAEMON_RECOVERY_RENUDGE_FILE="$renudge_file" \
     BRIDGE_DAEMON_LIVENESS_DRY_RUN="${BRIDGE_DAEMON_LIVENESS_DRY_RUN:-1}" \
     BRIDGE_AUTH_SH="$AUTH_SHIM" \
+    BRIDGE_DAEMON_LIVENESS_DAEMON_SH="$DAEMON_SHIM" \
     BRIDGE_BASH_BIN="bash" \
     BRIDGE_DAEMON_TOKEN_LIFELINE_STATE_FILE="$LIFE_STATE_DIR/token-lifeline.ts" \
     BRIDGE_DAEMON_TOKEN_LIFELINE_INTERVAL_SECONDS="${BRIDGE_DAEMON_TOKEN_LIFELINE_INTERVAL_SECONDS:-300}" \
+    BRIDGE_DAEMON_TOKEN_LIFELINE_ENABLED=1 \
+    BRIDGE_DAEMON_TOKEN_LIFELINE_STALE_SECONDS=600 \
+    BRIDGE_DAEMON_TOKEN_LIFELINE_TIMEOUT_SECONDS="${BRIDGE_DAEMON_TOKEN_LIFELINE_TIMEOUT_SECONDS:-60}" \
+    BRIDGE_CLAUDE_TOKEN_SYNC_AGENTS="${BRIDGE_CLAUDE_TOKEN_SYNC_AGENTS:-static}" \
     "$@" \
     bash "$LIVENESS_SRC" >"$LIFE_STATE_DIR/liveness.out" 2>&1 || true
 }
@@ -182,6 +210,59 @@ auth_first_line() {
   local n
   n="$(grep -n -- "$pat" "$AUTH_LOG" 2>/dev/null | head -n1 | cut -d: -f1)"
   printf '%s' "${n:-0}"
+}
+
+# Observed heartbeat age (now - mtime) for the per-case heartbeat file. Prints the
+# integer age, or -1 if the file/mtime is unreadable.
+#
+# #2239 r2 (GNU/Linux CI red): the mtime MUST be read GNU-first (`stat -c %Y`),
+# then BSD (`stat -f %m`) — the SAME order set_heartbeat_mtime's verify block uses
+# (and which demonstrably lands correct on the Linux runner). The reverse order
+# (`stat -f %m` first) is a trap on GNU: `-f` there means "file SYSTEM status", so
+# GNU reads `%m` as a FILENAME, exits non-zero, and dumps the filesystem block/
+# inode table to STDOUT (`2>/dev/null` only hides stderr). The `||` then appends
+# the real `stat -c %Y` mtime, and `${m//[^0-9]/}` concatenates the fs-table digits
+# with the mtime into one absurd number — the ~-3.46e18 CI age signature. Reading
+# `stat -c %Y` first never runs `stat -f` on GNU, so no stdout pollution. The
+# plausibility gate (< 1e11) is belt-and-suspenders against any variant that still
+# emits a large filesystem-field number.
+life_heartbeat_age() {
+  local hb_file="$LIFE_STATE_DIR/daemon.heartbeat" m now
+  m="$(stat -c %Y "$hb_file" 2>/dev/null || stat -f %m "$hb_file" 2>/dev/null || true)"
+  m="${m//[^0-9]/}"
+  # A real second-resolution mtime is ~1.78e9 (10 digits). Reject empty or an
+  # implausibly large value (>= 1e11 ⇒ a filesystem-field / ns garbage read).
+  { [[ -n "$m" ]] && (( m < 100000000000 )); } || { printf '%s' -1; return; }
+  now="$(date +%s)"
+  printf '%s' "$(( now - m ))"
+}
+
+# Deterministic pre-assertion for a REAL (DRY_RUN=0) stale-heartbeat tick. The
+# real tick silently no-ops — emitting NOTHING (empty auth log, empty
+# liveness.out, absent state file) — when ANY of its gating preconditions is not
+# actually held: a back-date that did not land stale enough (so main() takes the
+# fresh/ok path), or a throttle-witness left behind (so the interval throttle
+# suppresses the tick). This was the #2239 full-suite CI flake, where the bare
+# `recover-due count=0` gave no hint WHICH precondition broke. life_run() now
+# hard-pins the ENABLED/STALE gates so a leaked env can no longer gate the tick.
+#
+# #2239 r4 (real root cause): the earlier "read age=0 on Linux" was NOT a
+# stat/back-date bug — daemon_pid_alive() only checks kill -0 (no identity), so
+# the smoke's live daemon.pid=$$ made every stale tick reach restart_daemon, which
+# ran the REAL `bridge-daemon.sh restart --force` and left orphaned `bridge-daemon
+# run` loops that kept touching the heartbeat FRESH, racing the back-date. With
+# the daemon-restart stub (BRIDGE_DAEMON_LIVENESS_DAEMON_SH) no real daemon can
+# spawn, so this deferred staleness read is stable again (age only grows) — restore
+# it as the loud regression canary. $1 = throttle-witness state file (must be due).
+assert_real_tick_preconditions() {
+  local state_file="$1"
+  # life_run() pins BRIDGE_DAEMON_TOKEN_LIFELINE_STALE_SECONDS=600, so age>=600 is
+  # the effective staleness gate the real tick will apply.
+  local age; age="$(life_heartbeat_age)"
+  (( age >= 600 )) \
+    || smoke_fail "real-tick precondition: heartbeat age=${age}s is NOT stale (need >=600) — a real daemon refreshed it (restart stub not wired?) or the back-date did not land; the tick would take the fresh/ok path and no-op"
+  [[ ! -e "$state_file" ]] \
+    || smoke_fail "real-tick precondition: throttle witness present [$(cat "$state_file" 2>&1)] — the interval throttle would suppress the tick"
 }
 
 # ===========================================================================
@@ -327,9 +408,18 @@ step_t7_dry_run_no_mutation() {
   # And prove it does NOT suppress a subsequent REAL tick: a real run right after
   # the DRY_RUN must actually invoke the auth shim (throttle was never armed).
   : >"$AUTH_LOG"   # isolate the real-tick auth calls from the (empty) DRY_RUN log
+  # #2239: fail LOUD if the real tick's gating preconditions are not actually held
+  # (stale-enough heartbeat + absent throttle witness), so a CI failure names the
+  # broken precondition instead of the opaque `recover-due count=0`. The heartbeat
+  # still carries the DRY_RUN tick's back-date; life_run() re-back-dates it below.
+  assert_real_tick_preconditions "$state_file"
   BRIDGE_DAEMON_LIVENESS_DRY_RUN=0 life_run 900
   if [[ "$(auth_count 'recover-due')" != "1" ]]; then
-    smoke_log "T7 diag FAIL-CTX: state_file=$([[ -e "$state_file" ]] && printf 'EXISTS[%s]' "$(cat "$state_file" 2>&1)" || printf ABSENT) auth_log=[$(cat "$AUTH_LOG")] liveness_out=[$(cat "$LIFE_STATE_DIR/liveness.out")]"
+    smoke_log "T7 diag FAIL-CTX: hb_age=$(life_heartbeat_age)s state_file=$([[ -e "$state_file" ]] && printf 'EXISTS[%s]' "$(cat "$state_file" 2>&1)" || printf ABSENT) auth_log=[$(cat "$AUTH_LOG")] liveness_out=[$(cat "$LIFE_STATE_DIR/liveness.out")]"
+    # #2239 r4: on failure, dump the runtime's own verdict (audit.jsonl records the
+    # exact heartbeat_age_seconds main() computed) + any stray bridge-daemon process
+    # — a leaked real daemon refreshing the heartbeat was the original T7 flake.
+    smoke_log "T7 diag FAIL-CTX: audit=[$(cat "$LIFE_STATE_DIR/audit.jsonl" 2>&1 | tr '\n' '|')] daemons=[$(ps -eo pid,command 2>/dev/null | grep -i 'bridge-daemon' | grep -v grep | tr '\n' ';')] restart_log=[$(cat "$DAEMON_LOG" 2>/dev/null | tr '\n' ';')]"
     smoke_fail "T7: a real tick after a DRY_RUN was throttled — DRY_RUN must not arm the throttle (recover-due count=$(auth_count 'recover-due'))"
   fi
   smoke_log "T7: OK — DRY_RUN audits but mutates nothing (state file absent; real tick not suppressed)"
@@ -503,9 +593,12 @@ step_t12_bounded_fail_closed() {
     BRIDGE_DAEMON_GATEWAY_STALL_DISABLE=1 \
     BRIDGE_DAEMON_LIVENESS_DRY_RUN=0 \
     BRIDGE_AUTH_SH="$slow_shim" \
+    BRIDGE_DAEMON_LIVENESS_DAEMON_SH="$DAEMON_SHIM" \
     BRIDGE_BASH_BIN="bash" \
     BRIDGE_DAEMON_TOKEN_LIFELINE_STATE_FILE="$LIFE_STATE_DIR/token-lifeline.ts" \
     BRIDGE_DAEMON_TOKEN_LIFELINE_TIMEOUT_SECONDS=2 \
+    BRIDGE_DAEMON_TOKEN_LIFELINE_ENABLED=1 \
+    BRIDGE_DAEMON_TOKEN_LIFELINE_STALE_SECONDS=600 \
     bash "$LIVENESS_SRC" >"$LIFE_STATE_DIR/liveness.out" 2>&1 || true
   end="$(date +%s)"
   # Bounded: the whole tick (3 sleeping phases, each fail-closed at rc=124) must
