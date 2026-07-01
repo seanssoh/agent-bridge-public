@@ -119,6 +119,21 @@ def _indirection_cases() -> list[tuple[str, "str | None"]]:
          "auth_token_mutation_via_sh"),
         ("eval 'agb auth claude-token activate x --label global-auth-sync'",
          "auth_token_mutation_via_eval"),
+        # #2163 codex r3 — the `-c` command STRING is the first operand after the
+        # option group, NOT the token right after `-c`: a POSIX `--` terminator
+        # or a further short option between `-c` and the command must be skipped,
+        # else `bash -c -- '<mutation>'` false-ALLOWs (the extractor returned the
+        # bare `--`). These MUST deny (auth + config, plain `--`, combined `-lc`,
+        # `-x`-after-`-c`, and an env-prefixed leaf).
+        ("bash -c -- 'agb auth claude-token rotate'",
+         "auth_token_mutation_via_bash"),
+        ("bash -lc -- 'agb config set-env K=V'", "config_mutation_via_bash"),
+        ("bash -c -x 'agb auth claude-token rotate'",
+         "auth_token_mutation_via_bash"),
+        ("env bash -c -- 'agb auth claude-token rotate'",
+         "auth_token_mutation_via_bash"),
+        ("sh -c -- 'agent-bridge auth claude-token activate default'",
+         "auth_token_mutation_via_sh"),
         # ---- C4b auth-token DENY via unresolved command-position $var ----
         ("agb auth claude-token $V", "auth_token_mutation_via_unresolved_var"),
         ("$C auth claude-token add x", "auth_token_mutation_via_unresolved_var"),

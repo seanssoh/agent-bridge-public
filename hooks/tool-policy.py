@@ -5891,6 +5891,19 @@ def _config_mutation_via_indirection(text: str) -> str | None:
     hook cannot expand). The reason string names both the surface (`config` vs
     `auth_token`) and the leaf, so the audit verb + deny message can diverge.
     Config takes precedence when a stage names both surfaces.
+
+    Scope boundary (documented residual, #2163 patch r3): only a genuine
+    command-STRING interpretation is treated as indirection — `eval <cmd>`,
+    `xargs <cmd>`, or a `-c`/`-lc` shell (the extracted command string, `--`
+    option terminator handled). STDIN-FED interpreter forms — a here-string
+    (`sh <<< '<cmd>'`), `bash -s`, or a pipe (`echo '<cmd>' | bash -s`) — are
+    NOT flagged: they carry no `-c` command string, the mutation verb is
+    literally VISIBLE (not the verb-hiding this gate targets), and the wrapper's
+    launch-shape-independent process-ancestry trust gate still governs the child
+    `agb`/`agent-bridge` process (no ancestry laundering). Same accepted-residual
+    class as the `ad[d]` glob spelling — this hook is defense-in-depth over the
+    wrapper gate, not the sole close criterion. A follow-up (#2163b) may widen to
+    stdin-fed forms if the redirect-stripping design is revisited.
     """
     joined = text.replace("\\\r\n", "").replace("\\\n", "")
     for stage in _COMMAND_OPERATOR_RE.split(joined):
@@ -8777,7 +8790,24 @@ def _interpreter_payload_command_str(real_tokens: list[str]) -> str | None:
                 and not tok.startswith("--")
                 and "c" in tok[1:]
             ):
-                return real_tokens[i + 1] if i + 1 < len(real_tokens) else None
+                # The command STRING is the first OPERAND after the option group,
+                # not simply the token after `-c`: a shell keeps parsing options
+                # past `-c` and honours a POSIX `--` terminator, so both
+                # `bash -c -- '<cmd>'` and `bash -c -x '<cmd>'` run '<cmd>'. Skip
+                # any further leading option tokens and a single `--` terminator
+                # before selecting the operand (#2163 codex r3: `bash -c --
+                # 'agb auth … rotate'` returned the bare `--`, which read as a
+                # non-mutation and FALSE-ALLOWED the auth mutation). Fail-closed:
+                # an exhausted operand list returns None (no command string). A
+                # real mutation leaf (`agb`/`agent-bridge`/`git`/`$var`) never
+                # starts with `-`, so skipping option tokens cannot drop it.
+                j = i + 1
+                while j < len(real_tokens) and real_tokens[j].startswith("-"):
+                    terminator = real_tokens[j] == "--"
+                    j += 1
+                    if terminator:
+                        break
+                return real_tokens[j] if j < len(real_tokens) else None
         return None
     return None
 
