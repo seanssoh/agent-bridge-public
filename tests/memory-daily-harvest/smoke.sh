@@ -1117,6 +1117,26 @@ else
 fi
 
 # =============================================================================
+# Scenario 2229 — self-signal sender-gate must catch the two bypasses that made
+# memory-daily backfill self-perpetuate on zero-activity days (issue #2229,
+# extends #728): (1) the cron wake `cron:memory-daily-<agent>` (colon prefix),
+# (2) the backfill task itself, now stamped `--from memory-daily`. A genuine
+# human task with a placeholder-ish title must still NOT be suppressed.
+# Delegated to a standalone check (no heredoc — heredoc-ban ratchet safe).
+# =============================================================================
+banner "2229 — self-signal bypass (cron: dispatch + backfill sender), #728 kept"
+# Stub task_cli so the check's writer-argv path (_queue_backfill) is exercised.
+: > "$BRIDGE_HOME/bridge-task.sh"
+if "$PYTHON" "$REPO_ROOT/tests/memory-daily-harvest/self_signal_2229_check.py" \
+     "$REPO_ROOT/bridge-memory.py" \
+     >"$SMOKE_ROOT/2229.out" 2>"$SMOKE_ROOT/2229.err"; then
+  pass "2229"
+else
+  fail "2229" "$(tr '\n' ' ' <"$SMOKE_ROOT/2229.err" | head -c 240)"
+fi
+rm -f "$BRIDGE_HOME/bridge-task.sh" 2>/dev/null || true
+
+# =============================================================================
 # Summary
 # =============================================================================
 printf '\n================================\n'

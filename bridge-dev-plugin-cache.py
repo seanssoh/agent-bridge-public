@@ -982,6 +982,72 @@ def link_source_node_modules(source_path: Path, cache_version_path: Path) -> tup
     return "linked", str(cache_node_modules)
 
 
+def _walk_source_with_inbound_symlinked_dirs(source_path: Path, source_root: Path):
+    """Yield ``os.walk`` tuples for ``source_path``, additionally descending
+    symlinked directories whose target resolves INSIDE ``source_root``.
+
+    Issue #2191 — ``os.walk(..., followlinks=False)`` never descends a symlinked
+    directory, so a required-contract file reachable ONLY through a
+    within-marketplace symlinked-dir dependency is not enumerated, and a partial
+    cache of such a dep passes verify (``unchanged-verified``). The linker is NOT
+    blind to those files: ``_overlay_entry`` step 4 recurses through
+    ``is_dir()``-True symlinks and materializes them into the cache, skipping
+    ONLY symlinks whose target escapes the root (step 3, via
+    ``_is_symlink_outside_source_root``). Verify must walk with the same reach or
+    the required-contract invariant has a hole.
+
+    Escaping symlinks (target outside ``source_root``) are NEVER followed — that
+    is the #786/#1663 traversal-safety boundary; naively flipping
+    ``followlinks=True`` would reopen it.
+
+    Cycle-safety uses a PER-CHAIN ancestor guard, not a global visited set: a
+    symlinked dir is a cycle only when its target is an ancestor of the symlink
+    on the current descent chain (descending it would re-enter a directory
+    already being walked). DISTINCT aliases to the same NON-ancestor target
+    (``dep_a`` and ``dep_b`` both -> ``../shared``) are therefore each walked —
+    the overlay materializes each alias into the cache at its own relative path,
+    so verify must require each too, otherwise a cache missing only one alias is
+    falsely certified (#2191 codex r1). A global realpath-dedup would drop the
+    second alias. ``source_root`` must already be resolved by the caller.
+    """
+
+    def _target_is_chain_ancestor(sub: Path, target_key: tuple) -> bool:
+        # True iff ``sub``'s symlink target is an ancestor of ``sub`` on the
+        # current lexical descent chain (source_path .. sub.parent). Compares
+        # (st_dev, st_ino) so a target reached by a different path but the same
+        # inode is caught. Stops at source_path (the walk root) or the fs root.
+        anc = sub.parent
+        while True:
+            try:
+                ast = anc.stat()
+            except OSError:
+                return True  # unresolvable ancestor — treat as cycle, skip
+            if (ast.st_dev, ast.st_ino) == target_key:
+                return True
+            if anc == source_path or anc.parent == anc:
+                return False
+            anc = anc.parent
+
+    def _walk(base: Path):
+        for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+            yield dirpath, dirnames, filenames
+            for dname in dirnames:
+                sub = Path(dirpath) / dname
+                if not sub.is_symlink():
+                    continue
+                if _is_symlink_outside_source_root(sub, source_root):
+                    continue  # escaping symlink — #786/#1663 boundary, never followed
+                try:
+                    tst = sub.stat()  # follow to the target directory
+                except OSError:
+                    continue  # broken / self-looping link — skip, don't crash
+                if _target_is_chain_ancestor(sub, (tst.st_dev, tst.st_ino)):
+                    continue
+                yield from _walk(sub)
+
+    yield from _walk(source_path)
+
+
 def _find_missing_required_contract(
     cache_version_path: Path, source_path: Path, source_root: Path | None = None
 ) -> str | None:
@@ -1014,6 +1080,16 @@ def _find_missing_required_contract(
     Issue #2182 partial-copy detection). When ``source_root`` is omitted (legacy
     callers) the plugin ``source_path`` is the boundary, as before.
 
+    Issue #2191 — the walk also descends symlinked *directories* whose target
+    resolves inside the same ``boundary`` (the marketplace root), matching the
+    overlay's reach (``_overlay_entry`` step 4 recurses through inbound symlinked
+    dirs). Without this, a required-contract file that lives ONLY under a
+    within-marketplace symlinked-dir dep is never enumerated and a partial copy
+    of that dep is certified. Symlinked dirs escaping the boundary are still not
+    followed (#786/#1663). This is orthogonal to the #2098 exclusion below, which
+    drops node_modules-internal contract *files* that are themselves symlinks
+    resolving outside the boundary.
+
     Any I/O error walking the source is reported as a verify failure (a
     source we cannot enumerate is not a cache we can certify).
     """
@@ -1022,7 +1098,9 @@ def _find_missing_required_contract(
     except OSError as exc:
         return f"required-contract-source-resolve-failed:{exc}"
     try:
-        source_entries = list(os.walk(source_path, followlinks=False))
+        source_entries = list(
+            _walk_source_with_inbound_symlinked_dirs(source_path, boundary)
+        )
     except OSError as exc:
         return f"required-contract-source-walk-failed:{exc}"
     for dirpath, _dirnames, filenames in source_entries:

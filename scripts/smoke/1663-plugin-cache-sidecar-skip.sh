@@ -308,10 +308,31 @@ t5_non_required_symlink_outside_skip() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# T6 — Issue #2191: verify must descend a within-marketplace symlinked
+#      DIRECTORY dep so a required-contract file reachable ONLY through it is
+#      enumerated (a partial copy flagged, not certified `unchanged-verified`).
+#      The overlay already recurses through inbound symlinked dirs; before the
+#      fix, verify walked `followlinks=False` and had a hole. Delegated to a
+#      standalone module-level check that builds the partial-cache state
+#      directly (no heredoc → heredoc-ban-ratchet safe), and also asserts the
+#      #786/#1663 escaping-symlink boundary + cycle-safety are preserved.
+# ---------------------------------------------------------------------------
+t6_2191_symlinked_dir_verify() {
+  local check="$REPO_ROOT/tests/plugin-cache/symlinked_dir_verify_2191_check.py"
+  smoke_assert_file_exists "$check" "T6 #2191 regression check present"
+  local out rc
+  out="$(python3 "$check" "$DEV_CACHE_PY" 2>&1)"
+  rc=$?
+  smoke_assert_eq "0" "$rc" "T6 #2191 symlinked-dir verify check must pass: $out"
+  return 0
+}
+
 smoke_run "T1 sidecar + unknown unreadable → verified, no cascade" t1_sidecar_non_fatal
 smoke_run "T2 required-contract unreadable → fail-loud" t2_required_contract_fail_loud
 smoke_run "T3 nested required-contract unreadable → fail-loud" t3_nested_required_contract_fail_loud
 smoke_run "T4 required-contract symlink-outside → fail-loud" t4_required_contract_symlink_outside_fail_loud
 smoke_run "T5 non-required symlink-outside → skip, still verified" t5_non_required_symlink_outside_skip
+smoke_run "T6 #2191 within-root symlinked-dir dep enumerated by verify" t6_2191_symlinked_dir_verify
 
 smoke_log "passed"

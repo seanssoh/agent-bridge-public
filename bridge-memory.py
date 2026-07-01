@@ -2906,7 +2906,18 @@ SELF_SIGNAL_PATTERNS = (
     re.compile(r" checked ok\s*$"),                   # no-op placeholder
     re.compile(r"^\[cron-followup\] memory-daily-"),  # cron failure followup
 )
-SELF_SIGNAL_FROM_PREFIXES = ("memory-daily", "cron-dispatch", "cron-followup")
+# issue #2229: cron-dispatch wakes are stamped `cron:$CRON_JOB_NAME`
+# (bridge-cron.sh), so the memory-daily harvest's own wake arrives as
+# `cron:memory-daily-<agent>`. That colon-prefixed form was NOT matched by the
+# plain "cron-dispatch"/"cron-followup" entries below, so the harvester counted
+# its own cron wake as real activity and re-queued a backfill every day. Match
+# the actual `cron:memory-daily` sender shape.
+SELF_SIGNAL_FROM_PREFIXES = (
+    "memory-daily",
+    "cron-dispatch",
+    "cron-followup",
+    "cron:memory-daily",
+)
 
 
 def _is_system_sender(from_field: str) -> bool:
@@ -3321,7 +3332,15 @@ def _queue_backfill(agent: str, date: str, home: Path, workdir: str, activity: d
                 [
                     "bash", str(task_cli), "create",
                     "--to", agent,
-                    "--from", agent,
+                    # issue #2229: stamp a SYSTEM sender (not the agent id) so the
+                    # next-day harvest's self-signal sender-gate (_is_system_sender,
+                    # issue #728) recognizes this backfill task and does not count
+                    # it as real activity. With `--from agent` the gate short-
+                    # circuited to False and the '^[memory-daily] backfill ' title
+                    # pattern was never checked, so processing one backfill spawned
+                    # the next day's — a self-perpetuating loop. Matches the sibling
+                    # memory-daily admin-notification create below.
+                    "--from", "memory-daily",
                     "--title", title,
                     "--body-file", tmp.name,
                     "--priority", "normal",
