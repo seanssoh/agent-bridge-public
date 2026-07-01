@@ -315,6 +315,15 @@ def infer_page(envelope: dict) -> str:
 # categorization in human hands rather than guessing wrong. If a
 # deployment has research subtypes it wants auto-routed, it can add
 # explicit hints here with confidence in the target mapping.
+#
+# Issue #744: `memory/shared/` is **deliberately not mapped here**. An
+# agent's `agents/<name>/memory/shared/` subtree is that agent's own
+# domain-content sharing area, not the team operating-rules SSOT. Mapping
+# it to `operating-rules` auto-collapsed every such capture into the single
+# `wiki/operating-rules.md` file (target_for_kind ignores page/title for
+# that kind), polluting the operating-rules SSOT with agent domain notes.
+# Such captures are hard-rejected in `process_one` (see the memory/shared
+# guard) so they land in human hands instead of a wrong single-file target.
 PATH_KIND_HINTS = (
     ("/memory/projects/", "project"),
     ("/memory/decisions/", "decision"),
@@ -323,7 +332,6 @@ PATH_KIND_HINTS = (
     ("/memory/people/", "people"),
     ("/memory/users/", "people"),
     ("/memory/data-sources/", "data-sources"),
-    ("/memory/shared/", "operating-rules"),
 )
 
 
@@ -505,6 +513,24 @@ def process_one(
         )
         return result
 
+    # Issue #744: an agent's `agents/<name>/memory/shared/` subtree is that
+    # agent's own domain-content sharing area, NOT the team operating-rules
+    # SSOT. Both the path hint and any envelope `suggested_entities=["shared/
+    # ..."]` route such captures to kind=operating-rules, which append into
+    # the single `wiki/operating-rules.md` file regardless of page/title —
+    # silently polluting the operating-rules SSOT with agent domain notes.
+    # Reject here (before envelope parsing) so both routes are covered; a
+    # human categorizes the capture instead of a wrong single-file promote.
+    if "/memory/shared/" in str(capture_path):
+        result["status"] = "rejected"
+        result["reason"] = "agent-memory-shared-ambiguous"
+        result["error"] = (
+            "capture lives under agents/<name>/memory/shared/ (agent domain "
+            "content); auto-promoting it to operating-rules would pollute the "
+            "wiki/operating-rules.md SSOT — categorize it explicitly instead"
+        )
+        return result
+
     # Issue #582 r2: content-hash dedup. Computed before envelope parsing
     # so it covers JSON, fenced markdown, and fallback shapes uniformly.
     # Only consults the marker store on real (non-dry-run) promotes —
@@ -618,6 +644,18 @@ def main(argv: list[str]) -> int:
     duplicate_count = 0
 
     # Canary: first call MUST be dry-run unless the whole run is dry.
+    #
+    # The canary exists to catch a genuine promote/infra failure at batch[0]
+    # before we commit the rest of the batch — NOT to gate benign
+    # per-capture outcomes. `process_one` returns `rejected` for captures a
+    # human must classify (daily-note, agent memory/shared — issue #744) and
+    # `duplicate` for content-hash dedup; both are expected steady-state
+    # results, not batch-fatal errors. Because task-body order is stable, a
+    # capture that deterministically lands in the batch[0] slot (e.g. an
+    # agent's memory/shared/ file) would otherwise halt EVERY daily-ingest
+    # run and silently drop all subsequent legit captures. So the canary
+    # halts only on a status OUTSIDE this benign set — `failed` (real
+    # promote/infra error) and any unforeseen status still halt.
     canary_cap = batch[0]
     canary_result = process_one(canary_cap, bridge_knowledge, shared_root,
                                 template_root, team_name, dry_run=True,
@@ -625,7 +663,7 @@ def main(argv: list[str]) -> int:
     canary_result["canary"] = True
     print(json.dumps(canary_result, ensure_ascii=False))
     sys.stdout.flush()
-    if canary_result["status"] != "ok":
+    if canary_result["status"] not in ("ok", "rejected", "duplicate"):
         print(json.dumps({
             "status": "canary-failed",
             "halted": True,
