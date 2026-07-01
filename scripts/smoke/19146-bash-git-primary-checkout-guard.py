@@ -288,6 +288,54 @@ def main() -> int:
     expect("switch via cd-primary", WT, f"cd {P} && git switch main", True)
     expect("restore via env wrapper", WT, f"env GIT_DIR={P}/.git git restore .", True)
 
+    # ---- DENY: #2159 same-command const-tracking — the escape vector is hidden
+    # ENTIRELY inside a variable VALUE / alias BODY / eval-or-shell payload, so
+    # the USING stage carries no literal git/-C/verb token. Resolved single-level
+    # then re-read through the indirection reader (deny-monotonic: never turns a
+    # pre-existing deny into an allow).
+    expect(
+        "2159 var value = full invocation",
+        WT,
+        f'g="git -C {P} reset"; $g --hard',
+        True,
+    )
+    expect(
+        "2159 F1 nested: cmd value holds $g -C primary reset",
+        WT,
+        f'g="git"; cmd="$g -C {P} reset"; $cmd',
+        True,
+    )
+    expect(
+        "2159 eval of const string",
+        WT,
+        f'cmd="git -C {P} reset --hard"; eval "$cmd"',
+        True,
+    )
+    expect(
+        "2159 sh -c of const string (interp breadth)",
+        WT,
+        f'cmd="git -C {P} reset --hard"; sh -c "$cmd"',
+        True,
+    )
+    expect(
+        "2159 zsh -c of const string (2nd interp leaf)",
+        WT,
+        f'cmd="git -C {P} reset --hard"; zsh -c "$cmd"',
+        True,
+    )
+    expect(
+        "2159 bash -c of const string",
+        WT,
+        f'cmd="git -C {P} reset"; bash -c "$cmd"',
+        True,
+    )
+    expect(
+        "2159 alias body = full invocation",
+        WT,
+        f'alias g="git -C {P} reset --hard"; g',
+        True,
+    )
+
     # ---- ALLOW: canonical-safe shape (over-block regression = 0) -------------
     expect("worktree bare reset --hard", WT, "git reset --hard", False)
     expect("worktree bare checkout file", WT, "git checkout .", False)
@@ -341,6 +389,31 @@ def main() -> int:
         "git status && make reset",
         False,
     )
+    # #2159 over-block-0: const-tracking must NOT resolve a `gitfoo` leaf as git
+    # (F2 exact-token, #1709 substring-bypass lineage), must NOT persist a per-
+    # command env PREFIX into a later `$NAME` (C1), and must leave a resolved-git
+    # -but-non-destructive / concrete-non-git leader ALLOWED.
+    expect(
+        "2159 allow gitfoo value (exact-token, not 'git'-substring)",
+        WT,
+        f'g="gitfoo -C {P} reset"; $g',
+        False,
+    )
+    expect("2159 allow $g=gitfoo non-destructive", WT, "g=gitfoo; $g status", False)
+    expect(
+        "2159 allow env-prefix not persisted (C1)",
+        WT,
+        "NAME=git ls; $NAME status",
+        False,
+    )
+    expect("2159 allow resolved-git non-destructive", WT, 'g="git status"; $g', False)
+    expect(
+        "2159 allow eval non-destructive payload",
+        WT,
+        'cmd="git status"; eval "$cmd"',
+        False,
+    )
+    expect("2159 allow concrete non-git leader", WT, "TOOL=make; $TOOL build", False)
 
     # ---- ALLOW: operator structural exemption (cwd = primary repo root) ------
     expect("operator cd-primary reset", P, f"cd {P} && git reset --hard", False)
