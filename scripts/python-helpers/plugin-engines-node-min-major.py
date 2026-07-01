@@ -99,25 +99,52 @@ def _comparator_floor(op: str, raw_major: str) -> int | None:
     return int(raw_major)
 
 
+# Separators that may legally sit BETWEEN comparator units in one
+# alternative: whitespace and commas (`>=14, <21` is a valid AND set).
+_SEPARATOR = re.compile(r"[\s,]+")
+
+
 def _alternative_floor(alt: str) -> int | None:
-    """Return the floor major for one ``||`` alternative, or None."""
+    """Return the floor major for one ``||`` alternative, or None.
+
+    None when the alternative is not FULLY covered by valid comparator
+    units + separators — i.e. any leftover non-whitespace garbage means we
+    could not parse it as a real range and must NOT derive a floor (else we
+    would scavenge a stray number out of garbage like ``foo20`` and
+    spuriously warn). None also composes with the OR-union short-circuit in
+    _min_major: a garbage alternative unbounds the whole union.
+    """
     alt = alt.strip()
     if not alt:
         return None
 
-    # Hyphen range takes the low bound's major as the floor.
+    # Hyphen range takes the low bound's major as the floor. The regex is
+    # anchored ^...$, so a match already implies full coverage.
     hm = _HYPHEN_RANGE.match(alt)
     if hm:
         return int(hm.group("low"))
 
+    # Walk the alternative left-to-right, requiring every character to be
+    # part of a comparator unit or an inter-unit separator. The moment a
+    # character is neither, the alternative is not a clean range -> None.
     floor: int | None = None
-    for m in _COMPARATOR.finditer(alt):
+    pos = 0
+    n = len(alt)
+    while pos < n:
+        sep = _SEPARATOR.match(alt, pos)
+        if sep:
+            pos = sep.end()
+            continue
+        m = _COMPARATOR.match(alt, pos)
+        if not m or m.end() == pos:
+            # Unparseable leftover (e.g. the "foo" in "foo20", or a bare
+            # "-" that is not a spaced hyphen range) -> no derivable floor.
+            return None
         op = m.group("op") or "="
         unit_floor = _comparator_floor(op, m.group("major"))
-        if unit_floor is None:
-            continue
-        if floor is None or unit_floor > floor:
+        if unit_floor is not None and (floor is None or unit_floor > floor):
             floor = unit_floor
+        pos = m.end()
     return floor
 
 

@@ -34,10 +34,11 @@ fi
 #   T0 (parser): the engines.node min-major parser derives the right
 #      floor for >=14, ^18||^20, ~16, 18.x, ">= 16 < 21" (=> 16, NOT 21),
 #      "14 - 18" (=> 14), and declares NO floor (exit 1) for "*", "x",
-#      upper-bound-only "<21", garbage, AND any OR union with a no-floor
-#      alternative ("* || >=20", "<21 || >=18") — the false-positive
-#      classes two codex review rounds flagged. Under-warning is safe; a
-#      false warn is not.
+#      upper-bound-only "<21", any OR union with a no-floor alternative
+#      ("* || >=20", "<21 || >=18"), AND numeric garbage that must not be
+#      scavenged ("foo20", "20abc", "node16", "v18foo", "18-garbage") —
+#      the false-positive classes three codex review rounds flagged.
+#      Under-warning is safe; a false warn is not.
 #   T1 (warn fires, old node): a plugin declaring engines.node ">=18"
 #      with host node shimmed to v12 emits a "requires node >= 18" warn.
 #   T2 (non-fatal): the gate returns 0 even when it warns (start would
@@ -154,6 +155,18 @@ test_parser_min_major() {
   _check_parser "* || >=20"   "" "1" "codex-or-union-wildcard-unbounds"
   _check_parser ">=14 || *"   "" "1" "codex-or-union-wildcard-trailing"
   _check_parser "<21 || >=18" "" "1" "codex-or-union-upper-bound-unbounds"
+  # Numeric garbage must NOT be scavenged for a floor: an alternative that
+  # is not FULLY covered by valid comparator/version tokens -> no floor ->
+  # exit 1 (agb-dev-codex Phase-4 finding: `foo20` printed 20 and warned,
+  # reopening the exact false-warning class #1191 closes). A garbage
+  # alternative also unbounds an OR union.
+  _check_parser "foo20"       "" "1" "phase4-garbage-prefix-not-scavenged"
+  _check_parser "20abc"       "" "1" "phase4-garbage-suffix-not-scavenged"
+  _check_parser "node16"      "" "1" "phase4-garbage-node-prefix"
+  _check_parser ">=x"         "" "1" "phase4-op-then-wildcard-no-floor"
+  _check_parser "18-garbage"  "" "1" "phase4-bare-hyphen-garbage"
+  _check_parser "v18foo"      "" "1" "phase4-vprefix-trailing-garbage"
+  _check_parser "foo || >=20" "" "1" "phase4-garbage-alt-unbounds-union"
   # Missing engines.node entirely -> exit 1.
   printf '{"name":"p"}\n' >"$pj"
   local out2 rc2
