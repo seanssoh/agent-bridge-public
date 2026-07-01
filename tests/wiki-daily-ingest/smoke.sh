@@ -1040,6 +1040,228 @@ fi
 chmod -R u+rwX "$ISO_RAW_WORKDIR" 2>/dev/null || true
 unset AGB_MOCK_AGENT_LIST_JSON BRIDGE_LAYOUT BRIDGE_DATA_ROOT AGB_MOCK_TASK_LOG 2>/dev/null || true
 
+# =============================================================================
+# Scenario 15 — Issue #744: an agent's `memory/shared/` capture must NOT be
+# auto-promoted into the single-file `wiki/operating-rules.md` SSOT.
+#
+# Two captures live under `agents/<name>/memory/shared/`, exercising both
+# routes that previously landed on kind=operating-rules:
+#   Fixture A — no envelope: relied on PATH_KIND_HINTS["/memory/shared/"].
+#   Fixture B — schema v1 envelope with suggested_entities=["shared/..."]:
+#               relied on ENTITY_KIND_PREFIXES["shared/"] (envelope route,
+#               which removing PATH_KIND_HINTS alone would NOT catch).
+# Both must be rejected with reason=agent-memory-shared-ambiguous, and the
+# fake bridge-knowledge must NOT be invoked for either (the path guard
+# short-circuits before run_promote()).
+#
+# A `memory/projects/` capture leads the batch as the positive control: it
+# proves the guard does not over-block (status=ok, kind=project). Leading
+# with a promotable capture keeps this scenario orthogonal to the canary
+# classification: it isolates the GUARD behavior (reject + zero promotes for
+# memory/shared) from the canary-halt behavior, which is exercised
+# separately in scenario 16. The canary-at-batch[0] regression — a
+# memory/shared reject in the canary slot must NOT wedge the batch — is
+# scenario 16's job.
+# =============================================================================
+banner "15 — Issue #744: memory/shared/ captures are guarded off operating-rules.md"
+
+S15_DIR="$SMOKE_ROOT/s15"
+S15_SHARED="$S15_DIR/shared"
+S15_MEM_SHARED="$S15_DIR/agents/$AGENT/memory/shared"
+S15_MEM_PROJECTS="$S15_DIR/agents/$AGENT/memory/projects"
+S15_TASK_BODY="$S15_DIR/task-body.md"
+S15_BK_LOG="$S15_DIR/fake-bk.log"
+mkdir -p "$S15_DIR" "$S15_SHARED" "$S15_MEM_SHARED" "$S15_MEM_PROJECTS"
+
+# Reuse the scenario-10 fake bridge-knowledge shape: log every invocation
+# and print a minimal promote payload. If the guard regresses, the two
+# memory/shared captures would appear in this log.
+cat >"$S15_DIR/fake-bk.py" <<'PY'
+#!/usr/bin/env python3
+import json, os, sys
+log = os.environ.get("FAKE_BK_LOG", "")
+if log:
+    with open(log, "a", encoding="utf-8") as f:
+        f.write(" ".join(sys.argv) + "\n")
+print(json.dumps({"relative_path": "projects/guard-smoke.md",
+                  "related_pages": []}))
+PY
+chmod +x "$S15_DIR/fake-bk.py"
+
+# Fixture A — memory/shared capture with NO envelope (plain markdown).
+S15_SHARED_A="$S15_MEM_SHARED/formulation-lessons.md"
+cat >"$S15_SHARED_A" <<'EOF'
+# Formulation Lessons
+ingredient profiles, comedogenic study notes, agent domain content
+EOF
+
+# Fixture B — memory/shared capture WITH a schema v1 envelope pointing at a
+# shared/ entity (the envelope route through ENTITY_KIND_PREFIXES).
+S15_SHARED_B="$S15_MEM_SHARED/domain-playbook.json"
+cat >"$S15_SHARED_B" <<EOF
+{
+  "schema_version": "1",
+  "agent": "$AGENT",
+  "captured_at": "${TODAY}T00:00:00Z",
+  "session_type": "default",
+  "trigger": "manual",
+  "source": "pre-compact-hook",
+  "custom_instructions_excerpt": "",
+  "suggested_entities": ["shared/domain-playbook"],
+  "suggested_concepts": [],
+  "suggested_slug": "domain-playbook",
+  "suggested_title": "domain playbook",
+  "excerpt": "agent domain playbook that must not pollute operating-rules",
+  "transcript_available": false
+}
+EOF
+
+# Positive control — a memory/projects capture that must still promote.
+S15_PROJECT_C="$S15_MEM_PROJECTS/guard-smoke.md"
+cat >"$S15_PROJECT_C" <<'EOF'
+# Guard Smoke Project
+legitimate project note that should still promote to kind=project
+EOF
+
+cat >"$S15_TASK_BODY" <<EOF
+# fake librarian-ingest body for issue #744 guard smoke
+
+### Raw envelopes (3)
+- $S15_PROJECT_C
+- $S15_SHARED_A
+- $S15_SHARED_B
+EOF
+
+: >"$S15_BK_LOG"
+FAKE_BK_LOG="$S15_BK_LOG" "$PYTHON" "$REPO_ROOT/scripts/librarian-process-ingest.py" \
+  --task-body "$S15_TASK_BODY" \
+  --shared-root "$S15_SHARED" \
+  --template-root "$S15_DIR" \
+  --team-name "smoke" \
+  --bridge-knowledge "$S15_DIR/fake-bk.py" \
+  --sleep 0 \
+  >"$SMOKE_ROOT/s15.out" 2>"$SMOKE_ROOT/s15.err"
+s15_rc=$?
+
+# Count how many times either memory/shared capture reached bridge-knowledge.
+# The guard runs before run_promote(), so this must be 0 for both fixtures.
+shared_bk_hits=$(grep -c -e 'formulation-lessons' -e 'domain-playbook' "$S15_BK_LOG" 2>/dev/null || true)
+
+if [[ "$s15_rc" -ne 0 ]]; then
+  fail "15" "librarian rc=$s15_rc stderr=$(tr '\n' ' ' <"$SMOKE_ROOT/s15.err" | head -c 200)"
+elif [[ "$(grep -c '"reason": "agent-memory-shared-ambiguous"' "$SMOKE_ROOT/s15.out" || true)" -ne 2 ]]; then
+  fail "15" "expected 2 agent-memory-shared-ambiguous rejects (fixtures A+B); got: $(head -c 500 "$SMOKE_ROOT/s15.out")"
+elif [[ "$shared_bk_hits" -ne 0 ]]; then
+  # The load-bearing anti-pollution proof: neither memory/shared capture
+  # ever reached bridge-knowledge, so nothing could append to
+  # wiki/operating-rules.md. If the guard regresses, one/both fixtures
+  # would show up in the fake-bk invocation log.
+  fail "15" "memory/shared capture reached bridge-knowledge $shared_bk_hits time(s) (expected 0); log: $(head -c 300 "$S15_BK_LOG")"
+elif ! grep -q '"status": "ok"' "$SMOKE_ROOT/s15.out"; then
+  fail "15" "positive control (memory/projects) did not promote; got: $(head -c 500 "$SMOKE_ROOT/s15.out")"
+elif ! grep -q '"kind": "project"' "$SMOKE_ROOT/s15.out"; then
+  fail "15" "positive control promoted with wrong kind (expected project); got: $(head -c 500 "$SMOKE_ROOT/s15.out")"
+else
+  pass "15"
+fi
+
+# =============================================================================
+# Scenario 16 — Issue #744 r2: a memory/shared reject in the canary slot must
+# NOT wedge the daily-ingest batch (canary-halt-on-reject regression).
+#
+# The daily-ingest canary runs batch[0] as a dry-run and previously halted
+# the WHOLE batch (`return 1`) on any status != "ok". Scenario 15's guard
+# introduced a new benign non-ok status (`rejected`) for memory/shared
+# captures. Because task-body order is stable, a memory/shared capture that
+# deterministically lands in the batch[0] slot would halt EVERY run and
+# silently drop all subsequent legit captures — a permanent daily-ingest
+# wedge. The r2 canary fix reclassifies `rejected`/`duplicate` as
+# non-canary-halting (only genuine `failed`/unforeseen statuses halt).
+#
+# Here the memory/shared capture LEADS the batch (canary slot). Assert:
+#   - rc=0 (batch NOT halted),
+#   - no `canary-failed` line emitted,
+#   - the shared capture is still rejected (guard fires),
+#   - the trailing memory/projects capture is still promoted (kind=project),
+#     proving the batch proceeded past the canary.
+# Mutation proof: reverting the canary classification (halt on any non-ok)
+# makes this rc=1 + canary-failed → RED.
+# =============================================================================
+banner "16 — Issue #744 r2: memory/shared reject in canary slot does not wedge the batch"
+
+S16_DIR="$SMOKE_ROOT/s16"
+S16_SHARED="$S16_DIR/shared"
+S16_MEM_SHARED="$S16_DIR/agents/$AGENT/memory/shared"
+S16_MEM_PROJECTS="$S16_DIR/agents/$AGENT/memory/projects"
+S16_TASK_BODY="$S16_DIR/task-body.md"
+S16_BK_LOG="$S16_DIR/fake-bk.log"
+mkdir -p "$S16_DIR" "$S16_SHARED" "$S16_MEM_SHARED" "$S16_MEM_PROJECTS"
+
+# Same fake bridge-knowledge shape as scenario 15.
+cat >"$S16_DIR/fake-bk.py" <<'PY'
+#!/usr/bin/env python3
+import json, os, sys
+log = os.environ.get("FAKE_BK_LOG", "")
+if log:
+    with open(log, "a", encoding="utf-8") as f:
+        f.write(" ".join(sys.argv) + "\n")
+print(json.dumps({"relative_path": "projects/canary-tail.md",
+                  "related_pages": []}))
+PY
+chmod +x "$S16_DIR/fake-bk.py"
+
+# batch[0] (canary slot) — a memory/shared capture that the guard rejects.
+S16_SHARED_HEAD="$S16_MEM_SHARED/domain-notes.md"
+cat >"$S16_SHARED_HEAD" <<'EOF'
+# Domain Notes
+agent domain content that must reject without halting the batch
+EOF
+
+# batch[1] — a legit memory/projects capture that MUST still be processed
+# after the canary reject, proving the batch did not halt.
+S16_PROJECT_TAIL="$S16_MEM_PROJECTS/canary-tail.md"
+cat >"$S16_PROJECT_TAIL" <<'EOF'
+# Canary Tail Project
+legit project note that must promote even though batch[0] was rejected
+EOF
+
+cat >"$S16_TASK_BODY" <<EOF
+# fake librarian-ingest body for issue #744 r2 canary-position regression
+
+### Raw envelopes (2)
+- $S16_SHARED_HEAD
+- $S16_PROJECT_TAIL
+EOF
+
+: >"$S16_BK_LOG"
+FAKE_BK_LOG="$S16_BK_LOG" "$PYTHON" "$REPO_ROOT/scripts/librarian-process-ingest.py" \
+  --task-body "$S16_TASK_BODY" \
+  --shared-root "$S16_SHARED" \
+  --template-root "$S16_DIR" \
+  --team-name "smoke" \
+  --bridge-knowledge "$S16_DIR/fake-bk.py" \
+  --sleep 0 \
+  >"$SMOKE_ROOT/s16.out" 2>"$SMOKE_ROOT/s16.err"
+s16_rc=$?
+
+# The trailing projects capture must have reached bridge-knowledge (proof the
+# batch proceeded past the canary reject).
+tail_bk_hits=$(grep -c 'canary-tail' "$S16_BK_LOG" 2>/dev/null || true)
+
+if [[ "$s16_rc" -ne 0 ]]; then
+  fail "16" "batch halted (rc=$s16_rc) on a memory/shared canary reject — daily-ingest wedge; out=$(head -c 400 "$SMOKE_ROOT/s16.out") stderr=$(tr '\n' ' ' <"$SMOKE_ROOT/s16.err" | head -c 200)"
+elif grep -q '"status": "canary-failed"' "$SMOKE_ROOT/s16.out"; then
+  fail "16" "canary-failed emitted on a benign memory/shared reject; got: $(head -c 400 "$SMOKE_ROOT/s16.out")"
+elif ! grep -q '"reason": "agent-memory-shared-ambiguous"' "$SMOKE_ROOT/s16.out"; then
+  fail "16" "canary-slot memory/shared capture was not rejected by the guard; got: $(head -c 400 "$SMOKE_ROOT/s16.out")"
+elif ! grep -q '"kind": "project"' "$SMOKE_ROOT/s16.out"; then
+  fail "16" "trailing memory/projects capture was not processed after canary reject (batch wedged); got: $(head -c 400 "$SMOKE_ROOT/s16.out")"
+elif [[ "$tail_bk_hits" -eq 0 ]]; then
+  fail "16" "trailing capture never reached bridge-knowledge — batch did not proceed past the canary; log: $(head -c 300 "$S16_BK_LOG")"
+else
+  pass "16"
+fi
+
 # -----------------------------------------------------------------------------
 # Summary
 # -----------------------------------------------------------------------------
