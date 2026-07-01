@@ -8791,23 +8791,28 @@ def _interpreter_payload_command_str(real_tokens: list[str]) -> str | None:
                 and "c" in tok[1:]
             ):
                 # The command STRING is the first OPERAND after the option group,
-                # not simply the token after `-c`: a shell keeps parsing options
-                # past `-c` and honours a POSIX `--` terminator, so both
-                # `bash -c -- '<cmd>'` and `bash -c -x '<cmd>'` run '<cmd>'. Skip
-                # any further leading option tokens and a single `--` terminator
-                # before selecting the operand (#2163 codex r3: `bash -c --
-                # 'agb auth … rotate'` returned the bare `--`, which read as a
-                # non-mutation and FALSE-ALLOWED the auth mutation). Fail-closed:
-                # an exhausted operand list returns None (no command string). A
-                # real mutation leaf (`agb`/`agent-bridge`/`git`/`$var`) never
-                # starts with `-`, so skipping option tokens cannot drop it.
-                j = i + 1
-                while j < len(real_tokens) and real_tokens[j].startswith("-"):
-                    terminator = real_tokens[j] == "--"
-                    j += 1
-                    if terminator:
-                        break
-                return real_tokens[j] if j < len(real_tokens) else None
+                # not simply the token after `-c`.
+                rest = real_tokens[i + 1:]
+                if not rest:
+                    return None
+                # Clean common case: the command string sits IMMEDIATELY after the
+                # c-flag — return that single token (precise; unchanged for the
+                # #2159 git guard). A real command leaf never starts with `-`/`+`.
+                if not (rest[0].startswith("-") or rest[0].startswith("+")):
+                    return rest[0]
+                # An option group intervenes. bash/sh/zsh/ksh/dash keep parsing
+                # options past `-c`: short `-x`, POSIX `+x`, value-taking
+                # `-O extglob` / `+o pipefail`, and the `--` terminator — a
+                # shell-specific grammar too brittle to model exactly (#2163 codex
+                # r3 surfaced `--`, r4 `-x`, r5 `+x` / `-O <val>`). FAIL CLOSED:
+                # return the JOINED remainder so the mutation-substring scan still
+                # fires on the command wherever it lands after the options. The
+                # join only over-scans option/arg noise (a mutation leaf never
+                # starts with `-`/`+`, so the clean branch never mis-returns noise
+                # and the join never drops the verb); a genuine `-c` invocation
+                # carrying a protected verb IS indirection regardless of the option
+                # spelling between `-c` and the command.
+                return " ".join(rest)
         return None
     return None
 

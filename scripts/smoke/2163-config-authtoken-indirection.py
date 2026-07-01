@@ -134,6 +134,21 @@ def _indirection_cases() -> list[tuple[str, "str | None"]]:
          "auth_token_mutation_via_bash"),
         ("sh -c -- 'agent-bridge auth claude-token activate default'",
          "auth_token_mutation_via_sh"),
+        # #2163 codex r5 — shells also parse POSIX `+`-options (`+x`, `+O`) and
+        # value-taking options (`-O extglob`, `-o pipefail`) AFTER `-c`. Rather
+        # than model each shell's option grammar (r3 `--`, r4 `-x`, r5 `+x`/`-O`
+        # each surfaced a new form), the extractor FAILS CLOSED: any option group
+        # between `-c` and the command → scan the joined remainder. These MUST
+        # deny regardless of the option spelling.
+        ("bash -c +x 'agb auth claude-token rotate'",
+         "auth_token_mutation_via_bash"),
+        ("dash -c +x 'agb config set-env K=V'", "config_mutation_via_dash"),
+        ("bash -c -O extglob 'agb auth claude-token rotate'",
+         "auth_token_mutation_via_bash"),
+        ("bash -c +O extglob 'agb config set-env K=V'",
+         "config_mutation_via_bash"),
+        ("bash -c -o pipefail -x 'agb auth claude-token rotate'",
+         "auth_token_mutation_via_bash"),
         # ---- C4b auth-token DENY via unresolved command-position $var ----
         ("agb auth claude-token $V", "auth_token_mutation_via_unresolved_var"),
         ("$C auth claude-token add x", "auth_token_mutation_via_unresolved_var"),
