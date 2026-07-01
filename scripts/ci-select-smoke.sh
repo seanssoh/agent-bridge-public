@@ -1552,6 +1552,14 @@ select_for_path() {
       # PR cannot silently revert the cadence gate back to the false-healthy
       # masking (an hourly job 35h overdue reading ok).
       add_required 1464-cron-aware-stale-health
+      # Issue #2100: bridge-status.py's classify_stale / classify_agent_stale
+      # now exempt an idle codex-engine agent (no idle-heartbeat mechanism)
+      # from stale=warn/crit, mirroring the dynamic-source carve-out on the
+      # engine signal. Pull classify-stale-dynamic-exemption on every
+      # bridge-status.py move so a future PR cannot silently drop the
+      # engine=='codex' exemption and re-arm the false-positive (a healthy
+      # idle codex pair reading crit) that #2100 reported.
+      add_required classify-stale-dynamic-exemption
       # Issue #1659: bridge-status.py's last_cron_run_by_agent now reduces the
       # run-dir to the LATEST run per distinct (agent, job-key) BEFORE running
       # the cadence check (was one occurrence-walk per historical run record =>

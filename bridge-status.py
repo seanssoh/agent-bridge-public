@@ -113,6 +113,7 @@ def classify_stale(
     warn_seconds: int,
     critical_seconds: int,
     source: str | None = None,
+    engine: str | None = None,
 ) -> str:
     # Stale-health classification is only meaningful for agents that are
     # expected to be doing autonomous work — i.e. static-source roles
@@ -127,6 +128,17 @@ def classify_stale(
     if not active:
         return "-"
     if source == "dynamic":
+        return "-"
+    # Issue #2100: a codex-engine agent has no idle-heartbeat mechanism — the
+    # session-activity signal only advances while it is actively working, and
+    # a healthy codex pair (e.g. patch-dev) sits idle for hours between review
+    # tasks with no wake/channel loop to refresh it. Keying idle staleness off
+    # that missing heartbeat mis-flags a perfectly healthy static codex agent
+    # as stale=crit after N hours idle. Mirror the dynamic carve-out: exempt
+    # the idle-heartbeat dimension only. A genuinely-down codex agent still
+    # surfaces through its real health signals (watchdog scan, daemon health),
+    # which this dashboard classifier does not gate.
+    if engine == "codex":
         return "-"
     if not activity_ts:
         return "crit"
@@ -166,10 +178,17 @@ def classify_agent_stale(
     warn_seconds: int,
     critical_seconds: int,
     source: str | None = None,
+    engine: str | None = None,
 ) -> str:
     if not active:
         return "-"
     if source == "dynamic":
+        return "-"
+    # Issue #2100: codex-engine agents have no idle-heartbeat, so their idle
+    # time is not a staleness signal (see classify_stale). Exempt before the
+    # cron-cadence gate — a codex static role need not have a mapped cron to
+    # be healthy while idle.
+    if engine == "codex":
         return "-"
     # Issue #1464: a static agent whose recurring cron fired *within its
     # cadence* is doing its scheduled work even though its interactive session
@@ -186,6 +205,7 @@ def classify_agent_stale(
         warn_seconds,
         critical_seconds,
         source=source,
+        engine=engine,
     )
 
 
@@ -1782,6 +1802,7 @@ def render_dashboard(args: argparse.Namespace) -> str:
             args.stale_warn_seconds,
             args.stale_critical_seconds,
             source=str(row.get("source", "")) or None,
+            engine=str(row.get("engine", "")) or None,
         )
         if stale == "warn":
             health_warn_count += 1
@@ -1936,6 +1957,7 @@ def render_dashboard(args: argparse.Namespace) -> str:
             args.stale_warn_seconds,
             args.stale_critical_seconds,
             source=str(row.get("source", "")) or None,
+            engine=str(row.get("engine", "")) or None,
         )
         load_bar = f"q:{render_bar(queued, width=4, char='=')} c:{render_bar(claimed, width=4, char='*')}"
         wake_state = "zmb" if zombie else (row.get("wake") or "-")
@@ -2153,6 +2175,7 @@ def render_dashboard_json(args: argparse.Namespace) -> str:
                     args.stale_warn_seconds,
                     args.stale_critical_seconds,
                     source=str(row.get("source", "")) or None,
+                    engine=str(row.get("engine", "")) or None,
                 ),
             },
             "plugins": plugins_for_agent(row, plugin_liveness),
