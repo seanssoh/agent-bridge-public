@@ -159,6 +159,10 @@ life_run() {
     BRIDGE_BASH_BIN="bash" \
     BRIDGE_DAEMON_TOKEN_LIFELINE_STATE_FILE="$LIFE_STATE_DIR/token-lifeline.ts" \
     BRIDGE_DAEMON_TOKEN_LIFELINE_INTERVAL_SECONDS="${BRIDGE_DAEMON_TOKEN_LIFELINE_INTERVAL_SECONDS:-300}" \
+    BRIDGE_DAEMON_TOKEN_LIFELINE_ENABLED=1 \
+    BRIDGE_DAEMON_TOKEN_LIFELINE_STALE_SECONDS=600 \
+    BRIDGE_DAEMON_TOKEN_LIFELINE_TIMEOUT_SECONDS="${BRIDGE_DAEMON_TOKEN_LIFELINE_TIMEOUT_SECONDS:-60}" \
+    BRIDGE_CLAUDE_TOKEN_SYNC_AGENTS="${BRIDGE_CLAUDE_TOKEN_SYNC_AGENTS:-static}" \
     "$@" \
     bash "$LIVENESS_SRC" >"$LIFE_STATE_DIR/liveness.out" 2>&1 || true
 }
@@ -182,6 +186,39 @@ auth_first_line() {
   local n
   n="$(grep -n -- "$pat" "$AUTH_LOG" 2>/dev/null | head -n1 | cut -d: -f1)"
   printf '%s' "${n:-0}"
+}
+
+# Observed heartbeat age (now - mtime) for the per-case heartbeat file, read the
+# SAME way the watcher's main() computes `age` (BSD `stat -f %m`, then GNU
+# `stat -c %Y`). Prints the integer age, or -1 if the file/mtime is unreadable.
+life_heartbeat_age() {
+  local hb_file="$LIFE_STATE_DIR/daemon.heartbeat" m now
+  m="$(stat -f %m "$hb_file" 2>/dev/null || stat -c %Y "$hb_file" 2>/dev/null || true)"
+  m="${m//[^0-9]/}"; [[ -n "$m" ]] || { printf '%s' -1; return; }
+  now="$(date +%s)"
+  printf '%s' "$(( now - m ))"
+}
+
+# Deterministic pre-assertion for a REAL (DRY_RUN=0) stale-heartbeat tick. The
+# real tick silently no-ops — emitting NOTHING (empty auth log, empty
+# liveness.out, absent state file) — when ANY of its gating preconditions is not
+# actually held: a back-date that did not land stale enough (so main() takes the
+# fresh/ok path), or a throttle-witness left behind (so the interval throttle
+# suppresses the tick). This was the #2239 full-suite CI flake, where the bare
+# `recover-due count=0` gave no hint WHICH precondition broke. life_run() now
+# hard-pins the ENABLED/STALE gates so a leaked env can no longer gate the tick;
+# this asserts the two REMAINING per-case preconditions LOUD with the observed
+# state BEFORE the tick, so a future regression surfaces the real cause instead of
+# an opaque count=0. $1 = throttle-witness state file that must be absent (due).
+assert_real_tick_preconditions() {
+  local state_file="$1"
+  local age; age="$(life_heartbeat_age)"
+  # life_run() pins BRIDGE_DAEMON_TOKEN_LIFELINE_STALE_SECONDS=600, so age>=600 is
+  # the effective staleness gate the tick will apply.
+  (( age >= 600 )) \
+    || smoke_fail "real-tick precondition: heartbeat age=${age}s is NOT stale (need >=600) — the back-date did not land; the tick would take the fresh/ok path and no-op"
+  [[ ! -e "$state_file" ]] \
+    || smoke_fail "real-tick precondition: throttle witness present [$(cat "$state_file" 2>&1)] — the interval throttle would suppress the tick"
 }
 
 # ===========================================================================
@@ -327,9 +364,14 @@ step_t7_dry_run_no_mutation() {
   # And prove it does NOT suppress a subsequent REAL tick: a real run right after
   # the DRY_RUN must actually invoke the auth shim (throttle was never armed).
   : >"$AUTH_LOG"   # isolate the real-tick auth calls from the (empty) DRY_RUN log
+  # #2239: fail LOUD if the real tick's gating preconditions are not actually held
+  # (stale-enough heartbeat + absent throttle witness), so a CI failure names the
+  # broken precondition instead of the opaque `recover-due count=0`. The heartbeat
+  # still carries the DRY_RUN tick's back-date; life_run() re-back-dates it below.
+  assert_real_tick_preconditions "$state_file"
   BRIDGE_DAEMON_LIVENESS_DRY_RUN=0 life_run 900
   if [[ "$(auth_count 'recover-due')" != "1" ]]; then
-    smoke_log "T7 diag FAIL-CTX: state_file=$([[ -e "$state_file" ]] && printf 'EXISTS[%s]' "$(cat "$state_file" 2>&1)" || printf ABSENT) auth_log=[$(cat "$AUTH_LOG")] liveness_out=[$(cat "$LIFE_STATE_DIR/liveness.out")]"
+    smoke_log "T7 diag FAIL-CTX: hb_age=$(life_heartbeat_age)s enabled=${BRIDGE_DAEMON_TOKEN_LIFELINE_ENABLED:-<unset>} stale_gate=${BRIDGE_DAEMON_TOKEN_LIFELINE_STALE_SECONDS:-<unset>} state_file=$([[ -e "$state_file" ]] && printf 'EXISTS[%s]' "$(cat "$state_file" 2>&1)" || printf ABSENT) auth_log=[$(cat "$AUTH_LOG")] liveness_out=[$(cat "$LIFE_STATE_DIR/liveness.out")]"
     smoke_fail "T7: a real tick after a DRY_RUN was throttled — DRY_RUN must not arm the throttle (recover-due count=$(auth_count 'recover-due'))"
   fi
   smoke_log "T7: OK — DRY_RUN audits but mutates nothing (state file absent; real tick not suppressed)"
@@ -506,6 +548,8 @@ step_t12_bounded_fail_closed() {
     BRIDGE_BASH_BIN="bash" \
     BRIDGE_DAEMON_TOKEN_LIFELINE_STATE_FILE="$LIFE_STATE_DIR/token-lifeline.ts" \
     BRIDGE_DAEMON_TOKEN_LIFELINE_TIMEOUT_SECONDS=2 \
+    BRIDGE_DAEMON_TOKEN_LIFELINE_ENABLED=1 \
+    BRIDGE_DAEMON_TOKEN_LIFELINE_STALE_SECONDS=600 \
     bash "$LIVENESS_SRC" >"$LIFE_STATE_DIR/liveness.out" 2>&1 || true
   end="$(date +%s)"
   # Bounded: the whole tick (3 sleeping phases, each fail-closed at rc=124) must
