@@ -3851,6 +3851,18 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       if [[ "$path" == "bridge-start.sh" ]]; then
         add_required 1738-config-caller-binding
       fi
+      # Issue #1191: bridge-start.sh's per-`agent start` node-version gate
+      # calls bridge_warn_plugins_node_engines (lib/bridge-channels.sh)
+      # for every to-be-loaded bundled plugin that declares engines.node,
+      # emitting a NON-FATAL "plugin X requires node >= Y" warn when the
+      # host node is missing/too old. Pull 1191-agent-start-node-version-
+      # gate whenever bridge-start.sh moves so a refactor cannot drop the
+      # gate call site or make it fatal. (The lib/bridge-channels.sh arm
+      # of this condition is added below alongside the channel-plugins
+      # case so a channels-module refactor pulls it too.)
+      if [[ "$path" == "bridge-start.sh" ]]; then
+        add_required 1191-agent-start-node-version-gate
+      fi
       # v0.15.0-beta5-2 Lane ξ (#1330/#1332/#1334/#1318-A): bridge-start.sh
       # gained the BRIDGE_AGENT_ID env-prefix inline (#1330 M7) and the
       # EFFECTIVE_CONTINUE_MODE warn gate (#1334 L4); bridge-run.sh's
@@ -4532,7 +4544,15 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # teams-managed-send and 2005-managed-send-plugin-state-dir on every
       # channels-lib move so the bash→python state-dir handoff and the adapter
       # contracts cannot regress.
-      add_required channel-plugins bridge-notify-no-default-discord-875 1165-track-a-scaffold-modes 1165-track-b-sudo-escalate-and-state 1342-write-state-marker-matrix A12-beta3-1246-1252-daemon-supp-group-and-state-dir mcp-liveness-giveup-auto-clear beta5-2-iota-daemon-escalation-family teams-managed-send 2005-managed-send-plugin-state-dir
+      # Issue #1191: lib/bridge-channels.sh hosts bridge_host_node_major and
+      # bridge_warn_plugins_node_engines — the per-`agent start` node-version
+      # gate (backed by scripts/python-helpers/plugin-engines-node-min-major.py)
+      # that warns NON-FATALLY when a to-be-loaded bundled plugin declares
+      # engines.node and the host node is missing/too old. Pull
+      # 1191-agent-start-node-version-gate on every channels-lib move so a
+      # refactor cannot regress the parse, the per-plugin floor comparison, or
+      # the non-fatal contract.
+      add_required channel-plugins bridge-notify-no-default-discord-875 1165-track-a-scaffold-modes 1165-track-b-sudo-escalate-and-state 1342-write-state-marker-matrix A12-beta3-1246-1252-daemon-supp-group-and-state-dir mcp-liveness-giveup-auto-clear beta5-2-iota-daemon-escalation-family teams-managed-send 2005-managed-send-plugin-state-dir 1191-agent-start-node-version-gate
       # Issue #1762: this arm's `runtime-templates/*` glob also matches the
       # shipped picker catalog + the picker-resolve skill (case takes the first
       # matching arm, ahead of the dedicated picker arm below). Pull the picker
@@ -6177,6 +6197,20 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # never-overwrite + allowlist contract cannot regress without CI catching
       # it.
       add_required 1753-hud-config-seed
+      add_integration integration-minimal
+      ;;
+
+    scripts/python-helpers/plugin-engines-node-min-major.py)
+      # Issue #1191: this file-as-argv helper parses a plugin's
+      # engines.node semver range and prints the minimum acceptable MAJOR
+      # (exit 1 when no numeric floor is derivable — wildcards/upper-bound-
+      # only/garbage). It backs the per-`agent start` node-version gate
+      # (bridge_warn_plugins_node_engines). A helper-only change (a range
+      # shape now over-warning on a fine host, or a wildcard no longer
+      # treated as no-requirement) must still re-run the #1191 smoke so the
+      # false-positive classes a codex review flagged cannot regress
+      # without CI catching it.
+      add_required 1191-agent-start-node-version-gate
       add_integration integration-minimal
       ;;
 

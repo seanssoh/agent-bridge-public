@@ -49,29 +49,35 @@ source "$source_root/bridge-lib.sh"
 # silently symlink /usr/local/bin/node — that would mutate system
 # PATH ownership across upgrades and create a hidden state surface.
 _node_version_check() {
-  local node_bin=""
-  if ! node_bin="$(command -v node 2>/dev/null)" || [[ -z "$node_bin" ]]; then
-    bridge_info "[bundled-plugins][node-check] node not on PATH — bundled MCPs that require Node.js will fail at spawn. Install Node 18 LTS via 'nvm install --lts' or your distro package manager."
-    return 0
-  fi
-  local raw_version=""
-  raw_version="$("$node_bin" --version 2>/dev/null || true)"
-  # Format: "v12.22.9" or "v18.19.0".
-  if [[ -z "$raw_version" ]]; then
-    bridge_info "[bundled-plugins][node-check] node at $node_bin returned no --version output — cannot validate"
-    return 0
-  fi
+  # Issue #1191: share the host-node detection with the per-`agent start`
+  # gate (bridge_host_node_major in lib/bridge-channels.sh) rather than
+  # re-parsing `node --version` here. bridge-lib.sh (sourced above) loads
+  # bridge-channels.sh, so the helper is in scope during upgrade.
   local major=""
-  major="$(printf '%s\n' "$raw_version" | sed -E 's/^v([0-9]+).*/\1/')"
+  if declare -F bridge_host_node_major >/dev/null 2>&1; then
+    major="$(bridge_host_node_major 2>/dev/null || true)"
+  else
+    # Defensive fallback if channels module is unavailable for any reason
+    # (keeps this helper standalone-safe). Same parse as the shared one.
+    local node_bin=""
+    node_bin="$(command -v node 2>/dev/null || true)"
+    if [[ -n "$node_bin" ]]; then
+      local raw_version=""
+      raw_version="$("$node_bin" --version 2>/dev/null || true)"
+      if [[ -n "$raw_version" ]]; then
+        major="$(printf '%s\n' "$raw_version" | sed -E 's/^v?([0-9]+).*/\1/')"
+      fi
+    fi
+  fi
   if [[ -z "$major" || ! "$major" =~ ^[0-9]+$ ]]; then
-    bridge_info "[bundled-plugins][node-check] could not parse node version from '$raw_version'"
+    bridge_info "[bundled-plugins][node-check] node not on PATH or version unreadable — bundled MCPs that require Node.js will fail at spawn. Install Node 18 LTS via 'nvm install --lts' or your distro package manager."
     return 0
   fi
   if (( major < 14 )); then
-    bridge_warn "[bundled-plugins][node-check] node at $node_bin is $raw_version (< 14) — plugins using optional chaining (?.), nullish coalescing (??), or top-level await (e.g. cosmax-ep-approval's ep-mcp-proxy.mjs) will fail with SyntaxError on first spawn. Install Node 18 LTS: 'nvm install --lts' (then re-open shell), or upgrade your distro. This warning is non-fatal — bundled-plugin install continues."
+    bridge_warn "[bundled-plugins][node-check] node is v${major}.x (< 14) at $(command -v node 2>/dev/null) — plugins using optional chaining (?.), nullish coalescing (??), or top-level await (e.g. cosmax-ep-approval's ep-mcp-proxy.mjs) will fail with SyntaxError on first spawn. Install Node 18 LTS: 'nvm install --lts' (then re-open shell), or upgrade your distro. This warning is non-fatal — bundled-plugin install continues."
     return 0
   fi
-  bridge_info "[bundled-plugins][node-check] node $raw_version OK (>= 14)"
+  bridge_info "[bundled-plugins][node-check] node v${major}.x OK (>= 14)"
   return 0
 }
 

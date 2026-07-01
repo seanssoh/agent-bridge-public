@@ -841,6 +841,101 @@ bridge_provision_teams_plugin_runtime() {
   return 0
 }
 
+# Issue #1191: detect the host Node.js MAJOR version, echo it on stdout.
+# Returns 1 (and echoes nothing) when node is missing from PATH or its
+# --version output is unparseable — the caller treats "unknown" as
+# "cannot warn" and stays silent, never blocking start. Mirrors the
+# detection in lib/upgrade-helpers/bundled-plugins-bun-install.sh's
+# _node_version_check but is factored here so the per-`agent start`
+# gate and any future caller share one parse.
+bridge_host_node_major() {
+  local node_bin raw_version major
+  node_bin="$(command -v node 2>/dev/null || true)"
+  [[ -n "$node_bin" ]] || return 1
+  raw_version="$("$node_bin" --version 2>/dev/null || true)"
+  [[ -n "$raw_version" ]] || return 1
+  # Format: "v12.22.9" or "v18.19.0".
+  major="$(printf '%s\n' "$raw_version" | sed -E 's/^v?([0-9]+).*/\1/')"
+  [[ "$major" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$major"
+  return 0
+}
+
+# Issue #1191 (fix shape (b)): per-`agent start` Node.js version gate.
+# For every to-be-loaded bundled plugin that declares `engines.node`,
+# warn (NON-FATALLY) when the host node is missing or older than the
+# declared minimum major. This surfaces the "plugin X requires node >= Y
+# but found Z" diagnostic AT START, instead of the confusing downstream
+# SyntaxError-in-logs the plugin MCP spawn would otherwise produce on a
+# stock-Ubuntu Node 12 host.
+#
+# Contract:
+#   $1 = comma-separated list of bundled plugin NAMES (dirs under
+#        $BRIDGE_SCRIPT_DIR/plugins/) the agent's channels require.
+#   Always returns 0 — this is a warn-only gate and MUST NOT block or
+#   fail the agent start (matches the install-path warn philosophy).
+#
+# Silent when: no plugin declares engines.node, or the host node already
+# satisfies every declared minimum, or node detection is inconclusive.
+bridge_warn_plugins_node_engines() {
+  local required_csv="${1:-}"
+  [[ -n "$required_csv" ]] || return 0
+  if ! bridge_resolve_script_dir_check; then
+    return 0
+  fi
+  local plugins_root="$BRIDGE_SCRIPT_DIR/plugins"
+  [[ -d "$plugins_root" ]] || return 0
+
+  local helper="$BRIDGE_SCRIPT_DIR/scripts/python-helpers/plugin-engines-node-min-major.py"
+  [[ -f "$helper" ]] || return 0
+  local python_bin
+  python_bin="$(command -v python3 2>/dev/null || true)"
+  [[ -n "$python_bin" ]] || return 0
+
+  # Collect the (name, min-major) pairs for plugins that actually declare
+  # engines.node. If none declare it, nothing to gate on — bail before we
+  # even resolve the host node version.
+  local names=() minors=()
+  local _IFS_save="$IFS"
+  IFS=','
+  local _name pkg_json min_major
+  for _name in $required_csv; do
+    _name="${_name// /}"
+    [[ -n "$_name" ]] || continue
+    pkg_json="$plugins_root/$_name/package.json"
+    [[ -f "$pkg_json" ]] || continue
+    min_major="$("$python_bin" "$helper" "$pkg_json" 2>/dev/null || true)"
+    [[ "$min_major" =~ ^[0-9]+$ ]] || continue
+    names+=("$_name")
+    minors+=("$min_major")
+  done
+  IFS="$_IFS_save"
+
+  (( ${#names[@]} > 0 )) || return 0
+
+  local host_major
+  host_major="$(bridge_host_node_major 2>/dev/null || true)"
+
+  local i
+  if [[ -z "$host_major" ]]; then
+    # node missing / unparseable but a plugin needs it — warn once,
+    # non-fatally, naming the offending plugins.
+    local plugin_list=""
+    for i in "${!names[@]}"; do
+      plugin_list="${plugin_list:+$plugin_list, }${names[$i]} (>= ${minors[$i]})"
+    done
+    bridge_warn "[start][node-check] agent's bundled plugin(s) $plugin_list declare a Node.js version requirement, but node is not on PATH (or its version is unreadable). Their MCP servers will fail at spawn. Install Node 18 LTS ('nvm install --lts', then re-open shell) or via your distro. This warning is non-fatal — the agent still starts."
+    return 0
+  fi
+
+  for i in "${!names[@]}"; do
+    if (( host_major < minors[i] )); then
+      bridge_warn "[start][node-check] plugin '${names[$i]}' requires node >= ${minors[$i]} (engines.node) but host node is v${host_major}.x at $(command -v node 2>/dev/null). Its MCP will likely fail with a SyntaxError on spawn (optional chaining / nullish coalescing / top-level await). Install a current Node ('nvm install --lts', then re-open shell) or upgrade your distro. This warning is non-fatal — the agent still starts."
+    fi
+  done
+  return 0
+}
+
 # L1-J (beta20, 2026-05-25): provision node_modules for EVERY bundled
 # plugin under $BRIDGE_SCRIPT_DIR/plugins/ that has a package.json.
 # Generalizes bridge_install_teams_plugin_node_modules so a new bundled
