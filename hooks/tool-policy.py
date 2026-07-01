@@ -428,18 +428,38 @@ def _fixed_temp_roots() -> list[str]:
 # #2163 F3 — the runtime-identity env anchors that, together with BRIDGE_HOME,
 # determine WHERE a config/auth mutation actually lands. The sandbox predicate
 # must consider all of them, not BRIDGE_HOME alone (see `_bridge_home_is_test_temp`).
+# The last two are the OAuth token-registry anchors (#2163 patch r1 BREAK2): the
+# registry file is `$BRIDGE_CLAUDE_TOKEN_REGISTRY` (direct override) else
+# `$BRIDGE_RUNTIME_SECRETS_DIR/claude-oauth-tokens.json` — exactly the two vars
+# this hook's own `claude_credential_paths()` resolves it from. Omitting them
+# left a split-root spoof where the config anchors point at /tmp (predicate
+# reads "sandbox") while the token registry is repointed LIVE, landing a
+# forged-admin token mutation in the live registry.
 _RUNTIME_IDENTITY_ENV_VARS = (
     "BRIDGE_RUNTIME_CONFIG_FILE",
     "BRIDGE_STATE_DIR",
     "BRIDGE_RUNTIME_ROOT",
+    "BRIDGE_CLAUDE_TOKEN_REGISTRY",
+    "BRIDGE_RUNTIME_SECRETS_DIR",
 )
 
 
 def _realpath_under_roots(path: str, roots: list[str]) -> bool:
-    """True iff *path* canonicalizes (``os.path.realpath``) to, or under, one of
-    the already-canonicalized fixed temp *roots*. Fail-closed (False) on OSError."""
+    """True iff *path* canonicalizes to, or under, one of the already-canonicalized
+    fixed temp *roots*. Fail-closed (False) on OSError.
+
+    Canonicalization is ``os.path.realpath(os.path.expanduser(path))`` — the
+    ``expanduser`` is REQUIRED (#2163 codex r1) so this predicate resolves a
+    runtime-identity anchor the SAME way its real writers do: bridge-auth.py
+    (`runtime_config_path`, the cred-state reader) and bridge-config.py all call
+    `Path(explicit).expanduser()` on `BRIDGE_RUNTIME_CONFIG_FILE` /
+    `BRIDGE_STATE_DIR` / `BRIDGE_RUNTIME_ROOT`. Without it a tilde-spelled LIVE
+    anchor (`BRIDGE_STATE_DIR=~/.agent-bridge/state`) would realpath as a
+    temp-cwd-relative `…/~/.agent-bridge/state` (reads "sandbox") while the
+    writer expands it to the live `$HOME/.agent-bridge/state` — reopening the
+    split-root forged-roster seam for confined cwds under a temp root."""
     try:
-        real = os.path.realpath(path)
+        real = os.path.realpath(os.path.expanduser(path))
     except OSError:
         return False
     for root in roots:
@@ -5789,25 +5809,35 @@ def _stage_reaches_auth_token_mutation(stage: str) -> bool:
     broad on purpose so the indirection gate fails closed, mirroring
     `_stage_reaches_config_mutation`.
 
-    C4a read-only carve-out: `auth claude-token global-auth-sync status` is a
-    READ and is NOT flagged; only `enable` / `disable` mutate. An unresolved `$`
-    that could expand to the action / verb IS flagged (the real argv is hidden).
+    Verb-check-FIRST (#2163 patch r1 BREAK1): a real mutation verb
+    (`add`/`activate`/`sync`/`rotate`, or `global-auth-sync enable`/`disable`)
+    anywhere in the stage denies, so a co-located `global-auth-sync` substring
+    planted in a `--note`/`--label` cannot divert a real mutation into the
+    read-only carve-out. The C4a read-only carve-out (`global-auth-sync status`,
+    `receive`, a bare `auth claude-token` read) applies ONLY when NO mutation
+    verb is present. An unresolved `$` that could expand to the action/verb IS
+    flagged (the real argv is hidden).
     """
     flat = _SHELL_QUOTE_ESCAPE_RE.sub("", stage)
-    if "global-auth-sync" in flat:
-        if ("enable" in flat) or ("disable" in flat):
-            return True
-        # `status` alone = read-only (C4a). A `$` hiding the action → mutation.
-        if ("status" not in flat) and ("$" in flat):
-            return True
+    has_gas = "global-auth-sync" in flat
+    if not (has_gas or (("auth" in flat) and ("claude-token" in flat))):
         return False
-    if ("auth" in flat) and ("claude-token" in flat):
-        if any(v in flat for v in _AUTH_TOKEN_MUTATION_VERBS):
-            return True
-        # A `$` could hide the mutating verb (`agb auth claude-token $V`).
-        if "$" in flat:
-            return True
-        return False
+    # Neutralize the `global-auth-sync` literal BEFORE the mutation-verb scan so
+    # (a) its trailing "sync" cannot masquerade as the `sync` verb — C4a status
+    # stays read-only — and (b) a co-located `global-auth-sync` token cannot mask
+    # a real add/activate/sync/rotate elsewhere in the stage (BREAK1). Substring
+    # scan stays broad/fail-closed (accepts an `activate`-in-`reactivate`-class
+    # false DENY — the fail-OPEN masking was the bug).
+    remainder = flat.replace("global-auth-sync", " ")
+    if any(v in remainder for v in _AUTH_TOKEN_MUTATION_VERBS):
+        return True
+    # `global-auth-sync enable|disable` mutate; `status` is read-only (C4a).
+    if has_gas and (("enable" in flat) or ("disable" in flat)):
+        return True
+    # No literal mutation verb resolved — an unresolved `$` could hide the
+    # action/verb (`agb auth claude-token $V`, `global-auth-sync $ACTION`).
+    if "$" in flat:
+        return True
     return False
 
 

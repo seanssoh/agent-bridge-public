@@ -41,12 +41,15 @@ import pathlib
 import sys
 
 # Runtime-identity anchors the F3 predicate must consider (kept local so this
-# smoke pins the intended set independently of the module constant).
+# smoke pins the intended set independently of the module constant). The last
+# two are the OAuth token-registry anchors (#2163 patch r1 BREAK2).
 _ANCHORS = (
     "BRIDGE_HOME",
     "BRIDGE_RUNTIME_CONFIG_FILE",
     "BRIDGE_STATE_DIR",
     "BRIDGE_RUNTIME_ROOT",
+    "BRIDGE_CLAUDE_TOKEN_REGISTRY",
+    "BRIDGE_RUNTIME_SECRETS_DIR",
 )
 
 # A path that is NOT under any fixed temp root — stands in for the LIVE runtime.
@@ -91,6 +94,22 @@ def _indirection_cases() -> list[tuple[str, "str | None"]]:
          "auth_token_mutation_via_bash"),
         ("bash -c 'agb auth claude-token global-auth-sync disable'",
          "auth_token_mutation_via_bash"),
+        # #2163 patch r1 BREAK1 — a co-located `global-auth-sync` /
+        # `global-auth-sync-status` substring planted in a --note/--label must
+        # NOT mask a real add/activate/sync/rotate (verb-check-first). These
+        # were the four ALLOW escapes patch reproduced; they MUST deny now.
+        ('eval "agb auth claude-token add sk-ant-oXXXXXX --note global-auth-sync"',
+         "auth_token_mutation_via_eval"),
+        ('bash -c "agb auth claude-token rotate --note global-auth-sync"',
+         "auth_token_mutation_via_bash"),
+        ('eval "agb auth claude-token add $TOK --label global-auth-sync-status"',
+         "auth_token_mutation_via_eval"),
+        ('$C auth claude-token add $TOK --label global-auth-sync-status',
+         "auth_token_mutation_via_unresolved_var"),
+        ("sh -c 'agb auth claude-token sync --note global-auth-sync'",
+         "auth_token_mutation_via_sh"),
+        ("eval 'agb auth claude-token activate x --label global-auth-sync'",
+         "auth_token_mutation_via_eval"),
         # ---- C4b auth-token DENY via unresolved command-position $var ----
         ("agb auth claude-token $V", "auth_token_mutation_via_unresolved_var"),
         ("$C auth claude-token add x", "auth_token_mutation_via_unresolved_var"),
@@ -116,6 +135,8 @@ def _indirection_cases() -> list[tuple[str, "str | None"]]:
         # global-auth-sync status is READ-ONLY — allowed direct AND via a shell.
         ("agb auth claude-token global-auth-sync status", None),
         ("bash -c 'agb auth claude-token global-auth-sync status'", None),
+        # a status read with an extra --note (no mutation verb) stays read-only.
+        ("agb auth claude-token global-auth-sync status --note foo", None),
         # DIRECT literal mutation verb is NOT flagged here — the wrapper's
         # caller-trust gate owns it; this hook is indirection-only.
         ("agb auth claude-token add mytoken", None),
@@ -184,6 +205,17 @@ def _run_stage_helpers(module, failures: list[str]) -> int:
     # receive is not a mutation.
     add("auth('...claude-token receive')",
         auth("agb auth claude-token receive"), False)
+    # #2163 patch r1 BREAK1 — a co-located global-auth-sync substring must NOT
+    # mask a real add/rotate; and its own trailing "sync" must NOT flag a status
+    # read as the `sync` mutation verb.
+    add("auth('add ... --note global-auth-sync' not masked)",
+        auth("agb auth claude-token add x --note global-auth-sync"), True)
+    add("auth('rotate ... --label global-auth-sync-status' not masked)",
+        auth("agb auth claude-token rotate --label global-auth-sync-status"), True)
+    add("auth('global-auth-sync status' not sync-verb)",
+        auth("agb auth claude-token global-auth-sync status"), False)
+    add("auth('global-auth-sync status --note foo' read-only)",
+        auth("agb auth claude-token global-auth-sync status --note foo"), False)
     # config predicate basics.
     add("cfg('agb config set-env K=V')",
         cfg("agb config set-env K=V"), True)
@@ -270,10 +302,23 @@ def _run_redaction(module, failures: list[str]) -> int:
 def _run_f3(module, tmp_root: str, failures: list[str]) -> int:
     """F3 — the all-env sandbox predicate. Manipulate os.environ and re-call
     `_bridge_home_is_test_temp` (operator_home() re-reads BRIDGE_HOME every
-    call, so there is no cache to defeat)."""
+    call, so there is no cache to defeat).
+
+    The tilde-spelled-anchor cases (#2163 codex r1 regression guard) are REAL
+    teeth only when cwd sits under a fixed temp root AND HOME resolves to a
+    non-temp (live) path: on the pre-fix `realpath` code a `~/…` anchor
+    canonicalizes as the temp-cwd-relative `<cwd>/~/…` (reads "sandbox"), while
+    the fixed `realpath(expanduser(...))` resolves it to `<HOME>/…` (live). So
+    this layer chdir's into the temp root and pins HOME to a fixed non-temp
+    home for the duration; both are restored in `finally`."""
     tt = module._bridge_home_is_test_temp
     home_tmp = f"{tmp_root}/home"
     state_tmp = f"{tmp_root}/state"
+    # A fixed non-temp HOME so `expanduser("~/…")` lands live regardless of the
+    # CI runner's real HOME (which lib.sh / a sibling smoke may point at a temp
+    # BRIDGE_HOME). `~/…` then expands to a `/opt/agent-bridge-live/.agent-bridge`
+    # LIVE path — outside every fixed temp root.
+    live_home = f"{_LIVE_ROOT}/home"
     n = 0
 
     cases: list[tuple[str, dict[str, str], bool]] = [
@@ -290,15 +335,58 @@ def _run_f3(module, tmp_root: str, failures: list[str]) -> int:
          False),
         ("spoof via BRIDGE_RUNTIME_ROOT",
          {"BRIDGE_HOME": home_tmp, "BRIDGE_RUNTIME_ROOT": _LIVE_ROOT}, False),
+        # #2163 codex r1 — TILDE-spelled LIVE anchors. The real writers
+        # (bridge-auth.py / bridge-config.py) expanduser() these; the predicate
+        # must too, else a `~/…` anchor reads temp-cwd-relative (sandbox) while
+        # the write lands live. These MUST be not-sandbox (False).
+        ("tilde spoof via BRIDGE_STATE_DIR",
+         {"BRIDGE_HOME": home_tmp, "BRIDGE_STATE_DIR": "~/.agent-bridge/state"},
+         False),
+        ("tilde spoof via BRIDGE_RUNTIME_CONFIG_FILE",
+         {"BRIDGE_HOME": home_tmp,
+          "BRIDGE_RUNTIME_CONFIG_FILE": "~/.agent-bridge/runtime/bridge-config.json"},
+         False),
+        ("tilde spoof via BRIDGE_RUNTIME_ROOT",
+         {"BRIDGE_HOME": home_tmp,
+          "BRIDGE_RUNTIME_ROOT": "~/.agent-bridge/runtime"}, False),
+        # #2163 patch r1 BREAK2 — the OAuth token-registry anchors must be in
+        # the enumerated set, else a fixer points the config anchors at /tmp
+        # (predicate "sandbox") while repointing the registry LIVE → forged-admin
+        # token mutation lands in the live registry. Live abs + tilde variants.
+        ("spoof via BRIDGE_CLAUDE_TOKEN_REGISTRY",
+         {"BRIDGE_HOME": home_tmp,
+          "BRIDGE_CLAUDE_TOKEN_REGISTRY": f"{_LIVE_ROOT}/registry.json"}, False),
+        ("spoof via BRIDGE_RUNTIME_SECRETS_DIR",
+         {"BRIDGE_HOME": home_tmp,
+          "BRIDGE_RUNTIME_SECRETS_DIR": f"{_LIVE_ROOT}/secrets"}, False),
+        ("tilde spoof via BRIDGE_CLAUDE_TOKEN_REGISTRY",
+         {"BRIDGE_HOME": home_tmp,
+          "BRIDGE_CLAUDE_TOKEN_REGISTRY":
+              "~/.agent-bridge/secrets/claude-oauth-tokens.json"}, False),
+        ("tilde spoof via BRIDGE_RUNTIME_SECRETS_DIR",
+         {"BRIDGE_HOME": home_tmp,
+          "BRIDGE_RUNTIME_SECRETS_DIR": "~/.agent-bridge/secrets"}, False),
+        # all anchors temp (incl. the registry pair) ⇒ sandbox.
+        ("all-temp incl token-registry anchors",
+         {"BRIDGE_HOME": home_tmp,
+          "BRIDGE_CLAUDE_TOKEN_REGISTRY": f"{tmp_root}/reg.json",
+          "BRIDGE_RUNTIME_SECRETS_DIR": f"{tmp_root}/secrets"}, True),
         # prod home (not temp) ⇒ not sandbox even with no anchors.
         ("prod home", {"BRIDGE_HOME": _LIVE_ROOT}, False),
+        # tilde-spelled prod home ⇒ not sandbox (BRIDGE_HOME is expanduser'd by
+        # operator_home() already; guards that path too).
+        ("tilde prod home", {"BRIDGE_HOME": "~/.agent-bridge"}, False),
         # empty anchor is treated as unset ⇒ inherits (temp) home (over-block-0).
         ("empty anchor inherits home",
          {"BRIDGE_HOME": home_tmp, "BRIDGE_STATE_DIR": ""}, True),
     ]
 
     saved = {k: os.environ.get(k) for k in _ANCHORS}
+    saved_home = os.environ.get("HOME")
+    saved_cwd = os.getcwd()
     try:
+        os.chdir(tmp_root)  # cwd under a fixed temp root (confined-fixer shape)
+        os.environ["HOME"] = live_home  # `~` ⇒ live, deterministic
         for label, env, want in cases:
             n += 1
             for k in _ANCHORS:
@@ -314,6 +402,11 @@ def _run_f3(module, tmp_root: str, failures: list[str]) -> int:
             else:
                 print(f"  PASS  [F3] {label} = {got}")
     finally:
+        os.chdir(saved_cwd)
+        if saved_home is not None:
+            os.environ["HOME"] = saved_home
+        else:
+            os.environ.pop("HOME", None)
         for k in _ANCHORS:
             os.environ.pop(k, None)
         for k, v in saved.items():
