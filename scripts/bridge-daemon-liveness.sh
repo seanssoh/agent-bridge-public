@@ -165,7 +165,11 @@ REPO_ROOT="$(cd -P "$SCRIPT_DIR/.." && pwd -P)"
 [[ "$BRIDGE_DAEMON_TOKEN_LIFELINE_INTERVAL_SECONDS" =~ ^[0-9]+$ ]] || BRIDGE_DAEMON_TOKEN_LIFELINE_INTERVAL_SECONDS=300
 [[ "$BRIDGE_DAEMON_TOKEN_LIFELINE_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]]  || BRIDGE_DAEMON_TOKEN_LIFELINE_TIMEOUT_SECONDS=60
 
-DAEMON_SH="$REPO_ROOT/bridge-daemon.sh"
+# The daemon binary the restart/rebootstrap path invokes (`bash "$DAEMON_SH"
+# restart --force`). Overridable via env for hermetic tests — mirrors
+# BRIDGE_AUTH_SH — so a smoke can stub the restart and never spawn a real
+# background daemon; defaults to the real binary in production (unchanged behavior).
+DAEMON_SH="${BRIDGE_DAEMON_LIVENESS_DAEMON_SH:-$REPO_ROOT/bridge-daemon.sh}"
 DAEMON_PID_FILE="${BRIDGE_DAEMON_PID_FILE:-$BRIDGE_STATE_DIR/daemon.pid}"
 
 now_ts() { date +%s; }

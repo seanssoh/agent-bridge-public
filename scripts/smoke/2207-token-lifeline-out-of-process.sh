@@ -86,6 +86,22 @@ AUTH_LOG="$SMOKE_TMP_ROOT/auth.log"
 } >"$AUTH_SHIM"
 chmod +x "$AUTH_SHIM"
 
+# #2239 r4: stub the daemon binary the liveness watcher's restart/rebootstrap path
+# invokes (`bash "$DAEMON_SH" restart --force`). Without this, the smoke's live
+# daemon.pid=$$ makes daemon_pid_alive() (kill -0 only, no identity check) treat
+# the test's own shell as a live daemon, so every stale tick ran the REAL
+# bridge-daemon.sh restart and leaked orphaned `bridge-daemon run` loops that kept
+# refreshing the heartbeat — the #2239 T7 flake. The stub logs the call (so a
+# restart is still observable) and exits 0 WITHOUT spawning anything.
+DAEMON_SHIM="$STUB_DIR/bridge-daemon.sh"
+DAEMON_LOG="$SMOKE_TMP_ROOT/daemon-restart.log"
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'printf "cmd: %%s\\n" "$*" >>"%s"\n' "$DAEMON_LOG"
+  printf 'exit 0\n'
+} >"$DAEMON_SHIM"
+chmod +x "$DAEMON_SHIM"
+
 # Per-case state dir + a live-looking pid file (our own pid is alive).
 LIFE_STATE_DIR=""
 life_setup() {
@@ -163,6 +179,7 @@ life_run() {
     BRIDGE_DAEMON_RECOVERY_RENUDGE_FILE="$renudge_file" \
     BRIDGE_DAEMON_LIVENESS_DRY_RUN="${BRIDGE_DAEMON_LIVENESS_DRY_RUN:-1}" \
     BRIDGE_AUTH_SH="$AUTH_SHIM" \
+    BRIDGE_DAEMON_LIVENESS_DAEMON_SH="$DAEMON_SHIM" \
     BRIDGE_BASH_BIN="bash" \
     BRIDGE_DAEMON_TOKEN_LIFELINE_STATE_FILE="$LIFE_STATE_DIR/token-lifeline.ts" \
     BRIDGE_DAEMON_TOKEN_LIFELINE_INTERVAL_SECONDS="${BRIDGE_DAEMON_TOKEN_LIFELINE_INTERVAL_SECONDS:-300}" \
@@ -229,18 +246,21 @@ life_heartbeat_age() {
 # `recover-due count=0` gave no hint WHICH precondition broke. life_run() now
 # hard-pins the ENABLED/STALE gates so a leaked env can no longer gate the tick.
 #
-# #2239 r3: the STALENESS precondition is NOT re-read here. Re-reading a heartbeat
-# mtime that was back-dated by an EARLIER life_run and asserting it later is a
-# timing trap — on the GitHub Linux runner the persisted mtime read back as ~now
-# (age=0) even though set_heartbeat_mtime verified it correctly at back-date time,
-# so the deferred read fired a false failure. Staleness is instead asserted with
-# ZERO gap inside the real tick's own set_heartbeat_mtime (its ±5s verify against
-# now-900 already guarantees age≈900 at the instant the tick reads it, and fails
-# LOUD otherwise). This pre-assertion checks only the throttle witness — a stable
-# on-disk file whose presence/absence does not depend on mtime timing.
-# $1 = throttle-witness state file that must be absent (due).
+# #2239 r4 (real root cause): the earlier "read age=0 on Linux" was NOT a
+# stat/back-date bug — daemon_pid_alive() only checks kill -0 (no identity), so
+# the smoke's live daemon.pid=$$ made every stale tick reach restart_daemon, which
+# ran the REAL `bridge-daemon.sh restart --force` and left orphaned `bridge-daemon
+# run` loops that kept touching the heartbeat FRESH, racing the back-date. With
+# the daemon-restart stub (BRIDGE_DAEMON_LIVENESS_DAEMON_SH) no real daemon can
+# spawn, so this deferred staleness read is stable again (age only grows) — restore
+# it as the loud regression canary. $1 = throttle-witness state file (must be due).
 assert_real_tick_preconditions() {
   local state_file="$1"
+  # life_run() pins BRIDGE_DAEMON_TOKEN_LIFELINE_STALE_SECONDS=600, so age>=600 is
+  # the effective staleness gate the real tick will apply.
+  local age; age="$(life_heartbeat_age)"
+  (( age >= 600 )) \
+    || smoke_fail "real-tick precondition: heartbeat age=${age}s is NOT stale (need >=600) — a real daemon refreshed it (restart stub not wired?) or the back-date did not land; the tick would take the fresh/ok path and no-op"
   [[ ! -e "$state_file" ]] \
     || smoke_fail "real-tick precondition: throttle witness present [$(cat "$state_file" 2>&1)] — the interval throttle would suppress the tick"
 }
@@ -393,20 +413,13 @@ step_t7_dry_run_no_mutation() {
   # broken precondition instead of the opaque `recover-due count=0`. The heartbeat
   # still carries the DRY_RUN tick's back-date; life_run() re-back-dates it below.
   assert_real_tick_preconditions "$state_file"
-  # #2239 INSTR (TEMPORARY CI diag — remove once root-caused): capture the heartbeat
-  # age the DRY_RUN tick LEFT behind + any leaked daemon/liveness process, right
-  # before the real tick re-back-dates. Tests whether the DRY_RUN tick spawned an
-  # async writer (leaked-daemon hypothesis) that clobbers the real tick's back-date.
-  local _hb_instr="$LIFE_STATE_DIR/daemon.heartbeat"
-  smoke_log "T7 INSTR pre-real-tick: hb_age_gnu=$(( $(date +%s) - $(stat -c %Y "$_hb_instr" 2>/dev/null || echo 0) ))s procs=[$(ps -eo pid,ppid,command 2>/dev/null | grep -iE 'bridge-daemon|daemon-liveness' | grep -v grep | tr '\n' ';')]"
   BRIDGE_DAEMON_LIVENESS_DRY_RUN=0 life_run 900
   if [[ "$(auth_count 'recover-due')" != "1" ]]; then
-    smoke_log "T7 diag FAIL-CTX: hb_age=$(life_heartbeat_age)s enabled=${BRIDGE_DAEMON_TOKEN_LIFELINE_ENABLED:-<unset>} stale_gate=${BRIDGE_DAEMON_TOKEN_LIFELINE_STALE_SECONDS:-<unset>} state_file=$([[ -e "$state_file" ]] && printf 'EXISTS[%s]' "$(cat "$state_file" 2>&1)" || printf ABSENT) auth_log=[$(cat "$AUTH_LOG")] liveness_out=[$(cat "$LIFE_STATE_DIR/liveness.out")]"
-    # #2239 INSTR (TEMPORARY): dump the REAL tick's audit rows — daemon_liveness_ok
-    # carries the exact heartbeat_age_seconds main() computed (fresh path), vs
-    # skip_not_running (stale) vs a token_lifeline row (ran). Decisive for WHY count=0.
-    smoke_log "T7 INSTR FAIL: audit=[$(cat "$LIFE_STATE_DIR/audit.jsonl" 2>&1 | tr '\n' '|')]"
-    smoke_log "T7 INSTR FAIL: post-tick hb_age_gnu=$(( $(date +%s) - $(stat -c %Y "$_hb_instr" 2>/dev/null || echo 0) ))s procs=[$(ps -eo pid,ppid,command 2>/dev/null | grep -iE 'bridge-daemon|daemon-liveness' | grep -v grep | tr '\n' ';')]"
+    smoke_log "T7 diag FAIL-CTX: hb_age=$(life_heartbeat_age)s state_file=$([[ -e "$state_file" ]] && printf 'EXISTS[%s]' "$(cat "$state_file" 2>&1)" || printf ABSENT) auth_log=[$(cat "$AUTH_LOG")] liveness_out=[$(cat "$LIFE_STATE_DIR/liveness.out")]"
+    # #2239 r4: on failure, dump the runtime's own verdict (audit.jsonl records the
+    # exact heartbeat_age_seconds main() computed) + any stray bridge-daemon process
+    # — a leaked real daemon refreshing the heartbeat was the original T7 flake.
+    smoke_log "T7 diag FAIL-CTX: audit=[$(cat "$LIFE_STATE_DIR/audit.jsonl" 2>&1 | tr '\n' '|')] daemons=[$(ps -eo pid,command 2>/dev/null | grep -i 'bridge-daemon' | grep -v grep | tr '\n' ';')] restart_log=[$(cat "$DAEMON_LOG" 2>/dev/null | tr '\n' ';')]"
     smoke_fail "T7: a real tick after a DRY_RUN was throttled — DRY_RUN must not arm the throttle (recover-due count=$(auth_count 'recover-due'))"
   fi
   smoke_log "T7: OK — DRY_RUN audits but mutates nothing (state file absent; real tick not suppressed)"
