@@ -34,8 +34,10 @@ fi
 #   T0 (parser): the engines.node min-major parser derives the right
 #      floor for >=14, ^18||^20, ~16, 18.x, ">= 16 < 21" (=> 16, NOT 21),
 #      "14 - 18" (=> 14), and declares NO floor (exit 1) for "*", "x",
-#      upper-bound-only "<21", and garbage — the false-positive classes a
-#      codex review flagged. Under-warning is safe; a false warn is not.
+#      upper-bound-only "<21", garbage, AND any OR union with a no-floor
+#      alternative ("* || >=20", "<21 || >=18") — the false-positive
+#      classes two codex review rounds flagged. Under-warning is safe; a
+#      false warn is not.
 #   T1 (warn fires, old node): a plugin declaring engines.node ">=18"
 #      with host node shimmed to v12 emits a "requires node >= 18" warn.
 #   T2 (non-fatal): the gate returns 0 even when it warns (start would
@@ -146,6 +148,12 @@ test_parser_min_major() {
   _check_parser "x"          ""   "1" "wildcard-x-no-floor"
   _check_parser "<21"        ""   "1" "upper-bound-only-no-floor"
   _check_parser "latest"     ""   "1" "garbage-no-floor"
+  # OR-union with a no-floor alternative accepts ALL versions -> exit 1.
+  # (codex round-2 blocking finding: skipping the None alternative and
+  # reducing over the bounded ones over-warns on an old host.)
+  _check_parser "* || >=20"   "" "1" "codex-or-union-wildcard-unbounds"
+  _check_parser ">=14 || *"   "" "1" "codex-or-union-wildcard-trailing"
+  _check_parser "<21 || >=18" "" "1" "codex-or-union-upper-bound-unbounds"
   # Missing engines.node entirely -> exit 1.
   printf '{"name":"p"}\n' >"$pj"
   local out2 rc2

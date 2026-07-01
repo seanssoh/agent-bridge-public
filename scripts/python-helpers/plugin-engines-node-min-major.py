@@ -26,10 +26,12 @@ Contract:
 
 Range handling (deliberately conservative — we only warn, never block, so a
 missed warning is safer than a FALSE one):
-  * A range is an ``||``-separated set of alternatives. The effective minimum
-    the plugin will accept is the SMALLEST major across the alternatives (any
-    one alternative being satisfied is enough for the plugin to run), so we
-    take the min of each alternative's floor.
+  * A range is an ``||``-separated set of alternatives (an OR union — any one
+    alternative being satisfied is enough for the plugin to run). The effective
+    minimum is the SMALLEST major across the alternatives' floors. BUT if even
+    one alternative has NO floor (a wildcard, or upper-bound-only), the whole
+    union accepts every version -> NO requirement -> exit 1 (e.g. ``* || >=20``
+    and ``<21 || >=18`` both exit 1, never warn).
   * Within one alternative, comparators are ANDed; the floor is the LARGEST
     lower-bound major among them (all must hold). Comparators are scanned as
     whole units, so an operator separated from its version by whitespace
@@ -120,12 +122,23 @@ def _alternative_floor(alt: str) -> int | None:
 
 
 def _min_major(spec: str) -> int | None:
-    """Return the smallest acceptable major across all ``||`` alternatives."""
+    """Return the smallest acceptable major across all ``||`` alternatives.
+
+    ``||`` is an OR union: the plugin runs if ANY alternative is satisfied.
+    So if even one alternative sets no lower floor (a wildcard like ``*``,
+    or an upper-bound-only comparator like ``<21``), the union as a whole
+    accepts every version — there is NO effective minimum and we must
+    return None (the caller then never warns). We therefore short-circuit
+    to None on the first no-floor alternative rather than skipping it and
+    reducing over the bounded ones (which would over-warn: e.g. ``* ||
+    >=20`` must NOT warn on a Node 12 host).
+    """
     result: int | None = None
     for alt in spec.split("||"):
         floor = _alternative_floor(alt)
         if floor is None:
-            continue
+            # An unbounded alternative makes the whole OR union unbounded.
+            return None
         if result is None or floor < result:
             result = floor
     return result
