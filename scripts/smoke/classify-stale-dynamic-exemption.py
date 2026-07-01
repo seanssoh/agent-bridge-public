@@ -7,7 +7,9 @@
 #
 # Loads bridge-status.py via importlib (the file name has a hyphen so a
 # plain import won't work) and runs the classify_stale truth table for
-# dynamic-source exemption.
+# the idle-staleness carve-outs: dynamic-source exemption plus the
+# Issue #2100 codex-engine static exemption (idle codex agents have no
+# heartbeat to refresh, so their long idle must not read as stale=crit).
 
 import importlib.util
 import pathlib
@@ -67,6 +69,32 @@ def main() -> int:
         "dynamic-inactive-stays-na",
         classify_stale(False, crit_age, 3600, 14400, source="dynamic"),
         "-",
+    )
+
+    # Issue #2100: a codex-engine STATIC agent (e.g. patch-dev) has no
+    # idle-heartbeat mechanism, so a long idle window with a stale/absent
+    # session-activity ts is the healthy normal — it must NOT be flagged
+    # crit. Mirror the dynamic carve-out on the engine signal.
+    check(
+        "codex-static-crit-age-becomes-na",
+        classify_stale(True, crit_age, 3600, 14400, source="static", engine="codex"),
+        "-",
+    )
+    # codex-static + missing activity_ts (the observed #2100 shape: no idle
+    # heartbeat at all) -> "-" (this is the exact false-positive path).
+    check(
+        "codex-static-missing-ts-becomes-na",
+        classify_stale(True, None, 3600, 14400, source="static", engine="codex"),
+        "-",
+    )
+    # A claude-engine STATIC agent with the same crit-age must STILL be crit —
+    # the exemption is engine-scoped, not a blanket static carve-out. Reverting
+    # the fix flips codex-static back to crit and turns the two codex cases
+    # above RED (mutation proof), while this case is unaffected either way.
+    check(
+        "claude-static-crit-stays-crit",
+        classify_stale(True, crit_age, 3600, 14400, source="static", engine="claude"),
+        "crit",
     )
 
     # static + fresh -> ok
