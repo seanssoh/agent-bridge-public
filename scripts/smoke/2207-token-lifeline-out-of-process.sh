@@ -188,13 +188,27 @@ auth_first_line() {
   printf '%s' "${n:-0}"
 }
 
-# Observed heartbeat age (now - mtime) for the per-case heartbeat file, read the
-# SAME way the watcher's main() computes `age` (BSD `stat -f %m`, then GNU
-# `stat -c %Y`). Prints the integer age, or -1 if the file/mtime is unreadable.
+# Observed heartbeat age (now - mtime) for the per-case heartbeat file. Prints the
+# integer age, or -1 if the file/mtime is unreadable.
+#
+# #2239 r2 (GNU/Linux CI red): the mtime MUST be read GNU-first (`stat -c %Y`),
+# then BSD (`stat -f %m`) — the SAME order set_heartbeat_mtime's verify block uses
+# (and which demonstrably lands correct on the Linux runner). The reverse order
+# (`stat -f %m` first) is a trap on GNU: `-f` there means "file SYSTEM status", so
+# GNU reads `%m` as a FILENAME, exits non-zero, and dumps the filesystem block/
+# inode table to STDOUT (`2>/dev/null` only hides stderr). The `||` then appends
+# the real `stat -c %Y` mtime, and `${m//[^0-9]/}` concatenates the fs-table digits
+# with the mtime into one absurd number — the ~-3.46e18 CI age signature. Reading
+# `stat -c %Y` first never runs `stat -f` on GNU, so no stdout pollution. The
+# plausibility gate (< 1e11) is belt-and-suspenders against any variant that still
+# emits a large filesystem-field number.
 life_heartbeat_age() {
   local hb_file="$LIFE_STATE_DIR/daemon.heartbeat" m now
-  m="$(stat -f %m "$hb_file" 2>/dev/null || stat -c %Y "$hb_file" 2>/dev/null || true)"
-  m="${m//[^0-9]/}"; [[ -n "$m" ]] || { printf '%s' -1; return; }
+  m="$(stat -c %Y "$hb_file" 2>/dev/null || stat -f %m "$hb_file" 2>/dev/null || true)"
+  m="${m//[^0-9]/}"
+  # A real second-resolution mtime is ~1.78e9 (10 digits). Reject empty or an
+  # implausibly large value (>= 1e11 ⇒ a filesystem-field / ns garbage read).
+  { [[ -n "$m" ]] && (( m < 100000000000 )); } || { printf '%s' -1; return; }
   now="$(date +%s)"
   printf '%s' "$(( now - m ))"
 }
