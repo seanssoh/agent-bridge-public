@@ -1200,13 +1200,25 @@ def parse_reset_at(text: str, reference: datetime | None = None) -> str:
                 hour += 12
             if meridiem == "am" and hour == 12:
                 hour = 0
+            # Fail closed on a malformed date/clock instead of letting
+            # datetime() raise out of the probe later: parse_reset_at's
+            # contract is to return "" for anything it cannot turn into a
+            # real instant, exactly like the bare-clock branch below. The
+            # static guard rejects gross overflow (``day 32``/``day 0``); the
+            # try/except still catches month-specific day overflow the static
+            # bound cannot (``Feb 30``, ``Apr 31``).
+            if not (1 <= day <= 31 and 0 <= hour <= 23 and 0 <= minute <= 59):
+                return ""
             # Build the reset instant in the stated zone, then normalize to
             # UTC. For ``(UTC)`` this is byte-identical to the legacy
             # direct-UTC construction.
-            local = datetime(reference.year, month, day, hour, minute, tzinfo=zone)
-            candidate = local.astimezone(timezone.utc)
-            if candidate < reference - timedelta(days=1):
-                candidate = local.replace(year=reference.year + 1).astimezone(timezone.utc)
+            try:
+                local = datetime(reference.year, month, day, hour, minute, tzinfo=zone)
+                candidate = local.astimezone(timezone.utc)
+                if candidate < reference - timedelta(days=1):
+                    candidate = local.replace(year=reference.year + 1).astimezone(timezone.utc)
+            except ValueError:
+                return ""
             return candidate.isoformat(timespec="seconds")
 
     relative = re.search(r"\bresets?\s+in\s+(\d+)h(?:\s+(\d+)m)?", text, re.IGNORECASE)
