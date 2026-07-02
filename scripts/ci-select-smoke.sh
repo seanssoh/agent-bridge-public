@@ -5101,6 +5101,18 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # controller re-raise, and the cross-scope command convergence cannot
       # regress back into the visible "UserPromptSubmit hook error" banner.
       add_required 1755-prompt-timestamp-concurrent-write
+      # Wave cut-prep Track A: the Claude-only per-turn parallel-dispatch nudge
+      # (UserPromptSubmit additionalContext). bridge-hooks.py gained
+      # prompt_parallel_nudge_hook_command / is_prompt_parallel_nudge_hook /
+      # cmd_ensure_prompt_parallel_nudge_hook + cmd_status_prompt_parallel_nudge_hook
+      # + the two subparsers; lib/bridge-hooks.sh gained
+      # bridge_ensure_claude_prompt_parallel_nudge_hook (wired at all three
+      # prompt-guard call sites). Pull prompt-parallel-nudge on every
+      # hooks/* / bridge-hooks.py / lib/bridge-hooks.sh move so a future patch
+      # cannot regress the exactly-one/additionalContext=true render, the
+      # idempotent dedup, the Claude-only boundary (never on the Codex render),
+      # or the anti-fan-out guardrail wording.
+      add_required prompt-parallel-nudge
       # Issue #1923: bridge-hooks.py gained the AskUserQuestion hard-ban
       # surface — askuserquestion_ban_hook_command / is_askuserquestion_ban_hook
       # / cmd_ensure_askuserquestion_ban + the ensure_scoped_permission_deny
