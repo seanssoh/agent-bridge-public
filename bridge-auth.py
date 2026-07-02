@@ -8,6 +8,7 @@ import errno
 import fcntl
 import hashlib
 import json
+import math
 import os
 import platform
 import pwd
@@ -3804,6 +3805,417 @@ def token_updater_lease_status_payload() -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Token-updater lease client + durable lease-state (#21895 phase-1, sub-PR 2/4).
+#
+# Contract A: the lease HTTP client (checkout/heartbeat/swap/checkin), a durable
+# 0600 lease-state file, and the email→local-token mapping. This is ADDITIVE and
+# DEFAULT-OFF: nothing here runs unless a caller both configures the feature
+# (URL + SERVER_ID + secret) and flips ENABLED — Sub-PR 2 wires NO rotator, NO
+# daemon tick, and NO caller of the client. When unconfigured the whole surface
+# is a byte-for-byte no-op (the verbs report OFF and mutate nothing).
+#
+# Design provenance (codex design-agreement r2, /tmp/…-codex-design-r2.md):
+#   * Q1 — service_token_id (remote lease id) and local_token_id (local registry
+#     row id) are stored SEPARATELY and are NOT required equal. "Drift" means the
+#     lease-state points at a DIFFERENT email/local row than the fresh response,
+#     never a bare id-shape mismatch.
+#   * Mapping join is casefold(account_email) restricted to operator-sourced
+#     rows; exactly-one → map, else fail-closed structured skip (never guess).
+TOKEN_UPDATER_LEASE_STATE_FILENAME = "token-updater-lease.json"
+# HTTP client tuning. Timeout is bounded so a hung lease service can never wedge
+# a rotator/daemon tick; a Retry-After header (429/503) is surfaced so callers
+# honor server backpressure.
+TOKEN_UPDATER_LEASE_HTTP_TIMEOUT_SECONDS = 10
+TOKEN_UPDATER_LEASE_UA_VERSION = "1.0"
+# Test-only injection seam (mirrors CLAUDE_PROFILE_PROBE_FIXTURE_ENV): a JSON
+# fixture DIR that simulates each lease HTTP response so smokes never touch the
+# network. Honored ONLY when set; production always calls live. Per-verb fixture
+# files inside the dir are named ``<verb>.json`` (checkout/heartbeat/swap/
+# checkin) with shape {"transport_error": true} → simulated transport failure,
+# or {"http_status": <int>, "body": <obj|str>, "headers": {<k>: <v>}}.
+TOKEN_UPDATER_LEASE_FIXTURE_DIR_ENV = "BRIDGE_TOKEN_UPDATER_LEASE_FIXTURE_DIR"
+
+
+def token_updater_lease_state_path() -> Path | None:
+    """Resolve the 0600 durable lease-state file, or None if no root.
+
+    Sits beside the API-key secret under ``$BRIDGE_RUNTIME_SECRETS_DIR`` (same
+    root the token registry / token-updater secret live under), so the mutable
+    lease bookkeeping shares the secrets tree's 0700 restriction. Returns None
+    when no root resolves so a caller degrades to unconfigured rather than
+    guessing a path outside the install."""
+    explicit = os.environ.get("BRIDGE_TOKEN_UPDATER_LEASE_STATE_FILE", "").strip()  # noqa: iso-helper-boundary - controller lease-state path
+    if explicit:
+        return Path(explicit).expanduser()
+    secret_path = token_updater_secret_path()
+    if secret_path is None:
+        return None
+    return secret_path.parent / TOKEN_UPDATER_LEASE_STATE_FILENAME
+
+
+# The durable lease-state keys (exact schema, codex Q1). service_token_id is the
+# REMOTE lease id (heartbeat/swap avoid/checkin target); local_token_id is the
+# LOCAL registry row id the lease maps to — stored separately, never inferred
+# from active_token_id.
+TOKEN_UPDATER_LEASE_STATE_KEYS = (
+    "service_token_id",
+    "account_email",
+    "local_token_id",
+    "lease_expires_at",
+    "last_heartbeat_at",
+)
+
+
+def read_token_updater_lease_state() -> dict[str, Any] | None:
+    """Read the durable lease-state file, or None when absent/unreadable.
+
+    Never raises: a missing / malformed / non-object file resolves to None so a
+    caller degrades to "no lease held" rather than an error. Only the known keys
+    are surfaced (a stray key in the file is ignored)."""
+    path = token_updater_lease_state_path()
+    if path is None:
+        return None
+    try:
+        if not path.is_file():  # noqa: raw-pathlib-controller-only - controller lease-state probe
+            return None
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return {key: parsed.get(key) for key in TOKEN_UPDATER_LEASE_STATE_KEYS}
+
+
+def write_token_updater_lease_state(state: dict[str, Any]) -> tuple[Path | None, str]:
+    """Atomically persist the durable lease-state to its 0600 file.
+
+    Mirrors ``write_token_updater_secret`` / ``save_registry``'s atomic-0600
+    write (mkstemp in the parent dir, fsync, chmod 0600 BEFORE ``os.replace``)
+    so the file is never world-readable at its final path and a torn write can
+    never leave partial bookkeeping. Only the known keys are written; a caller
+    that omits one gets an explicit null. Returns ``(path, "ok")`` or
+    ``(None, reason)``."""
+    if not isinstance(state, dict):
+        return None, "lease_state_not_object"
+    path = token_updater_lease_state_path()
+    if path is None:
+        return None, "no_lease_state_path (set BRIDGE_RUNTIME_SECRETS_DIR, BRIDGE_RUNTIME_ROOT, or BRIDGE_HOME)"
+    normalized = {key: state.get(key) for key in TOKEN_UPDATER_LEASE_STATE_KEYS}
+    text = json.dumps(normalized, ensure_ascii=True, indent=2) + "\n"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only - controller lease-state-dir create
+        os.chmod(path.parent, 0o700)
+        write_private_file_atomic(
+            path, text, mode=0o600, prefix=".token-updater-lease."
+        )
+    except OSError as exc:
+        return None, f"lease_state_write_failed: {exc}"
+    return path, "ok"
+
+
+def _token_updater_lease_fixture(verb: str) -> tuple[int, str, dict[str, str]] | None:
+    """Resolve a per-verb lease HTTP fixture, or None when no seam is set.
+
+    Returns ``(http_status, body_text, headers)`` for a matched fixture. Raises
+    ``urllib.error.URLError`` for a ``transport_error`` fixture so the client's
+    transport-degrade path is exercised exactly as a real socket error would.
+    Never touches the network."""
+    fixture_dir = os.environ.get(TOKEN_UPDATER_LEASE_FIXTURE_DIR_ENV, "").strip()
+    if not fixture_dir:
+        return None
+    fixture_path = Path(fixture_dir).expanduser() / f"{verb}.json"
+    if not fixture_path.is_file():  # noqa: raw-pathlib-controller-only - controller-side test fixture probe (never an isolated-agent path)
+        return None
+    with open(fixture_path, encoding="utf-8") as fh:  # noqa: raw-pathlib-controller-only - controller-side test fixture read (never an isolated-agent path)
+        spec = json.loads(fh.read())
+    if not isinstance(spec, dict):
+        raise ValueError("lease fixture must be a JSON object")
+    if spec.get("transport_error"):
+        raise urllib.error.URLError("lease fixture transport error")
+    status = int(spec.get("http_status", 200))
+    body = spec.get("body", "")
+    body_text = body if isinstance(body, str) else json.dumps(body)
+    headers = spec.get("headers")
+    header_map = {
+        str(k): str(v) for k, v in headers.items()
+    } if isinstance(headers, dict) else {}
+    return status, body_text, header_map
+
+
+def _http_post_json(
+    url: str,
+    payload: dict[str, Any],
+    *,
+    api_key: str,
+    timeout: float,
+    verb: str,
+) -> tuple[int, str, dict[str, str]]:
+    """POST a JSON body and return ``(http_status, body_text, headers)``.
+
+    Clones ``_http_get_claude_profile``'s shape: the API key lives ONLY in the
+    in-process ``Authorization`` header (no subprocess → no env-leak surface, and
+    it is never logged). An HTTPError is unwrapped into its ``(code, body,
+    headers)`` so a 404/409/429/5xx is surfaced to the caller as a structured
+    result rather than an exception. The ``verb`` selects the test fixture when
+    the ``BRIDGE_TOKEN_UPDATER_LEASE_FIXTURE_DIR`` seam is set (CI never hits the
+    network)."""
+    fixture = _token_updater_lease_fixture(verb)
+    if fixture is not None:
+        return fixture
+    body_bytes = json.dumps(payload, ensure_ascii=True).encode("utf-8")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": f"agent-bridge-token-updater/{TOKEN_UPDATER_LEASE_UA_VERSION}",
+    }
+    req = urllib.request.Request(url, data=body_bytes, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            charset = resp.headers.get_content_charset() or "utf-8"
+            resp_headers = {str(k): str(v) for k, v in resp.headers.items()}
+            return (
+                int(getattr(resp, "status", 200) or 200),
+                resp.read().decode(charset, errors="replace"),
+                resp_headers,
+            )
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001 - error body is best-effort context only
+            body = ""
+        resp_headers = {str(k): str(v) for k, v in (exc.headers or {}).items()}
+        return int(exc.code), body, resp_headers
+
+
+def _parse_retry_after(headers: dict[str, str]) -> int | None:
+    """Parse a ``Retry-After`` header into a bounded non-negative seconds int.
+
+    Honors the delta-seconds form only (an HTTP-date form is uncommon for this
+    service and is ignored → None). A malformed / negative / non-finite value
+    degrades to None so a caller never sleeps on garbage. The returned value is
+    advisory — the caller decides the cooldown floor/cap."""
+    if not isinstance(headers, dict):
+        return None
+    raw = ""
+    for key, value in headers.items():
+        if str(key).lower() == "retry-after":
+            raw = str(value or "").strip()
+            break
+    if not raw:
+        return None
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError):
+        return None
+    # OverflowError guards ``int(float("inf"))`` / ``Infinity``; the isfinite
+    # screen also rejects NaN (NaN >= 0 is False, but be explicit) so a hostile
+    # server's ``Retry-After: inf`` degrades to None instead of raising out.
+    if not math.isfinite(parsed):
+        return None
+    seconds = int(parsed)
+    return seconds if seconds >= 0 else None
+
+
+def token_updater_map_account_to_local(
+    account_email: str, registry: dict[str, Any]
+) -> dict[str, Any]:
+    """Map a lease ``account_email`` to a LOCAL registry token-row id, fail-closed.
+
+    Join rule (codex Q1): ``casefold(account_email)`` against local registry rows
+    RESTRICTED to operator-sourced emails (``account_email_source == "operator"``
+    — the probe-sourced / unmarked-legacy value is never trusted). Exactly-one
+    match → ``{"status": "ok", "local_token_id": <id>}``. Zero / more-than-one /
+    missing email → a fail-closed structured skip (``{"status": "error",
+    "reason": "map_ambiguous|map_missing"}``) — NEVER a guess."""
+    normalized = str(account_email or "").strip()
+    if not normalized:
+        return {"status": "error", "reason": "map_missing"}
+    target = normalized.casefold()
+    matches: list[str] = []
+    for row in token_rows(registry):
+        row_email = operator_account_email(row)
+        if row_email and row_email.casefold() == target:
+            row_id = str(row.get("id") or "")
+            if row_id:
+                matches.append(row_id)
+    if len(matches) == 1:
+        return {"status": "ok", "local_token_id": matches[0]}
+    if not matches:
+        return {"status": "error", "reason": "map_missing"}
+    return {"status": "error", "reason": "map_ambiguous"}
+
+
+class TokenUpdaterLeaseClient:
+    """Stdlib-urllib client for the token-updater lease service (Contract A).
+
+    Each method returns a STRUCTURED dict ``{"status": "ok"|"error"|"conflict"|
+    "limited", "http": <int|None>, ...}`` — a transport failure / timeout / 5xx
+    degrades to ``status="error"`` (never raises out), a 409 nothing-usable to
+    ``status="conflict"``, and a 429/limited to ``status="limited"`` carrying the
+    parsed ``retry_after``. The secret lives only in the request Authorization
+    header. This class holds NO durable state — the caller owns the lease-state
+    file; the client just speaks the wire protocol."""
+
+    def __init__(
+        self,
+        *,
+        api_url: str | None = None,
+        api_key: str | None = None,
+        server_id: str | None = None,
+        timeout: float = TOKEN_UPDATER_LEASE_HTTP_TIMEOUT_SECONDS,
+    ) -> None:
+        self.api_url = (api_url if api_url is not None else token_updater_api_url()).rstrip("/")
+        self.api_key = api_key if api_key is not None else token_updater_api_key()
+        self.server_id = server_id if server_id is not None else token_updater_server_id()
+        self.timeout = timeout
+
+    def _configured(self) -> bool:
+        return bool(self.api_url and self.api_key and self.server_id)
+
+    def _endpoint(self, verb: str) -> str:
+        return f"{self.api_url}/lease/{verb}"
+
+    def _call(self, verb: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Shared POST → classified-result helper for every verb.
+
+        Returns ``{"status", "http", "body", "retry_after"?}`` where ``body`` is
+        the parsed JSON object (or ``{}`` when the response is empty/unparseable
+        — a caller reads only the fields it needs). Classifies by status: 200 →
+        ok, 409 → conflict (nothing-usable), 429 → limited, anything else /
+        transport failure → error."""
+        if not self._configured():
+            return {"status": "error", "http": None, "reason": "unconfigured", "body": {}}
+        body_payload = {"server_id": self.server_id, **payload}
+        try:
+            http, text, headers = _http_post_json(
+                self._endpoint(verb),
+                body_payload,
+                api_key=self.api_key,
+                timeout=self.timeout,
+                verb=verb,
+            )
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+            return {
+                "status": "error",
+                "http": None,
+                "reason": f"transport: {type(exc).__name__}",
+                "body": {},
+            }
+        try:
+            parsed = json.loads(text) if text.strip() else {}
+        except ValueError:
+            parsed = {}
+        if not isinstance(parsed, dict):
+            parsed = {}
+        result: dict[str, Any] = {"http": http, "body": parsed}
+        if http == 200:
+            result["status"] = "ok"
+        elif http == 409:
+            result["status"] = "conflict"
+        elif http == 429:
+            result["status"] = "limited"
+            retry_after = _parse_retry_after(headers)
+            if retry_after is not None:
+                result["retry_after"] = retry_after
+        else:
+            result["status"] = "error"
+            result["reason"] = f"http_{http}"
+        return result
+
+    @staticmethod
+    def _epoch_or_none(value: Any) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def checkout(self) -> dict[str, Any]:
+        """Acquire (or renew) a lease for this server.
+
+        On ``ok`` returns ``{status, http, service_token_id, account_email,
+        lease_expires_at, secret_material?}`` — ``secret_material`` is passed
+        through verbatim when the service supplies it (the caller lands it in the
+        local registry; it never touches the lease-state file). A 409 →
+        ``status="conflict"`` (nothing usable); a 429 → ``status="limited"``."""
+        result = self._call("checkout", {})
+        body = result.get("body") or {}
+        if result.get("status") == "ok":
+            out = {
+                "status": "ok",
+                "http": result.get("http"),
+                "service_token_id": str(body.get("service_token_id") or ""),
+                "account_email": str(body.get("account_email") or ""),
+                "lease_expires_at": self._epoch_or_none(body.get("lease_expires_at")),
+            }
+            if body.get("secret_material") is not None:
+                out["secret_material"] = body.get("secret_material")
+            return out
+        return {k: v for k, v in result.items() if k != "body"}
+
+    def heartbeat(self, service_token_id: str) -> dict[str, Any]:
+        """Renew the lease TTL for ``service_token_id`` from the lease-state file.
+
+        On ``ok`` returns ``{status, http, lease_expires_at?}``. A 404 (lease
+        gone) or 409 (superseded) is surfaced via ``status``/``http`` so the
+        caller re-checks out. Never mutates the lease-state file itself — the
+        caller owns that."""
+        result = self._call("heartbeat", {"service_token_id": str(service_token_id or "")})
+        body = result.get("body") or {}
+        if result.get("status") == "ok":
+            return {
+                "status": "ok",
+                "http": result.get("http"),
+                "lease_expires_at": self._epoch_or_none(body.get("lease_expires_at")),
+            }
+        return {k: v for k, v in result.items() if k != "body"}
+
+    def swap(self, avoid_service_token_id: str = "") -> dict[str, Any]:
+        """Request a DIFFERENT usable lease, avoiding ``avoid_service_token_id``.
+
+        On ``ok`` returns ``{status, http, service_token_id, account_email,
+        lease_expires_at, secret_material?}``. An authoritative 409 nothing-usable
+        (whole pool held/reserved) → ``status="conflict"``, ``http=409``, plus any
+        reset fields the response carries (``reset_at``/``resets_at`` passed
+        through) so the caller can drive a remote-cooldown latch instead of
+        locally rotating a fleet-reserved token."""
+        payload: dict[str, Any] = {}
+        if avoid_service_token_id:
+            payload["avoid"] = str(avoid_service_token_id)
+        result = self._call("swap", payload)
+        body = result.get("body") or {}
+        if result.get("status") == "ok":
+            out = {
+                "status": "ok",
+                "http": result.get("http"),
+                "service_token_id": str(body.get("service_token_id") or ""),
+                "account_email": str(body.get("account_email") or ""),
+                "lease_expires_at": self._epoch_or_none(body.get("lease_expires_at")),
+            }
+            if body.get("secret_material") is not None:
+                out["secret_material"] = body.get("secret_material")
+            return out
+        out = {k: v for k, v in result.items() if k != "body"}
+        # Pass through any reset fields a 409 carries (empty when absent → the
+        # caller's cooldown writer falls back to its bounded floor).
+        for reset_key in ("reset_at", "resets_at", "retry_after"):
+            if reset_key in body and reset_key not in out:
+                out[reset_key] = body.get(reset_key)
+        return out
+
+    def checkin(self, service_token_id: str) -> dict[str, Any]:
+        """Best-effort release of ``service_token_id`` (never raises out).
+
+        Returns ``{status, http?}``. A transport failure / non-200 is reported
+        but never fatal — the lease TTL is the correctness backstop, so a failed
+        checkin only means the lease lingers until it expires."""
+        if not str(service_token_id or "").strip():
+            return {"status": "error", "http": None, "reason": "no_service_token_id"}
+        result = self._call("checkin", {"service_token_id": str(service_token_id)})
+        return {k: v for k, v in result.items() if k != "body"}
+
+
 def _global_credential_writer_is_root() -> bool:
     """True when the global credential write must FAIL CLOSED on root.
 
@@ -5966,19 +6378,111 @@ def cmd_global_auth_sync(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_token_updater_lease(args: argparse.Namespace) -> int:
-    """#21895 phase-1 (sub-PR 1/4) — the token-updater lease CONFIG surface.
+def _token_updater_lease_client_from_args(args: argparse.Namespace) -> TokenUpdaterLeaseClient:
+    """Build the lease client, honoring an optional per-invocation timeout flag."""
+    timeout = getattr(args, "timeout", None)
+    if timeout is None:
+        return TokenUpdaterLeaseClient()
+    return TokenUpdaterLeaseClient(timeout=float(timeout))
 
-    Verbs (config foundation only; NO lease client / rotator / daemon tick):
-      * ``config``  — persist URL / SERVER_ID / ENABLED to runtime-config via
-        the sanctioned single-key writer, and the API KEY to its 0600 secret
-        file. The secret NEVER enters runtime-config JSON and is NEVER settable
-        through ``config set-env`` (denied there fail-closed).
-      * ``status``  — read-only effective-state snapshot (no secret value).
-        ``--check`` is the exit-code-only probe the later daemon tick reuses:
-        exit 0 iff the lease is EFFECTIVELY enabled (persisted ENABLED AND fully
-        configured), exit 1 otherwise. NEVER mutates and prints nothing under
-        ``--check``.
+
+def _cmd_token_updater_lease_client_verb(
+    args: argparse.Namespace, action: str, json_mode: bool
+) -> int:
+    """Drive one Contract-A lease client verb and emit its structured result.
+
+    Fail-closed default-OFF: if the feature is not EFFECTIVELY enabled the verb
+    reports ``{"status": "disabled", ...}`` and exits non-zero WITHOUT any HTTP
+    call or state mutation, so an unconfigured install is a byte-for-byte no-op.
+    ``heartbeat``/``checkin`` degrade to a no-op when there is no lease-state.
+    The remote id (``--service-token-id``) defaults to the durable lease-state's
+    ``service_token_id`` so a rotator/daemon tick can call ``heartbeat``/``swap``/
+    ``checkin`` without re-passing it; ``checkout`` needs none. Exit code: 0 for
+    an ``ok`` result, non-zero for ``error``/``conflict``/``limited``/``disabled``
+    /``noop`` so a caller can branch on the shell rc as well as the JSON."""
+    if not token_updater_lease_enabled():
+        payload = {"status": "disabled", "action": action, "reason": "not_enabled"}
+        if json_mode:
+            json_dump(payload)
+        else:
+            print("token-updater lease: disabled (feature not enabled/configured)")
+        return 1
+
+    client = _token_updater_lease_client_from_args(args)
+
+    if action == "checkout":
+        result = client.checkout()
+    elif action == "heartbeat":
+        # Renew the lease TTL for the remote id we currently hold. The id comes
+        # from --service-token-id or the durable lease-state — never inferred
+        # from active_token_id. No lease held → structured no-op (the daemon
+        # tick's cue to checkout instead), not an HTTP call.
+        service_token_id = str(getattr(args, "service_token_id", "") or "")
+        if not service_token_id:
+            state = read_token_updater_lease_state() or {}
+            service_token_id = str(state.get("service_token_id") or "")
+        if not service_token_id:
+            payload = {"status": "noop", "action": "heartbeat", "reason": "no_lease_held"}
+            if json_mode:
+                json_dump(payload)
+            else:
+                print("token-updater lease: heartbeat no-op (no lease held)")
+            return 1
+        result = client.heartbeat(service_token_id)
+    elif action == "swap":
+        # Avoid the currently-held lease when we have one (the rotator's intent
+        # is "give me a DIFFERENT usable lease"). The remote id comes from the
+        # durable lease-state — never inferred from active_token_id.
+        avoid = str(getattr(args, "service_token_id", "") or "")
+        if not avoid:
+            state = read_token_updater_lease_state() or {}
+            avoid = str(state.get("service_token_id") or "")
+        result = client.swap(avoid)
+    else:  # checkin
+        service_token_id = str(getattr(args, "service_token_id", "") or "")
+        if not service_token_id:
+            state = read_token_updater_lease_state() or {}
+            service_token_id = str(state.get("service_token_id") or "")
+        if not service_token_id:
+            payload = {"status": "noop", "action": "checkin", "reason": "no_lease_held"}
+            if json_mode:
+                json_dump(payload)
+            else:
+                print("token-updater lease: checkin no-op (no lease held)")
+            return 0
+        result = client.checkin(service_token_id)
+
+    result.setdefault("action", action)
+    if json_mode:
+        json_dump(result)
+    else:
+        print(
+            f"token-updater lease {action}: {result.get('status')} "
+            f"(http={result.get('http')})"
+        )
+    return 0 if result.get("status") == "ok" else 1
+
+
+def cmd_token_updater_lease(args: argparse.Namespace) -> int:
+    """#21895 phase-1 — the token-updater lease surface.
+
+    Verbs:
+      * ``config``  (sub-PR 1) — persist URL / SERVER_ID / ENABLED to
+        runtime-config via the sanctioned single-key writer, and the API KEY to
+        its 0600 secret file. The secret NEVER enters runtime-config JSON and is
+        NEVER settable through ``config set-env`` (denied there fail-closed).
+      * ``status``  (sub-PR 1) — read-only effective-state snapshot (no secret
+        value). ``--check`` is the exit-code-only probe the later daemon tick
+        reuses: exit 0 iff the lease is EFFECTIVELY enabled (persisted ENABLED
+        AND fully configured), exit 1 otherwise. NEVER mutates and prints
+        nothing under ``--check``.
+      * ``checkout``/``heartbeat``/``swap``/``checkin`` (sub-PR 2) — drive the
+        Contract-A lease HTTP client and emit its structured JSON. These are the
+        CLI surface for the client (the ONLY way the bash daemon tick / rotator
+        reaches it); the rotator/daemon-tick that CALLS these at runtime is
+        Sub-PR 3/4. Fail-closed when the feature is not effectively enabled
+        (report ``disabled`` and mutate nothing) so an unconfigured install is a
+        byte-for-byte no-op.
 
     Default-OFF invariant: with the feature unconfigured/disabled this command's
     ``status --check`` reports OFF and no other code path behaves differently."""
@@ -5991,6 +6495,9 @@ def cmd_token_updater_lease(args: argparse.Namespace) -> int:
         # bash early-skip reuses THIS single python predicate as the source of
         # truth rather than re-deriving the gate in bash.
         return 0 if token_updater_lease_enabled() else 1
+
+    if action in ("checkout", "heartbeat", "swap", "checkin"):
+        return _cmd_token_updater_lease_client_verb(args, action, json_mode)
 
     if action == "status":
         payload = token_updater_lease_status_payload()
@@ -7993,13 +8500,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     global_auth_sync_parser.set_defaults(handler=cmd_global_auth_sync)
 
-    # #21895 phase-1 (sub-PR 1/4): the token-updater lease CONFIG surface. This
-    # sub-PR ships ONLY persistence + the status/--check probe — no lease
-    # client, rotator wiring, or daemon tick. Default-OFF: `status --check`
-    # reports OFF and nothing else changes until an operator both configures the
-    # feature (URL + SERVER_ID + secret) AND flips ENABLED.
+    # #21895 phase-1: the token-updater lease surface. Sub-PR 1 shipped the
+    # config foundation (`config`/`status` + the `status --check` probe);
+    # sub-PR 2 adds the Contract-A lease HTTP client verbs (`checkout`/
+    # `heartbeat`/`swap`/`checkin`) that emit the client's structured JSON — the
+    # bash daemon tick / rotator reach the client ONLY through these CLI verbs.
+    # Default-OFF: every verb (incl. the client ones) is a no-op until an
+    # operator both configures the feature (URL + SERVER_ID + secret) AND flips
+    # ENABLED. Sub-PR 2 wires NO rotator and NO daemon tick — those CALL the
+    # client (sub-PR 3/4).
     lease_parser = sub.add_parser("lease")
-    lease_parser.add_argument("action", choices=("config", "status"))
+    lease_parser.add_argument(
+        "action",
+        choices=("config", "status", "checkout", "heartbeat", "swap", "checkin"),
+    )
     lease_parser.add_argument("--json", action="store_true")
     lease_parser.add_argument(
         "--check",
@@ -8023,6 +8537,11 @@ def build_parser() -> argparse.ArgumentParser:
     # runtime-config JSON, never via `config set-env`.
     lease_parser.add_argument("--api-key-file", default=None)
     lease_parser.add_argument("--api-key-stdin", action="store_true")
+    # sub-PR 2 client-verb inputs. --service-token-id is the REMOTE lease id for
+    # swap(avoid)/checkin; omitted → read from the durable lease-state file. The
+    # secret is NEVER passed here (it stays in the 0600 file the client reads).
+    lease_parser.add_argument("--service-token-id", dest="service_token_id", default="")
+    lease_parser.add_argument("--timeout", type=float, default=None)
     lease_parser.set_defaults(handler=cmd_token_updater_lease)
 
     # Issue #1855: create-if-absent keychain-free settings backfill for a single

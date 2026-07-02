@@ -5823,6 +5823,19 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # later sub-PR (lease client / rotator / daemon tick) cannot regress the
       # default-OFF foundation.
       add_required token-updater-config
+      # #21895 phase-1 (sub-PR 2/4): bridge-auth.py/.sh host the token-updater
+      # lease CLIENT surface — the Contract-A HTTP client (checkout/heartbeat/
+      # swap/checkin via stdlib urllib), the durable 0600 lease-state file
+      # (read/write_token_updater_lease_state), the email->local casefold mapping
+      # (token_updater_map_account_to_local, operator-sourced + fail-closed), and
+      # the `lease {checkout,swap,checkin}` verbs. token-updater-lease-client pins
+      # the disabled/unconfigured no-op invariant (every client verb OFF, no
+      # lease-state write), the fail-closed mapping (missing/probe-only/ambiguous/
+      # empty), the 0600 lease-state round-trip, and each client method's happy +
+      # 404/409/transport path served from a NO-NETWORK fixture. Pull it on every
+      # auth move so a later sub-PR (rotator / daemon tick) cannot regress the
+      # client contract or the default-OFF foundation.
+      add_required token-updater-lease-client
       add_integration integration-minimal
       ;;
 
