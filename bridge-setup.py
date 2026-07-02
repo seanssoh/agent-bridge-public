@@ -2441,7 +2441,7 @@ def cmd_token_updater(args: argparse.Namespace) -> int:
 
     This is an install-level (operator-global) config, NOT an agent-scoped
     channel — so unlike the ms365/teams wizards it takes no `<agent>` and touches
-    no per-agent `.env`. Default-OFF: unless the operator both supplies the three
+    no per-agent dotenv file. Default-OFF: unless the operator both supplies the three
     values AND opts in with --enable, the lease feature stays disabled and
     nothing else changes.
     """
