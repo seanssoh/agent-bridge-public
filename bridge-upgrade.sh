@@ -643,6 +643,7 @@ bridge_upgrade_propagate_claude_hooks() {
       bridge_ensure_claude_session_start_hook "$workdir" "$launch_cmd" "$agent" >/dev/null 2>&1 || true
       bridge_ensure_claude_prompt_hook "$workdir" "$launch_cmd" "$agent" >/dev/null 2>&1 || true
       bridge_ensure_claude_prompt_guard_hook "$workdir" "$launch_cmd" "$agent" >/dev/null 2>&1 || true
+      bridge_ensure_claude_prompt_parallel_nudge_hook "$workdir" "$launch_cmd" "$agent" >/dev/null 2>&1 || true
       bridge_ensure_claude_tool_policy_hooks "$workdir" "$launch_cmd" "$agent" >/dev/null 2>&1 || true
       # Issue #1923: backfill the AskUserQuestion hard-ban into every existing
       # Claude agent on upgrade — including dynamic-vanilla agents created

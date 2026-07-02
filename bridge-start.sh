@@ -692,6 +692,9 @@ if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 ]]; then
   if ! bridge_ensure_claude_prompt_guard_hook "$WORK_DIR" "$AGENT_LAUNCH_CMD" "$AGENT" >/dev/null; then
     bridge_die "Claude prompt guard hook 설정에 실패했습니다: $WORK_DIR"
   fi
+  if ! bridge_ensure_claude_prompt_parallel_nudge_hook "$WORK_DIR" "$AGENT_LAUNCH_CMD" "$AGENT" >/dev/null; then
+    bridge_die "Claude parallel-nudge hook 설정에 실패했습니다: $WORK_DIR"
+  fi
   if ! bridge_ensure_claude_tool_policy_hooks "$WORK_DIR" "$AGENT_LAUNCH_CMD" "$AGENT" >/dev/null; then
     bridge_die "Claude tool policy hook 설정에 실패했습니다: $WORK_DIR"
   fi

@@ -627,6 +627,11 @@ def prompt_guard_hook_command(bridge_home: Path, python_bin: str) -> str:
     return shell_command(python_bin, shell_path(hook_path))
 
 
+def prompt_parallel_nudge_hook_command(bridge_home: Path, python_bin: str) -> str:
+    hook_path = _stable_hooks_dir(bridge_home) / "prompt-parallel-nudge.py"
+    return shell_command(python_bin, shell_path(hook_path))
+
+
 def tool_policy_hook_command(bridge_home: Path, python_bin: str) -> str:
     hook_path = _stable_hooks_dir(bridge_home) / "tool-policy.py"
     return shell_command(python_bin, shell_path(hook_path))
@@ -762,6 +767,10 @@ def is_prompt_timestamp_hook(command: str) -> bool:
 
 def is_prompt_guard_hook(command: str) -> bool:
     return "prompt-guard.py" in str(command)
+
+
+def is_prompt_parallel_nudge_hook(command: str) -> bool:
+    return "prompt-parallel-nudge.py" in str(command)
 
 
 def is_tool_policy_hook(command: str) -> bool:
@@ -1386,6 +1395,52 @@ def cmd_ensure_prompt_guard_hook(args: argparse.Namespace) -> int:
     print_payload(payload, args.format)
     if args.format != "shell":
         print("prompt_guard_hook: present")
+    return 0
+
+
+def cmd_status_prompt_parallel_nudge_hook(args: argparse.Namespace) -> int:
+    settings_path = resolve_settings_path(args)
+    settings = ensure_settings_root(settings_path)
+    prompt_hooks = hooks_list(settings, "UserPromptSubmit")
+    _group, hook = find_command_hook(prompt_hooks, is_prompt_parallel_nudge_hook)
+    command = str(hook.get("command") or "") if hook else ""
+    payload = {
+        "HOOK_SETTINGS_FILE": str(settings_path),
+        "HOOK_STATUS": "present" if hook else "missing",
+        "HOOK_STOP_HOOK": "",
+        "HOOK_PROMPT_HOOK": "present" if hook else "missing",
+        "HOOK_COMMAND": command,
+        "HOOK_ADDITIONAL_CONTEXT": "true" if hook and bool(hook.get("additionalContext")) else "false",
+    }
+    print_payload(payload, args.format)
+    if args.format != "shell":
+        print(f"prompt_parallel_nudge_hook: {'present' if hook else 'missing'}")
+    return 0 if hook else 1
+
+
+def cmd_ensure_prompt_parallel_nudge_hook(args: argparse.Namespace) -> int:
+    bridge_home = Path(args.bridge_home).expanduser()
+    settings_path = resolve_settings_path(args)
+    desired_command = prompt_parallel_nudge_hook_command(bridge_home, args.python_bin)
+    changed = ensure_command_hook(
+        settings_path,
+        "UserPromptSubmit",
+        desired_command,
+        is_prompt_parallel_nudge_hook,
+        timeout=3,
+        additional_context=True,
+    )
+    payload = {
+        "HOOK_SETTINGS_FILE": str(settings_path),
+        "HOOK_STATUS": "updated" if changed else "unchanged",
+        "HOOK_STOP_HOOK": "",
+        "HOOK_PROMPT_HOOK": "present",
+        "HOOK_COMMAND": desired_command,
+        "HOOK_ADDITIONAL_CONTEXT": "true",
+    }
+    print_payload(payload, args.format)
+    if args.format != "shell":
+        print("prompt_parallel_nudge_hook: present")
     return 0
 
 
@@ -4526,6 +4581,22 @@ def build_parser() -> argparse.ArgumentParser:
     status_prompt_guard_parser.add_argument("--python-bin", required=True)
     status_prompt_guard_parser.add_argument("--format", choices=("text", "shell"), default="text")
     status_prompt_guard_parser.set_defaults(handler=cmd_status_prompt_guard_hook)
+
+    ensure_prompt_parallel_nudge_parser = subparsers.add_parser("ensure-prompt-parallel-nudge-hook")
+    ensure_prompt_parallel_nudge_parser.add_argument("--workdir")
+    ensure_prompt_parallel_nudge_parser.add_argument("--settings-file")
+    ensure_prompt_parallel_nudge_parser.add_argument("--bridge-home", required=True)
+    ensure_prompt_parallel_nudge_parser.add_argument("--python-bin", required=True)
+    ensure_prompt_parallel_nudge_parser.add_argument("--format", choices=("text", "shell"), default="text")
+    ensure_prompt_parallel_nudge_parser.set_defaults(handler=cmd_ensure_prompt_parallel_nudge_hook)
+
+    status_prompt_parallel_nudge_parser = subparsers.add_parser("status-prompt-parallel-nudge-hook")
+    status_prompt_parallel_nudge_parser.add_argument("--workdir")
+    status_prompt_parallel_nudge_parser.add_argument("--settings-file")
+    status_prompt_parallel_nudge_parser.add_argument("--bridge-home", required=True)
+    status_prompt_parallel_nudge_parser.add_argument("--python-bin", required=True)
+    status_prompt_parallel_nudge_parser.add_argument("--format", choices=("text", "shell"), default="text")
+    status_prompt_parallel_nudge_parser.set_defaults(handler=cmd_status_prompt_parallel_nudge_hook)
 
     ensure_tool_policy_parser = subparsers.add_parser("ensure-tool-policy-hooks")
     ensure_tool_policy_parser.add_argument("--workdir")

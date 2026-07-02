@@ -8865,6 +8865,7 @@ bridge_daemon_reheal_missing_hook_files() {
         bridge_ensure_claude_session_start_hook "$workdir" "$launch_cmd" "$agent" >/dev/null 2>&1
         bridge_ensure_claude_prompt_hook "$workdir" "$launch_cmd" "$agent" >/dev/null 2>&1
         bridge_ensure_claude_prompt_guard_hook "$workdir" "$launch_cmd" "$agent" >/dev/null 2>&1
+        bridge_ensure_claude_prompt_parallel_nudge_hook "$workdir" "$launch_cmd" "$agent" >/dev/null 2>&1
         bridge_ensure_claude_tool_policy_hooks "$workdir" "$launch_cmd" "$agent" >/dev/null 2>&1
         bridge_ensure_claude_pre_compact_hook "$workdir" "$launch_cmd" "$agent" >/dev/null 2>&1
         bridge_ensure_claude_askuserquestion_ban "$workdir" "$launch_cmd" "$agent" >/dev/null 2>&1

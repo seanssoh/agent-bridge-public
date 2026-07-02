@@ -929,6 +929,25 @@ bridge_ensure_claude_prompt_guard_hook() {
   fi
 }
 
+# Claude-only per-turn parallel-dispatch nudge (UserPromptSubmit
+# additionalContext). Reminds the main session to consider parallel Claude
+# Agent(run_in_background) dispatch for independent, non-conflicting work,
+# pointing at the COMMON-INSTRUCTIONS.md SSOT rather than duplicating policy.
+# Same shared/local routing as bridge_ensure_claude_prompt_guard_hook. Never
+# wired into any Codex hook path.
+bridge_ensure_claude_prompt_parallel_nudge_hook() {
+  local workdir="$1"
+  local launch_cmd="${2-}"
+  local agent="${3-}"
+  if [[ "$(bridge_claude_settings_mode "$workdir")" == "shared" ]]; then
+    bridge_hooks_python ensure-prompt-parallel-nudge-hook --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)" >/dev/null
+    bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd" "$agent"
+  else
+    local -a _ta=(); bridge_claude_local_hook_target_args "$workdir" _ta "$agent" || return 1
+    bridge_hooks_python ensure-prompt-parallel-nudge-hook "${_ta[@]}" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)"
+  fi
+}
+
 bridge_ensure_claude_tool_policy_hooks() {
   local workdir="$1"
   local launch_cmd="${2-}"
