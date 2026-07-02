@@ -4132,7 +4132,18 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # GIT_*/wrapper/-S/-C/--chdir/--git-dir/-C-primary/function-redef/symlink/
       # cd-primary/obfuscation DENY; shared-repo verbs DENY) or weaken the
       # structural operator exemption (cwd-derived, over-block 0).
-      add_required hooks agent-update v2-cross-class-read admin-hook-exemption tool-policy-roster-read-classify 1205-hook-iso-fail-open 6607-hook-admin-allowlist K-beta4-nits 1358-admin-credential-routine-exempt 1367-auth-sealed-paste 1442-config-protected-globs-v2 1569-askuserquestion-bound 1690-tasksdb-read-carveout 1692-admin-bash-symmetry 1709-shared-secret-suffix-guard 1693-read-viewers v0166-lc-config-set-env 1786-tasksdb-doctor-verb 1806-admin-guard-allow-audit 1823-v2-peer-home-containment 1738-config-caller-binding 19146-bash-git-primary-checkout-guard
+      # Issue #2163 (SECURITY): hooks/tool-policy.py's interim indirection gate
+      # (_config_mutation_via_indirection) now also denies an AUTH-TOKEN mutation
+      # (auth claude-token add/activate/sync/rotate, global-auth-sync
+      # enable|disable) hidden behind eval / a `-c` shell (the FULL
+      # _BASH_GIT_INTERPRETER_LEAVES set — C6) / an unresolved $var, symmetric
+      # with the #1738 config gate; and _bridge_home_is_test_temp now inspects
+      # BRIDGE_HOME PLUS every runtime-identity anchor (F3 split-root spoof).
+      # Pull the 2163 unit smoke whenever tool-policy.py moves so a future PR
+      # cannot regress the auth-token indirection DENY, the read-only
+      # global-auth-sync status ALLOW (C4a), the F3 all-env predicate, or the
+      # audit-row token redaction.
+      add_required hooks agent-update v2-cross-class-read admin-hook-exemption tool-policy-roster-read-classify 1205-hook-iso-fail-open 6607-hook-admin-allowlist K-beta4-nits 1358-admin-credential-routine-exempt 1367-auth-sealed-paste 1442-config-protected-globs-v2 1569-askuserquestion-bound 1690-tasksdb-read-carveout 1692-admin-bash-symmetry 1709-shared-secret-suffix-guard 1693-read-viewers v0166-lc-config-set-env 1786-tasksdb-doctor-verb 1806-admin-guard-allow-audit 1823-v2-peer-home-containment 1738-config-caller-binding 19146-bash-git-primary-checkout-guard 2163-config-authtoken-indirection
       # Issue #1497 (P2): lib/system_config_paths.py::bridge_home_dir() now
       # delegates to lib/operator_home.py::operator_home() (the operator-home
       # SSOT). Pull 1497-p2-operator-home so a change to this module or the
