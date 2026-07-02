@@ -104,9 +104,23 @@ grep -q 'bridge_daemon_token_lease_checkin_on_exit' "$DAEMON_SRC" \
 lifecycle_trap_count="$(grep -cE "trap[[:space:]]+'_bridge_daemon_on_exit'[[:space:]]+EXIT" "$DAEMON_SRC" || true)"
 [[ "$lifecycle_trap_count" == "1" ]] \
   || smoke_fail "expected exactly one '_bridge_daemon_on_exit' EXIT trap, found $lifecycle_trap_count (a competing trap would drop pid-file cleanup)"
-awk '/^_bridge_daemon_on_exit\(\) \{/,/^}/' "$DAEMON_SRC" \
-  | grep -q 'bridge_daemon_token_lease_checkin_on_exit' \
-  || smoke_fail "check-in must be folded INTO _bridge_daemon_on_exit, not a separate trap"
+if ! awk '/^_bridge_daemon_on_exit\(\) \{/,/^}/' "$DAEMON_SRC" \
+  | grep -q 'bridge_daemon_token_lease_checkin_on_exit'; then
+  # Diagnostic: a structural assertion that fails should show what it read, so a
+  # future failure is diagnosable instead of mysterious. Prints the source path,
+  # a content hash, the function/check-in line anchors, the awk-range tail, and —
+  # critically — whether the working-tree bridge-daemon.sh differs from HEAD (a
+  # prior smoke in the same shard mutating the shared checkout would show here).
+  {
+    echo "[DIAG token-tick] DAEMON_SRC=$DAEMON_SRC"
+    echo "[DIAG token-tick] md5=$(md5sum "$DAEMON_SRC" 2>/dev/null | cut -d' ' -f1 || md5 -q "$DAEMON_SRC" 2>/dev/null) wc_l=$(wc -l < "$DAEMON_SRC" 2>/dev/null)"
+    echo "[DIAG token-tick] anchors _bridge_daemon_on_exit:"; grep -n '^_bridge_daemon_on_exit() {' "$DAEMON_SRC" 2>/dev/null | head
+    echo "[DIAG token-tick] anchors checkin_on_exit:"; grep -n 'bridge_daemon_token_lease_checkin_on_exit' "$DAEMON_SRC" 2>/dev/null | head
+    echo "[DIAG token-tick] awk-range last 6 lines:"; awk '/^_bridge_daemon_on_exit\(\) \{/,/^}/' "$DAEMON_SRC" 2>/dev/null | tail -6
+    echo "[DIAG token-tick] working-tree vs HEAD:"; git -C "$SMOKE_REPO_ROOT" status --porcelain -- bridge-daemon.sh 2>/dev/null; git -C "$SMOKE_REPO_ROOT" diff --stat HEAD -- bridge-daemon.sh 2>/dev/null | head
+  } >&2
+  smoke_fail "check-in must be folded INTO _bridge_daemon_on_exit, not a separate trap"
+fi
 
 # Shim dir: the function bodies find bridge-auth.sh + bridge-daemon-helpers.py
 # via "$SCRIPT_DIR/...", so we point SCRIPT_DIR (in the driver) at this dir.
