@@ -5904,6 +5904,25 @@ def _config_mutation_via_indirection(text: str) -> str | None:
     class as the `ad[d]` glob spelling — this hook is defense-in-depth over the
     wrapper gate, not the sole close criterion. A follow-up (#2163b) may widen to
     stdin-fed forms if the redirect-stripping design is revisited.
+
+    Interpreter command-flag boundary (documented residual, #2163 codex r3-r6,
+    Sean operator decision 2026-07-02 — option C: stop static-hardening here).
+    `_interpreter_payload_command_str` recognizes the DOCUMENTED command-string
+    flags of the POSIX `-c` shells in the declared interpreter set — the `-c`/`+c`
+    family (any `{-,+}`-prefixed c-bearing option, at any post-flag option position,
+    via a fail-closed operand join) plus the `eval`/`xargs` positional forms. fish's
+    plain `-c` is caught by that same POSIX path (identical spelling). fish's
+    NON-`-c` command-eval spellings (`--command`/`-C`/`--init-command`/`--init-cmd`
+    and other documented long/alias forms), and any genuinely novel or future
+    per-interpreter command-string grammar, are an ACCEPTED RESIDUAL under the same
+    containment-not-sandbox threat model as #2159: this layer catches
+    ACCIDENTAL/opportunistic verb-hiding, not a shell-lawyer's deliberate multi-step
+    evasion. The wrapper's own process-ancestry trust gate is the AUTHORITATIVE
+    control regardless of launch shape — it governs the child `agb`/`agent-bridge`
+    process identically whether spawned via fish, bash, or any interpreter. Extend
+    this set (with a smoke row) only when a real interpreter's documented grammar is
+    shown to enable accidental indirection in practice, rather than chasing each
+    per-shell spelling as a fresh close-blocker.
     """
     joined = text.replace("\\\r\n", "").replace("\\\n", "")
     for stage in _COMMAND_OPERATOR_RE.split(joined):
