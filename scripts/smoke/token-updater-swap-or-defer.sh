@@ -365,6 +365,36 @@ print("ok")
   smoke_assert_eq "ok" "$out" "H13 do_swap forwards lease-state service_token_id as the swap avoid"
 }
 
+# ── H14 (codex #2248 finding 3) — swapped path PERSISTS the new lease-state ────
+# Contract B activates the swapped local token but must ALSO record the NEW remote
+# lease into the durable lease-state. WITHOUT it the lease-state still records the
+# pre-swap svc-old/tok-a, so the Sub-PR 4 daemon tick reads active_token_id (now
+# tok-b) != lease.local_token_id (stale tok-a) as mapping-drift and re-checks-out —
+# stranding the just-swapped lease unheartbeated until TTL. Seed a STALE lease-
+# state, swap, then assert it advanced to svc-new/tok-b (matching the registry
+# active → no drift) and that the swap secret never persisted.
+test_swapped_persists_lease_state() {
+  seed_registry
+  enable_lease
+  local lease_state="$BRIDGE_RUNTIME_SECRETS_DIR/token-updater-lease.json" out
+  # Seed the STALE pre-swap lease-state (svc-old / tok-a).
+  printf '%s' '{"service_token_id":"svc-old","account_email":"a@example.com","local_token_id":"tok-a","lease_expires_at":1,"last_heartbeat_at":1}' >"$lease_state"
+  chmod 600 "$lease_state"
+  out="$(BRIDGE_TOKEN_UPDATER_SWAP_FIXTURE='{"status":"ok","service_token_id":"svc-new","account_email":"b@example.com","lease_expires_at":1751999999,"secret_material":"SWAP-SECRET-MUST-NOT-PERSIST"}' \
+         BRIDGE_TOKEN_UPDATER_MAP_FIXTURE='{"status":"ok","local_token_id":"tok-b"}' \
+         swap_or_defer usage_monitor)"
+  smoke_assert_eq "swapped" "$(printf '%s' "$out" | jfield action)" "H14 action=swapped"
+  smoke_assert_eq "tok-b" "$(registry_active)" "H14 registry active advanced to tok-b"
+  # THE BINDING: the durable lease-state now records the NEW lease (not the stale one)
+  # so the daemon tick heartbeats it instead of re-checking-out (finding 3).
+  smoke_assert_eq "svc-new" "$(jfield service_token_id <"$lease_state")" "H14 lease-state service_token_id advanced to svc-new (no strand)"
+  smoke_assert_eq "tok-b" "$(jfield local_token_id <"$lease_state")" "H14 lease-state local_token_id advanced to tok-b (== registry active → no drift)"
+  smoke_assert_eq "b@example.com" "$(jfield account_email <"$lease_state")" "H14 lease-state account_email updated"
+  # SECRET NEVER PERSISTED: secret_material absent from the durable lease-state file.
+  smoke_assert_not_contains "$(cat "$lease_state")" "SWAP-SECRET-MUST-NOT-PERSIST" "H14 secret_material NOT persisted to lease-state"
+  smoke_assert_not_contains "$(cat "$lease_state")" "secret_material" "H14 no secret_material key in lease-state"
+}
+
 # ── W — the PRODUCTION path: the bridge-auth.sh WRAPPER dispatches the verb ───
 # Every rotator calls `bash bridge-auth.sh claude-token lease-swap-or-defer …`,
 # NOT bridge-auth.py directly. If the wrapper's claude-token case lacks the arm,
@@ -687,6 +717,7 @@ smoke_run "H11 REAL 2-arg mapper reachable un-fixtured → swapped (codex f1)"  
 smoke_run "H12a auto-rotate OFF + --if-auto-enabled → defer_local (codex f2)"     test_auto_rotate_gate_blocks_swap
 smoke_run "H12b auto-rotate gate is opt-in (no flag → still swaps)"               test_auto_rotate_gate_opt_in
 smoke_run "H13 swap forwards lease-state service_token_id as avoid (codex f3)"    test_swap_forwards_avoid
+smoke_run "H14 swapped path PERSISTS new lease-state, secret NOT persisted (#2248 f3)" test_swapped_persists_lease_state
 smoke_run "W  wrapper (bridge-auth.sh) dispatches the verb → swapped + advance"   test_wrapper_dispatches_swapped
 smoke_run "W  wrapper 409 → suppress_cooldown (fleet-safe, PRODUCTION path)"      test_wrapper_dispatches_suppress
 smoke_run "W  wrapper unknown flag fails closed (rc=2)"                           test_wrapper_unknown_flag_fails_closed

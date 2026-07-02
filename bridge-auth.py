@@ -4626,6 +4626,30 @@ def token_updater_lease_swap_or_defer(
         # logged/audited by every rotator.
         return _defer(f"activate_error:{type(exc).__name__}")
 
+    # Bind Contract B → Contract C (codex #2248 finding 3): persist the just-swapped
+    # lease into the durable lease-state so the Sub-PR 4 daemon tick's `lease status`
+    # reflects the NEW held lease (service_token_id=svc-new, local_token_id=the row
+    # just activated). WITHOUT this the lease-state still records the pre-swap
+    # svc-old/tok-a, so the tick reads active_token_id (now tok-b) != lease
+    # local_token_id (stale tok-a) as mapping-drift and re-checks-out — stranding
+    # the just-swapped lease unheartbeated until its TTL. Secret-free: only the
+    # allowlisted non-secret keys are written (never secret_material); local_token_id
+    # is the authoritative id activated under the registry lock above. Best-effort —
+    # a persist failure must NOT fail the swap (the lease TTL + next tick are the
+    # correctness backstop, identical to the CLI verb persist path).
+    try:
+        write_token_updater_lease_state(
+            {
+                "service_token_id": str(swap_result.get("service_token_id") or ""),
+                "account_email": account_email,
+                "local_token_id": local_token_id,
+                "lease_expires_at": swap_result.get("lease_expires_at"),
+                "last_heartbeat_at": now_iso(),
+            }
+        )
+    except Exception:  # noqa: BLE001 - lease-state persist is best-effort (TTL is the backstop)
+        pass
+
     # SECURITY (patch Phase-5 note on Sub-PR 2): the Contract-A ``swap()`` response
     # may carry ``secret_material`` (the new token's actual secret) on its JSON
     # stdout. It stays in-process ONLY — the secret is activated through the
