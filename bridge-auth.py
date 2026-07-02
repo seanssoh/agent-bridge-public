@@ -3774,7 +3774,7 @@ def write_token_updater_secret(api_key: str) -> tuple[Path | None, str]:
     if path is None:
         return None, "no_secret_path (set BRIDGE_RUNTIME_SECRETS_DIR, BRIDGE_RUNTIME_ROOT, or BRIDGE_HOME)"
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only - controller secret-dir create
         os.chmod(path.parent, 0o700)
         # The payload is the raw key text with a single trailing newline; the
         # reader rstrips CR/LF, so this round-trips exactly.
