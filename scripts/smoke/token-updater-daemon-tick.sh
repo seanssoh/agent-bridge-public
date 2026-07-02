@@ -127,7 +127,7 @@ cp "$FIXTURE_DIR/driver.sh" "$DRIVER"
 chmod +x "$DRIVER"
 
 AUDIT_FILE="$SMOKE_TMP_ROOT/audit.log"
-LEASE_SHIM_STATE="$SMOKE_TMP_ROOT/lease-shim-state.env"
+LEASE_SHIM_STATE="$SMOKE_TMP_ROOT/lease-shim-state.env"  # noqa: iso-helper-boundary - controller-only smoke temp fixture filename, not a cross-agent .env read
 LEASE_SHIM_CALLS="$SMOKE_TMP_ROOT/lease-shim-calls.log"
 : >"$AUDIT_FILE"
 : >"$LEASE_SHIM_STATE"
