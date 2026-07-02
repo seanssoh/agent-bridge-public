@@ -1846,6 +1846,53 @@ def reactive_rotation_enabled() -> bool:
     return env_truthy(os.environ.get("BRIDGE_CRON_REACTIVE_ROTATION", "1"))  # noqa: iso-helper-boundary — plain env read (os.environ), not a .env file
 
 
+def token_updater_lease_enabled() -> bool:
+    """#21895 sub-PR 3: is the token-updater lease EFFECTIVELY enabled?
+
+    Reuses the single python predicate via `claude-token lease status --check`
+    (exit 0 iff persisted-enabled AND fully configured). rc!=0 / any failure →
+    False, so a DISABLED / unconfigured install NEVER routes through the lease
+    helper and the existing local rotate runs byte-for-byte unchanged."""
+    try:
+        completed = _run_token_cli(["lease", "status", "--check"], timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0
+
+
+def _lease_swap_or_defer(*, reason: str, limited_until: str) -> dict[str, Any]:
+    """#21895 sub-PR 3: run the shared lease swap-or-defer verb, return its decision.
+
+    Emits the same rotate-shaped envelope the local rotate does on a `swapped`
+    (status=rotated + old/new active id) or `suppress_cooldown`
+    (status=skipped/all_tokens_limited), so the caller's existing advancement +
+    skip handling reads it unchanged. Any failure degrades to a `defer_local`
+    decision so the caller falls back to its EXISTING local rotate."""
+    args = [
+        "lease-swap-or-defer",
+        "--caller",
+        "cron_reactive",
+        "--sync",
+        # Parity with the fallback local rotate (which passes --if-auto-enabled):
+        # the lease path must honor the operator's auto-rotate switch (codex
+        # #2250 f2) instead of swapping past an OFF gate.
+        "--if-auto-enabled",
+        "--reason",
+        reason,
+        "--json",
+    ]
+    if limited_until:
+        args += ["--limited-until", limited_until]
+    try:
+        completed = _run_token_cli(args, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return {"action": "defer_local", "reason": "lease_swap_subprocess_error"}
+    decision = _parse_json_stdout(completed.stdout)
+    if str(decision.get("action") or "") not in ("swapped", "defer_local", "suppress_cooldown"):
+        return {"action": "defer_local", "reason": "lease_swap_bad_decision"}
+    return decision
+
+
 def env_truthy(value: str | None) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -2110,28 +2157,50 @@ def maybe_reactive_rotate(
     # ROTATE FIRST. `rotate --if-auto-enabled` is a no-op (status=skipped) when
     # auto-rotate is disabled OR there is no enabled alternate — in which case
     # we leave the quota-hit token as-is and DO NOT re-dispatch (fail normally).
-    rotate_args = [
-        "rotate",
-        "--if-auto-enabled",
-        "--sync",
-        "--agents",
-        "all",
-        "--reason",
-        "cron_reactive_quota",
-        "--json",
-    ]
-    # #17927: stamp the rotating-away token's real reset window (parity with
-    # the proactive daemon usage-monitor rotate at bridge-daemon.sh) so the
-    # vacated token carries `limited_until` even if the follow-up `mark-quota`
-    # disable fails, and recovery stays clock-authoritative.
-    if summary["reset_at"]:
-        rotate_args += ["--limited-until", summary["reset_at"]]
-    try:
-        rotate_completed = _run_token_cli(rotate_args, timeout=120)
-    except (OSError, subprocess.SubprocessError) as exc:
-        summary["rotate_error"] = f"{exc!r}"
-        return summary
-    rotate_payload = _parse_json_stdout(rotate_completed.stdout)
+    #
+    # #21895 sub-PR 3: when the token-updater lease is ENABLED the rotate decision
+    # is authoritative REMOTE — route through the shared swap-or-defer helper. Its
+    # `swapped` / `suppress_cooldown` decision carries a rotate-shaped envelope the
+    # advancement + skip handling below reads byte-identically to a local rotate;
+    # a `defer_local` (disabled/degraded/mapping-ambiguous/break-glass) falls
+    # through to the EXISTING local rotate unchanged. The lease swap converges the
+    # operator-global credential inline (`--sync`); the daemon's periodic token
+    # sync re-propagates to agents the same way it backstops a missed `--agents
+    # all` pass, so `agents_synced` tracks the swap verb's exit code.
+    lease_routed = False
+    rotate_completed = None
+    rotate_payload: dict[str, Any] = {}
+    if token_updater_lease_enabled():
+        decision = _lease_swap_or_defer(
+            reason="cron_reactive_quota",
+            limited_until=str(summary["reset_at"] or ""),
+        )
+        if str(decision.get("action") or "") != "defer_local":
+            lease_routed = True
+            rotate_payload = decision
+    if not lease_routed:
+        rotate_args = [
+            "rotate",
+            "--if-auto-enabled",
+            "--sync",
+            "--agents",
+            "all",
+            "--reason",
+            "cron_reactive_quota",
+            "--json",
+        ]
+        # #17927: stamp the rotating-away token's real reset window (parity with
+        # the proactive daemon usage-monitor rotate at bridge-daemon.sh) so the
+        # vacated token carries `limited_until` even if the follow-up `mark-quota`
+        # disable fails, and recovery stays clock-authoritative.
+        if summary["reset_at"]:
+            rotate_args += ["--limited-until", summary["reset_at"]]
+        try:
+            rotate_completed = _run_token_cli(rotate_args, timeout=120)
+        except (OSError, subprocess.SubprocessError) as exc:
+            summary["rotate_error"] = f"{exc!r}"
+            return summary
+        rotate_payload = _parse_json_stdout(rotate_completed.stdout)
     rotate_status = str(rotate_payload.get("status") or "")
     # Advancement is judged SOLELY from the rotate payload's own ids — the
     # payload is the authoritative record of what the registry actually did.
@@ -2179,9 +2248,18 @@ def maybe_reactive_rotate(
     # retire the old token + emit the rotation audit (the registry IS rotated;
     # the daemon's periodic token sync re-propagates to any agent the inline
     # `--agents all` pass missed).
-    sync_ok = rotate_completed.returncode == 0
+    #
+    # #21895 sub-PR 3: a lease-routed swap converged the operator-global
+    # credential inline and the swap verb exits 0 (its decision is in the
+    # payload). There is no `--agents all` fanout on the swap path; the daemon's
+    # periodic token sync re-propagates to agents, exactly as it backstops a
+    # missed `--agents all` pass. Track sync from the swap verb's exit code.
+    if lease_routed:
+        sync_ok = rotate_completed is None or rotate_completed.returncode == 0
+    else:
+        sync_ok = rotate_completed.returncode == 0
     summary["agents_synced"] = sync_ok
-    if not sync_ok:
+    if not sync_ok and rotate_completed is not None:
         summary["sync_rc"] = rotate_completed.returncode
 
     # THEN deterministically retire the vacated quota-hit token (we proved

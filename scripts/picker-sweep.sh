@@ -510,9 +510,58 @@ _psw_release_rotation_lock() {
     rm -rf "$lock_dir" 2>/dev/null || true
 }
 
+# #21895 sub-PR 3: is the token-updater lease EFFECTIVELY enabled? Cheap
+# exit-code-only probe reusing the single python predicate (`lease status
+# --check` exits 0 iff persisted-enabled AND fully configured). rc!=0 → treat as
+# disabled so the picker rotate stays byte-for-byte its existing local rotate.
+# shellcheck disable=SC2329 # invoked below by _psw_default_rotate_claude_token (itself seam-dispatched via $_PSW_*_FN)
+_psw_token_updater_lease_enabled() {
+    bash "$BRIDGE_HOME/bridge-auth.sh" claude-token lease status --check >/dev/null 2>&1
+}
+
+# #21895 sub-PR 3: extract the swap-or-defer decision action, falling open to
+# `defer_local` on any parse failure so a garbled decision never suppresses the
+# safe local fallback. Reuses the same helper the daemon route uses.
+# shellcheck disable=SC2329 # invoked below by _psw_default_rotate_claude_token (itself seam-dispatched via $_PSW_*_FN)
+_psw_lease_decision_action() {
+    local decision_json="$1" action=""
+    action="$(python3 "$BRIDGE_HOME/bridge-daemon-helpers.py" lease-decision-parse "$decision_json" 2>/dev/null || true)"
+    action="${action%$'\n'}"
+    case "$action" in
+        swapped|suppress_cooldown) printf '%s' "$action" ;;
+        *) printf 'defer_local' ;;
+    esac
+}
+
+# shellcheck disable=SC2329 # invoked indirectly via $_PSW_ROTATE_CLAUDE_TOKEN_FN below
 _psw_default_rotate_claude_token() {
     local agent="$1"
     local scope="${BRIDGE_PICKER_SWEEP_TOKEN_ROTATE_AGENTS:-${BRIDGE_CLAUDE_TOKEN_SYNC_AGENTS:-static}}"
+
+    # #21895 sub-PR 3: the SHARED reactive-429 path also fires from picker-sweep.
+    # When the token-updater lease is ENABLED, route the rotate decision through
+    # the shared swap-or-defer authority (same helper the daemon reactive-429 path
+    # uses) so a picker-driven rate-limit event honors the remote lease instead of
+    # blindly local-rotating. swapped/suppress_cooldown → the swap verb emits a
+    # rotate-shaped envelope (printed as this function's output); defer_local →
+    # fall through to the EXISTING local rotate below. DISABLED ⇒ this gate is a
+    # cheap no-op and the local rotate runs byte-for-byte unchanged. The picker's
+    # existing shared reactive-rotate cooldown de-dup (bridge_reactive_rotate_*)
+    # in the sweep loop is untouched.
+    if _psw_token_updater_lease_enabled; then
+        local decision_json="" action=""
+        decision_json="$(bash "$BRIDGE_HOME/bridge-auth.sh" claude-token lease-swap-or-defer \
+            --caller picker_sweep \
+            --sync \
+            --if-auto-enabled \
+            --reason "picker-sweep-rate-limit:${agent}" \
+            --json 2>/dev/null || true)"
+        action="$(_psw_lease_decision_action "$decision_json")"
+        if [[ "$action" != "defer_local" ]]; then
+            printf '%s' "$decision_json"
+            return 0
+        fi
+    fi
 
     # Match the daemon's preflighted rotation contract (bridge-daemon.sh usage
     # pass): WITHOUT --preflight this picker-driven rotate can hand the active

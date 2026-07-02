@@ -165,6 +165,12 @@ build_recover_env() {
     # directly); the recover C-cases pass scope=static, so a static fixture is
     # deterministic. AGB_FIXTURE_STATIC=0 lets a caller flip it for a negative.
     printf '%s\n' 'bridge_agent_is_static() { [[ "${AGB_FIXTURE_STATIC:-1}" == "1" ]]; }'
+    # #21895 sub-PR 3: the active-dead recover rotate now routes through the shared
+    # lease swap-or-defer helper first. These C-cases exercise the DISABLED/local-
+    # rotate path (no token-updater lease configured), so the stub returns
+    # `defer_local` (lease OFF) → the extracted recover fn falls through to its
+    # EXISTING local rotate, byte-for-byte the pre-lease behavior under test.
+    printf '%s\n' 'bridge_daemon_lease_swap_route() { BRIDGE_LEASE_ROUTE_DECISION="defer_local"; BRIDGE_LEASE_ROUTE_ENVELOPE=""; return 0; }'
     printf '%s\n' ''
     # Real in-process deps (pure / state-file-bounded) extracted verbatim.
     extract_fn bridge_claude_pool_exhausted_state_file

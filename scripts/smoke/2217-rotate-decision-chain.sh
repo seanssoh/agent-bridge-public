@@ -143,6 +143,17 @@ bridge_agent_has_notify_transport() { return 0; }
 bridge_notify_send() { NOTIFY_LEDGER+="sent "; }
 # shellcheck disable=SC2329
 bridge_agent_is_static() { [[ "$1" == static-* ]]; }
+# #21895 sub-PR 3: the reactive-429 rotate now routes through the shared lease
+# swap-or-defer helper first. This chain smoke exercises the DISABLED/local-rotate
+# path (no token-updater lease configured), so the stub returns `defer_local`
+# (lease OFF) → the extracted reactive fn falls through to its EXISTING local
+# rotate, byte-for-byte the pre-lease chain behavior under test.
+# shellcheck disable=SC2329
+bridge_daemon_lease_swap_route() {
+  BRIDGE_LEASE_ROUTE_DECISION="defer_local"
+  BRIDGE_LEASE_ROUTE_ENVELOPE=""
+  return 0
+}
 
 reset_reactive() {
   printf '0' >"$ROTATE_COUNT_FILE"
