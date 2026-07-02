@@ -831,6 +831,17 @@ _bridge_daemon_on_exit() {
 
   bridge_stop_queue_gateway_socket_listener >/dev/null 2>&1 || true
 
+  # #21895 phase-1 (sub-PR 4/4): best-effort token-updater lease check-in on a
+  # clean shutdown so a fleet peer can re-acquire the leased token immediately
+  # instead of waiting out the 15-min TTL. FOLDED into this single existing
+  # EXIT trap (never a competing `trap … EXIT`, which bash would silently
+  # replace, dropping the pid-file cleanup + telemetry below). Guarded fail-open
+  # + timeout-bounded internally: a no-op when the lease is disabled, and it can
+  # never wedge shutdown — the TTL is the correctness backstop if it fails.
+  if command -v bridge_daemon_token_lease_checkin_on_exit >/dev/null 2>&1; then
+    bridge_daemon_token_lease_checkin_on_exit >/dev/null 2>&1 || true
+  fi
+
   ts="$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || echo unknown)"
   mkdir -p "$BRIDGE_STATE_DIR" 2>/dev/null || true
   printf '[%s] [info] daemon exit pid=%d ec=%d sig=%s last_step=%s err_location=%s\n' \
@@ -3036,6 +3047,245 @@ bridge_daemon_global_auth_sync_tick() {
     2>/dev/null || true
   daemon_warn "operator-global auth sync failed (bridge-auth.sh exited non-zero; see audit log)"
   return 1
+}
+
+# ─────────────────────────────────────────────────────────────────────
+# Token-updater lease lifecycle tick (#21895 phase-1, sub-PR 4/4).
+#
+# When the operator has configured AND enabled the token-updater lease
+# (Contract A, sub-PR 1 config surface + sub-PR 2 client), a central
+# token-updater service leases a per-account Claude token to this host for a
+# bounded TTL (15 min in the agreed design). This daemon tick is the lease
+# LIFECYCLE owner: it keeps the lease alive (heartbeat) and re-acquires it
+# (checkout) whenever the current lease is gone or no longer maps to the
+# active local token. The tick runs on BRIDGE_USAGE_MONITOR_INTERVAL_SECONDS
+# (default 300s) so a heartbeat lands comfortably inside the 15-min TTL.
+#
+# HARD default-OFF invariant: with the feature unconfigured/disabled the
+# cheap `lease status --check` probe below exits non-zero and the tick
+# returns immediately WITHOUT any subprocess spawn, audit row, or state-file
+# write — the daemon's behavior is byte-for-byte unchanged. This mirrors the
+# global-auth-sync tick's opt-in early-skip and reuses the SAME single python
+# predicate (bridge-auth.py token_updater_lease_enabled) so the bash skip can
+# never drift looser or tighter than the authoritative gate.
+#
+# Re-checkout triggers (codex Q5), evaluated by the daemon (NOT hidden in a
+# subprocess) so the decision stays legible and auditable:
+#   * no live lease recorded in the durable lease-state file, OR
+#   * lease_expires_at has passed relative to the daemon's wall clock, OR
+#   * active/local mapping drift — the registry's active_token_id no longer
+#     equals the lease-state local_token_id (a DIFFERENT local row is active
+#     than the one the lease was bound to; codex Q1), OR
+#   * a heartbeat that returns HTTP 404 (lease gone) / 409 (bound elsewhere).
+# Otherwise the tick heartbeats the existing lease and continues.
+#
+# All secret material stays in the 0600 lease-state file managed by
+# bridge-auth.py; this tick only ever sees NON-secret ids (service/local
+# token ids) for audit. NO heredoc-stdin (bridge-daemon.sh footgun #11
+# ceiling is 0): the JSON envelopes are parsed via bridge-daemon-helpers.py.
+bridge_daemon_token_lease_state_file() {
+  printf '%s/daemon/last-token-lease-tick' "$BRIDGE_STATE_DIR"
+}
+
+bridge_daemon_token_lease_due() {
+  local interval="${BRIDGE_USAGE_MONITOR_INTERVAL_SECONDS:-300}"
+  local file=""
+  local last_ts=0
+  local now=0
+  local elapsed=0
+
+  [[ "$interval" =~ ^[0-9]+$ ]] || interval=300
+  # Interval 0 == disabled. Treat as never-due so the tick is a no-op.
+  (( interval > 0 )) || return 1
+  file="$(bridge_daemon_token_lease_state_file)"
+  # First-call case: no state file yet — fire immediately so a freshly-started
+  # daemon does not wait a full interval before establishing the lease.
+  [[ -f "$file" ]] || return 0
+  last_ts="$(tr -dc '0-9' < "$file" 2>/dev/null || printf '0')"
+  [[ -n "$last_ts" ]] || last_ts=0
+  now="$(date +%s)"
+  elapsed=$(( now - last_ts ))
+  (( elapsed >= interval ))
+}
+
+# Perform a lease checkout and audit the outcome. Sets the module-scoped
+# variable named by $1 to the resulting status string (best-effort). Returns
+# 0 on a checkout that reported status=ok, 1 otherwise.
+bridge_daemon_token_lease_checkout() {
+  local out_var="$1"
+  local trigger="$2"
+  local target="${BRIDGE_ADMIN_AGENT_ID:-daemon}"
+  local checkout_json=""
+  local status=""
+
+  if checkout_json="$(bridge_with_timeout 15 daemon_token_lease_checkout "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token lease checkout --json 2>/dev/null)"; then
+    status="$(bridge_with_timeout 5 lease_checkout_status_parse python3 \
+      "$SCRIPT_DIR/bridge-daemon-helpers.py" sync-status-parse "$checkout_json" \
+      2>/dev/null || printf '')"
+  fi
+  status="${status:-failed}"
+  printf -v "$out_var" '%s' "$status"
+  bridge_audit_log daemon claude_token_lease_checkout "$target" \
+    --detail status="$status" \
+    --detail trigger="$trigger" \
+    2>/dev/null || true
+  [[ "$status" == "ok" ]]
+}
+
+bridge_daemon_token_lease_tick() {
+  local trigger="${1:-periodic}"
+  local target="${BRIDGE_ADMIN_AGENT_ID:-daemon}"
+  local interval="${BRIDGE_USAGE_MONITOR_INTERVAL_SECONDS:-300}"
+  local file=""
+  local now=0
+  local status_json=""
+  local status_row=""
+  local configured="0" has_lease="0" lease_expires_at="-"
+  local local_token_id="-" active_token_id="-" service_token_id="-"
+  local checkout_status=""
+  local heartbeat_json="" hb_row="" hb_status="" hb_http="-"
+
+  # Default-OFF opt-in early skip. `lease status --check` exits 0 iff the
+  # token-updater lease is EFFECTIVELY enabled (persisted token_updater_enabled
+  # AND fully configured: URL + SERVER_ID + a 0600 API-key secret) — the SINGLE
+  # python predicate (bridge-auth.py token_updater_lease_enabled). Reusing it
+  # keeps the cheap bash skip from ever drifting from the authoritative gate; a
+  # check failure/timeout fails safe to skip (the next tick retries).
+  bridge_with_timeout 5 token_updater_lease_optin_check \
+    "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token \
+    lease status --check >/dev/null 2>&1 || return 1
+
+  [[ "$interval" =~ ^[0-9]+$ ]] || interval=300
+  (( interval > 0 )) || return 1
+  bridge_daemon_token_lease_due || return 1
+
+  file="$(bridge_daemon_token_lease_state_file)"
+  now="$(date +%s)"
+  # Record the attempt timestamp up front so a persistent lease-service
+  # failure does not retrigger every 5s poll tick (mirrors the periodic-sync
+  # cadence contract). The audit rows below carry the actual outcome.
+  mkdir -p "$(dirname "$file")" 2>/dev/null || true
+  printf '%s\n' "$now" >"$file" 2>/dev/null || true
+
+  # Read the current durable lease-state + active mapping so the re-checkout
+  # decision (codex Q5) is made HERE in the daemon, not hidden in a subprocess.
+  if status_json="$(bridge_with_timeout 10 daemon_token_lease_status "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token lease status --json 2>/dev/null)"; then
+    status_row="$(bridge_with_timeout 5 lease_status_parse python3 \
+      "$SCRIPT_DIR/bridge-daemon-helpers.py" lease-status-parse "$status_json" \
+      2>/dev/null || printf '')"
+  fi
+  if [[ -n "$status_row" ]]; then
+    IFS=$'\t' read -r configured has_lease lease_expires_at \
+      local_token_id active_token_id service_token_id <<<"$status_row"
+  fi
+
+  # A parse failure sentinels `error` in the configured column — skip this
+  # tick rather than act on a garbled envelope; the next tick retries.
+  if [[ "$configured" == "error" ]]; then
+    bridge_audit_log daemon claude_token_lease_tick "$target" \
+      --detail status=skipped \
+      --detail reason=status_parse_error \
+      --detail trigger="$trigger" \
+      2>/dev/null || true
+    daemon_warn "token-updater lease tick: could not parse lease status (trigger=$trigger); skipping — see audit log"
+    return 1
+  fi
+
+  # Decide checkout-vs-heartbeat (codex Q5). Map the `-` empty sentinel back
+  # before the numeric expiry compare.
+  local checkout_reason=""
+  if [[ "$has_lease" != "1" ]]; then
+    checkout_reason="no_lease"
+  elif [[ "$lease_expires_at" =~ ^[0-9]+$ ]] && (( lease_expires_at <= now )); then
+    checkout_reason="lease_expired"
+  elif [[ "$active_token_id" != "-" && "$local_token_id" != "-" && "$active_token_id" != "$local_token_id" ]]; then
+    # Active/local mapping drift: a DIFFERENT local row is active than the one
+    # the lease was bound to (codex Q1). Re-checkout to re-establish authority.
+    checkout_reason="mapping_drift"
+  fi
+
+  if [[ -n "$checkout_reason" ]]; then
+    if bridge_daemon_token_lease_checkout checkout_status "${trigger}:${checkout_reason}"; then
+      daemon_info "token-updater lease checkout: status=$checkout_status reason=$checkout_reason trigger=$trigger"
+      bridge_audit_log daemon claude_token_lease_tick "$target" \
+        --detail status=checked_out \
+        --detail reason="$checkout_reason" \
+        --detail trigger="$trigger" \
+        2>/dev/null || true
+      return 0
+    fi
+    daemon_warn "token-updater lease checkout did NOT succeed (status=$checkout_status reason=$checkout_reason trigger=$trigger); the lease may be unavailable — see audit log"
+    bridge_audit_log daemon claude_token_lease_tick "$target" \
+      --detail status=checkout_failed \
+      --detail reason="$checkout_reason" \
+      --detail trigger="$trigger" \
+      2>/dev/null || true
+    return 1
+  fi
+
+  # A live, correctly-mapped lease exists — heartbeat it to extend the TTL.
+  if heartbeat_json="$(bridge_with_timeout 10 daemon_token_lease_heartbeat "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token lease heartbeat --json 2>/dev/null)"; then
+    hb_row="$(bridge_with_timeout 5 lease_heartbeat_parse python3 \
+      "$SCRIPT_DIR/bridge-daemon-helpers.py" lease-heartbeat-parse "$heartbeat_json" \
+      2>/dev/null || printf '')"
+  fi
+  if [[ -n "$hb_row" ]]; then
+    IFS=$'\t' read -r hb_status hb_http <<<"$hb_row"
+  fi
+
+  # A 404 (lease gone) or 409 (lease bound elsewhere) means our recorded lease
+  # is no longer ours — re-checkout to recover (codex Q5).
+  if [[ "$hb_http" == "404" || "$hb_http" == "409" ]]; then
+    if bridge_daemon_token_lease_checkout checkout_status "${trigger}:heartbeat_${hb_http}"; then
+      daemon_info "token-updater lease re-checkout after heartbeat http=$hb_http: status=$checkout_status trigger=$trigger"
+      bridge_audit_log daemon claude_token_lease_tick "$target" \
+        --detail status=checked_out \
+        --detail reason="heartbeat_${hb_http}" \
+        --detail trigger="$trigger" \
+        2>/dev/null || true
+      return 0
+    fi
+    daemon_warn "token-updater lease re-checkout after heartbeat http=$hb_http did NOT succeed (status=$checkout_status trigger=$trigger); see audit log"
+    bridge_audit_log daemon claude_token_lease_tick "$target" \
+      --detail status=checkout_failed \
+      --detail reason="heartbeat_${hb_http}" \
+      --detail trigger="$trigger" \
+      2>/dev/null || true
+    return 1
+  fi
+
+  bridge_audit_log daemon claude_token_lease_tick "$target" \
+    --detail status="${hb_status:-unknown}" \
+    --detail reason=heartbeat \
+    --detail http="${hb_http:--}" \
+    --detail service_token_id="$service_token_id" \
+    --detail trigger="$trigger" \
+    2>/dev/null || true
+  if [[ "$hb_status" == "ok" ]]; then
+    daemon_info "token-updater lease heartbeat: status=ok trigger=$trigger"
+    return 0
+  fi
+  daemon_warn "token-updater lease heartbeat did not report ok (status=${hb_status:-unknown} http=${hb_http:--} trigger=$trigger); the lease TTL is the correctness backstop — see audit log"
+  return 1
+}
+
+# Bounded best-effort lease check-in, called ONLY from the daemon EXIT trap
+# (_bridge_daemon_on_exit). Releases the host's token-updater lease back to the
+# service on a clean shutdown so a fleet peer can pick it up immediately rather
+# than waiting out the TTL. HARD invariants: (1) default-OFF — the cheap
+# `lease status --check` probe skips entirely when the feature is disabled, so
+# an unconfigured daemon's exit path is byte-for-byte unchanged; (2) it MUST
+# NEVER wedge shutdown — every call is timeout-bounded and every failure is
+# swallowed; the 15-min lease TTL is the correctness backstop if check-in never
+# lands. This is a best-effort courtesy, not a required teardown step.
+bridge_daemon_token_lease_checkin_on_exit() {
+  bridge_with_timeout 3 token_updater_lease_checkin_optin_check \
+    "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token \
+    lease status --check >/dev/null 2>&1 || return 0
+  bridge_with_timeout 5 daemon_token_lease_checkin \
+    "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token \
+    lease checkin >/dev/null 2>&1 || true
+  return 0
 }
 
 # ─────────────────────────────────────────────────────────────────────
@@ -16211,6 +16461,15 @@ cmd_sync_cycle() {
   # periodic tick guarantees a wall-clock sync regardless of rotation events.
   BRIDGE_DAEMON_LAST_STEP="claude_token_periodic_sync"
   if bridge_daemon_periodic_token_sync_tick; then
+    changed=0
+  fi
+  # #21895 phase-1 (sub-PR 4/4): token-updater lease lifecycle. A hard no-op
+  # (cheap `lease status --check` early-skip, no subprocess/audit/state-file)
+  # unless the operator configured AND enabled the lease. When on, keeps the
+  # host's leased Claude token alive (heartbeat @300s < 15-min TTL) and
+  # re-checks-out on expiry / mapping drift / heartbeat 404|409.
+  BRIDGE_DAEMON_LAST_STEP="token_updater_lease"
+  if bridge_daemon_token_lease_tick; then
     changed=0
   fi
   # #1470 Phase 2: Codex single-source → fleet-shared auth.json sync. A
