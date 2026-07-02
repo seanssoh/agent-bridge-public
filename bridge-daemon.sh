@@ -11430,6 +11430,73 @@ nudge_agent_session() {
           _nudge_drop_reason="modal_${_blocker_state}"
         fi
       fi
+
+      # Issue #2179: durable re-spool for the mid-turn / false-idle drop.
+      #
+      # The idle-ready classifier can fire a nudge into the narrow
+      # between-tool-call window where a claude agent's pane momentarily shows
+      # a clean prompt while the agent is logically busy mid-turn on its
+      # already-claimed task. The typed nudge + C-m never lands (the agent
+      # resumes its turn and discards the composer text), so the task sits
+      # queued and — because every subsequent idle-nudge tick re-hits the same
+      # mid-turn race — recovery waits ~30 min for the unclaimed-task
+      # escalation. `agent-bridge urgent` recovers only because the operator
+      # triggers it once the agent is genuinely idle.
+      #
+      # Distinguish the two drop classes (detection only — NO key-sending here,
+      # so urgent/general submit semantics stay byte-unchanged):
+      #   - mid-turn false-idle (banner is the live tail) → the submit could
+      #     not have landed; re-spool via the EXISTING pending-attention path
+      #     so the flush loop re-delivers on the NEXT genuine idle transition
+      #     (the flush's own busy-gate refuses to clobber a mid-turn session).
+      #   - clean prompt miss (not mid-turn) → keep legacy behavior; the next
+      #     idle-nudge tick retries into a clean prompt, which already works.
+      #
+      # Scoped strictly to the daemon nudge verification path, claude engine,
+      # and a genuine composer race (blocker=none — a modal drop stays
+      # operator-actionable and is never silently re-spooled). Idempotency /
+      # lease: append at most ONE durable copy per agent (skip when the spool
+      # already holds an entry). The flush loop re-derives that single copy
+      # against the LIVE queue every tick and drops it (rederive rc=2) the
+      # instant the task is claimed/done, so delivery is exactly-once and
+      # self-clearing. The task stays `queued`, so the unclaimed-task
+      # escalation is never suppressed while the agent is legitimately
+      # mid-turn on its claimed work.
+      local _respooled=0
+      local _respool_reason="none"
+      if [[ "$_blocker_state" == "none" && "$_nudge_engine" == "claude" && -n "$session" ]]; then
+        local _drop_recent=""
+        _drop_recent="$(bridge_capture_recent "$session" 40 join 2>/dev/null || true)"
+        if bridge_tmux_claude_capture_is_midturn "$_drop_recent"; then
+          _respool_reason="midturn_no_spool_needed"
+          if bridge_tmux_spool_enabled "$agent"; then
+            local _spool_count=0
+            _spool_count="$(bridge_tmux_pending_attention_count "$agent" 2>/dev/null || printf '0')"
+            [[ "$_spool_count" =~ ^[0-9]+$ ]] || _spool_count=0
+            if (( _spool_count == 0 )); then
+              # Compose byte-identically to the dispatched nudge above
+              # (bridge_dispatch_notification … "" "normal") — empty task_id +
+              # normal priority — so the spooled copy re-renders as a
+              # recognizable queue nudge and the flush loop re-derives it
+              # against the live queue.
+              local _respool_text=""
+              _respool_text="$(bridge_compose_notification_text "$title" "$message" "" "normal")"
+              if [[ -n "$_respool_text" ]] \
+                 && bridge_tmux_pending_attention_append "$agent" "$_respool_text"; then
+                _respooled=1
+                _respool_reason="midturn_respooled"
+              else
+                _respool_reason="midturn_respool_failed"
+              fi
+            else
+              _respool_reason="midturn_spool_nonempty"
+            fi
+          else
+            _respool_reason="midturn_spool_disabled"
+          fi
+        fi
+      fi
+
       bridge_audit_log daemon session_nudge_dropped "$agent" \
         --detail task_id="$task_id" \
         --detail reason="$_nudge_drop_reason" \
@@ -11440,8 +11507,14 @@ nudge_agent_session() {
         --detail queued="$live_queued" \
         --detail claimed="$live_claimed" \
         --detail idle_seconds="$idle" \
+        --detail respooled="$_respooled" \
+        --detail respool_reason="$_respool_reason" \
         --detail title="$title"
-      daemon_info "nudge to ${agent} appears dropped (task #${task_id} still queued after ${_total_wait_seconds}s, stage1=${nudge_grace_seconds}s stage2_total=${nudge_grace_stage2_total}s); will retry on next idle-nudge tick"
+      if (( _respooled == 1 )); then
+        daemon_info "nudge to ${agent} appears dropped mid-turn (task #${task_id} still queued after ${_total_wait_seconds}s); re-spooled to pending-attention for durable re-delivery on next idle transition"
+      else
+        daemon_info "nudge to ${agent} appears dropped (task #${task_id} still queued after ${_total_wait_seconds}s, stage1=${nudge_grace_seconds}s stage2_total=${nudge_grace_stage2_total}s); will retry on next idle-nudge tick"
+      fi
       return 1
     fi
   fi
