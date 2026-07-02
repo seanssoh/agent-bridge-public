@@ -21,6 +21,7 @@ Usage:
   $(basename "$0") telegram <agent> [--token <token>] [--channel-account <account>] [--runtime-config <path>] [--allow-from <id>]... [--default-chat <id>] [--test-chat <id>] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
   $(basename "$0") teams <agent> [--app-id <id>] [--app-password-file <path>] [--app-password-stdin] [--tenant-id <id>] [--channel-account <account>] [--runtime-config <path>] [--messaging-endpoint <url>] [--webhook-host <host>] [--webhook-port <port>] [--ingress-port <port>] [--allow-from <id>]... [--conversation <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run] [--allow-probe-failure]
   $(basename "$0") ms365 <agent> [--redirect-uri <url>] [--messaging-endpoint <url>] [--tenant-id <id>] [--client-id <id>] [--client-secret <secret>] [--client-secret-file <path>] [--client-secret-stdin] [--default-upn <upn>] [--default-scopes <scopes>] [--allow-localhost] [--skip-entra-probe] [--yes] [--dry-run] [--allow-probe-failure]
+  $(basename "$0") token-updater [--api-url <url>] [--server-id <id>] [--api-key-file <path>] [--api-key-stdin] [--enable] [--disable] [--yes] [--dry-run]
   $(basename "$0") template-sync [--from <reference-agent default admin>] [--exclude <csv>] [--targets <csv-existing-agents>] [--dry-run] [--yes]
   $(basename "$0") agent <agent> [--skip-discord] [--skip-telegram] [--skip-teams] [--test-start] [setup options...]
   $(basename "$0") admin <agent>
@@ -64,6 +65,17 @@ EOF
       cat <<EOF
 Usage:
   $(basename "$0") ms365 <agent> [--redirect-uri <url>] [--messaging-endpoint <url>] [--tenant-id <id>] [--client-id <id>] [--client-secret <secret>] [--client-secret-file <path>] [--client-secret-stdin] [--default-upn <upn>] [--default-scopes <scopes>] [--allow-localhost] [--skip-entra-probe] [--yes] [--dry-run] [--allow-probe-failure]
+EOF
+      ;;
+    token-updater)
+      cat <<EOF
+Usage:
+  $(basename "$0") token-updater [--api-url <url>] [--server-id <id>] [--api-key-file <path>] [--api-key-stdin] [--enable] [--disable] [--yes] [--dry-run]
+
+Install-level token-updater lease config (not agent-scoped). URL / server id /
+enabled go to runtime-config; the API key goes to a 0600 secrets file (never
+runtime-config, never \`config set-env\`). Default-OFF: nothing changes until you
+supply URL + server id + API key AND pass --enable.
 EOF
       ;;
     template-sync)
@@ -1532,6 +1544,44 @@ run_admin() {
   echo "next_command: agb admin"
 }
 
+# #21895 phase-1 (sub-PR 1/4): `setup token-updater` — the install-level
+# token-updater lease config wizard. NOT agent-scoped (no positional <agent>):
+# it collects the lease service URL + SERVER_ID + API key and delegates
+# persistence to the sanctioned `bridge-auth.py lease config` writer. The API
+# key is streamed to the python wizard over stdin (never argv); value-bearing
+# flags are validated so a bare secret can't land on the command line. The
+# feature is DEFAULT-OFF — nothing changes until the operator both configures it
+# and passes --enable.
+run_token_updater() {
+  local dry_run=0
+  local py_args=()
+
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || "${1:-}" == "help" ]]; then
+    setup_subcommand_usage "token-updater"
+    return 0
+  fi
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --api-url|--server-id|--api-key-file)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        py_args+=("$1" "$2")
+        shift 2
+        ;;
+      --api-key-stdin|--enable|--disable|--yes|--dry-run)
+        [[ "$1" == "--dry-run" ]] && dry_run=1
+        py_args+=("$1")
+        shift
+        ;;
+      *)
+        bridge_die "지원하지 않는 setup token-updater 옵션입니다: $1"
+        ;;
+    esac
+  done
+
+  bridge_setup_python token-updater "${py_args[@]}"
+}
+
 # Issue #1427 Lane B: `setup template-sync` — seed new (and optionally
 # existing) agents from a reference agent's roster-resident config.
 #
@@ -1691,6 +1741,9 @@ case "$subcommand" in
   ms365)
     run_ms365 "$@"
     ;;
+  token-updater)
+    run_token_updater "$@"
+    ;;
   template-sync)
     run_template_sync "$@"
     ;;
@@ -1706,7 +1759,7 @@ case "$subcommand" in
   *)
     # Issue #163 Phase 2: surface an intent-recovery hint before dying.
     _hint="$(bridge_suggest_subcommand "$subcommand" \
-      "discord telegram teams ms365 template-sync agent admin")"
+      "discord telegram teams ms365 token-updater template-sync agent admin")"
     [[ -n "$_hint" ]] && bridge_warn "$_hint"
     bridge_die "지원하지 않는 setup 명령입니다: $subcommand"
     ;;

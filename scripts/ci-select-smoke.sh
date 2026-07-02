@@ -1639,6 +1639,16 @@ select_for_path() {
       if [[ "$path" == "bridge-status.py" ]]; then
         add_required 1181-modal-blocker-detect
       fi
+      # #21895 phase-1 (sub-PR 1/4): bridge-setup.py/.sh host the install-level
+      # `setup token-updater` lease config wizard (cmd_token_updater), which
+      # delegates persistence to the sanctioned `bridge-auth.py lease config`
+      # writer. token-updater-config pins the wizard's dry-run no-op, the
+      # delegated 0600-secret / runtime-config split, and the default-OFF gate.
+      # Pull it on every bridge-setup.py/.sh move so a wizard refactor cannot
+      # regress the delegation or leak the secret into runtime-config JSON.
+      if [[ "$path" == "bridge-setup.py" || "$path" == "bridge-setup.sh" ]]; then
+        add_required token-updater-config
+      fi
       add_integration integration-minimal
       ;;
 
@@ -4150,6 +4160,14 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # tool-policy/config consumers cannot drift the operator-home resolution
       # off the canonical form (parity + footgun-guard teeth).
       add_required 1497-p2-operator-home
+      # #21895 phase-1 (sub-PR 1/4): bridge-config.py's ENV_KEY_DENY_SUBSTRINGS
+      # (TOKEN/SECRET/KEY) is WHY the token-updater secret can never be set
+      # through `config set-env` — it must land in a 0600 secrets file instead.
+      # token-updater-config asserts that deny stays intact (all TOKEN_UPDATER_*
+      # names refused) alongside the default-OFF config foundation. Pull it on
+      # every bridge-config.py move so a future widening of the allowlist cannot
+      # silently re-open a set-env path for the lease secret.
+      add_required token-updater-config
       add_integration integration-minimal
       ;;
 
@@ -5792,6 +5810,19 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # auth move so a refactor of the verb (or its wrapper passthrough) that
       # regressed the digest shape would surface as a latch failure here.
       add_required 2217-reactive-429-rotate
+      # #21895 phase-1 (sub-PR 1/4): bridge-auth.py/.sh host the token-updater
+      # lease CONFIG surface — the sanctioned runtime-config writer
+      # (write_token_updater_config), the 0600 API-key secret writer
+      # (write_token_updater_secret), the runtime readers, and the
+      # `lease {config,status}` verb + `status --check` exit-code probe.
+      # token-updater-config pins the default-OFF no-op invariant (unconfigured =>
+      # OFF, no write), the persist SPLIT (URL/SERVER_ID/ENABLED -> runtime-config,
+      # KEY -> 0600 secret file NEVER in JSON), the conjunctive effective gate, the
+      # secret-never-in-argv discipline, the set-env deny staying intact, and the
+      # wrapper plumbing / fail-closed flag guard. Pull it on every auth move so a
+      # later sub-PR (lease client / rotator / daemon tick) cannot regress the
+      # default-OFF foundation.
+      add_required token-updater-config
       add_integration integration-minimal
       ;;
 
