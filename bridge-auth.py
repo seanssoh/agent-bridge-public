@@ -6026,16 +6026,30 @@ def cmd_token_updater_lease(args: argparse.Namespace) -> int:
         enabled = False
 
     # The API key is read from a file / stdin (never argv) so it is not captured
-    # in the process table or shell history. Empty (no key source) => leave the
-    # existing secret untouched.
+    # in the process table or shell history. A key SOURCE that yields an empty /
+    # whitespace value is REFUSED fail-closed (codex r1 finding): a caller that
+    # explicitly passed --api-key-file/--api-key-stdin intended to set a key, so
+    # an empty source is an error — never a silent skip that leaves a stale
+    # secret in place. Passing NO key source at all is fine (leave the existing
+    # secret untouched).
     api_key = ""
+    api_key_source_requested = False
     if getattr(args, "api_key_stdin", False):
+        api_key_source_requested = True
         api_key = sys.stdin.read()
     elif getattr(args, "api_key_file", None):
+        api_key_source_requested = True
         try:
             api_key = Path(args.api_key_file).expanduser().read_text(encoding="utf-8")
         except OSError as exc:
             return fail(f"cannot read --api-key-file: {exc}", json_mode)
+    if api_key_source_requested and not api_key.strip():
+        src = "--api-key-stdin" if getattr(args, "api_key_stdin", False) else "--api-key-file"
+        return fail(
+            f"{src} yielded an empty API key — refusing to leave a stale secret in "
+            "place (omit the key source to keep the existing secret unchanged)",
+            json_mode,
+        )
 
     wrote_secret = False
     secret_path: Path | None = None

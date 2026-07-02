@@ -2468,12 +2468,17 @@ def cmd_token_updater(args: argparse.Namespace) -> int:
             raise SetupError(
                 "--api-key-file and --api-key-stdin are mutually exclusive — pass only one."
             )
+        # A key SOURCE that yields an empty / whitespace value is REFUSED
+        # (codex r1 finding): an operator who explicitly passed a key source
+        # intended to set a key, so an empty source is an error — never a silent
+        # skip that could leave a stale secret in place.
         if getattr(args, "api_key_stdin", False):
             data = sys.stdin.read()
             api_key = data[:-1] if data.endswith("\n") else data
-            if not api_key:
+            if not api_key.strip():
                 raise SetupError(
-                    "--api-key-stdin read an empty secret from stdin (no bytes before EOF)."
+                    "--api-key-stdin read an empty API key from stdin (no non-blank "
+                    "bytes before EOF); omit the key source to keep an existing secret."
                 )
         elif getattr(args, "api_key_file", None):
             key_path = Path(args.api_key_file).expanduser()
@@ -2483,6 +2488,11 @@ def cmd_token_updater(args: argparse.Namespace) -> int:
             except OSError as exc:
                 raise SetupError(f"cannot read --api-key-file {key_path}: {exc}")
             api_key = raw[:-1] if raw.endswith("\n") else raw
+            if not api_key.strip():
+                raise SetupError(
+                    f"--api-key-file {key_path} yielded an empty API key; omit the "
+                    "key source to keep an existing secret unchanged."
+                )
 
         if interactive:
             if not api_url:

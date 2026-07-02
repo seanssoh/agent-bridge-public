@@ -25,6 +25,8 @@
 #       unknown flag fails closed (rc=2)
 #   T8  setup wizard delegates to the sanctioned writer (dry-run writes nothing;
 #       real run persists via bridge-auth.py; secret 0600, not in config JSON)
+#   T9  an explicit-but-empty/whitespace key source is REFUSED fail-closed (CLI
+#       + wizard, stdin + file); the existing secret survives the refusal intact
 #   T10 ci-select routing: bridge-auth.py / bridge-config.py / bridge-setup.py
 #       and the smoke file all select this smoke
 
@@ -236,6 +238,47 @@ test_setup_wizard_delegates() {
   [[ "$rc" -eq 0 ]] || smoke_fail "T8 status --check rc=$rc after wizard enable (want 0)"
 }
 
+# ── T9 (codex r1) ──────────────────────────────────────────────────────
+# A key SOURCE that yields an empty/whitespace value is REFUSED fail-closed —
+# never a silent skip that could leave a stale secret active. Covers BOTH the
+# CLI verb and the wizard, via stdin and file. Also proves the EXISTING secret
+# is left byte-for-byte unchanged on the refusal (no partial clobber).
+test_empty_key_source_refused() {
+  reset_surfaces
+  # Seed a good secret first so we can assert it survives a later refusal.
+  printf '%s' "$FIXTURE_KEY" | lease_py config \
+    --api-url "https://lease.example.com" --server-id "srv-1" --enabled --api-key-stdin --json >/dev/null
+  local before_ck; before_ck="$(cksum <"$SECRET")"
+  local rc
+
+  # CLI: empty stdin key source => rc!=0, secret unchanged.
+  set +e
+  printf '' | lease_py config --server-id "srv-2" --api-key-stdin --json >/dev/null 2>&1; rc=$?
+  set -e 2>/dev/null || true
+  [[ "$rc" -ne 0 ]] || smoke_fail "T9 CLI empty --api-key-stdin returned 0 (must refuse)"
+  smoke_assert_eq "$before_ck" "$(cksum <"$SECRET")" "T9 CLI refusal left the existing secret unchanged"
+
+  # CLI: whitespace-only file key source => rc!=0.
+  local blankfile="$SMOKE_TMP_ROOT/blank.txt"
+  printf '   \n' >"$blankfile"
+  set +e
+  lease_py config --server-id "srv-3" --api-key-file "$blankfile" --json >/dev/null 2>&1; rc=$?
+  set -e 2>/dev/null || true
+  [[ "$rc" -ne 0 ]] || smoke_fail "T9 CLI whitespace --api-key-file returned 0 (must refuse)"
+
+  # Wizard: empty stdin key source => rc!=0.
+  set +e
+  printf '' | python3 "$SETUP_PY" token-updater --server-id "srv-w2" --api-key-stdin --yes >/dev/null 2>&1; rc=$?
+  set -e 2>/dev/null || true
+  [[ "$rc" -ne 0 ]] || smoke_fail "T9 wizard empty --api-key-stdin returned 0 (must refuse)"
+
+  # Wizard: whitespace-only file key source => rc!=0.
+  set +e
+  python3 "$SETUP_PY" token-updater --server-id "srv-w3" --api-key-file "$blankfile" --yes >/dev/null 2>&1; rc=$?
+  set -e 2>/dev/null || true
+  [[ "$rc" -ne 0 ]] || smoke_fail "T9 wizard whitespace --api-key-file returned 0 (must refuse)"
+}
+
 # ── T10 ───────────────────────────────────────────────────────────────
 # ci-select routes bridge-auth.py / bridge-config.py / bridge-setup.py /
 # bridge-setup.sh to this smoke by source-file mapping. (A change to the smoke
@@ -260,6 +303,7 @@ smoke_run "T5 conjunctive gate: ENABLED-but-unconfigured -> effective OFF"      
 smoke_run "T6 secret from --api-key-file -> 0600, verbatim round-trip"            test_secret_from_file
 smoke_run "T7 bash wrapper plumbing + unknown-flag fail-closed (rc=2)"            test_bash_wrapper_plumbing
 smoke_run "T8 setup wizard delegates (dry-run no-op; real run persists 0600)"     test_setup_wizard_delegates
+smoke_run "T9 empty/whitespace key source refused (CLI+wizard, secret intact)"    test_empty_key_source_refused
 smoke_run "T10 ci-select routing -> auth/config/setup + smoke selected"          test_ci_select_routing
 
 smoke_log "all checks passed"
