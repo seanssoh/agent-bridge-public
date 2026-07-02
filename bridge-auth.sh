@@ -1528,14 +1528,15 @@ case "$command" in
           global-auth-sync "$action" "$@"
         ;;
       lease)
-        # #21895 phase-1 (sub-PR 1/4): the token-updater lease CONFIG surface.
-        # `config` persists URL/SERVER_ID/ENABLED to runtime/bridge-config.json
-        # (blessed admin path — never a raw edit) and the API KEY to a 0600
-        # secrets file (NEVER runtime-config JSON, NEVER `config set-env`).
-        # `status` is a read-only effective-state report; `status --check` is the
-        # exit-code-only probe the later daemon tick reuses. This sub-PR wires NO
-        # lease client / rotator / daemon tick — config foundation only,
-        # default-OFF (byte-for-byte no-op until configured AND enabled).
+        # #21895 phase-1: the token-updater lease surface. `config` persists
+        # URL/SERVER_ID/ENABLED to runtime/bridge-config.json (blessed admin path
+        # — never a raw edit) and the API KEY to a 0600 secrets file (NEVER
+        # runtime-config JSON, NEVER `config set-env`). `status` is a read-only
+        # effective-state report; `status --check` is the exit-code-only probe
+        # the daemon tick reuses. sub-PR 2 adds the Contract-A lease client verbs
+        # `checkout`/`swap`/`checkin` (structured JSON). This sub-PR wires NO
+        # rotator / daemon tick — config + client surface only, default-OFF
+        # (byte-for-byte no-op until configured AND enabled).
         action="${1:-}"
         case "$action" in
           -h|--help|help)
@@ -1548,12 +1549,14 @@ case "$command" in
             ;;
         esac
         shift || true
-        # Value-bearing flags (--api-url/--server-id/--api-key-file) and the
-        # value-less flags (--json/--check/--enabled/--disabled/--api-key-stdin)
-        # are allowlisted; an unknown flag fails closed (exit 2). The secret is
-        # read from a file/stdin INSIDE python, never captured here.
+        # Value-bearing flags (--api-url/--server-id/--api-key-file/
+        # --service-token-id/--timeout) and the value-less flags (--json/--check/
+        # --enabled/--disabled/--api-key-stdin) are allowlisted; an unknown flag
+        # fails closed (exit 2). The secret is read from a file/stdin INSIDE
+        # python (never captured here); the client verbs never take the secret on
+        # argv either — it stays in the 0600 file the client reads.
         bridge_auth_guard_wrapper_flags "claude-token lease" \
-          "--api-url,--server-id,--api-key-file" \
+          "--api-url,--server-id,--api-key-file,--service-token-id,--timeout" \
           "--json,--check,--enabled,--disabled,--api-key-stdin" "$@"
         exec python3 "$SCRIPT_DIR/bridge-auth.py" --registry "$registry" \
           lease "$action" "$@"
