@@ -117,21 +117,28 @@ set_heartbeat_mtime() {
   now="$(date +%s)"
   mtime=$(( now - hb_age ))
   printf '%s\n' "$mtime" >"$hb_file"
-  # GNU coreutils touch: -d @EPOCH. Try it first (Linux/CI path).
-  if ! touch -d "@$mtime" "$hb_file" 2>/dev/null; then
-    # BSD/mac touch: -t [[CC]YY]MMDDhhmm[.SS] from a BSD `date -r EPOCH`.
-    touch -t "$(date -r "$mtime" +%Y%m%d%H%M.%S 2>/dev/null)" "$hb_file" 2>/dev/null || true
-  fi
-  # Verify the back-date actually took (within 5s) — fail loudly otherwise so a
-  # platform where neither form works can never masquerade a fresh heartbeat as
-  # stale (or vice-versa).
-  # Read the mtime back PORTABLY. GNU coreutils: `stat -c %Y`; BSD/mac: `stat -f %m`.
-  # (Order matters: `stat -f` on GNU means "filesystem status" and prints garbage,
-  # so we MUST try the platform-correct form and sanitize the result to digits.)
+  # Portable, platform-identical back-date. os.utime takes (atime, mtime) seconds.
+  # (LTS CI-health backport of mainline's fix for the T7 Linux-CI red: `touch -d
+  # @EPOCH` did not land the mtime on the GitHub Linux runner, so the staleness
+  # gate mis-fired; os.utime is deterministic across GNU/BSD.)
+  python3 -c 'import os,sys; t=int(sys.argv[2]); os.utime(sys.argv[1],(t,t))' \
+    "$hb_file" "$mtime" \
+    || smoke_fail "set_heartbeat_mtime: python3 os.utime back-date failed for $hb_file (wanted mtime=$mtime)"
+  # Read the landed mtime back GNU-first (`stat -c %Y`), then BSD (`stat -f %m`).
+  # `stat -f` on GNU is FILESYSTEM status and pollutes stdout, so `-c` MUST be
+  # first; the digit-squeeze + plausibility gate reject any stray fs-field output.
   got="$(stat -c %Y "$hb_file" 2>/dev/null || stat -f %m "$hb_file" 2>/dev/null || true)"
-  got="${got//[^0-9]/}"; [[ -n "$got" ]] || got=0
-  local delta=$(( got - mtime )); (( delta < 0 )) && delta=$(( -delta ))
-  (( delta <= 5 )) || smoke_fail "set_heartbeat_mtime: could not back-date $hb_file to age=${hb_age}s (wanted mtime=$mtime, got=$got) — heartbeat staleness would be wrong on this platform"
+  got="${got//[^0-9]/}"
+  { [[ -n "$got" ]] && (( got < 100000000000 )); } || got=0
+  # Verify the landed AGE (now - got) matches the intended hb_age within tolerance,
+  # re-reading `now` so a slow setup does not itself trip the check. Fail LOUD so a
+  # platform where the back-date silently no-ops can never masquerade a fresh
+  # heartbeat as stale (or vice-versa).
+  local now2 landed_age delta
+  now2="$(date +%s)"
+  landed_age=$(( now2 - got ))
+  delta=$(( landed_age - hb_age )); (( delta < 0 )) && delta=$(( -delta ))
+  (( delta <= 5 )) || smoke_fail "set_heartbeat_mtime: back-date did not land — wanted age=${hb_age}s, got age=${landed_age}s (mtime=$got, now=$now2) — heartbeat staleness would be wrong on this platform"
 }
 
 life_run() {
