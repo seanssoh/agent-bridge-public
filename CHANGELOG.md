@@ -4,6 +4,36 @@ All notable changes to Agent Bridge are documented here. This project adheres
 loosely to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and tracks
 version bumps via the `VERSION` file.
 
+## [0.17.0-beta9] — 2026-07-03 (mainline · beta · token-updater lease auto-rotation completes (default-off) + macOS/reliability hardening)
+
+**v0.17.0-beta9 completes the token-updater lease auto-rotation feature** (#21895) — all four sub-PRs are now on main: the config surface + setup wizard landed in beta8 (#2245), and this cut lands the lease client (checkout / heartbeat / checkin), the swap-or-defer decision + daemon-tick that drives due-check / rotation on the daemon loop, and the picker-sweep integration (#2252). It ships **default-OFF**: nothing rotates until an operator enables it per host, and reactive-429 rotation remains separately gated behind a 2-host canary. Alongside the marquee, this beta hardens three reliability surfaces — a **macOS post-upgrade daemon-recovery safety net** (#2203, re-verified with real launchctl in a disposable macOS VM), **durable idle-nudge re-spool** (#2179), and an **iso-v2 onboarding-layer reconcile** (#2193) — plus the **security-cycle-A git-guard** hardening (#2159 / #2163) and the autonomous-operation reminder hooks already landed on main. This is a **mainline beta (prerelease)**: the **`v0.16.x` LTS line stays the `lts` / Latest head** and production installs tracking `lts` are unaffected; a **`v0.16.22` LTS fast-follow** backports the qualifying reliability fixes only (#2179, #2203), and the token-updater lease auto-rotation is deferred to a separate, deliberately-reviewed **`v0.16.23` LTS follow-up** (tracked in #2255) — it does not cherry-pick cleanly onto the LTS line and warrants its own conflict-resolution + review rather than a deadline-rushed port. Each underlying fix carried its own codex / patch-dev review; the assembled cut is green on CI with the four cut PRs re-verified CLEAN + head-matched at merge.
+
+### Token-updater lease auto-rotation (#21895 — marquee, default-OFF)
+
+- **auth / daemon: token-updater lease auto-rotation — sub-PRs 2–4 (#2252).** The lease client (`claude-token lease` checkout / heartbeat / checkin), the swap-or-defer decision + the daemon tick that drives due-check / rotation on the daemon loop, and the picker-sweep integration. Completes the feature begun in beta8 by #2245 (config surface + setup wizard). **Default-OFF** — no behavior change until an operator enables it per host; the reactive-429 rotation path is separately gated behind a 2-host canary and is not enabled by this cut.
+
+### Reliability / platform hardening
+
+- **upgrade: reliably restore the daemon on macOS after `upgrade --restart-daemon` (#2085 / #2203).** Adds post-restart liveness confirmation (a running pid **and** a fresh heartbeat, not just a loaded launchd job) plus a recovery net; on an out-of-band launchd split (the daemon supervised out-of-band of launchd, `bridge_daemon_launchd_restart` rc=2) it **refuses** to fork a competing plain-bash daemon, avoiding the KeepAlive thrash. No-op on the healthy path. Re-verified end-to-end with **real launchctl** in a disposable tart macOS VM (both the drift-recovery and rc=2 out-of-band-split-gate scenarios file-corroborated).
+- **daemon: durable idle-nudge re-spool on a post-grace queued-drop (#2179).** A daemon idle-nudge that drops at the post-grace boundary is durably re-spooled instead of being silently lost. Submit primitives are byte-unchanged; no key-send, no task mutation.
+- **upgrade: reconcile iso-owned onboarding-layer `SESSION-TYPE.md` copies on migrate (#2193).** Follow-up to #2084 — iso-v2 agent-UID-owned onboarding copies are reconciled as the agent user after migrate, clearing the post-upgrade false "agent profile drift" warn. Best-effort, one-way pending→complete, shared-mode byte-unchanged.
+
+### Security — git-guard cycle A
+
+- **guard: close the #2159 variable-VALUE-hidden git escape via const-tracking (#2241).**
+- **guard: #2163 tight config / auth-token indirection backstop (#2242).**
+
+### Operating hooks / agent lifecycle / misc (landed on main since beta8)
+
+- teams-renderer quoteResult (quantity + sub-material spec) + devReq section-label styling → 0.1.11 (#2251).
+- operating reminders: autonomous inbox-progress with the confirm-first gate intact (#2247), a long-running-task ack reminder folded into the per-turn hook (#2246), and a Claude-only per-turn parallel-dispatch nudge (#2244).
+- watchdog: treat an agent-ROOT managed block as present for home-subdir agents (#2018 blast radius / #2243).
+- start: non-fatal node-version gate for agents whose plugins declare `engines.node` (#1191 / #2238).
+- cron: opt-in `--reconcile` to adopt new default cadences over same-family drift (#2090 / #2237).
+- status: exempt idle codex-engine static agents from `stale=crit` (#2100 / #2235).
+- smoke: pin lifeline gating envs + pre-assert a real tick to kill the #2207 T7 full-suite flake (#2239 / #2240).
+- librarian: guard agent memory / shared captures from the operating-rules SSOT (#2236).
+
 ## [0.17.0-beta8] — 2026-07-01 (mainline · beta · never-die wave — 데몬 절대 안 죽음 defense-in-depth + 동적→정적 converter FR#2061 in-beta QA)
 
 **v0.17.0-beta8 — the daemon "never-die" hardening wave, the operator's #1 priority after the 06-30 M4 fleet-down incident**, on top of beta7's rotation *core* fix. The 06-30 RCA (#2209 umbrella) found the daemon could go silently DOWN and stay down across five distinct failure classes: a hung restart failed open, launchd unloaded+disabled drift had no self-heal, the token lifeline died with the daemon (fleet quota-cascade), an interrupted upgrade left version skew + partial state, and a `--no-restart-daemon` reconcile could boot the daemon out. This beta lands the **six-fix defense-in-depth wave** that closes each of those, bundled with the **first-class dynamic→static agent converter (FR#2061 + #2216)** — shipped for **in-beta QA** per operator direction (live-QA #20517 moves to the beta channel) — plus the auto-rotate roadmap (#2217, 5 steps) and standalone reliability fixes already landed on main. This is a **mainline beta (prerelease)**: the **`v0.16.20` LTS stays the `lts` / Latest head** and production installs tracking `lts` are unaffected; a **`v0.16.21` LTS fast-follow will backport the never-die wave only** (features stay mainline). The bundled integration (never-die + converter + main) passed a full-branch codex `implement-ok` on the combination surface and green CI; each underlying fix carried its own codex / patch-dev review.
