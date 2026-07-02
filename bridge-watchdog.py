@@ -2221,8 +2221,21 @@ def scan_agent(
                 # legitimately has no block — and re-created a false drift task every
                 # cycle. Check both identity candidates; a block genuinely absent
                 # from ALL of them still surfaces as drift.
+                #
+                # The agent-ROOT climb is gated on the GENERATED v2 layout, not a
+                # bare ``basename == "home"`` — an agent may legitimately be NAMED
+                # ``home`` (only ``help``/``version`` are reserved), giving a flat
+                # identity home at ``.../agents/home`` whose ``.name`` is also
+                # ``"home"``. Requiring the home's PARENT basename to equal the
+                # resolved agent id proves ``.../agents/<id>/home`` (the runtime
+                # ``home/`` subdir) and refuses to climb from a flat home into the
+                # unrelated agents-root ``CLAUDE.md`` (codex PR #2243 r1).
                 identity_candidates = [agent_home_dir / "CLAUDE.md"]
-                if agent_home_dir.name == "home":
+                if (
+                    agent_home_dir.name == "home"
+                    and agent_name
+                    and agent_home_dir.parent.name == agent_name
+                ):
                     identity_candidates.append(agent_home_dir.parent / "CLAUDE.md")
                 for identity_claude in identity_candidates:
                     if identity_claude.exists():  # noqa: raw-pathlib-controller-only

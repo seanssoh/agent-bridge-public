@@ -200,6 +200,45 @@ test_flat_home_does_not_climb() {
   rm -f "$BRIDGE_AGENT_HOME_ROOT/CLAUDE.md"
 }
 
+# ===========================================================================
+# T3b -- ALLOWED-NAME COLLISION (codex PR #2243 r1): an agent LITERALLY NAMED
+#        "home" has a flat identity home at <agents-root>/home, so
+#        `agent_home_dir.name == "home"` is true for the WRONG reason (the agent
+#        NAME, not the v2 runtime `home/` subdir). Agent names allow "home" (only
+#        help/version are reserved), so this is a valid registry shape. The climb
+#        must NOT fire -- consulting the unrelated <agents-root>/CLAUDE.md would
+#        falsely suppress real drift. The tightened guard requires the home's
+#        PARENT basename to equal the resolved agent id (the generated v2 layout
+#        `.../agents/<id>/home`), which a flat `.../agents/home` fails (its parent
+#        basename is the agents root, not "home").
+# ===========================================================================
+test_allowed_name_home_does_not_climb() {
+  smoke_cleanup_temp_root
+  smoke_setup_bridge_home "$SMOKE_NAME"
+  local agent=home                                # agent LITERALLY named "home"
+  local home="$BRIDGE_AGENT_HOME_ROOT/$agent"     # flat home == <agents-root>/home
+  local workdir="$SMOKE_TMP_ROOT/proj-$agent"
+  mkdir -p "$home" "$workdir"
+
+  # Decoy managed block ONLY at the agents-root parent -- the unrelated dir a
+  # basename-only climb would wrongly consult for an agent named "home".
+  write_block_claude "$BRIDGE_AGENT_HOME_ROOT/CLAUDE.md"
+  write_blockless_claude "$home/CLAUDE.md"
+  write_blockless_claude "$workdir/CLAUDE.md"
+  seed_profile_files "$workdir"
+
+  local reg="$SMOKE_TMP_ROOT/reg-t3b.json"
+  write_registry "$reg" "$agent" "$workdir" "$home"
+  local out="$SMOKE_TMP_ROOT/out-t3b.json"
+  run_scan "$reg" "$out"
+
+  smoke_assert_eq "true" "$(field_for "$out" "$agent" missing_managed_claude_block)" \
+    "T3b (allowed-name collision): an agent named 'home' with a FLAT home must NOT climb to <agents-root>/CLAUDE.md -- a decoy block there must stay missing_managed_claude_block=true"
+
+  # Clean up the agents-root decoy so it can't leak into another test's scan.
+  rm -f "$BRIDGE_AGENT_HOME_ROOT/CLAUDE.md"
+}
+
 main() {
   smoke_run "T1 agent-root managed block (home-subdir registry) scans ok, not drift" \
     test_agent_root_block_is_not_drift
@@ -207,6 +246,8 @@ main() {
     test_block_absent_everywhere_is_drift
   smoke_run "T3 guard precision: flat home does not climb to an unrelated parent" \
     test_flat_home_does_not_climb
+  smoke_run "T3b allowed-name collision: agent named 'home' with flat home does not climb" \
+    test_allowed_name_home_does_not_climb
   smoke_log "PASS: $SMOKE_NAME"
 }
 
