@@ -6429,6 +6429,17 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # on every watchdog move so a refactor can neither re-introduce the
       # workdir-only false positive nor mask a block genuinely absent from BOTH.
       add_required 2018-watchdog-managed-block-identity-home
+      # Issue #22101 (#2018 blast radius): a static Claude agent whose registry
+      # `home` is the runtime `home/` SUBDIR carries its managed block at the
+      # agent ROOT one level up (where the scaffold writes it) — which the #2018
+      # fall-back (home-subdir CLAUDE.md only) missed, so the watchdog re-created
+      # a false `[watchdog] agent profile drift` task every cycle. The
+      # 22101-watchdog-managed-block-agent-root smoke pins the agent-root climb
+      # (scoped to `home.name == "home"`), a NON-VACUOUS absent-everywhere control
+      # (a block truly missing still surfaces), and a guard-precision case (a FLAT
+      # home must NOT climb to an unrelated parent). Pull it on every watchdog move
+      # so the climb can neither regress nor over-suppress genuine drift.
+      add_required 22101-watchdog-managed-block-agent-root
       # Issue #2062 (#1816 marker-stamp blast radius): the watchdog's literal
       # MANAGED_START drift probe must match the block AS THE RENDERER EMITS IT.
       # The existing watchdog smokes hand-write a literal-marker fixture, so they

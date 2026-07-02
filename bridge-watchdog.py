@@ -2209,13 +2209,42 @@ def scan_agent(
                 # entrypoint probe above — runs inside scan_agent's try/except
                 # that maps any PermissionError to a structured scan_error row
                 # (#1119), so the fail-soft "never crash the pass" contract holds.
-                home_claude = agent_home_dir / "CLAUDE.md"
-                if home_claude.exists():  # noqa: raw-pathlib-controller-only
-                    home_text = read_text(home_claude)
-                    if MANAGED_START in home_text and MANAGED_END in home_text:
-                        # Present in the agent_home identity source (the
-                        # authoritative materialization target) — not drift.
-                        missing_block = False
+                #
+                # Issue #22101: the managed block is materialized into the agent's
+                # IDENTITY source, which is EITHER the registered ``agent_home``
+                # OR — when ``agent_home`` is the runtime ``home/`` subdir (registry
+                # ``home`` = ``.../agents/<a>/home``) — the agent ROOT one level up
+                # (``.../agents/<a>/CLAUDE.md``), which is where the scaffold writes
+                # the block. `bridge-docs.py`'s audit descends to that same root, so
+                # it reports these agents clean while the watchdog (using the
+                # registry ``home`` directly) saw only ``.../home/CLAUDE.md`` — which
+                # legitimately has no block — and re-created a false drift task every
+                # cycle. Check both identity candidates; a block genuinely absent
+                # from ALL of them still surfaces as drift.
+                #
+                # The agent-ROOT climb is gated on the GENERATED v2 layout, not a
+                # bare ``basename == "home"`` — an agent may legitimately be NAMED
+                # ``home`` (only ``help``/``version`` are reserved), giving a flat
+                # identity home at ``.../agents/home`` whose ``.name`` is also
+                # ``"home"``. Requiring the home's PARENT basename to equal the
+                # resolved agent id proves ``.../agents/<id>/home`` (the runtime
+                # ``home/`` subdir) and refuses to climb from a flat home into the
+                # unrelated agents-root ``CLAUDE.md`` (codex PR #2243 r1).
+                identity_candidates = [agent_home_dir / "CLAUDE.md"]
+                if (
+                    agent_home_dir.name == "home"
+                    and agent_name
+                    and agent_home_dir.parent.name == agent_name
+                ):
+                    identity_candidates.append(agent_home_dir.parent / "CLAUDE.md")
+                for identity_claude in identity_candidates:
+                    if identity_claude.exists():  # noqa: raw-pathlib-controller-only
+                        identity_text = read_text(identity_claude)
+                        if MANAGED_START in identity_text and MANAGED_END in identity_text:
+                            # Present in an identity source (the authoritative
+                            # materialization target) — not drift.
+                            missing_block = False
+                            break
         else:
             missing_block = False
         session_type, onboarding_state = parse_session_type(agent_dir)
