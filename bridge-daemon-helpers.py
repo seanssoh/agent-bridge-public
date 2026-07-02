@@ -1004,6 +1004,27 @@ def cmd_rotation_status_parse(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_lease_decision_parse(args: argparse.Namespace) -> int:
+    """#21895 sub-PR 3: extract the ``action`` from a lease-swap-or-defer decision.
+
+    Parses the bridge-auth.sh ``claude-token lease-swap-or-defer --json`` envelope
+    and prints a single field: the ``action`` (``swapped`` / ``defer_local`` /
+    ``suppress_cooldown``). A parse failure or a missing/unknown action prints
+    ``defer_local`` so the caller degrades to its EXISTING local rotate — a
+    garbled lease decision must NEVER suppress the safe local fallback.
+    """
+    try:
+        payload = json.loads(args.decision_json)
+    except Exception:
+        print("defer_local")
+        return 0
+    action = str(payload.get("action") or "")
+    if action not in ("swapped", "defer_local", "suppress_cooldown"):
+        action = "defer_local"
+    print(action)
+    return 0
+
+
 def cmd_recovery_status_parse(args: argparse.Namespace) -> int:
     """Original site: bridge-daemon.sh:1227 (process_claude_token_recovery).
 
@@ -1044,6 +1065,27 @@ def cmd_sync_status_parse(args: argparse.Namespace) -> int:
     """
     try:
         payload = json.loads(args.sync_json)
+        print(str(payload.get("status", "")))
+    except Exception:
+        print("error")
+    return 0
+
+
+def cmd_lease_checkout_status_parse(args: argparse.Namespace) -> int:
+    """#21895 sub-PR 4/4 — parse a lease CHECKOUT envelope's status from STDIN.
+
+    Original site: bridge-daemon.sh:bridge_daemon_token_lease_checkout.
+
+    The lease ``checkout`` (and ``swap``) envelope carries ``secret_material``
+    (the new token's actual secret) in production, so it must NEVER transit argv
+    — a ``ps``/``/proc/<pid>/cmdline`` reader would see the secret verbatim
+    (codex #2248 finding 2, P1). This reads the whole envelope from STDIN
+    (parity with the config verb's ``--api-key-stdin`` secret-handling
+    precedent) and prints ONLY the non-secret ``status`` field. ``error`` on
+    empty/garbled stdin so the bash callsite surfaces a checkout failure rather
+    than silently treating it as success."""
+    try:
+        payload = json.loads(sys.stdin.read())
         print(str(payload.get("status", "")))
     except Exception:
         print("error")
@@ -1096,6 +1138,102 @@ def cmd_sync_aliveness_parse(args: argparse.Namespace) -> int:
         if not name:
             continue
         print(f"{name}\t{aliveness}\t{remaining_ms}")
+    return 0
+
+
+def cmd_lease_status_parse(args: argparse.Namespace) -> int:
+    """#21895 phase-1 (sub-PR 4/4) — token-updater lease tick decision inputs.
+
+    Original site: bridge-daemon.sh:bridge_daemon_token_lease_tick.
+
+    Parses the ``bridge-auth.sh claude-token lease status --json`` envelope
+    (Contract A, owned by sub-PR 2) into the six fields the daemon tick needs
+    to make the codex-Q5 re-checkout decision IN BASH (so the decision stays in
+    the daemon, not hidden in a subprocess). Output is a single tab-separated
+    row (mirrors rotation-status-parse's ``-``-for-empty convention so the bash
+    ``IFS=$'\\t' read`` never column-shifts on an empty middle field):
+
+      configured \\t has_lease \\t lease_expires_at \\t local_token_id \\t active_token_id \\t service_token_id
+
+      * ``configured`` / ``has_lease`` — ``1``/``0`` booleans. ``has_lease`` is
+        true iff the durable lease-state file records a live lease (a non-empty
+        ``service_token_id``); the daemon checks out when it is ``0``.
+      * ``lease_expires_at`` — epoch int or ``-`` (checkout when it is in the
+        past relative to the daemon's ``now``).
+      * ``local_token_id`` / ``active_token_id`` — the lease-state local row id
+        vs the registry active row id. A mismatch is the codex-Q1 "drift"
+        signal (a DIFFERENT local row is active than the lease bound), which
+        the daemon treats as re-checkout.
+      * ``service_token_id`` — the remote lease id, carried through for audit.
+
+    JSON-parse error degrades to ``error`` in ``configured`` so the bash
+    ``case`` classifies it under the error branch and skips this tick.
+    """
+    try:
+        payload = json.loads(args.status_json)
+    except Exception:
+        # Sentinel the parse failure in-band; the bash callsite treats a
+        # ``configured`` value of ``error`` as "skip this tick".
+        print("error\t0\t-\t-\t-\t-")
+        return 0
+    if not isinstance(payload, dict):
+        print("error\t0\t-\t-\t-\t-")
+        return 0
+
+    def _norm(value: object) -> str:
+        text = "" if value is None else str(value)
+        return text if text else "-"
+
+    lease = payload.get("lease") if isinstance(payload.get("lease"), dict) else {}
+    service_token_id = str(lease.get("service_token_id", "") or "")
+    columns = [
+        "1" if payload.get("configured") else "0",
+        "1" if service_token_id else "0",
+        _norm(lease.get("lease_expires_at")),
+        _norm(lease.get("local_token_id")),
+        _norm(payload.get("active_token_id")),
+        _norm(service_token_id),
+    ]
+    print("\t".join(columns))
+    return 0
+
+
+def cmd_lease_heartbeat_parse(args: argparse.Namespace) -> int:
+    """#21895 phase-1 (sub-PR 4/4) — parse a lease heartbeat outcome.
+
+    Original site: bridge-daemon.sh:bridge_daemon_token_lease_tick.
+
+    Parses the structured dict returned by the Contract-A client's heartbeat
+    (surfaced through ``bridge-auth.sh claude-token lease heartbeat --json``)
+    into the two fields the daemon reacts to. Output — a single tab-separated
+    row (``-`` for an empty http):
+
+      status \\t http
+
+    The daemon re-checks out when ``http`` is 404 or 409 (lease gone / bound
+    elsewhere), heartbeats-and-continues when ``status`` is ``ok``, and skips
+    otherwise. JSON-parse error degrades to ``error\\t-`` (skip this tick).
+    """
+    try:
+        payload = json.loads(args.heartbeat_json)
+    except Exception:
+        print("error\t-")
+        return 0
+    if not isinstance(payload, dict):
+        print("error\t-")
+        return 0
+    # Normalize BOTH fields to the `-` sentinel when empty/None — symmetrically.
+    # If `status` were emitted as "" while `http` was e.g. 404, the row "\t404"
+    # collapses under the daemon's `IFS=$'\t' read -r hb_status hb_http` (a
+    # leading tab is trimmed as IFS whitespace → hb_status=404, hb_http=""),
+    # silently bypassing the http∈{404,409} re-checkout gate (gemini HIGH latent,
+    # #2248). Keeping both fields non-empty makes the two-column row unambiguous.
+    status = payload.get("status")
+    http = payload.get("http")
+    print("\t".join([
+        str(status) if status not in (None, "") else "-",
+        str(http) if http not in (None, "") else "-",
+    ]))
     return 0
 
 
@@ -1855,6 +1993,12 @@ SUBCOMMANDS = {
         [("rotate_json", "JSON envelope from bridge-auth.sh claude-token rotate --json")],
         "Single-row rotation outcome: status / reason / from / to / sync_status / soonest_reset (6 cols).",
     ),
+    # #21895 sub-PR 3: route on the lease-swap-or-defer decision's action.
+    "lease-decision-parse": (
+        cmd_lease_decision_parse,
+        [("decision_json", "JSON envelope from bridge-auth.sh claude-token lease-swap-or-defer --json")],
+        "Single line — the decision action (swapped/defer_local/suppress_cooldown); 'defer_local' on parse failure.",
+    ),
     # Issue #1468: classify a native usage-probe --json result for an audit row.
     "usage-probe-result-parse": (
         cmd_usage_probe_result_parse,
@@ -1872,10 +2016,31 @@ SUBCOMMANDS = {
         [("sync_json", "JSON envelope from bridge-auth.sh claude-token sync --json")],
         "Single line — sync status string ('error' on parse failure).",
     ),
+    # #21895 phase-1 (sub-PR 4/4): the lease CHECKOUT envelope carries
+    # secret_material, so its status is parsed from STDIN (never argv) — no
+    # positional arg. See cmd_lease_checkout_status_parse.
+    "lease-checkout-status-parse": (
+        cmd_lease_checkout_status_parse,
+        [],
+        "Single line — lease checkout status string from STDIN ('error' on parse failure). "
+        "STDIN-only so the secret-bearing envelope never transits argv (codex #2248 P1).",
+    ),
     "sync-aliveness-parse": (
         cmd_sync_aliveness_parse,
         [("sync_json", "JSON envelope from bridge-auth.sh claude-token sync --json")],
         "Per-agent aliveness/remaining_ms (3 tab-separated cols / row). Empty on parse failure.",
+    ),
+    # #21895 phase-1 (sub-PR 4/4): token-updater lease tick decision inputs.
+    "lease-status-parse": (
+        cmd_lease_status_parse,
+        [("status_json", "JSON envelope from bridge-auth.sh claude-token lease status --json")],
+        "Single row: configured / has_lease / lease_expires_at / local_token_id / "
+        "active_token_id / service_token_id (6 cols, `-` for empty; `error` in col 1 on parse fail).",
+    ),
+    "lease-heartbeat-parse": (
+        cmd_lease_heartbeat_parse,
+        [("heartbeat_json", "JSON envelope from bridge-auth.sh claude-token lease heartbeat --json")],
+        "Single row: status / http (2 cols, `-` for empty http; `error` on parse fail).",
     ),
     # Issue #1262 Gap 3 (v0.15.0-beta4 Lane I): outbox stuck-alert
     # decision helper. See cmd_a2a_stuck_decide.

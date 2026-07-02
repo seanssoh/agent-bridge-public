@@ -27,6 +27,7 @@ Usage:
   bash $SCRIPT_DIR/bridge-auth.sh claude-token keychain-free <enable|disable|status> [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token global-auth-sync <enable|disable|status> [--check] [--json]   # #18849: operator-global seamless token-sync opt-in (persisted; env override secondary). --check = exit-code-only effective-state probe (daemon early-skip)
   bash $SCRIPT_DIR/bridge-auth.sh claude-token rotate [--if-auto-enabled] [--reason <text>] [--sync] [--agents static|all|csv] [--json]
+  bash $SCRIPT_DIR/bridge-auth.sh claude-token lease-swap-or-defer [--caller <site>] [--reason <text>] [--limited-until <iso>] [--sync] [--json]   # #21895 sub-PR 3/4: the ONE shared lease-authoritative swap-or-defer decision every rotator routes through when the token-updater lease is ENABLED
   bash $SCRIPT_DIR/bridge-auth.sh claude-token check <id> [--enable-on-ok] [--disable-on-quota] [--timeout <sec>] [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token classify-output [--stdout-file <path>] [--stderr-file <path>] [--returncode <n>]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token mark-quota <id> [--reset-at <iso>] [--retry-seconds <sec>] [--json]
@@ -1528,14 +1529,15 @@ case "$command" in
           global-auth-sync "$action" "$@"
         ;;
       lease)
-        # #21895 phase-1 (sub-PR 1/4): the token-updater lease CONFIG surface.
-        # `config` persists URL/SERVER_ID/ENABLED to runtime/bridge-config.json
-        # (blessed admin path — never a raw edit) and the API KEY to a 0600
-        # secrets file (NEVER runtime-config JSON, NEVER `config set-env`).
-        # `status` is a read-only effective-state report; `status --check` is the
-        # exit-code-only probe the later daemon tick reuses. This sub-PR wires NO
-        # lease client / rotator / daemon tick — config foundation only,
-        # default-OFF (byte-for-byte no-op until configured AND enabled).
+        # #21895 phase-1: the token-updater lease surface. `config` persists
+        # URL/SERVER_ID/ENABLED to runtime/bridge-config.json (blessed admin path
+        # — never a raw edit) and the API KEY to a 0600 secrets file (NEVER
+        # runtime-config JSON, NEVER `config set-env`). `status` is a read-only
+        # effective-state report; `status --check` is the exit-code-only probe
+        # the daemon tick reuses. sub-PR 2 adds the Contract-A lease client verbs
+        # `checkout`/`swap`/`checkin` (structured JSON). This sub-PR wires NO
+        # rotator / daemon tick — config + client surface only, default-OFF
+        # (byte-for-byte no-op until configured AND enabled).
         action="${1:-}"
         case "$action" in
           -h|--help|help)
@@ -1548,15 +1550,33 @@ case "$command" in
             ;;
         esac
         shift || true
-        # Value-bearing flags (--api-url/--server-id/--api-key-file) and the
-        # value-less flags (--json/--check/--enabled/--disabled/--api-key-stdin)
-        # are allowlisted; an unknown flag fails closed (exit 2). The secret is
-        # read from a file/stdin INSIDE python, never captured here.
+        # Value-bearing flags (--api-url/--server-id/--api-key-file/
+        # --service-token-id/--timeout) and the value-less flags (--json/--check/
+        # --enabled/--disabled/--api-key-stdin) are allowlisted; an unknown flag
+        # fails closed (exit 2). The secret is read from a file/stdin INSIDE
+        # python (never captured here); the client verbs never take the secret on
+        # argv either — it stays in the 0600 file the client reads.
         bridge_auth_guard_wrapper_flags "claude-token lease" \
-          "--api-url,--server-id,--api-key-file" \
+          "--api-url,--server-id,--api-key-file,--service-token-id,--timeout" \
           "--json,--check,--enabled,--disabled,--api-key-stdin" "$@"
         exec python3 "$SCRIPT_DIR/bridge-auth.py" --registry "$registry" \
           lease "$action" "$@"
+        ;;
+      lease-swap-or-defer)
+        # #21895 phase-1 (sub-PR 3/4): the ONE shared lease-authoritative
+        # swap-or-defer authority every rotator routes its rotate decision
+        # through when the token-updater lease is ENABLED. Value-bearing flags
+        # (--caller/--reason/--limited-until) and the value-less --sync/--json are
+        # allowlisted; an unknown flag fails closed (exit 2). --sync converges the
+        # operator-global credential INSIDE python on a swap (parity with
+        # `rotate --sync`), so there is no bash-side sync fanout here — the daemon's
+        # periodic token sync re-propagates to agents (as it backstops a missed
+        # `--agents all` pass). The verb always exits 0; its decision is the JSON.
+        bridge_auth_guard_wrapper_flags "claude-token lease-swap-or-defer" \
+          "--caller,--reason,--limited-until" \
+          "--sync,--json,--if-auto-enabled" "$@"
+        exec python3 "$SCRIPT_DIR/bridge-auth.py" --registry "$registry" \
+          lease-swap-or-defer "$@"
         ;;
       rotate)
         json_mode=0
