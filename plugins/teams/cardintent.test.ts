@@ -425,15 +425,18 @@ describe('buildAdaptiveCard render shape (6-field per-RFQ stack, card 8)', () =>
     expect(header.text).toBe(intent.sections[0].label)
     expect(header.color).toBe('Accent')
     expect(header.weight).toBe('Bolder')
-    // emphasis sub-container holds the FactSet[용량, 랩넘버] + 2 price ColumnSets
+    // emphasis sub-container holds the FactSet[RFQ, 랩넘버, 용량, 수량, 부자재사양] + 2 price ColumnSets
     const emph = first.items.find((i: any) => i.type === 'Container' && i.style === 'emphasis')
     expect(emph).toBeDefined()
     const factSet = emph.items.find((i: any) => i.type === 'FactSet')
-    expect(factSet.facts.map((f: any) => f.title)).toEqual(['용량', '랩넘버', 'RFQ'])
-    expect(factSet.facts[0].value).toBe('306 g')
-    expect(factSet.facts[1].value).toBe('TESTCTO1')
-    // no RFQ row in this fixture → factValue routes the missing field to em dash
-    expect(factSet.facts[2].value).toBe('—')
+    // #22358 A1 order: RFQ · 랩넘버 · 용량 · 수량 · 부자재사양
+    expect(factSet.facts.map((f: any) => f.title)).toEqual(['RFQ', '랩넘버', '용량', '수량', '부자재사양'])
+    // this fixture carries only 용량 + 랩넘버 → RFQ/수량/부자재사양 route to em dash
+    expect(factSet.facts.find((f: any) => f.title === 'RFQ').value).toBe('—')
+    expect(factSet.facts.find((f: any) => f.title === '랩넘버').value).toBe('TESTCTO1')
+    expect(factSet.facts.find((f: any) => f.title === '용량').value).toBe('306 g')
+    expect(factSet.facts.find((f: any) => f.title === '수량').value).toBe('—')
+    expect(factSet.facts.find((f: any) => f.title === '부자재사양').value).toBe('—')
     const priceRows = emph.items.filter((i: any) => i.type === 'ColumnSet')
     expect(priceRows.length).toBe(2)
     expect(JSON.stringify(priceRows[0])).toContain('내용물 견적')
@@ -526,6 +529,51 @@ describe('buildAdaptiveCard render shape (6-field per-RFQ stack, card 8)', () =>
     expect(JSON.stringify(card)).toContain('RFQ900000385')
     // section without an RFQ row → em dash, never a leak
     expect(factSetOf(1).find((f: any) => f.title === 'RFQ').value).toBe('—')
+  })
+
+  test('#22358 A1: 수량 + 부자재사양 rows render verbatim in the FactSet; missing → em dash', () => {
+    // Server (v239+) emits 수량 (already thousands-formatted) and 부자재사양
+    // (already " · "-joined) rows. The renderer SELECTS + orders them and prints
+    // the server strings verbatim — no reformatting.
+    const intent: any = {
+      kind: 'quoteResult',
+      title: 't',
+      fallbackMarkdown: 'f',
+      sections: [
+        {
+          label: 'A사 · 세럼A',
+          rows: [
+            { label: 'RFQ', value: 'RFQ900000385', valueState: 'value' },
+            { label: '랩넘버', value: 'TESTCTO1', valueState: 'value' },
+            { label: '용량', value: '50 g', valueState: 'value' },
+            { label: '수량', value: '5,000', valueState: 'value' },
+            { label: '부자재사양', value: '단상자 · 라벨 · 스티커', valueState: 'value' },
+            { label: '내용물 견적', value: '1,000 원', valueState: 'value' },
+          ],
+        },
+        {
+          // no 수량 / 부자재사양 rows → both route to an em dash
+          label: 'B사 · 크림B',
+          rows: [{ label: '내용물 견적', value: '2,000 원', valueState: 'value' }],
+        },
+      ],
+    }
+    const card: any = buildAdaptiveCard(intent)
+    const factSetOf = (containerIdx: number) =>
+      card.body
+        .filter((b: any) => b.type === 'Container')[containerIdx]
+        .items.find((i: any) => i.type === 'Container').items
+        .find((i: any) => i.type === 'FactSet').facts
+    const f0 = factSetOf(0)
+    // full A1 field order + verbatim values
+    expect(f0.map((f: any) => f.title)).toEqual(['RFQ', '랩넘버', '용량', '수량', '부자재사양'])
+    expect(f0.find((f: any) => f.title === '수량').value).toBe('5,000')
+    expect(f0.find((f: any) => f.title === '부자재사양').value).toBe('단상자 · 라벨 · 스티커')
+    expect(f0.find((f: any) => f.title === '용량').value).toBe('50 g')
+    // missing 수량 / 부자재사양 → em dash, never a leak
+    const f1 = factSetOf(1)
+    expect(f1.find((f: any) => f.title === '수량').value).toBe('—')
+    expect(f1.find((f: any) => f.title === '부자재사양').value).toBe('—')
   })
 
   test('a masked/calculating 용량·랩넘버 FactSet row NEVER leaks its raw value', () => {
@@ -1144,6 +1192,43 @@ describe('devReqAutofill render shape (section-order grouping)', () => {
     const p1 = JSON.stringify(emphasis[0])
     expect(p1).toContain('프로젝트정보')
     expect(p1).toContain('제품정보')
+  })
+
+  test('#22358 A3: content sub-section labels carry the quoteRequest Accent header tone', () => {
+    // 프로젝트정보/제품정보/벌크 sub-section headers must match the quoteRequest
+    // card's { weight:'Bolder', color:'Accent' } tone (previously small/subtle
+    // greyed) so section boundaries stand out.
+    const card = buildDevReqAutofillCard(validDevReqIntent()) as Record<string, unknown>
+    const body = card.body as Array<Record<string, unknown>>
+    const emphasis = body.filter(el => el.type === 'Container' && el.style === 'emphasis')
+    const items0 = emphasis[0].items as Array<Record<string, unknown>>
+    // find the 프로젝트정보 / 제품정보 sub-section TextBlocks inside P1
+    const subHeaders = items0.filter(
+      el => el.type === 'TextBlock' && (el.text === '프로젝트정보' || el.text === '제품정보'),
+    )
+    expect(subHeaders.length).toBe(2)
+    for (const h of subHeaders) {
+      expect(h.color).toBe('Accent')
+      expect(h.weight).toBe('Bolder')
+      // no longer the old small/subtle greyed subheader
+      expect(h.size).toBeUndefined()
+      expect(h.isSubtle).toBeUndefined()
+    }
+  })
+
+  test('#22358 A3: the flat safety-net section header also carries the Accent tone', () => {
+    const intent = validDevReqIntent()
+    intent.sections = [{ label: '단독 섹션', rows: [{ label: 'a', value: 'b', valueState: 'value' }] }]
+    intent.actions = []
+    const card = buildDevReqAutofillCard(intent) as Record<string, unknown>
+    const body = card.body as Array<Record<string, unknown>>
+    const flat = body.find(
+      el => el.type === 'Container' && !el.style && (el.items as Array<Record<string, unknown>>)?.[0]?.text === '단독 섹션',
+    ) as Record<string, unknown>
+    expect(flat).toBeDefined()
+    const header = (flat.items as Array<Record<string, unknown>>)[0]
+    expect(header.color).toBe('Accent')
+    expect(header.weight).toBe('Bolder')
   })
 
   test('AC v1.2 only — no Table / targetWidth / Action.Submit / ToggleVisibility', () => {
