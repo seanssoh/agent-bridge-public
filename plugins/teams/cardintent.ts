@@ -621,15 +621,16 @@ function toQuoteResultAction(a: Action): AcElement | null {
   return null
 }
 
-// quoteResult per-RFQ fields (#17138 6-field design). The card is the SINGLE
-// mobile-safe per-product stack (appendix card 8): one Container per RFQ with a
-// 고객·제품 header + a 용량/랩넘버 FactSet + 내용물 견적 / 가공비 견적 price rows.
-// The wide 6-column desktop table (appendix card 7) is NOT rendered in chat — it
-// lives behind the [전체 견적결과 보기] deeplink (the renderer cannot detect the
-// Teams client device, so the narrow layout is the only safe one to push).
+// quoteResult per-RFQ fields (#17138 6-field design; #22358 A1 spec fields). The
+// card is the SINGLE mobile-safe per-product stack (appendix card 8): one
+// Container per RFQ with a 고객·제품 header + an RFQ/랩넘버/용량/수량/부자재사양
+// FactSet + 내용물 견적 / 가공비 견적 price rows. The wide 6-column desktop table
+// (appendix card 7) is NOT rendered in chat — it lives behind the
+// [전체 견적결과 보기] deeplink (the renderer cannot detect the Teams client
+// device, so the narrow layout is the only safe one to push).
 //
-// 용량/랩넘버 are matched out of the section's rows by stable labels; missing →
-// an em dash. The price cells are PriceCells (string-only Row.value) matched by
+// RFQ/랩넘버/용량/수량/부자재사양 are matched out of the section's rows by stable
+// labels; missing → an em dash. The price cells are PriceCells (string-only Row.value) matched by
 // the viewer-facing 내용물 견적 / 가공비 견적 labels (these are the ALLOWED §10
 // price labels — never the role-internal cost language). The dropped beta2.2
 // 견적 소계 / 산출상태 columns are gone: each price cell carries its own
@@ -637,6 +638,13 @@ function toQuoteResultAction(a: Action): AcElement | null {
 const FIELD_VOLUME_LABELS: readonly string[] = ['용량']
 const FIELD_LABNO_LABELS: readonly string[] = ['랩넘버']
 const FIELD_RFQ_LABELS: readonly string[] = ['RFQ']
+// #22358 A1: the server (v239+) also emits 수량 (already thousands-formatted,
+// e.g. "5,000") and 부자재사양 (already " · "-joined server-side) rows for the
+// quoteResult chat card. Both are spec identifiers (NOT §10 cost fields — the
+// server projection guarantees it), matched + ordered by these stable labels and
+// printed VERBATIM; a missing row falls back to the existing em dash.
+const FIELD_QUANTITY_LABELS: readonly string[] = ['수량']
+const FIELD_SUBMATERIAL_LABELS: readonly string[] = ['부자재사양']
 const FIELD_CONTENT_PRICE_LABELS: readonly string[] = ['내용물 견적']
 const FIELD_PROCESSING_PRICE_LABELS: readonly string[] = ['가공비 견적']
 const EMDASH = '—'
@@ -695,9 +703,9 @@ function priceRow(label: string, rows: Row[], labels: readonly string[]): AcElem
 
 // list render (AC 1.2) = the mobile-safe per-product stack (appendix card 8):
 // the title, then one Container (separator) per RFQ section. Each RFQ Container
-// holds a 고객·제품 header (Accent, Bolder) + an `emphasis` Container with a
-// 용량/랩넘버 FactSet and the 내용물 견적 / 가공비 견적 PriceCell rows. This is
-// the ONLY chat layout — the wide 6-column desktop table (card 7) lives behind
+// holds a 고객·제품 header (Accent, Bolder) + an `emphasis` Container with an
+// RFQ/랩넘버/용량/수량/부자재사양 FactSet and the 내용물 견적 / 가공비 견적
+// PriceCell rows. This is the ONLY chat layout — the wide 6-column desktop table (card 7) lives behind
 // the [전체 견적결과 보기] deeplink. ColumnSet (NOT the AC 1.5 Table element)
 // keeps us on AC 1.2 / no Table / no targetWidth, ≤3 columns per ColumnSet.
 // Per-section actions are NOT emitted in Phase 1a (the only card action is the
@@ -718,9 +726,16 @@ function renderRfqContainer(section: Section): AcElement {
           {
             type: 'FactSet',
             facts: [
-              { title: '용량', value: factValue(section.rows, FIELD_VOLUME_LABELS) },
-              { title: '랩넘버', value: factValue(section.rows, FIELD_LABNO_LABELS) },
+              // #22358 A1 field order: RFQ (grouping identifier, kept per the
+              // operator live-feedback golden) then 랩넘버 · 용량 · 수량 ·
+              // 부자재사양. Each value is the server-provided string printed
+              // verbatim via factValue (§10: spec identifiers, not cost); a
+              // missing row → em dash.
               { title: 'RFQ', value: factValue(section.rows, FIELD_RFQ_LABELS) },
+              { title: '랩넘버', value: factValue(section.rows, FIELD_LABNO_LABELS) },
+              { title: '용량', value: factValue(section.rows, FIELD_VOLUME_LABELS) },
+              { title: '수량', value: factValue(section.rows, FIELD_QUANTITY_LABELS) },
+              { title: '부자재사양', value: factValue(section.rows, FIELD_SUBMATERIAL_LABELS) },
             ],
           },
           priceRow('내용물 견적', section.rows, FIELD_CONTENT_PRICE_LABELS),
@@ -902,9 +917,13 @@ function isDevReqWarningSection(label: string): boolean {
 }
 
 // A subheader TextBlock + its FactSet (nested inside a project Container).
+// #22358 A3: match the quoteRequest card's section-label tone so the
+// 프로젝트정보/제품정보/벌크 boundaries stand out — the same Accent header style
+// renderQuoteRequestContainer uses ({ weight:'Bolder', color:'Accent' }),
+// replacing the prior small/subtle greyed subheader.
 function devReqSubSection(subheader: string, rows: Row[]): AcElement[] {
   return [
-    textBlock(subheader, { weight: 'Bolder', size: 'Small', isSubtle: true, spacing: 'Small' }),
+    textBlock(subheader, { weight: 'Bolder', color: 'Accent', spacing: 'Small' }),
     devReqFactSet(rows),
   ]
 }
@@ -954,11 +973,12 @@ function renderDevReqBody(intent: DevReqAutofillIntent): AcElement[] {
       currentProjectItems.push(...devReqSubSection(section.label, section.rows))
     } else {
       // Flat safety-net: a content section with no open project header.
+      // #22358 A3: same Accent section-label tone as the nested sub-sections.
       body.push({
         type: 'Container',
         separator: true,
         spacing: 'Medium',
-        items: [textBlock(section.label, { weight: 'Bolder' }), devReqFactSet(section.rows)],
+        items: [textBlock(section.label, { weight: 'Bolder', color: 'Accent' }), devReqFactSet(section.rows)],
       })
     }
   }
