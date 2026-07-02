@@ -25,6 +25,11 @@
 #       unknown flag fails closed (rc=2)
 #   T8  setup wizard delegates to the sanctioned writer (dry-run writes nothing;
 #       real run persists via bridge-auth.py; secret 0600, not in config JSON)
+#   T11 an explicit-but-empty --api-key-file PATH ("") is REFUSED fail-closed in
+#       CLI + wizard, writing NO partial config and leaving any existing secret
+#       byte-for-byte (codex r2: truthiness treated an empty path as "omitted")
+#   T12 --api-key-file + --api-key-stdin together fail closed in CLI + wizard
+#       (one unambiguous secret source; codex r2 CLI-side gap)
 #   T9  an explicit-but-empty/whitespace key source is REFUSED fail-closed (CLI
 #       + wizard, stdin + file); the existing secret survives the refusal intact
 #   T10 ci-select routing: bridge-auth.py / bridge-config.py / bridge-setup.py
@@ -279,6 +284,68 @@ test_empty_key_source_refused() {
   [[ "$rc" -ne 0 ]] || smoke_fail "T9 wizard whitespace --api-key-file returned 0 (must refuse)"
 }
 
+# ── T11 (codex r2) ─────────────────────────────────────────────────────
+# An explicit but EMPTY PATH argument (`--api-key-file ""`) is a distinct bug
+# class from empty CONTENT (T9): a truthiness test on the flag treated it as
+# "omitted", silently skipping the secret writer while STILL persisting
+# URL/SERVER_ID/ENABLED -> exit 0 with a stale secret left active. It must now
+# fail closed BEFORE any write, in BOTH the CLI and the wizard, leaving secret
+# AND config byte-for-byte unchanged (no partial config write).
+test_empty_key_path_refused() {
+  reset_surfaces
+  # Seed a full, good config + secret so we can detect ANY partial write.
+  printf '%s' "$FIXTURE_KEY" | lease_py config \
+    --api-url "https://lease.example.com" --server-id "srv-1" --enabled --api-key-stdin --json >/dev/null
+  local before_ck; before_ck="$(cksum <"$SECRET")"
+  local before_cfg; before_cfg="$(cksum <"$CFG")"
+  local rc
+
+  # CLI: explicit empty --api-key-file path => rc!=0, NO partial config write.
+  set +e
+  lease_py config --server-id "srv-x" --enabled --api-key-file "" --json >/dev/null 2>&1; rc=$?
+  set -e 2>/dev/null || true
+  [[ "$rc" -ne 0 ]] || smoke_fail "T11 CLI explicit empty --api-key-file path returned 0 (must refuse)"
+  smoke_assert_eq "$before_ck" "$(cksum <"$SECRET")" "T11 CLI empty-path refusal left the secret unchanged"
+  smoke_assert_eq "$before_cfg" "$(cksum <"$CFG")" "T11 CLI empty-path refusal wrote NO partial config"
+  smoke_assert_eq "srv-1" "$(cat "$CFG" | field token_updater_server_id)" "T11 CLI server_id NOT overwritten to srv-x"
+
+  # Wizard: explicit empty --api-key-file path => rc!=0, surfaces unchanged.
+  set +e
+  python3 "$SETUP_PY" token-updater --server-id "srv-wx" --enable --api-key-file "" --yes >/dev/null 2>&1; rc=$?
+  set -e 2>/dev/null || true
+  [[ "$rc" -ne 0 ]] || smoke_fail "T11 wizard explicit empty --api-key-file path returned 0 (must refuse)"
+  smoke_assert_eq "$before_ck" "$(cksum <"$SECRET")" "T11 wizard empty-path refusal left the secret unchanged"
+  smoke_assert_eq "$before_cfg" "$(cksum <"$CFG")" "T11 wizard empty-path refusal wrote NO partial config"
+}
+
+# ── T12 (codex r2) ─────────────────────────────────────────────────────
+# The secret source must be unambiguous: passing --api-key-file AND
+# --api-key-stdin together fails closed at the CLI (the wizard already rejected
+# it) so the sanctioned writer never silently prefers one source over the other.
+test_source_mutually_exclusive() {
+  reset_surfaces
+  printf '%s' "$FIXTURE_KEY" | lease_py config \
+    --api-url "https://lease.example.com" --server-id "srv-1" --enabled --api-key-stdin --json >/dev/null
+  local before_ck; before_ck="$(cksum <"$SECRET")"
+  local keyfile="$SMOKE_TMP_ROOT/dual.key"; printf 'from-file-key\n' >"$keyfile"
+  local rc
+
+  # CLI: both sources => rc!=0, secret unchanged.
+  set +e
+  printf 'from-stdin-key' | lease_py config --server-id "srv-2" \
+    --api-key-file "$keyfile" --api-key-stdin --json >/dev/null 2>&1; rc=$?
+  set -e 2>/dev/null || true
+  [[ "$rc" -ne 0 ]] || smoke_fail "T12 CLI --api-key-file + --api-key-stdin together returned 0 (must fail closed)"
+  smoke_assert_eq "$before_ck" "$(cksum <"$SECRET")" "T12 CLI dual-source refusal left the secret unchanged"
+
+  # Wizard: both sources => rc!=0 (still rejected under the is-not-None check).
+  set +e
+  printf 'from-stdin-key' | python3 "$SETUP_PY" token-updater --server-id "srv-w2" \
+    --api-key-file "$keyfile" --api-key-stdin --yes >/dev/null 2>&1; rc=$?
+  set -e 2>/dev/null || true
+  [[ "$rc" -ne 0 ]] || smoke_fail "T12 wizard --api-key-file + --api-key-stdin together returned 0 (must fail closed)"
+}
+
 # ── T10 ───────────────────────────────────────────────────────────────
 # ci-select routes bridge-auth.py / bridge-config.py / bridge-setup.py /
 # bridge-setup.sh to this smoke by source-file mapping. (A change to the smoke
@@ -304,6 +371,8 @@ smoke_run "T6 secret from --api-key-file -> 0600, verbatim round-trip"          
 smoke_run "T7 bash wrapper plumbing + unknown-flag fail-closed (rc=2)"            test_bash_wrapper_plumbing
 smoke_run "T8 setup wizard delegates (dry-run no-op; real run persists 0600)"     test_setup_wizard_delegates
 smoke_run "T9 empty/whitespace key source refused (CLI+wizard, secret intact)"    test_empty_key_source_refused
+smoke_run "T11 explicit empty --api-key-file PATH refused (CLI+wizard, no write)" test_empty_key_path_refused
+smoke_run "T12 --api-key-file + --api-key-stdin mutually exclusive (CLI+wizard)"  test_source_mutually_exclusive
 smoke_run "T10 ci-select routing -> auth/config/setup + smoke selected"          test_ci_select_routing
 
 smoke_log "all checks passed"

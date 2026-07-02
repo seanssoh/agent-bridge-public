@@ -2464,7 +2464,13 @@ def cmd_token_updater(args: argparse.Namespace) -> int:
         # Secret precedence: --api-key-stdin, then --api-key-file, then (in an
         # interactive TTY) a getpass prompt. Never a bare argv flag.
         api_key = ""
-        if getattr(args, "api_key_stdin", False) and getattr(args, "api_key_file", None):
+        # `--api-key-file` defaults to None; an explicit `--api-key-file ""` is a
+        # distinct (empty) VALUE, not an omitted flag — test `is not None`, never
+        # truthiness, or the explicit empty path is silently treated as "no source"
+        # and can leave a stale secret in place (codex r2 finding).
+        api_key_stdin = bool(getattr(args, "api_key_stdin", False))
+        api_key_file = getattr(args, "api_key_file", None)
+        if api_key_stdin and api_key_file is not None:
             raise SetupError(
                 "--api-key-file and --api-key-stdin are mutually exclusive — pass only one."
             )
@@ -2472,7 +2478,7 @@ def cmd_token_updater(args: argparse.Namespace) -> int:
         # (codex r1 finding): an operator who explicitly passed a key source
         # intended to set a key, so an empty source is an error — never a silent
         # skip that could leave a stale secret in place.
-        if getattr(args, "api_key_stdin", False):
+        if api_key_stdin:
             data = sys.stdin.read()
             api_key = data[:-1] if data.endswith("\n") else data
             if not api_key.strip():
@@ -2480,8 +2486,16 @@ def cmd_token_updater(args: argparse.Namespace) -> int:
                     "--api-key-stdin read an empty API key from stdin (no non-blank "
                     "bytes before EOF); omit the key source to keep an existing secret."
                 )
-        elif getattr(args, "api_key_file", None):
-            key_path = Path(args.api_key_file).expanduser()
+        elif api_key_file is not None:
+            # An explicit but empty/whitespace PATH is a caller error, not an
+            # omitted source: reject it before any read so it cannot be mistaken
+            # for "no source" and silently keep a stale secret in place.
+            if not str(api_key_file).strip():
+                raise SetupError(
+                    "--api-key-file was given an empty path; omit the flag to keep "
+                    "an existing secret, or pass a real file path."
+                )
+            key_path = Path(api_key_file).expanduser()
             try:
                 # noqa: raw-pathlib-controller-only — operator-supplied secret-file path.
                 raw = key_path.read_text(encoding="utf-8")  # noqa: raw-pathlib-controller-only
@@ -4081,7 +4095,9 @@ def build_parser() -> argparse.ArgumentParser:
     token_updater_parser.add_argument("--server-id", default="")
     # The secret is read from a file or stdin (or an interactive prompt) — never
     # a bare argv flag, so it stays out of the process table / shell history.
-    token_updater_parser.add_argument("--api-key-file", default="")
+    # None (not "") default so an explicit `--api-key-file ""` is a distinct
+    # empty VALUE the wizard can reject, not an indistinguishable "omitted" flag.
+    token_updater_parser.add_argument("--api-key-file", default=None)
     token_updater_parser.add_argument("--api-key-stdin", action="store_true")
     token_updater_parser.add_argument("--enable", action="store_true")
     token_updater_parser.add_argument("--disable", action="store_true")

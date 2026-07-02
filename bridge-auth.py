@@ -6034,17 +6034,37 @@ def cmd_token_updater_lease(args: argparse.Namespace) -> int:
     # secret untouched).
     api_key = ""
     api_key_source_requested = False
-    if getattr(args, "api_key_stdin", False):
+    api_key_stdin = bool(getattr(args, "api_key_stdin", False))
+    # `--api-key-file` defaults to None; an explicit `--api-key-file ""` is a
+    # distinct (empty) VALUE, not an omitted flag — test `is not None`, never
+    # truthiness, or the explicit empty path is silently treated as "no source"
+    # and can leave a stale secret in place (codex r2 finding).
+    api_key_file = getattr(args, "api_key_file", None)
+    # A secret source must be unambiguous: passing both file + stdin fails closed
+    # (the wizard already rejects the combo — mirror it here so both surfaces
+    # share the one-source contract) rather than silently preferring stdin.
+    if api_key_stdin and api_key_file is not None:
+        return fail("pass at most one of --api-key-stdin / --api-key-file", json_mode)
+    if api_key_stdin:
         api_key_source_requested = True
         api_key = sys.stdin.read()
-    elif getattr(args, "api_key_file", None):
+    elif api_key_file is not None:
+        # An explicit but empty/whitespace PATH is a caller error, not an omitted
+        # source: reject it before any read/write so it cannot be mistaken for
+        # "no source" and silently keep a stale secret in place.
+        if not str(api_key_file).strip():
+            return fail(
+                "--api-key-file was given an empty path — omit the flag to keep the "
+                "existing secret, or pass a real file path",
+                json_mode,
+            )
         api_key_source_requested = True
         try:
-            api_key = Path(args.api_key_file).expanduser().read_text(encoding="utf-8")
+            api_key = Path(api_key_file).expanduser().read_text(encoding="utf-8")
         except OSError as exc:
             return fail(f"cannot read --api-key-file: {exc}", json_mode)
     if api_key_source_requested and not api_key.strip():
-        src = "--api-key-stdin" if getattr(args, "api_key_stdin", False) else "--api-key-file"
+        src = "--api-key-stdin" if api_key_stdin else "--api-key-file"
         return fail(
             f"{src} yielded an empty API key — refusing to leave a stale secret in "
             "place (omit the key source to keep the existing secret unchanged)",
