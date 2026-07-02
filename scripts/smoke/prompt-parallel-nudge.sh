@@ -10,14 +10,19 @@
 # (§"Background Subagent Delegation" / §"Wave Orchestration"). Fail-open,
 # idempotent, tiny. Never wired into any Codex hook path.
 #
+# Heredoc-free by design: settings.json is inspected with `grep` + the
+# `status-prompt-parallel-nudge-hook` CLI verb (--format shell), NOT an inline
+# python-stdin heredoc, so this smoke adds no new heredoc-stdin subprocess
+# site (scripts/lint-heredoc-ban.sh baseline stays flat).
+#
 # Tests:
 #   T1: after ensure-prompt-parallel-nudge-hook renders into a fresh Claude
 #       settings.json, UserPromptSubmit contains EXACTLY ONE parallel-nudge hook
 #       (prompt-parallel-nudge.py) with additionalContext=true.
 #   T2 (idempotent): a second ensure re-render reports `unchanged` and still
 #       leaves EXACTLY ONE parallel-nudge hook — no duplicate appended.
-#   T3: the rendered hook COMMAND, when executed, prints the nudge wording
-#       (stable substrings 병렬 점검 + fan-out) and exits 0.
+#   T3: the shipped hook script, when executed, prints the nudge wording
+#       (stable substrings 병렬 점검 + fan-out + the SSOT pointer) and exits 0.
 #   T4 (Claude-only): the Codex ensure-codex-hooks render does NOT include the
 #       parallel-nudge hook.
 #   T5 (over-spawn guard present): the emitted string carries the anti-fan-out
@@ -38,47 +43,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Count UserPromptSubmit command hooks whose command mentions the nudge script.
+# Count UserPromptSubmit command hooks that reference the nudge script. Plain
+# grep -o (occurrence count, formatting-agnostic) — no heredoc, no JSON parse.
 count_nudge_hooks() {
   local settings_file="$1"
-  python3 - "$settings_file" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-settings_file = sys.argv[1]
-payload = json.loads(Path(settings_file).read_text(encoding="utf-8"))
-groups = payload.get("hooks", {}).get("UserPromptSubmit", [])
-count = 0
-for group in groups:
-    for hook in group.get("hooks", []):
-        if "prompt-parallel-nudge.py" in str(hook.get("command") or ""):
-            count += 1
-print(count)
-PY
-}
-
-# Print the single parallel-nudge hook command (or empty).
-nudge_hook_command() {
-  local settings_file="$1"
-  python3 - "$settings_file" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-settings_file = sys.argv[1]
-payload = json.loads(Path(settings_file).read_text(encoding="utf-8"))
-groups = payload.get("hooks", {}).get("UserPromptSubmit", [])
-for group in groups:
-    for hook in group.get("hooks", []):
-        if "prompt-parallel-nudge.py" in str(hook.get("command") or ""):
-            print(str(hook.get("command") or ""))
-            raise SystemExit(0)
-PY
+  grep -o 'prompt-parallel-nudge.py' "$settings_file" 2>/dev/null | wc -l | tr -d '[:space:]'
 }
 
 claude_render_and_dedup() {
-  local workdir settings_file payload ensure_out ensure_out2 count count2 command nudge_out rc status_out
+  local workdir settings_file payload ensure_out ensure_out2 count count2 nudge_out rc status_out status_shell
 
   workdir="$SMOKE_TMP_ROOT/claude-nudge-workdir"
   mkdir -p "$workdir"
@@ -102,28 +75,19 @@ claude_render_and_dedup() {
   count="$(count_nudge_hooks "$settings_file")"
   smoke_assert_eq "1" "$count" "T1: exactly one parallel-nudge hook after first render"
 
-  # additionalContext=true on the nudge hook.
-  local additional_context
-  additional_context="$(
-    python3 - "$settings_file" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-settings_file = sys.argv[1]
-payload = json.loads(Path(settings_file).read_text(encoding="utf-8"))
-groups = payload.get("hooks", {}).get("UserPromptSubmit", [])
-result = "false"
-for group in groups:
-    for hook in group.get("hooks", []):
-        if "prompt-parallel-nudge.py" in str(hook.get("command") or ""):
-            result = "true" if bool(hook.get("additionalContext")) is True else "false"
-print(result)
-PY
+  # additionalContext=true — read via the status verb's shell payload (no heredoc).
+  status_shell="$(
+    python3 "$SMOKE_REPO_ROOT/bridge-hooks.py" status-prompt-parallel-nudge-hook \
+      --workdir "$workdir" \
+      --bridge-home "$BRIDGE_HOME" \
+      --python-bin "$(command -v python3)" \
+      --format shell
   )"
-  smoke_assert_eq "true" "$additional_context" "T1: parallel-nudge hook sets additionalContext=true"
+  smoke_assert_contains "$status_shell" "HOOK_ADDITIONAL_CONTEXT=true" \
+    "T1: parallel-nudge hook sets additionalContext=true"
+  smoke_assert_contains "$status_shell" "HOOK_STATUS=present" "T1: status verb reports present"
 
-  # status verb agrees.
+  # status verb (text format) agrees.
   status_out="$(
     python3 "$SMOKE_REPO_ROOT/bridge-hooks.py" status-prompt-parallel-nudge-hook \
       --workdir "$workdir" \
@@ -144,13 +108,10 @@ PY
   count2="$(count_nudge_hooks "$settings_file")"
   smoke_assert_eq "1" "$count2" "T2: still exactly one parallel-nudge hook after re-render"
 
-  # T3 — the rendered command, executed, prints the nudge and exits 0.
-  command="$(nudge_hook_command "$settings_file")"
-  [[ -n "$command" ]] || smoke_fail "T3: could not extract parallel-nudge hook command"
+  # T3 — the shipped hook script, executed, prints the nudge and exits 0.
   # The rendered command points at $BRIDGE_HOME/hooks/... which is not
-  # materialized in this isolated temp BRIDGE_HOME; execute the tracked source
-  # script directly (the command shape is asserted above; this checks runtime
-  # output of the shipped hook).
+  # materialized in this isolated temp BRIDGE_HOME; the command shape is
+  # asserted above, so here we execute the tracked source script directly.
   nudge_out="$(python3 "$SMOKE_REPO_ROOT/hooks/prompt-parallel-nudge.py")"
   rc=$?
   smoke_assert_eq "0" "$rc" "T3: nudge hook exits 0"
