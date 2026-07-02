@@ -1489,9 +1489,13 @@ bridge_daemon_lease_swap_route() {
     "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token lease status --check \
     >/dev/null 2>&1 || return 0
   local decision_json=""
+  # --if-auto-enabled is hardcoded (like --sync): all three daemon callers
+  # (usage_monitor / active_dead / reactive_429) pair the lease route with a local
+  # rotate that passes --if-auto-enabled, so the lease path must honor the same
+  # operator auto-rotate gate (codex #2250 finding 2) — never swap past an OFF switch.
   decision_json="$(bridge_with_timeout "${BRIDGE_CLAUDE_ROTATE_TIMEOUT_SECONDS:-30}" daemon_lease_swap_or_defer \
     "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token lease-swap-or-defer \
-    --caller "$caller" --sync "$@" --json 2>/dev/null || true)"
+    --caller "$caller" --sync --if-auto-enabled "$@" --json 2>/dev/null || true)"
   local action=""
   action="$(bridge_with_timeout 5 daemon_lease_decision_parse python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" lease-decision-parse "$decision_json" || true)"
   action="${action%$'\n'}"

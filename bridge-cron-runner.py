@@ -1873,6 +1873,10 @@ def _lease_swap_or_defer(*, reason: str, limited_until: str) -> dict[str, Any]:
         "--caller",
         "cron_reactive",
         "--sync",
+        # Parity with the fallback local rotate (which passes --if-auto-enabled):
+        # the lease path must honor the operator's auto-rotate switch (codex
+        # #2250 f2) instead of swapping past an OFF gate.
+        "--if-auto-enabled",
         "--reason",
         reason,
         "--json",

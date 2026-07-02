@@ -1574,7 +1574,7 @@ case "$command" in
         # `--agents all` pass). The verb always exits 0; its decision is the JSON.
         bridge_auth_guard_wrapper_flags "claude-token lease-swap-or-defer" \
           "--caller,--reason,--limited-until" \
-          "--sync,--json" "$@"
+          "--sync,--json,--if-auto-enabled" "$@"
         exec python3 "$SCRIPT_DIR/bridge-auth.py" --registry "$registry" \
           lease-swap-or-defer "$@"
         ;;

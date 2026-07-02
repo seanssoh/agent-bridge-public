@@ -99,6 +99,17 @@ open(sys.argv[1],"w").write(json.dumps(reg))
 ' "$REGISTRY"
 }
 
+seed_registry_autorotate_off() {
+  # Same two operator-sourced tokens, but the operator has auto-rotate OFF.
+  python3 -c '
+import json,sys
+reg={"version":1,"active_token_id":"tok-a","auto_rotate_enabled":False,"tokens":[
+ {"id":"tok-a","token":"FAKE-LOCAL-TOKEN-A","enabled":True,"account_email":"a@example.com","account_email_source":"operator"},
+ {"id":"tok-b","token":"FAKE-LOCAL-TOKEN-B","enabled":True,"account_email":"b@example.com","account_email_source":"operator"}]}
+open(sys.argv[1],"w").write(json.dumps(reg))
+' "$REGISTRY"
+}
+
 registry_active() { python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["active_token_id"])' "$REGISTRY"; }
 registry_field() { python3 -c '
 import json,sys
@@ -269,6 +280,89 @@ test_swapped_no_secret_leak() {
   smoke_assert_not_contains "$out" "secret_material" "H9 decision has no secret_material key"
   smoke_assert_not_contains "$out" "AT-SECRET" "H9 decision does NOT leak access_token"
   smoke_assert_not_contains "$out" "RT-SECRET" "H9 decision does NOT leak refresh_token"
+}
+
+# ── H11 (codex #2250 f1) — the REAL mapper, NO map fixture → production path ──
+# H2/H6 set BRIDGE_TOKEN_UPDATER_MAP_FIXTURE, which short-circuits the real
+# Contract-A mapper and MASKS an arity break: the real helper is
+# token_updater_map_account_to_local(account_email, registry) (2 args), but the
+# adapter must pass the registry. With ONLY the swap fixture set (no map fixture),
+# the real 2-arg mapper runs against the seeded operator-sourced rows — b@ → tok-b.
+# A 1-arg call would raise TypeError → defer_local(map_error), and this asserts the
+# production swapped path is REACHABLE (regression: it was unreachable un-fixtured).
+test_real_mapper_reachable() {
+  seed_registry
+  enable_lease
+  local out
+  out="$(BRIDGE_TOKEN_UPDATER_SWAP_FIXTURE='{"status":"ok","service_token_id":"svc-9","account_email":"b@example.com"}' \
+         swap_or_defer usage_monitor --reason "usage:5h:99")"
+  smoke_assert_eq "swapped" "$(printf '%s' "$out" | jfield action)" "H11 REAL 2-arg mapper reachable (no fixture) → swapped"
+  smoke_assert_eq "tok-b" "$(printf '%s' "$out" | jfield active_token_id)" "H11 real mapper joined b@example.com → tok-b"
+  smoke_assert_eq "tok-b" "$(registry_active)" "H11 registry advanced via the real mapper (production path)"
+}
+
+# ── H12 (codex #2250 f2) — the lease swap honors the operator auto-rotate gate ─
+# Local `rotate --if-auto-enabled` skips when auto_rotate_enabled is false; the
+# lease swap MUST honor the same switch (else it rotates past the operator's
+# off-switch). With --if-auto-enabled + auto_rotate OFF → defer_local, no rotate.
+test_auto_rotate_gate_blocks_swap() {
+  seed_registry_autorotate_off
+  enable_lease
+  local out
+  out="$(BRIDGE_TOKEN_UPDATER_SWAP_FIXTURE='{"status":"ok","service_token_id":"svc-9","account_email":"b@example.com"}' \
+         BRIDGE_TOKEN_UPDATER_MAP_FIXTURE='{"status":"ok","local_token_id":"tok-b"}' \
+         swap_or_defer usage_monitor --if-auto-enabled --reason "usage:5h:99")"
+  smoke_assert_eq "defer_local" "$(printf '%s' "$out" | jfield action)" "H12a auto-rotate OFF + --if-auto-enabled → defer_local"
+  smoke_assert_eq "auto_rotate_disabled" "$(printf '%s' "$out" | jfield reason)" "H12a reason=auto_rotate_disabled"
+  smoke_assert_eq "tok-a" "$(registry_active)" "H12a NO swap past the operator off-switch (active unchanged)"
+}
+
+# The gate is OPT-IN (parity with local rotate): a caller that does NOT pass
+# --if-auto-enabled still swaps even with auto_rotate OFF — so the flag, not a
+# blanket block, is what enforces the gate (guards against over-gating emergency callers).
+test_auto_rotate_gate_opt_in() {
+  seed_registry_autorotate_off
+  enable_lease
+  local out
+  out="$(BRIDGE_TOKEN_UPDATER_SWAP_FIXTURE='{"status":"ok","service_token_id":"svc-9","account_email":"b@example.com"}' \
+         BRIDGE_TOKEN_UPDATER_MAP_FIXTURE='{"status":"ok","local_token_id":"tok-b"}' \
+         swap_or_defer usage_monitor --reason "usage:5h:99")"
+  smoke_assert_eq "swapped" "$(printf '%s' "$out" | jfield action)" "H12b NO --if-auto-enabled → gate not applied (opt-in) → swapped"
+  smoke_assert_eq "tok-b" "$(registry_active)" "H12b opt-in: gate only fires when the caller passes the flag"
+}
+
+# ── H13 (codex #2250 f3) — swap avoids the currently-held lease ───────────────
+# Contract-A swap(avoid=…) returns a DIFFERENT usable lease. Contract-B must read
+# the durable lease-state's service_token_id and forward it as the avoid, or a
+# swap can be handed back the SAME current lease. The fixture seam short-circuits
+# the client, so this stubs the client + lease-state at the module level and
+# asserts client.swap() received the current service_token_id as its avoid.
+# Footgun #11: the python is passed as -c argv, never heredoc-stdin.
+test_swap_forwards_avoid() {
+  seed_registry
+  enable_lease
+  local out
+  out="$(python3 -c '
+import sys, os, importlib.util
+from pathlib import Path
+auth_py, registry = sys.argv[1], sys.argv[2]
+spec = importlib.util.spec_from_file_location("bridge_auth_h13", auth_py)
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+os.environ.pop("BRIDGE_TOKEN_UPDATER_SWAP_FIXTURE", None)
+captured = {}
+class FakeClient:
+    def swap(self, avoid_service_token_id=""):
+        captured["avoid"] = avoid_service_token_id
+        return {"status": "error", "http": 503}  # force defer; we assert only the avoid
+m._token_updater_lease_client = lambda: FakeClient()
+m._token_updater_read_lease_state = lambda: {"service_token_id": "svc-CURRENT"}
+m.token_updater_lease_enabled = lambda: True
+m.token_updater_lease_swap_or_defer("test", registry_path=Path(registry))
+assert captured.get("avoid") == "svc-CURRENT", "avoid not forwarded: %r" % (captured,)
+print("ok")
+' "$AUTH_PY" "$REGISTRY" 2>&1)"
+  smoke_assert_eq "ok" "$out" "H13 do_swap forwards lease-state service_token_id as the swap avoid"
 }
 
 # ── W — the PRODUCTION path: the bridge-auth.sh WRAPPER dispatches the verb ───
@@ -589,6 +683,10 @@ smoke_run "H7 5xx/error → defer_local (service unreachable)"                  
 smoke_run "H8 limited_until stamped on rotating-away token ONLY"                  test_limited_until_old_only
 smoke_run "H9 swapped decision leaks NO secret_material (patch Phase-5)"          test_swapped_no_secret_leak
 smoke_run "H10 swapped --sync envelope → rotation-status-parse reads sync_status" test_swapped_sync_status_parity
+smoke_run "H11 REAL 2-arg mapper reachable un-fixtured → swapped (codex f1)"      test_real_mapper_reachable
+smoke_run "H12a auto-rotate OFF + --if-auto-enabled → defer_local (codex f2)"     test_auto_rotate_gate_blocks_swap
+smoke_run "H12b auto-rotate gate is opt-in (no flag → still swaps)"               test_auto_rotate_gate_opt_in
+smoke_run "H13 swap forwards lease-state service_token_id as avoid (codex f3)"    test_swap_forwards_avoid
 smoke_run "W  wrapper (bridge-auth.sh) dispatches the verb → swapped + advance"   test_wrapper_dispatches_swapped
 smoke_run "W  wrapper 409 → suppress_cooldown (fleet-safe, PRODUCTION path)"      test_wrapper_dispatches_suppress
 smoke_run "W  wrapper unknown flag fails closed (rc=2)"                           test_wrapper_unknown_flag_fails_closed

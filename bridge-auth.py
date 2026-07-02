@@ -4304,13 +4304,16 @@ def _token_updater_lease_client():
         return None
 
 
-def _token_updater_do_swap() -> dict[str, Any] | None:
+def _token_updater_do_swap(avoid_service_token_id: str = "") -> dict[str, Any] | None:
     """Call the Contract-A client ``swap()`` (or the CI fixture), or None on fail.
 
-    The fixture seam (``$BRIDGE_TOKEN_UPDATER_SWAP_FIXTURE``) short-circuits the
-    live client for CI. Otherwise builds the Contract-A client and calls
-    ``swap()``. Returns None on any failure so the caller degrades to a local
-    rotate."""
+    ``avoid_service_token_id`` is forwarded to Contract-A ``swap(avoid=…)`` so the
+    service returns a DIFFERENT usable lease than the one the durable lease-state
+    records as currently held — never handing back the same current lease. Empty
+    ⇒ no ``avoid`` constraint (prior behavior). The fixture seam
+    (``$BRIDGE_TOKEN_UPDATER_SWAP_FIXTURE``) short-circuits the live client for
+    CI. Otherwise builds the Contract-A client and calls ``swap()``. Returns None
+    on any failure so the caller degrades to a local rotate."""
     fixture = _token_updater_load_json_fixture(TOKEN_UPDATER_SWAP_FIXTURE_ENV)
     if fixture is not None:
         return fixture
@@ -4318,7 +4321,7 @@ def _token_updater_do_swap() -> dict[str, Any] | None:
     if client is None:
         return None
     try:
-        result = client.swap()
+        result = client.swap(avoid_service_token_id)
     except Exception:  # noqa: BLE001 - any transport failure → local fallback
         return None
     return result if isinstance(result, dict) else None
@@ -4336,13 +4339,18 @@ def _token_updater_read_lease_state() -> dict[str, Any] | None:
     return state if isinstance(state, dict) else None
 
 
-def _token_updater_map_account(account_email: str) -> dict[str, Any]:
+def _token_updater_map_account(account_email: str, registry_path: Path) -> dict[str, Any]:
     """Map a lease account email → local token id via the Contract-A helper.
 
     Fail-closed structured skip (``{status:"error", reason:...}``) when the
     mapping helper is missing/ambiguous — the caller then defers to a local
     rotate rather than guessing a local token. The CI fixture seam
-    (``$BRIDGE_TOKEN_UPDATER_MAP_FIXTURE``) short-circuits the live helper."""
+    (``$BRIDGE_TOKEN_UPDATER_MAP_FIXTURE``) short-circuits the live helper.
+
+    Contract-A ``token_updater_map_account_to_local(account_email, registry)``
+    joins against the LOCAL registry rows, so we load the registry and pass it
+    (the arity the real helper requires — a 1-arg call would raise TypeError and
+    make every un-fixtured swap defer)."""
     fixture = _token_updater_load_json_fixture(TOKEN_UPDATER_MAP_FIXTURE_ENV)
     if fixture is not None:
         return fixture
@@ -4350,9 +4358,13 @@ def _token_updater_map_account(account_email: str) -> dict[str, Any]:
     if mapper is None:
         return {"status": "error", "reason": "map_helper_unavailable"}
     try:
-        result = mapper(account_email)
+        registry = load_registry(registry_path)
+        result = mapper(account_email, registry)
     except Exception as exc:  # noqa: BLE001 - mapping failure → structured skip
-        return {"status": "error", "reason": f"map_error:{exc}"}
+        # Bound the reason to the exception CLASS (non-secret; the mapping path
+        # carries only an account email + registry ids, never token bytes) —
+        # matches Contract-A's fingerprint/class-only error discipline.
+        return {"status": "error", "reason": f"map_error:{type(exc).__name__}"}
     return result if isinstance(result, dict) else {"status": "error", "reason": "map_bad_result"}
 
 
@@ -4370,6 +4382,28 @@ def _token_updater_swap_reset_at(swap_result: dict[str, Any]) -> str:
     return ""
 
 
+class _LeaseAutoRotateDisabled(Exception):
+    """Raised UNDER the registry lock when the auto-rotate gate is enforced and the
+    operator flipped ``auto_rotate_enabled`` OFF (possibly between the pre-swap
+    check and the activation). The swap-or-defer caller catches it and returns a
+    clean ``defer_local`` (reason ``auto_rotate_disabled``) — NOT an
+    ``activate_error`` — so the outcome is byte-identical to a local rotate that
+    skipped on the same gate."""
+
+
+def _token_updater_auto_rotate_enabled(registry_path: Path) -> bool:
+    """Read the operator's ``auto_rotate_enabled`` switch, fail-closed.
+
+    An unreadable/absent registry reads as DISABLED (False) so the lease path
+    defers to the local rotate rather than swapping past a gate it could not
+    evaluate. Parity with ``cmd_rotate``'s ``--if-auto-enabled`` predicate
+    (bridge-auth.py: ``registry.get("auto_rotate_enabled", False)``)."""
+    try:
+        return bool(load_registry(registry_path).get("auto_rotate_enabled", False))
+    except Exception:  # noqa: BLE001 - unreadable registry → treat as disabled
+        return False
+
+
 def _token_updater_activate_local(
     registry_path: Path,
     local_token_id: str,
@@ -4377,6 +4411,7 @@ def _token_updater_activate_local(
     reason: str,
     limited_until: str,
     sync: bool,
+    if_auto_enabled: bool = False,
 ) -> dict[str, Any]:
     """Activate the lease-mapped local token — the ``swapped`` registry mutation.
 
@@ -4386,12 +4421,20 @@ def _token_updater_activate_local(
     ring. Returns a rotate-shaped envelope so downstream parsers read it exactly
     like a local rotate. ``limited_until`` (codex Q4) stamps the rotating-AWAY
     token ONLY (the caller passes the old token's 429/reset window when it holds
-    one) — never a blanket copy onto the pool."""
+    one) — never a blanket copy onto the pool. ``if_auto_enabled`` mirrors
+    ``cmd_rotate``'s under-lock auto-rotate gate: when set and the operator has
+    auto-rotate OFF, the activation is aborted (``_LeaseAutoRotateDisabled``)
+    before any registry mutation — closing the flip-mid-swap TOCTOU."""
     old_id = ""
     new_id = local_token_id
     row: dict[str, Any] | None = None
     with registry_lock(registry_path):
         registry = load_registry(registry_path)
+        # Under-lock parity with cmd_rotate (bridge-auth.py:2040): honor the
+        # operator's auto-rotate switch as the AUTHORITATIVE gate. Abort BEFORE
+        # mutating active_token_id so an OFF switch can never rotate the pool.
+        if if_auto_enabled and not bool(registry.get("auto_rotate_enabled", False)):
+            raise _LeaseAutoRotateDisabled()
         target = find_token(registry, local_token_id)
         if target is None:
             raise ValueError(f"lease-mapped local token id is missing from registry: {local_token_id}")
@@ -4449,6 +4492,7 @@ def token_updater_lease_swap_or_defer(
     reason: str = "",
     limited_until: str = "",
     sync: bool = False,
+    if_auto_enabled: bool = False,
 ) -> dict[str, Any]:
     """The ONE shared lease-authoritative swap-or-defer authority (Contract B).
 
@@ -4458,10 +4502,16 @@ def token_updater_lease_swap_or_defer(
     and ``suppress_cooldown`` — a rotate-shaped envelope the caller hands to the
     same downstream parser it already uses, so no downstream code changes.
 
+    ``if_auto_enabled`` mirrors local ``rotate --if-auto-enabled``: when set (as
+    every live caller sets it, matching its fallback local rotate) and the
+    operator has ``auto_rotate_enabled`` OFF, the lease path does NOT swap — it
+    defers to the local rotate, which itself no-ops. Without it the swap path
+    would rotate past the operator's off-switch (codex #2250 finding 2).
+
     Failure classification (codex Q3):
-      * lease DISABLED, config/mapping-ambiguous, network/timeout, 5xx, or the
-        break-glass override ⇒ ``defer_local`` (caller runs its EXISTING local
-        rotate, byte-for-byte).
+      * lease DISABLED, auto-rotate gated OFF, config/mapping-ambiguous,
+        network/timeout, 5xx, or the break-glass override ⇒ ``defer_local``
+        (caller runs its EXISTING local rotate, byte-for-byte).
       * authoritative ``409 nothing-usable`` (service RESPONDED, pool reserved) ⇒
         ``suppress_cooldown``: fire the caller's existing pool-exhausted writer,
         do NOT local-rotate (draining a fleet-reserved token). Override only via
@@ -4476,7 +4526,21 @@ def token_updater_lease_swap_or_defer(
     if not token_updater_lease_enabled():
         return _defer("lease_disabled")
 
-    swap_result = _token_updater_do_swap()
+    # Auto-rotate gate parity with cmd_rotate (bridge-auth.py:2040). Checked
+    # BEFORE the network swap so an OFF registry costs no lease round-trip; the
+    # AUTHORITATIVE re-check happens under the registry lock in
+    # ``_token_updater_activate_local`` (closes the flip-mid-swap TOCTOU).
+    if if_auto_enabled and not _token_updater_auto_rotate_enabled(registry_path):
+        return _defer("auto_rotate_disabled")
+
+    # Ask the service for a DIFFERENT usable lease than the one the durable
+    # lease-state records as currently held (Contract-A ``swap(avoid=…)``), so a
+    # swap can never return the same current lease. Best-effort: absent/unreadable
+    # lease-state ⇒ empty avoid (unconstrained swap, prior behavior).
+    lease_state = _token_updater_read_lease_state() or {}
+    avoid_service_token_id = str(lease_state.get("service_token_id") or "").strip()
+
+    swap_result = _token_updater_do_swap(avoid_service_token_id)
     if not isinstance(swap_result, dict):
         return _defer("swap_unavailable")
 
@@ -4510,7 +4574,7 @@ def token_updater_lease_swap_or_defer(
     if not account_email:
         return _defer("swap_missing_account_email")
 
-    mapping = _token_updater_map_account(account_email)
+    mapping = _token_updater_map_account(account_email, registry_path)
     if str(mapping.get("status") or "") != "ok":
         # 0/>1/missing/mismatch → never guess a local token; fall back local.
         return _defer(str(mapping.get("reason") or "map_ambiguous"))
@@ -4525,9 +4589,17 @@ def token_updater_lease_swap_or_defer(
             reason=reason or f"token_updater_lease:{caller}",
             limited_until=limited_until,
             sync=sync,
+            if_auto_enabled=if_auto_enabled,
         )
+    except _LeaseAutoRotateDisabled:
+        # Auto-rotate flipped OFF between the pre-swap check and the locked
+        # activation → clean defer (parity with a gated local rotate skip).
+        return _defer("auto_rotate_disabled")
     except Exception as exc:  # noqa: BLE001 - a commit failure degrades to local rotate
-        return _defer(f"activate_error:{exc}")
+        # Bound to the exception CLASS (non-secret) — the activation path holds
+        # only local registry ids, never token bytes, and this reason string is
+        # logged/audited by every rotator.
+        return _defer(f"activate_error:{type(exc).__name__}")
 
     # SECURITY (patch Phase-5 note on Sub-PR 2): the Contract-A ``swap()`` response
     # may carry ``secret_material`` (the new token's actual secret) on its JSON
@@ -4574,6 +4646,7 @@ def cmd_token_updater_lease_swap_or_defer(args: argparse.Namespace) -> int:
         reason=str(args.reason or ""),
         limited_until=str(getattr(args, "limited_until", "") or ""),
         sync=bool(getattr(args, "sync", False)),
+        if_auto_enabled=bool(getattr(args, "if_auto_enabled", False)),
     )
     json_dump(decision)
     return 0
@@ -8924,6 +8997,9 @@ def build_parser() -> argparse.ArgumentParser:
     # Q4: the rotating-away token's 429/reset window, stamped onto the OLD token
     # only (never a blanket copy). Parity with `rotate --limited-until`.
     lease_swap_parser.add_argument("--limited-until", default="")
+    # Parity with `rotate --if-auto-enabled`: honor the operator's auto-rotate
+    # switch (the lease swap must not rotate past an OFF gate — codex #2250 f2).
+    lease_swap_parser.add_argument("--if-auto-enabled", action="store_true")
     lease_swap_parser.add_argument("--sync", action="store_true", help=argparse.SUPPRESS)
     lease_swap_parser.add_argument("--json", action="store_true")
     lease_swap_parser.set_defaults(handler=cmd_token_updater_lease_swap_or_defer)

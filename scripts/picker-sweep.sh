@@ -553,6 +553,7 @@ _psw_default_rotate_claude_token() {
         decision_json="$(bash "$BRIDGE_HOME/bridge-auth.sh" claude-token lease-swap-or-defer \
             --caller picker_sweep \
             --sync \
+            --if-auto-enabled \
             --reason "picker-sweep-rate-limit:${agent}" \
             --json 2>/dev/null || true)"
         action="$(_psw_lease_decision_action "$decision_json")"
