@@ -1071,6 +1071,27 @@ def cmd_sync_status_parse(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_lease_checkout_status_parse(args: argparse.Namespace) -> int:
+    """#21895 sub-PR 4/4 — parse a lease CHECKOUT envelope's status from STDIN.
+
+    Original site: bridge-daemon.sh:bridge_daemon_token_lease_checkout.
+
+    The lease ``checkout`` (and ``swap``) envelope carries ``secret_material``
+    (the new token's actual secret) in production, so it must NEVER transit argv
+    — a ``ps``/``/proc/<pid>/cmdline`` reader would see the secret verbatim
+    (codex #2248 finding 2, P1). This reads the whole envelope from STDIN
+    (parity with the config verb's ``--api-key-stdin`` secret-handling
+    precedent) and prints ONLY the non-secret ``status`` field. ``error`` on
+    empty/garbled stdin so the bash callsite surfaces a checkout failure rather
+    than silently treating it as success."""
+    try:
+        payload = json.loads(sys.stdin.read())
+        print(str(payload.get("status", "")))
+    except Exception:
+        print("error")
+    return 0
+
+
 def cmd_sync_aliveness_parse(args: argparse.Namespace) -> int:
     """Codex r1 BLOCKING #1 (v0.15.0-beta4 Lane F r2, 2026-05-27).
 
@@ -1987,6 +2008,15 @@ SUBCOMMANDS = {
         cmd_sync_status_parse,
         [("sync_json", "JSON envelope from bridge-auth.sh claude-token sync --json")],
         "Single line — sync status string ('error' on parse failure).",
+    ),
+    # #21895 phase-1 (sub-PR 4/4): the lease CHECKOUT envelope carries
+    # secret_material, so its status is parsed from STDIN (never argv) — no
+    # positional arg. See cmd_lease_checkout_status_parse.
+    "lease-checkout-status-parse": (
+        cmd_lease_checkout_status_parse,
+        [],
+        "Single line — lease checkout status string from STDIN ('error' on parse failure). "
+        "STDIN-only so the secret-bearing envelope never transits argv (codex #2248 P1).",
     ),
     "sync-aliveness-parse": (
         cmd_sync_aliveness_parse,

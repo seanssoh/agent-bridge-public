@@ -24,6 +24,10 @@
 #       LEASE_HEARTBEAT_STATUS str  (heartbeat status: ok|error|conflict)
 #       LEASE_HEARTBEAT_HTTP  int|"" (heartbeat http: 200|404|409|"")
 #       LEASE_CHECKOUT_STATUS str   (checkout envelope status: ok|error)
+#       LEASE_CHECKOUT_SECRET str   (secret_material carried in the checkout
+#                                    envelope; production ALWAYS carries one, so a
+#                                    smoke can prove it never transits parser argv
+#                                    — codex #2248 finding 2, P1. Empty ⇒ omitted.)
 #   LEASE_SHIM_CALLS — path to a log file; one line per verb invoked
 #                      (status-check / status-json / checkout / heartbeat /
 #                      checkin), so the smoke asserts what the daemon called.
@@ -44,6 +48,7 @@ LEASE_STATUS_BAD=0
 LEASE_HEARTBEAT_STATUS="ok"
 LEASE_HEARTBEAT_HTTP="200"
 LEASE_CHECKOUT_STATUS="ok"
+LEASE_CHECKOUT_SECRET=""
 if [[ -f "$LEASE_SHIM_STATE" ]]; then
   # shellcheck source=/dev/null
   source "$LEASE_SHIM_STATE"
@@ -102,8 +107,16 @@ case "$action" in
     ;;
   checkout)
     record_call "checkout"
-    printf '{"status": "%s", "service_token_id": "%s", "account_email": "op@example.test", "lease_expires_at": %s}\n' \
-      "$LEASE_CHECKOUT_STATUS" "$LEASE_SERVICE_TOKEN_ID" "$(( $(date +%s) + 900 ))"
+    # Production checkout envelopes carry secret_material (the new token secret).
+    # Emit it when the scenario sets one so the smoke can prove it never transits
+    # the parser's argv (codex #2248 finding 2, P1) — it must reach the parser via
+    # STDIN only. Absent ⇒ omit the field (back-compat with the other cases).
+    secret_field=""
+    if [[ -n "$LEASE_CHECKOUT_SECRET" ]]; then
+      secret_field="$(printf ', "secret_material": "%s"' "$LEASE_CHECKOUT_SECRET")"
+    fi
+    printf '{"status": "%s", "service_token_id": "%s", "account_email": "op@example.test", "lease_expires_at": %s%s}\n' \
+      "$LEASE_CHECKOUT_STATUS" "$LEASE_SERVICE_TOKEN_ID" "$(( $(date +%s) + 900 ))" "$secret_field"
     [[ "$LEASE_CHECKOUT_STATUS" == "ok" ]] && exit 0 || exit 0
     ;;
   heartbeat)

@@ -35,9 +35,16 @@ bridge_audit_log() {
   printf '%s\n' "$row" >>"$AUDIT_FILE"
 }
 
-# bridge_with_timeout — pass-through (no real timeout binary needed).
+# bridge_with_timeout — pass-through (no real timeout binary needed). When
+# WITH_TIMEOUT_ARGV_LOG is set, record the FULL subprocess argv (post shift-2)
+# it is about to exec, so a smoke can assert a secret-bearing envelope never
+# reaches a parser positionally (codex #2248 finding 2 regression guard). Real
+# `timeout(1)`/gtimeout would exec the same argv, so this proxy is faithful.
 bridge_with_timeout() {
   shift 2 || true
+  if [[ -n "${WITH_TIMEOUT_ARGV_LOG:-}" ]]; then
+    printf '%s\n' "$*" >>"$WITH_TIMEOUT_ARGV_LOG"
+  fi
   "$@"
 }
 

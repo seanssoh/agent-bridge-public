@@ -3119,8 +3119,12 @@ bridge_daemon_token_lease_checkout() {
   local status=""
 
   if checkout_json="$(bridge_with_timeout 15 daemon_token_lease_checkout "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token lease checkout --json 2>/dev/null)"; then
-    status="$(bridge_with_timeout 5 lease_checkout_status_parse python3 \
-      "$SCRIPT_DIR/bridge-daemon-helpers.py" sync-status-parse "$checkout_json" \
+    # The checkout envelope carries secret_material — feed it to the parser via
+    # STDIN, NEVER argv, so a `ps`/`/proc/<pid>/cmdline` reader can't see the
+    # secret (codex #2248 finding 2, P1). A pipe is NOT the footgun-#11 heredoc-
+    # stdin deadlock pattern; parity with the config verb's --api-key-stdin.
+    status="$(printf '%s' "$checkout_json" | bridge_with_timeout 5 lease_checkout_status_parse python3 \
+      "$SCRIPT_DIR/bridge-daemon-helpers.py" lease-checkout-status-parse \
       2>/dev/null || printf '')"
   fi
   status="${status:-failed}"

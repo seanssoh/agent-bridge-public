@@ -142,6 +142,9 @@ set_scenario() {
   done
 }
 
+ARGV_LOG="$SMOKE_TMP_ROOT/with-timeout-argv.log"
+: >"$ARGV_LOG"
+
 run_driver() {
   local action="$1"
   local interval="${2:-300}"
@@ -152,6 +155,7 @@ run_driver() {
       AUDIT_FILE="$AUDIT_FILE" \
       LEASE_SHIM_STATE="$LEASE_SHIM_STATE" \
       LEASE_SHIM_CALLS="$LEASE_SHIM_CALLS" \
+      WITH_TIMEOUT_ARGV_LOG="${WITH_TIMEOUT_ARGV_LOG:-}" \
       BRIDGE_USAGE_MONITOR_INTERVAL_SECONDS="$interval" \
       bash "$DRIVER" "$action" 2>/dev/null | tail -n 1
 }
@@ -320,6 +324,38 @@ step_b10_exit_checkin() {
   smoke_assert_eq "1" "$(calls_count checkin)" "B10: exactly one checkin call when enabled"
 }
 
+# ── B11: checkout secret_material NEVER transits parser argv (codex #2248 P1) ─
+step_b11_checkout_secret_never_in_argv() {
+  smoke_log "B11: checkout envelope secret_material never reaches parser argv (codex #2248 finding 2, P1)"
+  reset_run_state
+  local marker="SEKRIT-CHECKOUT-MATERIAL-MUST-NOT-LEAK"
+  # Enable the argv proxy for THIS case only, then capture what the daemon execs.
+  WITH_TIMEOUT_ARGV_LOG="$ARGV_LOG"
+  : >"$ARGV_LOG"
+  # No live lease → the tick takes the checkout path; the shim returns an ok
+  # envelope CARRYING secret_material.
+  set_scenario "LEASE_ENABLED=1" "LEASE_CONFIGURED=1" "LEASE_HAS_LEASE=0" \
+    "LEASE_SERVICE_TOKEN_ID=svc-1" "LEASE_CHECKOUT_STATUS=ok" "LEASE_CHECKOUT_SECRET=$marker"
+  assert_marker "$(run_driver tick 300)" "TICK-OK" "B11 tick fires (checkout path)"
+  WITH_TIMEOUT_ARGV_LOG=""
+  smoke_assert_eq "1" "$(calls_count checkout)" "B11: exactly one checkout"
+  # The checkout still SUCCEEDED — proving the status was parsed from STDIN (the
+  # secret-bearing envelope was delivered, just not via argv).
+  smoke_assert_contains "$(last_tick_row)" "status=checked_out" "B11: checkout succeeded via stdin-delivered envelope"
+  # THE P1 GUARD: the secret marker must appear in NO subprocess argv the daemon
+  # built. A revert to `sync-status-parse "$checkout_json"` would leak it here.
+  if grep -q "$marker" "$ARGV_LOG" 2>/dev/null; then
+    smoke_fail "B11: secret_material LEAKED into subprocess argv (ps/proc-visible): $(grep "$marker" "$ARGV_LOG" | head -n1)"
+  fi
+  # And the checkout-status parser must be the STDIN verb, invoked with NO JSON
+  # positional after it (belt-and-suspenders against a positional-arg regression).
+  grep -q 'lease-checkout-status-parse' "$ARGV_LOG" \
+    || smoke_fail "B11: expected the stdin verb 'lease-checkout-status-parse' in the checkout path (argv log)"
+  if grep 'lease-checkout-status-parse' "$ARGV_LOG" | grep -q '{'; then
+    smoke_fail "B11: checkout-status parser argv carried a JSON blob — secret-in-argv regression"
+  fi
+}
+
 smoke_run "B1 disabled tick is a byte-for-byte no-op" step_b1_disabled_noop
 smoke_run "B2 no live lease checks out" step_b2_no_lease_checks_out
 smoke_run "B3 expired lease re-checks out" step_b3_expired_rechecks_out
@@ -330,3 +366,4 @@ smoke_run "B7 healthy lease heartbeats only" step_b7_healthy_heartbeat_only
 smoke_run "B8 cadence gate blocks immediate re-tick" step_b8_cadence_gate
 smoke_run "B9 status parse error skips the tick" step_b9_status_parse_error_skips
 smoke_run "B10 exit-trap check-in is bounded + gated" step_b10_exit_checkin
+smoke_run "B11 checkout secret_material never transits parser argv" step_b11_checkout_secret_never_in_argv
