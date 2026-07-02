@@ -2429,6 +2429,213 @@ def print_ms365_result(result: dict[str, Any], *, stream: Any = sys.stdout) -> N
         print(f"error: {result['error']}", file=stream)
 
 
+def cmd_token_updater(args: argparse.Namespace) -> int:
+    """#21895 phase-1 (sub-PR 1/4): `agent-bridge setup token-updater` wizard.
+
+    Collects the token-updater lease service URL + SERVER_ID (non-secret) and
+    the API KEY (secret), then DELEGATES persistence to the single sanctioned
+    writer — `bridge-auth.py lease config`. The wizard NEVER writes runtime-config
+    or the secret file itself: that keeps ONE writer path (the same one the CLI
+    verb uses), and the secret is streamed to bridge-auth over stdin so it never
+    lands in argv / the process table.
+
+    This is an install-level (operator-global) config, NOT an agent-scoped
+    channel — so unlike the ms365/teams wizards it takes no `<agent>` and touches
+    no per-agent `.env`. Default-OFF: unless the operator both supplies the three
+    values AND opts in with --enable, the lease feature stays disabled and
+    nothing else changes.
+    """
+    interactive = sys.stdin.isatty() and sys.stdout.isatty() and not args.yes
+
+    result: dict[str, Any] = {
+        "api_url": "",
+        "server_id": "",
+        "api_key_present": False,
+        "enabled": None,
+        "write_status": "pending",
+        "config_file": "",
+        "secret_written": False,
+    }
+
+    try:
+        api_url = (args.api_url or "").strip()
+        server_id = (args.server_id or "").strip()
+
+        # Secret precedence: --api-key-stdin, then --api-key-file, then (in an
+        # interactive TTY) a getpass prompt. Never a bare argv flag.
+        api_key = ""
+        if getattr(args, "api_key_stdin", False) and getattr(args, "api_key_file", None):
+            raise SetupError(
+                "--api-key-file and --api-key-stdin are mutually exclusive — pass only one."
+            )
+        if getattr(args, "api_key_stdin", False):
+            data = sys.stdin.read()
+            api_key = data[:-1] if data.endswith("\n") else data
+            if not api_key:
+                raise SetupError(
+                    "--api-key-stdin read an empty secret from stdin (no bytes before EOF)."
+                )
+        elif getattr(args, "api_key_file", None):
+            key_path = Path(args.api_key_file).expanduser()
+            try:
+                # noqa: raw-pathlib-controller-only — operator-supplied secret-file path.
+                raw = key_path.read_text(encoding="utf-8")  # noqa: raw-pathlib-controller-only
+            except OSError as exc:
+                raise SetupError(f"cannot read --api-key-file {key_path}: {exc}")
+            api_key = raw[:-1] if raw.endswith("\n") else raw
+
+        if interactive:
+            if not api_url:
+                api_url = prompt_text("Token-updater lease service base URL (https://…)").strip()
+            if not server_id:
+                server_id = prompt_text("Token-updater server id").strip()
+            if not api_key:
+                api_key = prompt_text("Token-updater API key", secret=True)
+
+        # --enable / --disable set the ENABLED bool; omitting both leaves it as-is.
+        if args.enable and args.disable:
+            raise SetupError("pass at most one of --enable / --disable")
+        enabled: Optional[bool] = None
+        if args.enable:
+            enabled = True
+        elif args.disable:
+            enabled = False
+
+        if api_url:
+            parsed = urlparse(api_url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise SetupError(
+                    f"token-updater URL must be a full http(s) URL: {api_url}"
+                )
+
+        # Enabling requires the full triple — surface it BEFORE the delegated
+        # write so the operator is not left with a persisted-enabled-but-unusable
+        # gate (the CLI's own effective gate is conjunctive too).
+        if enabled is True and not (api_url and server_id and api_key):
+            raise SetupError(
+                "--enable requires all of URL + server id + API key (pass the "
+                "flags, run interactively, or configure them first, then --enable)."
+            )
+
+        if not api_url and not server_id and not api_key and enabled is None:
+            raise SetupError(
+                "nothing to configure: pass --api-url / --server-id / an API key "
+                "(--api-key-file or --api-key-stdin) / --enable / --disable, or run "
+                "in an interactive TTY."
+            )
+
+        result["api_url"] = api_url
+        result["server_id"] = server_id
+        result["api_key_present"] = bool(api_key.strip())
+        result["enabled"] = enabled
+
+        if args.dry_run:
+            result["write_status"] = "dry-run"
+            print_token_updater_result(result)
+            return 0
+
+        # Delegate to the single sanctioned writer. The secret goes over stdin
+        # (never argv); the non-secret values go as flags.
+        auth_script = Path(__file__).resolve().parent / "bridge-auth.py"
+        if not auth_script.exists():  # noqa: raw-pathlib-controller-only — repo-resident sibling
+            raise SetupError(f"bridge-auth.py not found next to bridge-setup.py: {auth_script}")
+        cmd = [
+            sys.executable,
+            str(auth_script),
+            "--registry",
+            # bridge-auth.py requires --registry; the lease verb does not touch
+            # it, but the arg is mandatory. Resolve the same default the wrapper
+            # uses so an isolated/test run stays self-contained.
+            _token_updater_registry_default(),
+            "lease",
+            "config",
+            "--json",
+        ]
+        if api_url:
+            cmd += ["--api-url", api_url]
+        if server_id:
+            cmd += ["--server-id", server_id]
+        if enabled is True:
+            cmd += ["--enabled"]
+        elif enabled is False:
+            cmd += ["--disabled"]
+        stdin_data: Optional[str] = None
+        if api_key.strip():
+            cmd += ["--api-key-stdin"]
+            stdin_data = api_key
+        proc = subprocess.run(  # noqa: raw-subprocess — sanctioned lease-config writer call
+            cmd,
+            input=stdin_data,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()
+            raise SetupError(f"lease config write failed: {detail or 'unknown error'}")
+        try:
+            payload = json.loads(proc.stdout or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        result["config_file"] = str(payload.get("config_file") or "")
+        result["secret_written"] = bool(payload.get("secret_written"))
+        # Effective state as reported by the writer (persisted AND fully configured).
+        if "enabled" in payload:
+            result["effective_enabled"] = bool(payload.get("enabled"))
+        result["write_status"] = "ok"
+        print_token_updater_result(result)
+        return 0
+    except SetupError as exc:
+        result["error"] = str(exc)
+        if result["write_status"] == "pending":
+            result["write_status"] = "skipped"
+        print_token_updater_result(result, stream=sys.stderr)
+        return 1
+
+
+def _token_updater_registry_default() -> str:
+    """Resolve the token registry path the same way bridge-auth.sh does.
+
+    bridge-auth.py takes a mandatory --registry even for the lease verb (which
+    never reads it). Mirror `bridge_auth_registry_path` so the wizard passes a
+    consistent, install-scoped value rather than a bare relative filename."""
+    explicit = os.environ.get("BRIDGE_CLAUDE_TOKEN_REGISTRY", "").strip()
+    if explicit:
+        return explicit
+    secrets_dir = os.environ.get("BRIDGE_RUNTIME_SECRETS_DIR", "").strip()
+    if secrets_dir:
+        return str(Path(secrets_dir).expanduser() / "claude-oauth-tokens.json")
+    runtime_root = os.environ.get("BRIDGE_RUNTIME_ROOT", "").strip()
+    if runtime_root:
+        return str(Path(runtime_root).expanduser() / "secrets" / "claude-oauth-tokens.json")
+    bridge_home = os.environ.get("BRIDGE_HOME", "").strip()
+    if bridge_home:
+        return str(Path(bridge_home).expanduser() / "runtime" / "secrets" / "claude-oauth-tokens.json")
+    return "claude-oauth-tokens.json"
+
+
+def print_token_updater_result(result: dict[str, Any], stream=sys.stdout) -> None:
+    print(f"api_url: {result.get('api_url') or '<unset>'}", file=stream)
+    print(f"server_id: {result.get('server_id') or '<unset>'}", file=stream)
+    print(f"api_key: {'set' if result.get('api_key_present') else '<unset>'}", file=stream)
+    if result.get("enabled") is not None:
+        print(f"enabled: {'yes' if result.get('enabled') else 'no'}", file=stream)
+    if result.get("config_file"):
+        print(f"config_file: {result['config_file']}", file=stream)
+    if result.get("secret_written"):
+        print("secret: written to the 0600 token-updater secret file", file=stream)
+    if "effective_enabled" in result:
+        print(
+            f"effective_enabled: {'yes' if result['effective_enabled'] else 'no'} "
+            "(persisted AND fully configured)",
+            file=stream,
+        )
+    print(f"write_status: {result['write_status']}", file=stream)
+    if result.get("error"):
+        print(f"error: {result['error']}", file=stream)
+
+
 def cmd_ms365(args: argparse.Namespace) -> int:
     """Issue #1209: `agent-bridge setup ms365 <agent>` wizard.
 
@@ -3853,6 +4060,24 @@ def build_parser() -> argparse.ArgumentParser:
     mattermost_parser.add_argument("--skip-validate", action="store_true")
     mattermost_parser.add_argument("--dry-run", action="store_true")
     mattermost_parser.set_defaults(handler=cmd_mattermost)
+
+    # #21895 phase-1 (sub-PR 1/4): `setup token-updater` — the install-level
+    # token-updater lease config wizard. Collects URL + SERVER_ID + API key and
+    # delegates persistence to the sanctioned `bridge-auth.py lease config`
+    # writer (URL/SERVER_ID/ENABLED → runtime-config; API key → 0600 secret
+    # file). NOT agent-scoped; default-OFF (requires --enable + full config).
+    token_updater_parser = subparsers.add_parser("token-updater")
+    token_updater_parser.add_argument("--api-url", default="")
+    token_updater_parser.add_argument("--server-id", default="")
+    # The secret is read from a file or stdin (or an interactive prompt) — never
+    # a bare argv flag, so it stays out of the process table / shell history.
+    token_updater_parser.add_argument("--api-key-file", default="")
+    token_updater_parser.add_argument("--api-key-stdin", action="store_true")
+    token_updater_parser.add_argument("--enable", action="store_true")
+    token_updater_parser.add_argument("--disable", action="store_true")
+    token_updater_parser.add_argument("--yes", action="store_true")
+    token_updater_parser.add_argument("--dry-run", action="store_true")
+    token_updater_parser.set_defaults(handler=cmd_token_updater)
 
     # Issue #1427 Lane B: `setup template-sync` — seed new (and optionally
     # existing) agents from a reference agent's roster-resident config.

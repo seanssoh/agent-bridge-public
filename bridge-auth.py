@@ -3598,6 +3598,212 @@ def global_auth_sync_effective_source() -> str:
     return "default"
 
 
+# ---------------------------------------------------------------------------
+# Token-updater lease config surface (#21895 phase-1, sub-PR 1/4).
+#
+# This is the DEFAULT-OFF config FOUNDATION for a later lease-authoritative
+# token-updater integration. Sub-PR 1 ships ONLY the persistence surface + the
+# `lease status`/`--check` probe the later daemon tick will reuse. It wires NO
+# rotator, NO daemon tick, and NO lease HTTP client — those are later sub-PRs.
+#
+# Invariant (load-bearing): disabled/unconfigured == byte-for-byte no behavior
+# change. Absent config ⇒ ``token_updater_lease_enabled()`` False ⇒ nothing in
+# the auth/daemon path behaves differently. The only way anything reads these
+# values is a caller that first checks the ENABLED gate (there is no such caller
+# in this sub-PR).
+#
+# Config split (mirrors the keychain-free / global-auth-sync precedent):
+#   * URL / SERVER_ID / ENABLED   → runtime-config JSON (bridge-config.json),
+#     written by the sanctioned single-key writers below (never a raw edit, and
+#     never through ``config set-env`` — which denies them anyway, see below).
+#   * API_KEY (the secret)        → a dedicated 0600 secrets file in
+#     ``$BRIDGE_RUNTIME_SECRETS_DIR`` (NEVER runtime-config JSON, NEVER
+#     ``config set-env``). bridge-config.py:``ENV_KEY_DENY_SUBSTRINGS`` denies
+#     any TOKEN/SECRET/KEY-bearing name fail-closed, so ``config set-env
+#     TOKEN_UPDATER_API_KEY=…`` is refused there and that deny stays intact.
+#
+# The lowercase runtime-config keys follow the ``claude_*`` naming precedent
+# (``KEYCHAIN_FREE_CONFIG_KEY``/``GLOBAL_AUTH_SYNC_CONFIG_KEY``); the operator-
+# facing UPPER_SNAKE names (``TOKEN_UPDATER_*``) are the wizard/env spelling.
+TOKEN_UPDATER_URL_CONFIG_KEY = "token_updater_api_url"
+TOKEN_UPDATER_SERVER_ID_CONFIG_KEY = "token_updater_server_id"
+TOKEN_UPDATER_ENABLED_CONFIG_KEY = "token_updater_enabled"
+# The secret lives in its own 0600 file (NOT runtime-config JSON). Filename is
+# a plain non-JSON payload holding just the API key text.
+TOKEN_UPDATER_SECRET_FILENAME = "token-updater-api-key"
+
+
+def token_updater_secret_path() -> Path | None:
+    """Resolve the 0600 token-updater API-key secret file, or None if no root.
+
+    Prefers ``BRIDGE_RUNTIME_SECRETS_DIR`` (the same root the token registry
+    lives under — see ``bridge_auth_registry_path`` in bridge-auth.sh), then
+    ``BRIDGE_RUNTIME_ROOT/secrets``, then ``BRIDGE_HOME/runtime/secrets``.
+    Returns None when no root resolves so a caller degrades to unconfigured
+    rather than guessing a path outside the install."""
+    explicit = os.environ.get("BRIDGE_TOKEN_UPDATER_SECRET_FILE", "").strip()  # noqa: iso-helper-boundary - controller token-updater secret path
+    if explicit:
+        return Path(explicit).expanduser()
+    secrets_dir = os.environ.get("BRIDGE_RUNTIME_SECRETS_DIR", "").strip()  # noqa: iso-helper-boundary - controller secrets root
+    if secrets_dir:
+        return Path(secrets_dir).expanduser() / TOKEN_UPDATER_SECRET_FILENAME
+    runtime_root = os.environ.get("BRIDGE_RUNTIME_ROOT", "").strip()  # noqa: iso-helper-boundary - controller runtime root
+    if runtime_root:
+        return Path(runtime_root).expanduser() / "secrets" / TOKEN_UPDATER_SECRET_FILENAME
+    bridge_home = os.environ.get("BRIDGE_HOME", "").strip()  # noqa: iso-helper-boundary - controller bridge home fallback
+    if bridge_home:
+        return (
+            Path(bridge_home).expanduser()
+            / "runtime"
+            / "secrets"
+            / TOKEN_UPDATER_SECRET_FILENAME
+        )
+    return None
+
+
+def token_updater_api_url() -> str:
+    """The configured lease service base URL (runtime-config), or empty."""
+    return str(runtime_config_value(TOKEN_UPDATER_URL_CONFIG_KEY) or "").strip()
+
+
+def token_updater_server_id() -> str:
+    """The configured lease server id (runtime-config), or empty."""
+    return str(runtime_config_value(TOKEN_UPDATER_SERVER_ID_CONFIG_KEY) or "").strip()
+
+
+def token_updater_persisted_enabled() -> bool:
+    """True iff the persisted ``token_updater_enabled`` runtime-config bool is ON."""
+    return runtime_config_truthy(TOKEN_UPDATER_ENABLED_CONFIG_KEY)
+
+
+def token_updater_api_key() -> str:
+    """Read the token-updater API key from its 0600 secret file, or empty.
+
+    Never raises: an absent/unreadable secret file resolves to the empty string
+    so an unconfigured install degrades to "no secret" rather than an error."""
+    path = token_updater_secret_path()
+    if path is None:
+        return ""
+    try:
+        if not path.is_file():  # noqa: raw-pathlib-controller-only - controller secret probe
+            return ""
+        return path.read_text(encoding="utf-8").rstrip("\r\n")
+    except OSError:
+        return ""
+
+
+def token_updater_lease_configured() -> bool:
+    """True iff URL + SERVER_ID + a non-empty secret are ALL present.
+
+    ENABLED alone is not enough to act — the later lease client needs a target
+    and a credential. This predicate is informational (surfaced by ``status``);
+    the ACT gate is ``token_updater_lease_enabled`` AND this."""
+    return bool(token_updater_api_url() and token_updater_server_id() and token_updater_api_key())
+
+
+def token_updater_lease_enabled() -> bool:
+    """The single default-OFF gate the later lease path routes through.
+
+    EFFECTIVE = persisted ``token_updater_enabled`` bool AND fully configured
+    (URL + SERVER_ID + secret). Absent config ⇒ False ⇒ no behavior change.
+    Deliberately conjunctive: an operator who flips ENABLED but has not finished
+    the wizard (missing URL/id/secret) stays OFF rather than half-activating a
+    lease path that would fail every call."""
+    return token_updater_persisted_enabled() and token_updater_lease_configured()
+
+
+def write_token_updater_config(
+    *,
+    api_url: str | None = None,
+    server_id: str | None = None,
+    enabled: bool | None = None,
+) -> tuple[Path | None, str]:
+    """Sanctioned multi-key writer for the token-updater runtime-config values.
+
+    Mirrors ``write_global_auth_sync_gate``: the blessed admin path so the
+    operator never raw-edits bridge-config.json (and is not blocked by the
+    ``config set-env`` KEY-substring guard, which would deny these anyway).
+    Read-modify-write preserves every OTHER config key; only the ``token_updater_*``
+    keys named by a non-None argument are set. Returns ``(path, "ok")`` or
+    ``(None, reason)`` and NEVER clobbers a malformed config.
+
+    The SECRET (API key) is intentionally NOT accepted here — it never lands in
+    runtime-config JSON. Use ``write_token_updater_secret``."""
+    path = runtime_config_path()
+    if path is None:
+        return None, "no_runtime_config_path (set BRIDGE_RUNTIME_ROOT or BRIDGE_HOME)"
+    config: dict[str, Any] = {}
+    mode = 0o600
+    if path.is_file():  # noqa: raw-pathlib-controller-only - controller runtime config probe
+        try:
+            mode = path.stat().st_mode & 0o777  # noqa: raw-pathlib-controller-only - controller runtime config mode
+            parsed = json.loads(path.read_text(encoding="utf-8"))  # noqa: raw-pathlib-controller-only - controller runtime config read
+        except Exception as exc:  # noqa: BLE001 - malformed config → refuse, do not clobber
+            return None, f"runtime_config_unreadable: {exc}"
+        if not isinstance(parsed, dict):
+            return None, "runtime_config_not_object"
+        config = parsed
+    if api_url is not None:
+        config[TOKEN_UPDATER_URL_CONFIG_KEY] = str(api_url).strip()
+    if server_id is not None:
+        config[TOKEN_UPDATER_SERVER_ID_CONFIG_KEY] = str(server_id).strip()
+    if enabled is not None:
+        config[TOKEN_UPDATER_ENABLED_CONFIG_KEY] = bool(enabled)
+    text = json.dumps(config, ensure_ascii=True, indent=2) + "\n"
+    try:
+        write_private_file_atomic(path, text, mode=mode, prefix=".bridge-config.")
+    except OSError as exc:
+        return None, f"runtime_config_write_failed: {exc}"
+    return path, "ok"
+
+
+def write_token_updater_secret(api_key: str) -> tuple[Path | None, str]:
+    """Atomically write the token-updater API key to its 0600 secret file.
+
+    Mirrors ``save_registry``'s atomic 0600 write (mkstemp in the parent dir,
+    fsync, chmod 0600 BEFORE ``os.replace``) so the secret is never
+    world-readable at its final path and a torn write cannot leave a partial
+    key. The secret NEVER enters runtime-config JSON. An empty key is refused —
+    the wizard requires a real value.
+
+    Returns ``(path, "ok")`` or ``(None, reason)``."""
+    key = str(api_key or "")
+    if not key.strip():
+        return None, "empty_api_key"
+    path = token_updater_secret_path()
+    if path is None:
+        return None, "no_secret_path (set BRIDGE_RUNTIME_SECRETS_DIR, BRIDGE_RUNTIME_ROOT, or BRIDGE_HOME)"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(path.parent, 0o700)
+        # The payload is the raw key text with a single trailing newline; the
+        # reader rstrips CR/LF, so this round-trips exactly.
+        write_private_file_atomic(
+            path, key.rstrip("\r\n") + "\n", mode=0o600, prefix=".token-updater-api-key."
+        )
+    except OSError as exc:
+        return None, f"secret_write_failed: {exc}"
+    return path, "ok"
+
+
+def token_updater_lease_status_payload() -> dict[str, Any]:
+    """Read-only effective-state snapshot for ``lease status`` (no secret value).
+
+    Reports the ENABLED gate, whether each surface is configured, and the
+    effective (enabled AND configured) state. NEVER includes the secret value —
+    only a boolean ``api_key_present``."""
+    persisted = token_updater_persisted_enabled()
+    configured = token_updater_lease_configured()
+    return {
+        "enabled": token_updater_lease_enabled(),
+        "persisted_enabled": persisted,
+        "configured": configured,
+        "api_url": token_updater_api_url(),
+        "server_id": token_updater_server_id(),
+        "api_key_present": bool(token_updater_api_key()),
+    }
+
+
 def _global_credential_writer_is_root() -> bool:
     """True when the global credential write must FAIL CLOSED on root.
 
@@ -5760,6 +5966,140 @@ def cmd_global_auth_sync(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_token_updater_lease(args: argparse.Namespace) -> int:
+    """#21895 phase-1 (sub-PR 1/4) — the token-updater lease CONFIG surface.
+
+    Verbs (config foundation only; NO lease client / rotator / daemon tick):
+      * ``config``  — persist URL / SERVER_ID / ENABLED to runtime-config via
+        the sanctioned single-key writer, and the API KEY to its 0600 secret
+        file. The secret NEVER enters runtime-config JSON and is NEVER settable
+        through ``config set-env`` (denied there fail-closed).
+      * ``status``  — read-only effective-state snapshot (no secret value).
+        ``--check`` is the exit-code-only probe the later daemon tick reuses:
+        exit 0 iff the lease is EFFECTIVELY enabled (persisted ENABLED AND fully
+        configured), exit 1 otherwise. NEVER mutates and prints nothing under
+        ``--check``.
+
+    Default-OFF invariant: with the feature unconfigured/disabled this command's
+    ``status --check`` reports OFF and no other code path behaves differently."""
+    action = args.action
+    json_mode = bool(args.json)
+
+    if getattr(args, "check", False):
+        # Exit-code-only effective-state probe (no stdout/mutation), mirroring
+        # global-auth-sync's --check: exit 0 iff EFFECTIVELY enabled so a later
+        # bash early-skip reuses THIS single python predicate as the source of
+        # truth rather than re-deriving the gate in bash.
+        return 0 if token_updater_lease_enabled() else 1
+
+    if action == "status":
+        payload = token_updater_lease_status_payload()
+        if json_mode:
+            json_dump(payload)
+        else:
+            gate = "enabled" if payload["enabled"] else "disabled"
+            print(
+                f"token-updater lease: {gate} "
+                f"(persisted={payload['persisted_enabled']}, "
+                f"configured={payload['configured']}, "
+                f"url={payload['api_url'] or '<unset>'}, "
+                f"server_id={payload['server_id'] or '<unset>'}, "
+                f"api_key_present={payload['api_key_present']})"
+            )
+        return 0
+
+    # action == "config" (argparse `choices` guarantees the second value).
+    # Only the surfaces the operator actually passed are written; omitted flags
+    # leave the existing value untouched (re-run preservation). --enabled /
+    # --disabled are mutually exclusive; when neither is passed the ENABLED bool
+    # is left as-is.
+    api_url = None if args.api_url is None else str(args.api_url).strip()
+    server_id = None if args.server_id is None else str(args.server_id).strip()
+    enabled: bool | None = None
+    if getattr(args, "enabled", False) and getattr(args, "disabled", False):
+        return fail(
+            "pass at most one of --enabled / --disabled", json_mode
+        )
+    if getattr(args, "enabled", False):
+        enabled = True
+    elif getattr(args, "disabled", False):
+        enabled = False
+
+    # The API key is read from a file / stdin (never argv) so it is not captured
+    # in the process table or shell history. Empty (no key source) => leave the
+    # existing secret untouched.
+    api_key = ""
+    if getattr(args, "api_key_stdin", False):
+        api_key = sys.stdin.read()
+    elif getattr(args, "api_key_file", None):
+        try:
+            api_key = Path(args.api_key_file).expanduser().read_text(encoding="utf-8")
+        except OSError as exc:
+            return fail(f"cannot read --api-key-file: {exc}", json_mode)
+
+    wrote_secret = False
+    secret_path: Path | None = None
+    if api_key.strip():
+        secret_path, reason = write_token_updater_secret(api_key)
+        if secret_path is None:
+            return fail(f"token-updater api-key write failed: {reason}", json_mode)
+        wrote_secret = True
+        auth_write_audit(
+            {
+                "kind": "token_updater_secret",
+                "action": "write",
+                "secret_file": str(secret_path),
+            }
+        )
+
+    config_path: Path | None = None
+    if api_url is not None or server_id is not None or enabled is not None:
+        config_path, reason = write_token_updater_config(
+            api_url=api_url, server_id=server_id, enabled=enabled
+        )
+        if config_path is None:
+            return fail(f"token-updater config write failed: {reason}", json_mode)
+        auth_write_audit(
+            {
+                "kind": "token_updater_config",
+                "action": "write",
+                "config_file": str(config_path),
+                # Non-secret provenance only — never the key value.
+                "set_url": api_url is not None,
+                "set_server_id": server_id is not None,
+                "set_enabled": enabled,
+            }
+        )
+
+    if config_path is None and not wrote_secret:
+        return fail(
+            "nothing to persist: pass --api-url / --server-id / --enabled / "
+            "--disabled and/or an --api-key-file / --api-key-stdin",
+            json_mode,
+        )
+
+    payload = {
+        "status": "ok",
+        "action": "config",
+        "config_file": str(config_path) if config_path else "",
+        "secret_written": wrote_secret,
+        "secret_file": str(secret_path) if secret_path else "",
+        # Effective state AFTER the write, so the caller sees the result gate.
+        "enabled": token_updater_lease_enabled(),
+        "configured": token_updater_lease_configured(),
+    }
+    if json_mode:
+        json_dump(payload)
+    else:
+        parts = []
+        if config_path:
+            parts.append(f"config→{config_path}")
+        if wrote_secret:
+            parts.append("api-key→(0600 secret file)")
+        print(f"token-updater lease config saved ({', '.join(parts)})")
+    return 0
+
+
 def cmd_api_key_helper(args: argparse.Namespace) -> int:
     json_mode = bool(args.json)
     if json_mode and not bool(args.check):
@@ -7618,6 +7958,38 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     global_auth_sync_parser.set_defaults(handler=cmd_global_auth_sync)
+
+    # #21895 phase-1 (sub-PR 1/4): the token-updater lease CONFIG surface. This
+    # sub-PR ships ONLY persistence + the status/--check probe — no lease
+    # client, rotator wiring, or daemon tick. Default-OFF: `status --check`
+    # reports OFF and nothing else changes until an operator both configures the
+    # feature (URL + SERVER_ID + secret) AND flips ENABLED.
+    lease_parser = sub.add_parser("lease")
+    lease_parser.add_argument("action", choices=("config", "status"))
+    lease_parser.add_argument("--json", action="store_true")
+    lease_parser.add_argument(
+        "--check",
+        action="store_true",
+        help=(
+            "exit-code-only effective-state probe (no stdout/mutation): exit 0 "
+            "iff the token-updater lease is EFFECTIVELY enabled (persisted "
+            "token_updater_enabled AND fully configured: URL + SERVER_ID + a "
+            "0600 API-key secret), exit 1 otherwise. The later daemon tick reuses "
+            "THIS single python predicate."
+        ),
+    )
+    # `config` verb inputs. URL / SERVER_ID default to None (the sentinel for
+    # "flag omitted → leave existing value"); only a passed flag is written.
+    lease_parser.add_argument("--api-url", default=None)
+    lease_parser.add_argument("--server-id", default=None)
+    lease_parser.add_argument("--enabled", action="store_true")
+    lease_parser.add_argument("--disabled", action="store_true")
+    # The secret NEVER comes through argv (process table / shell history). It is
+    # read from a file or stdin and written to a 0600 secrets file — never into
+    # runtime-config JSON, never via `config set-env`.
+    lease_parser.add_argument("--api-key-file", default=None)
+    lease_parser.add_argument("--api-key-stdin", action="store_true")
+    lease_parser.set_defaults(handler=cmd_token_updater_lease)
 
     # Issue #1855: create-if-absent keychain-free settings backfill for a single
     # pre-#1520 shared Claude agent (driven per-agent by the upgrade / daemon
