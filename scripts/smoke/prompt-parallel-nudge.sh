@@ -34,6 +34,11 @@
 #       second operating reminder (응답 지연 방지 + the Long-running SSOT
 #       pointer) with its no-over-ack (즉답·trivial) + exact-first (먼저 실행)
 #       carve-outs, so a reword can't silently drop them.
+#   T7 (autonomous inbox-progress reminder): the SAME hook carries the THIRD
+#       operating reminder ([자율 진행] + the Autonomy & Anti-Stall SSOT
+#       pointer). Pins the confirm-first gate guardrails (confirm-first,
+#       게이트를 건너뛰라는 뜻이 절대 아니다, 명시적 사전 승인) so a reword can
+#       never turn "keep progressing the inbox" into "skip approvals".
 #
 # Host-agnostic: no sudo, isolated BRIDGE_HOME, hermetic temp workdir.
 
@@ -136,6 +141,15 @@ claude_render_and_dedup() {
   smoke_assert_contains "$nudge_out" "Long-running 작업" "T6: ack points at the Long-running SSOT section"
   smoke_assert_contains "$nudge_out" "즉답·trivial" "T6: ack keeps the no-over-ack carve-out"
   smoke_assert_contains "$nudge_out" "먼저 실행" "T6: ack keeps the exact-first/no-ack precedence carve-out"
+
+  # T7 — the THIRD operating reminder (autonomous inbox-progress) rides the same
+  # hook. Its confirm-first gate guardrails must survive any reword so the "keep
+  # progressing" nudge can never be read as "skip approvals".
+  smoke_assert_contains "$nudge_out" "[자율 진행]" "T7: nudge carries the autonomous-progress reminder"
+  smoke_assert_contains "$nudge_out" "confirm-first" "T7: autonomy keeps the confirm-first gate"
+  smoke_assert_contains "$nudge_out" "게이트를 건너뛰라는 뜻이 절대 아니다" "T7: autonomy keeps the anti-bulldoze clause"
+  smoke_assert_contains "$nudge_out" "명시적 사전 승인" "T7: autonomy keeps the explicit-prior-approval requirement"
+  smoke_assert_contains "$nudge_out" "기준: COMMON-INSTRUCTIONS.md Autonomy & Anti-Stall" "T7: autonomy points at the SSOT section"
 }
 
 codex_render_excludes_nudge() {
