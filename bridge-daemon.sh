@@ -3136,6 +3136,8 @@ bridge_daemon_token_lease_checkout() {
   [[ "$status" == "ok" ]]
 }
 
+# shellcheck disable=SC2120  # optional $1 trigger label (default "periodic"); the
+# sole daemon caller invokes it bare, external/future callers may pass a trigger.
 bridge_daemon_token_lease_tick() {
   local trigger="${1:-periodic}"
   local target="${BRIDGE_ADMIN_AGENT_ID:-daemon}"
