@@ -265,6 +265,89 @@ test_cli_heartbeat() {
   disable_feature
 }
 
+# ── T9c ───────────────────────────────────────────────────────────────
+# Contract A ↔ Contract C binding (codex #2248 finding 1): a CLI `lease checkout`
+# must PERSIST the durable lease-state so the daemon tick's `lease status` sees a
+# held lease (else it checkout-thrashes every poll). The mapped local_token_id is
+# recorded from the account email. The checkout envelope carries secret_material
+# — it must NEVER land in the durable lease-state file (allowlist excludes it).
+test_cli_checkout_persists_lease_state() {
+  disable_feature
+  enable_feature
+  # Registry so account_email → local_token_id resolves (the drift-check input).
+  cat >"$REGISTRY" <<'JSON'
+{"active_token_id":"tok-active","tokens":[
+  {"id":"tok-lease","account_email":"op@example.com","account_email_source":"operator"},
+  {"id":"tok-active","account_email":"other@example.com","account_email_source":"operator"}
+]}
+JSON
+  local fix="$SMOKE_TMP_ROOT/fix-persist" out rc
+  write_fixture "$fix" checkout '{"http_status":200,"body":{"service_token_id":"svc-persist","account_email":"op@example.com","lease_expires_at":1751222222,"secret_material":"SEKRIT-STATE-MUST-NOT-PERSIST"}}'
+  [[ ! -f "$LEASE_STATE" ]] || smoke_fail "T9c precondition: lease-state exists before checkout"
+  set +e
+  out="$(BRIDGE_TOKEN_UPDATER_LEASE_FIXTURE_DIR="$fix" lease_py checkout --json 2>/dev/null)"; rc=$?
+  set -e 2>/dev/null || true
+  [[ "$rc" -eq 0 ]] || smoke_fail "T9c CLI checkout rc=$rc (want 0 for ok)"
+  # THE BINDING: checkout persisted the durable lease-state (else the tick thrashes).
+  [[ -f "$LEASE_STATE" ]] || smoke_fail "T9c checkout did NOT persist lease-state ($LEASE_STATE) — daemon tick would checkout-thrash (finding 1)"
+  smoke_assert_eq "600" "$(file_mode "$LEASE_STATE")" "T9c lease-state persisted at 0600"
+  smoke_assert_eq "svc-persist" "$(field service_token_id <"$LEASE_STATE")" "T9c persisted service_token_id"
+  smoke_assert_eq "tok-lease" "$(field local_token_id <"$LEASE_STATE")" "T9c persisted the mapped local_token_id"
+  smoke_assert_eq "op@example.com" "$(field account_email <"$LEASE_STATE")" "T9c persisted account_email"
+  # SECRET NEVER PERSISTED: secret_material must be absent from the state file.
+  if grep -q "SEKRIT-STATE-MUST-NOT-PERSIST" "$LEASE_STATE" 2>/dev/null; then
+    smoke_fail "T9c secret_material LEAKED into the durable lease-state file: $LEASE_STATE"
+  fi
+  smoke_assert_eq "" "$(field secret_material <"$LEASE_STATE")" "T9c no secret_material key in lease-state"
+  disable_feature
+}
+
+# ── T9d ───────────────────────────────────────────────────────────────
+# Contract A ↔ Contract C binding (status side, codex #2248 finding 1): `lease
+# status --json` must surface lease.{service_token_id, local_token_id,
+# lease_expires_at} + the registry active_token_id — the exact inputs the daemon
+# tick's lease-status-parse reads to decide re-checkout / drift. Without them the
+# tick sees "no lease held" every poll.
+test_cli_status_surfaces_lease() {
+  disable_feature
+  enable_feature
+  cat >"$REGISTRY" <<'JSON'
+{"active_token_id":"tok-active","tokens":[
+  {"id":"tok-active","account_email":"other@example.com","account_email_source":"operator"}
+]}
+JSON
+  printf '%s' '{"service_token_id":"svc-status","account_email":"op@example.com","local_token_id":"tok-lease","lease_expires_at":1751333333,"last_heartbeat_at":1}' >"$LEASE_STATE"
+  chmod 600 "$LEASE_STATE"
+  local out
+  out="$(lease_py status --json 2>/dev/null)"
+  smoke_assert_eq "svc-status" "$(printf '%s' "$out" | field lease.service_token_id)" "T9d status surfaces lease.service_token_id"
+  smoke_assert_eq "tok-lease" "$(printf '%s' "$out" | field lease.local_token_id)" "T9d status surfaces lease.local_token_id"
+  smoke_assert_eq "1751333333" "$(printf '%s' "$out" | field lease.lease_expires_at)" "T9d status surfaces lease.lease_expires_at"
+  smoke_assert_eq "tok-active" "$(printf '%s' "$out" | field active_token_id)" "T9d status surfaces registry active_token_id (drift input)"
+  # Secret hygiene: the status payload must never carry the secret value.
+  smoke_assert_eq "" "$(printf '%s' "$out" | field secret_material)" "T9d status payload carries no secret_material"
+  disable_feature
+}
+
+# ── T9e ───────────────────────────────────────────────────────────────
+# Contract A ↔ Contract C binding (release side): a CLI `lease checkin` (the
+# daemon exit-trap path) clears the durable lease-state so the next boot does not
+# resurrect a stale lease — `has_lease` reads 0 afterward (empty service_token_id).
+test_cli_checkin_clears_lease_state() {
+  disable_feature
+  enable_feature
+  printf '%s' '{"service_token_id":"svc-gone","account_email":"op@example.com","local_token_id":"tok-lease","lease_expires_at":1751444444,"last_heartbeat_at":1}' >"$LEASE_STATE"
+  chmod 600 "$LEASE_STATE"
+  local fix="$SMOKE_TMP_ROOT/fix-checkin" rc
+  write_fixture "$fix" checkin '{"http_status":200,"body":{}}'
+  set +e
+  BRIDGE_TOKEN_UPDATER_LEASE_FIXTURE_DIR="$fix" lease_py checkin --json >/dev/null 2>&1; rc=$?
+  set -e 2>/dev/null || true
+  [[ "$rc" -eq 0 ]] || smoke_fail "T9e CLI checkin rc=$rc (want 0 for ok)"
+  smoke_assert_eq "" "$(field service_token_id <"$LEASE_STATE")" "T9e checkin cleared service_token_id (no stale lease)"
+  disable_feature
+}
+
 # ── T10 ───────────────────────────────────────────────────────────────
 # ci-select routes bridge-auth.py / bridge-auth.sh to this smoke by source-file
 # mapping (else CI silently skips it on a source change).
@@ -289,6 +372,9 @@ smoke_run "T8 client transport error -> error, http=None (never raises)"        
 smoke_run "T8b _parse_retry_after robust (neg/inf/Infinity/nan/date/empty -> None)" test_retry_after_robust
 smoke_run "T9 CLI enabled checkout 200 -> ok + field passthrough"                  test_cli_enabled_checkout
 smoke_run "T9b CLI lease heartbeat: no-lease noop / with-lease ok (Sub-PR 4 seam)"  test_cli_heartbeat
+smoke_run "T9c CLI checkout PERSISTS lease-state (A↔C bind), secret NOT persisted"  test_cli_checkout_persists_lease_state
+smoke_run "T9d CLI status surfaces lease + active_token_id (A↔C bind, tick inputs)" test_cli_status_surfaces_lease
+smoke_run "T9e CLI checkin CLEARS lease-state (no stale lease resurrection)"        test_cli_checkin_clears_lease_state
 smoke_run "T10 ci-select routing -> bridge-auth.py/.sh select this smoke"          test_ci_select_routing
 
 smoke_log "all checks passed"

@@ -3787,14 +3787,29 @@ def write_token_updater_secret(api_key: str) -> tuple[Path | None, str]:
     return path, "ok"
 
 
-def token_updater_lease_status_payload() -> dict[str, Any]:
+def token_updater_lease_status_payload(
+    registry_path: Path | None = None,
+) -> dict[str, Any]:
     """Read-only effective-state snapshot for ``lease status`` (no secret value).
 
     Reports the ENABLED gate, whether each surface is configured, and the
-    effective (enabled AND configured) state. NEVER includes the secret value —
-    only a boolean ``api_key_present``."""
+    effective (enabled AND configured) state. Also surfaces the durable
+    lease-state (the ``lease`` sub-dict) and the registry ``active_token_id`` so
+    the Sub-PR 4 daemon tick's ``lease-status-parse`` can make its re-checkout /
+    drift decision IN BASH — WITHOUT this the tick sees no held lease every poll
+    and checkout-thrashes (codex #2248 finding 1: the A↔C binding). NEVER
+    includes the secret value: only a boolean ``api_key_present``, and the
+    ``lease`` sub-dict carries ONLY the allowlisted non-secret lease-state keys
+    (secret_material is never persisted to the lease-state file it reads)."""
     persisted = token_updater_persisted_enabled()
     configured = token_updater_lease_configured()
+    lease_state = read_token_updater_lease_state() or {}
+    active_token_id = ""
+    if registry_path is not None:
+        try:
+            active_token_id = str(load_registry(registry_path).get("active_token_id") or "")
+        except Exception:  # noqa: BLE001 - unreadable registry → empty active id (no drift claim)
+            active_token_id = ""
     return {
         "enabled": token_updater_lease_enabled(),
         "persisted_enabled": persisted,
@@ -3802,6 +3817,16 @@ def token_updater_lease_status_payload() -> dict[str, Any]:
         "api_url": token_updater_api_url(),
         "server_id": token_updater_server_id(),
         "api_key_present": bool(token_updater_api_key()),
+        # Durable lease-state (non-secret) + the registry active row id — the exact
+        # inputs lease-status-parse reads: lease.{service_token_id, local_token_id,
+        # lease_expires_at} + active_token_id. A mismatch of active vs local is the
+        # codex-Q1 drift signal; an empty service_token_id means "no lease held".
+        "lease": {
+            "service_token_id": lease_state.get("service_token_id") or "",
+            "local_token_id": lease_state.get("local_token_id") or "",
+            "lease_expires_at": lease_state.get("lease_expires_at"),
+        },
+        "active_token_id": active_token_id,
     }
 
 
@@ -4600,6 +4625,30 @@ def token_updater_lease_swap_or_defer(
         # only local registry ids, never token bytes, and this reason string is
         # logged/audited by every rotator.
         return _defer(f"activate_error:{type(exc).__name__}")
+
+    # Bind Contract B → Contract C (codex #2248 finding 3): persist the just-swapped
+    # lease into the durable lease-state so the Sub-PR 4 daemon tick's `lease status`
+    # reflects the NEW held lease (service_token_id=svc-new, local_token_id=the row
+    # just activated). WITHOUT this the lease-state still records the pre-swap
+    # svc-old/tok-a, so the tick reads active_token_id (now tok-b) != lease
+    # local_token_id (stale tok-a) as mapping-drift and re-checks-out — stranding
+    # the just-swapped lease unheartbeated until its TTL. Secret-free: only the
+    # allowlisted non-secret keys are written (never secret_material); local_token_id
+    # is the authoritative id activated under the registry lock above. Best-effort —
+    # a persist failure must NOT fail the swap (the lease TTL + next tick are the
+    # correctness backstop, identical to the CLI verb persist path).
+    try:
+        write_token_updater_lease_state(
+            {
+                "service_token_id": str(swap_result.get("service_token_id") or ""),
+                "account_email": account_email,
+                "local_token_id": local_token_id,
+                "lease_expires_at": swap_result.get("lease_expires_at"),
+                "last_heartbeat_at": now_iso(),
+            }
+        )
+    except Exception:  # noqa: BLE001 - lease-state persist is best-effort (TTL is the backstop)
+        pass
 
     # SECURITY (patch Phase-5 note on Sub-PR 2): the Contract-A ``swap()`` response
     # may carry ``secret_material`` (the new token's actual secret) on its JSON
@@ -6822,6 +6871,65 @@ def _token_updater_lease_client_from_args(args: argparse.Namespace) -> TokenUpda
     return TokenUpdaterLeaseClient(timeout=float(timeout))
 
 
+def _token_updater_persist_lease_after(
+    action: str, result: dict[str, Any], registry_path: Path | None
+) -> None:
+    """Persist / refresh / clear the durable lease-state after a client verb (ok only).
+
+    This is the Contract-A ↔ Contract-C binding (codex #2248 finding 1): the
+    Sub-PR 4 daemon tick decides checkout-vs-heartbeat by reading the HELD lease
+    through ``lease status`` → ``lease-status-parse``. If an ``ok`` checkout/swap
+    never RECORDS the lease (and a heartbeat never refreshes it, a checkin never
+    clears it), the tick sees "no lease held" on every poll and checks out again
+    and again (thrash). So:
+      * ``checkout`` / ``swap`` ok → (re)establish the full lease-state, mapping
+        the lease account email → LOCAL registry row id fail-closed.
+      * ``heartbeat`` ok → refresh the TTL + heartbeat stamp, keep identity.
+      * ``checkin`` ok → clear the lease-state (no lease held).
+
+    NEVER writes secret_material: the state dict is built EXPLICITLY from the
+    non-secret provenance fields (never ``result`` verbatim), and
+    ``write_token_updater_lease_state`` itself only persists the allowlisted
+    ``TOKEN_UPDATER_LEASE_STATE_KEYS`` (which exclude every secret field).
+    Best-effort — a write failure is swallowed; the lease TTL + next tick are the
+    correctness backstop, and a persist error must not fail the verb."""
+    if not isinstance(result, dict) or result.get("status") != "ok":
+        return
+    try:
+        if action == "checkin":
+            # Released — clear the durable lease-state (all keys → null).
+            write_token_updater_lease_state({})
+            return
+        if action == "heartbeat":
+            # Refresh the TTL + heartbeat stamp; keep the identity fields.
+            state = read_token_updater_lease_state() or {}
+            if result.get("lease_expires_at") is not None:
+                state["lease_expires_at"] = result.get("lease_expires_at")
+            state["last_heartbeat_at"] = now_iso()
+            write_token_updater_lease_state(state)
+            return
+        # checkout / swap — (re)establish the full lease-state. Map the lease
+        # account email → LOCAL registry row id fail-closed (0 / ambiguous → empty,
+        # the daemon then reads no-drift rather than guessing a local row).
+        account_email = str(result.get("account_email") or "")
+        local_token_id = ""
+        if account_email and registry_path is not None:
+            mapped = _token_updater_map_account(account_email, registry_path)
+            if isinstance(mapped, dict) and mapped.get("status") == "ok":
+                local_token_id = str(mapped.get("local_token_id") or "")
+        write_token_updater_lease_state(
+            {
+                "service_token_id": str(result.get("service_token_id") or ""),
+                "account_email": account_email,
+                "local_token_id": local_token_id,
+                "lease_expires_at": result.get("lease_expires_at"),
+                "last_heartbeat_at": now_iso(),
+            }
+        )
+    except Exception:  # noqa: BLE001 - lease-state persist is best-effort (TTL is the backstop)
+        return
+
+
 def _cmd_token_updater_lease_client_verb(
     args: argparse.Namespace, action: str, json_mode: bool
 ) -> int:
@@ -6889,6 +6997,14 @@ def _cmd_token_updater_lease_client_verb(
         result = client.checkin(service_token_id)
 
     result.setdefault("action", action)
+    # Bind Contract A → Contract C: record/refresh/clear the durable lease-state
+    # so the daemon tick's `lease status` reflects the held lease (else it
+    # checkout-thrashes — codex #2248 finding 1). Secret-free + best-effort.
+    _token_updater_persist_lease_after(
+        action,
+        result,
+        Path(args.registry).expanduser() if getattr(args, "registry", None) else None,
+    )
     if json_mode:
         json_dump(result)
     else:
@@ -6936,7 +7052,10 @@ def cmd_token_updater_lease(args: argparse.Namespace) -> int:
         return _cmd_token_updater_lease_client_verb(args, action, json_mode)
 
     if action == "status":
-        payload = token_updater_lease_status_payload()
+        status_registry_path = (
+            Path(args.registry).expanduser() if getattr(args, "registry", None) else None
+        )
+        payload = token_updater_lease_status_payload(status_registry_path)
         if json_mode:
             json_dump(payload)
         else:
