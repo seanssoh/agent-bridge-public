@@ -106,19 +106,22 @@ lifecycle_trap_count="$(grep -cE "trap[[:space:]]+'_bridge_daemon_on_exit'[[:spa
   || smoke_fail "expected exactly one '_bridge_daemon_on_exit' EXIT trap, found $lifecycle_trap_count (a competing trap would drop pid-file cleanup)"
 # The check-in must be FOLDED INTO _bridge_daemon_on_exit (a call within the
 # function body), not a separate competing `trap … EXIT`. Capture the function
-# body into a variable FIRST, then grep the variable — do NOT pipe awk straight
-# into `grep -q`. Under `set -o pipefail`, `grep -q` exits on its first match and
-# closes the read end of the pipe while awk is still emitting the rest of the
-# function body; awk then dies with SIGPIPE and pipefail turns the whole pipeline
-# non-zero, producing a spurious "not folded" failure. That bit CI shard-3 (mawk
-# + GNU grep -q; the source file was byte-identical to a passing local run, so it
-# was purely the pipeline's broken-pipe behavior, not the assertion target) —
-# #2248. Command-substitution capture lets awk finish and exit 0 (no reader to
-# close the pipe early), so the check is SIGPIPE-immune and engine-independent.
+# body into a variable FIRST, then match with a bash `case` glob — do NOT pipe
+# awk straight into `grep -q`, and do NOT feed a here-string to grep either.
+# Under `set -o pipefail`, `grep -q` exits on its first match and closes the read
+# end of the pipe while awk is still emitting the rest of the function body; awk
+# then dies with SIGPIPE and pipefail turns the whole pipeline non-zero,
+# producing a spurious "not folded" failure. That bit CI shard-3 (mawk + GNU
+# grep -q; the source file was byte-identical to a passing local run, so it was
+# purely the pipeline's broken-pipe behavior, not the assertion target) — #2248.
+# A command-substitution capture + `case` glob avoids the pipe (SIGPIPE-immune,
+# engine-independent) AND the `<<<` here-string (no heredoc-ban H3 site — footgun
+# #11 lint). `case`'s `*…*` matches across newlines, so the multiline body is fine.
 trap_body="$(awk '/^_bridge_daemon_on_exit\(\) \{/,/^}/' "$DAEMON_SRC")"
-if ! grep -q 'bridge_daemon_token_lease_checkin_on_exit' <<<"$trap_body"; then
-  smoke_fail "check-in must be folded INTO _bridge_daemon_on_exit, not a separate trap"
-fi
+case "$trap_body" in
+  *bridge_daemon_token_lease_checkin_on_exit*) : ;;  # folded into the handler — good
+  *) smoke_fail "check-in must be folded INTO _bridge_daemon_on_exit, not a separate trap" ;;
+esac
 
 # Shim dir: the function bodies find bridge-auth.sh + bridge-daemon-helpers.py
 # via "$SCRIPT_DIR/...", so we point SCRIPT_DIR (in the driver) at this dir.
