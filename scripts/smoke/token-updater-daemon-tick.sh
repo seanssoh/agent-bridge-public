@@ -104,21 +104,19 @@ grep -q 'bridge_daemon_token_lease_checkin_on_exit' "$DAEMON_SRC" \
 lifecycle_trap_count="$(grep -cE "trap[[:space:]]+'_bridge_daemon_on_exit'[[:space:]]+EXIT" "$DAEMON_SRC" || true)"
 [[ "$lifecycle_trap_count" == "1" ]] \
   || smoke_fail "expected exactly one '_bridge_daemon_on_exit' EXIT trap, found $lifecycle_trap_count (a competing trap would drop pid-file cleanup)"
-if ! awk '/^_bridge_daemon_on_exit\(\) \{/,/^}/' "$DAEMON_SRC" \
-  | grep -q 'bridge_daemon_token_lease_checkin_on_exit'; then
-  # Diagnostic: a structural assertion that fails should show what it read, so a
-  # future failure is diagnosable instead of mysterious. Prints the source path,
-  # a content hash, the function/check-in line anchors, the awk-range tail, and —
-  # critically — whether the working-tree bridge-daemon.sh differs from HEAD (a
-  # prior smoke in the same shard mutating the shared checkout would show here).
-  {
-    echo "[DIAG token-tick] DAEMON_SRC=$DAEMON_SRC"
-    echo "[DIAG token-tick] md5=$(md5sum "$DAEMON_SRC" 2>/dev/null | cut -d' ' -f1 || md5 -q "$DAEMON_SRC" 2>/dev/null) wc_l=$(wc -l < "$DAEMON_SRC" 2>/dev/null)"
-    echo "[DIAG token-tick] anchors _bridge_daemon_on_exit:"; grep -n '^_bridge_daemon_on_exit() {' "$DAEMON_SRC" 2>/dev/null | head
-    echo "[DIAG token-tick] anchors checkin_on_exit:"; grep -n 'bridge_daemon_token_lease_checkin_on_exit' "$DAEMON_SRC" 2>/dev/null | head
-    echo "[DIAG token-tick] awk-range last 6 lines:"; awk '/^_bridge_daemon_on_exit\(\) \{/,/^}/' "$DAEMON_SRC" 2>/dev/null | tail -6
-    echo "[DIAG token-tick] working-tree vs HEAD:"; git -C "$SMOKE_REPO_ROOT" status --porcelain -- bridge-daemon.sh 2>/dev/null; git -C "$SMOKE_REPO_ROOT" diff --stat HEAD -- bridge-daemon.sh 2>/dev/null | head
-  } >&2
+# The check-in must be FOLDED INTO _bridge_daemon_on_exit (a call within the
+# function body), not a separate competing `trap … EXIT`. Capture the function
+# body into a variable FIRST, then grep the variable — do NOT pipe awk straight
+# into `grep -q`. Under `set -o pipefail`, `grep -q` exits on its first match and
+# closes the read end of the pipe while awk is still emitting the rest of the
+# function body; awk then dies with SIGPIPE and pipefail turns the whole pipeline
+# non-zero, producing a spurious "not folded" failure. That bit CI shard-3 (mawk
+# + GNU grep -q; the source file was byte-identical to a passing local run, so it
+# was purely the pipeline's broken-pipe behavior, not the assertion target) —
+# #2248. Command-substitution capture lets awk finish and exit 0 (no reader to
+# close the pipe early), so the check is SIGPIPE-immune and engine-independent.
+trap_body="$(awk '/^_bridge_daemon_on_exit\(\) \{/,/^}/' "$DAEMON_SRC")"
+if ! grep -q 'bridge_daemon_token_lease_checkin_on_exit' <<<"$trap_body"; then
   smoke_fail "check-in must be folded INTO _bridge_daemon_on_exit, not a separate trap"
 fi
 

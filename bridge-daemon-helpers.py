@@ -1222,9 +1222,16 @@ def cmd_lease_heartbeat_parse(args: argparse.Namespace) -> int:
     if not isinstance(payload, dict):
         print("error\t-")
         return 0
+    # Normalize BOTH fields to the `-` sentinel when empty/None — symmetrically.
+    # If `status` were emitted as "" while `http` was e.g. 404, the row "\t404"
+    # collapses under the daemon's `IFS=$'\t' read -r hb_status hb_http` (a
+    # leading tab is trimmed as IFS whitespace → hb_status=404, hb_http=""),
+    # silently bypassing the http∈{404,409} re-checkout gate (gemini HIGH latent,
+    # #2248). Keeping both fields non-empty makes the two-column row unambiguous.
+    status = payload.get("status")
     http = payload.get("http")
     print("\t".join([
-        str(payload.get("status", "") or ""),
+        str(status) if status not in (None, "") else "-",
         str(http) if http not in (None, "") else "-",
     ]))
     return 0

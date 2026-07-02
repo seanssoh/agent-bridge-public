@@ -3146,7 +3146,14 @@ bridge_daemon_token_lease_tick() {
   local now=0
   local status_json=""
   local status_row=""
-  local configured="0" has_lease="0" lease_expires_at="-"
+  # `configured` defaults to the `error` sentinel (NOT "0") so that a status
+  # fetch/parse failure — which leaves status_row empty and skips the populate
+  # block below — fails SAFE: the `configured == error` gate skips this tick and
+  # retries next, rather than falling through with has_lease="0" and firing a
+  # blind checkout on an unknown state (gemini MEDIUM, #2248). The normal path
+  # overwrites all six fields from a good status_row, so this only affects the
+  # empty-row failure case.
+  local configured="error" has_lease="0" lease_expires_at="-"
   local local_token_id="-" active_token_id="-" service_token_id="-"
   local checkout_status=""
   local heartbeat_json="" hb_row="" hb_status="" hb_http="-"
