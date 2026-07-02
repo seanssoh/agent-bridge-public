@@ -1004,6 +1004,27 @@ def cmd_rotation_status_parse(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_lease_decision_parse(args: argparse.Namespace) -> int:
+    """#21895 sub-PR 3: extract the ``action`` from a lease-swap-or-defer decision.
+
+    Parses the bridge-auth.sh ``claude-token lease-swap-or-defer --json`` envelope
+    and prints a single field: the ``action`` (``swapped`` / ``defer_local`` /
+    ``suppress_cooldown``). A parse failure or a missing/unknown action prints
+    ``defer_local`` so the caller degrades to its EXISTING local rotate — a
+    garbled lease decision must NEVER suppress the safe local fallback.
+    """
+    try:
+        payload = json.loads(args.decision_json)
+    except Exception:
+        print("defer_local")
+        return 0
+    action = str(payload.get("action") or "")
+    if action not in ("swapped", "defer_local", "suppress_cooldown"):
+        action = "defer_local"
+    print(action)
+    return 0
+
+
 def cmd_recovery_status_parse(args: argparse.Namespace) -> int:
     """Original site: bridge-daemon.sh:1227 (process_claude_token_recovery).
 
@@ -1854,6 +1875,12 @@ SUBCOMMANDS = {
         cmd_rotation_status_parse,
         [("rotate_json", "JSON envelope from bridge-auth.sh claude-token rotate --json")],
         "Single-row rotation outcome: status / reason / from / to / sync_status / soonest_reset (6 cols).",
+    ),
+    # #21895 sub-PR 3: route on the lease-swap-or-defer decision's action.
+    "lease-decision-parse": (
+        cmd_lease_decision_parse,
+        [("decision_json", "JSON envelope from bridge-auth.sh claude-token lease-swap-or-defer --json")],
+        "Single line — the decision action (swapped/defer_local/suppress_cooldown); 'defer_local' on parse failure.",
     ),
     # Issue #1468: classify a native usage-probe --json result for an audit row.
     "usage-probe-result-parse": (

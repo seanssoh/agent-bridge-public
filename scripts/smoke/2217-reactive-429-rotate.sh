@@ -152,6 +152,17 @@ bridge_notify_send() { NOTIFY_LEDGER+="sent "; }
 # bridge_agent_is_static is consulted by the scope gate for the "static" keyword.
 # shellcheck disable=SC2329
 bridge_agent_is_static() { [[ "$1" == static-* ]]; }
+# #21895 sub-PR 3: the reactive-429 rotate now routes through the shared lease
+# swap-or-defer helper first. This smoke exercises the DISABLED/local-rotate path
+# (no token-updater lease configured), so the stub returns `defer_local` (the
+# lease OFF behavior) → the extracted function falls through to its EXISTING
+# local rotate, byte-for-byte the pre-lease behavior every scenario below asserts.
+# shellcheck disable=SC2329
+bridge_daemon_lease_swap_route() {
+  BRIDGE_LEASE_ROUTE_DECISION="defer_local"
+  BRIDGE_LEASE_ROUTE_ENVELOPE=""
+  return 0
+}
 
 # Reset per-scenario shared state + ledgers.
 reset_scenario() {

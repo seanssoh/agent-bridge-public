@@ -4224,6 +4224,359 @@ class TokenUpdaterLeaseClient:
             return {"status": "error", "http": None, "reason": "no_service_token_id"}
         result = self._call("checkin", {"service_token_id": str(service_token_id)})
         return {k: v for k, v in result.items() if k != "body"}
+# Token-updater lease SWAP-OR-DEFER authority (#21895 phase-1, sub-PR 3/4).
+#
+# Contract B: ONE shared entry every live rotator routes its rotate decision
+# through WHEN the lease is ENABLED — the only path that performs a lease-
+# authoritative swap. Sub-PR 2 owns the lease client + durable lease-state +
+# email→local mapping (Contract A); this helper CALLS them and NEVER edits them.
+#
+# The decision it returns tells the caller what to do:
+#   * ``swapped``          — the lease rotated authority; the return ALSO carries
+#     a rotate-shaped envelope (``status=rotated`` + old/new active id) so every
+#     downstream rotate-status parser reads it byte-identically to a local rotate.
+#   * ``defer_local``      — degrade to the caller's EXISTING local ``cmd_rotate``
+#     (config / mapping-ambiguous / network / timeout / 5xx, the break-glass
+#     override, or the lease simply DISABLED). The caller falls back unchanged.
+#   * ``suppress_cooldown``— authoritative ``409 nothing-usable``: the remote pool
+#     is held/reserved, so a local rotate would drain a fleet token. The return
+#     carries a ``skipped:all_tokens_limited`` envelope so the caller's EXISTING
+#     pool-exhausted writer fires and NO local rotate happens.
+#
+# Disabled/unconfigured ⇒ ``defer_local`` immediately (no client, no network),
+# so a caller that gates on the ENABLED probe first is byte-for-byte no-op.
+TOKEN_UPDATER_BREAKGLASS_LOCAL_ROTATE_ENV = "BRIDGE_TOKEN_LEASE_BREAKGLASS_LOCAL_ROTATE"
+# INJECTION SEAMS (CI only): serve the Contract-A swap() / mapping from a local
+# fixture so the swap-or-defer decision matrix is exercised without a live lease
+# service or the parallel Sub-PR 2 client. Inert in production (unset → the real
+# Contract-A client path). The secret never enters these — a fixture is a plain
+# JSON decision the test author controls.
+TOKEN_UPDATER_SWAP_FIXTURE_ENV = "BRIDGE_TOKEN_UPDATER_SWAP_FIXTURE"
+TOKEN_UPDATER_MAP_FIXTURE_ENV = "BRIDGE_TOKEN_UPDATER_MAP_FIXTURE"
+
+
+def _token_updater_breakglass_local_rotate() -> bool:
+    """Named break-glass (default OFF): force ``defer_local`` even on a 409.
+
+    Set ``BRIDGE_TOKEN_LEASE_BREAKGLASS_LOCAL_ROTATE=1`` to override the
+    authoritative-409 → ``suppress_cooldown`` and fall back to the local rotate
+    instead. For an operator who has deliberately decided the remote reservation
+    is wrong and wants the local pool to rotate anyway. OFF by default so the
+    fleet-safe suppression is the standing behavior."""
+    return os.environ.get(TOKEN_UPDATER_BREAKGLASS_LOCAL_ROTATE_ENV, "").strip() == "1"
+
+
+def _token_updater_load_json_fixture(env_name: str) -> dict[str, Any] | None:
+    """Load a CI injection-seam fixture (inline JSON or @path), or None if unset.
+
+    ``$ENV`` may be inline JSON (``{"status":"ok",...}``) or ``@/path/to.json``.
+    A malformed/unreadable fixture returns None so the caller degrades to the
+    real client path rather than crashing on a bad test fixture."""
+    raw = os.environ.get(env_name, "").strip()  # noqa: iso-helper-boundary - CI test-seam env read, not an iso agent-env file
+    if not raw:
+        return None
+    try:
+        if raw.startswith("@"):
+            text = Path(raw[1:]).expanduser().read_text(encoding="utf-8")
+        else:
+            text = raw
+        parsed = json.loads(text)
+    except Exception:  # noqa: BLE001 - a bad fixture must not crash the helper
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _token_updater_lease_client():
+    """Resolve the Contract-A lease client, or None when unavailable.
+
+    Sub-PR 2 owns ``TokenUpdaterLeaseClient`` (built from the persisted config +
+    0600 secret). It is built in parallel and lands FIRST in the integration
+    merge; until then this returns None so a ``defer_local`` degrade holds rather
+    than a NameError. Once Sub-PR 2 is merged the class is present and this is a
+    plain constructor call — the guard is a graceful-degrade seam, not a runtime
+    branch on the merged tree."""
+    ctor = globals().get("TokenUpdaterLeaseClient")
+    if ctor is None:
+        return None
+    try:
+        return ctor()
+    except Exception:  # noqa: BLE001 - a client we cannot build → defer_local
+        return None
+
+
+def _token_updater_do_swap() -> dict[str, Any] | None:
+    """Call the Contract-A client ``swap()`` (or the CI fixture), or None on fail.
+
+    The fixture seam (``$BRIDGE_TOKEN_UPDATER_SWAP_FIXTURE``) short-circuits the
+    live client for CI. Otherwise builds the Contract-A client and calls
+    ``swap()``. Returns None on any failure so the caller degrades to a local
+    rotate."""
+    fixture = _token_updater_load_json_fixture(TOKEN_UPDATER_SWAP_FIXTURE_ENV)
+    if fixture is not None:
+        return fixture
+    client = _token_updater_lease_client()
+    if client is None:
+        return None
+    try:
+        result = client.swap()
+    except Exception:  # noqa: BLE001 - any transport failure → local fallback
+        return None
+    return result if isinstance(result, dict) else None
+
+
+def _token_updater_read_lease_state() -> dict[str, Any] | None:
+    """Read the Contract-A durable lease-state, or None (defer) when absent."""
+    reader = globals().get("read_token_updater_lease_state")
+    if reader is None:
+        return None
+    try:
+        state = reader()
+    except Exception:  # noqa: BLE001 - unreadable lease-state → defer_local
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def _token_updater_map_account(account_email: str) -> dict[str, Any]:
+    """Map a lease account email → local token id via the Contract-A helper.
+
+    Fail-closed structured skip (``{status:"error", reason:...}``) when the
+    mapping helper is missing/ambiguous — the caller then defers to a local
+    rotate rather than guessing a local token. The CI fixture seam
+    (``$BRIDGE_TOKEN_UPDATER_MAP_FIXTURE``) short-circuits the live helper."""
+    fixture = _token_updater_load_json_fixture(TOKEN_UPDATER_MAP_FIXTURE_ENV)
+    if fixture is not None:
+        return fixture
+    mapper = globals().get("token_updater_map_account_to_local")
+    if mapper is None:
+        return {"status": "error", "reason": "map_helper_unavailable"}
+    try:
+        result = mapper(account_email)
+    except Exception as exc:  # noqa: BLE001 - mapping failure → structured skip
+        return {"status": "error", "reason": f"map_error:{exc}"}
+    return result if isinstance(result, dict) else {"status": "error", "reason": "map_bad_result"}
+
+
+def _token_updater_swap_reset_at(swap_result: dict[str, Any]) -> str:
+    """Extract the soonest advisory reset the swap response carried, or "".
+
+    A ``409 nothing-usable`` may carry the service's soonest pool reset; passing
+    it through to the pool-exhausted writer stamps a truthful cooldown window.
+    When ABSENT the caller passes empty and the writer's bounded floor/max
+    cooldown governs (Contract B / codex Q3)."""
+    for key in ("soonest_reset", "reset_at", "retry_at", "lease_expires_at"):
+        value = swap_result.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def _token_updater_activate_local(
+    registry_path: Path,
+    local_token_id: str,
+    *,
+    reason: str,
+    limited_until: str,
+    sync: bool,
+) -> dict[str, Any]:
+    """Activate the lease-mapped local token — the ``swapped`` registry mutation.
+
+    Mirrors ``cmd_rotate``'s commit (registry lock → set ``active_token_id`` →
+    stamp ``last_activated_at`` + ``last_rotation`` → save), but the target token
+    is CHOSEN by the lease authority (the mapped local id), not the round-robin
+    ring. Returns a rotate-shaped envelope so downstream parsers read it exactly
+    like a local rotate. ``limited_until`` (codex Q4) stamps the rotating-AWAY
+    token ONLY (the caller passes the old token's 429/reset window when it holds
+    one) — never a blanket copy onto the pool."""
+    old_id = ""
+    new_id = local_token_id
+    row: dict[str, Any] | None = None
+    with registry_lock(registry_path):
+        registry = load_registry(registry_path)
+        target = find_token(registry, local_token_id)
+        if target is None:
+            raise ValueError(f"lease-mapped local token id is missing from registry: {local_token_id}")
+        if not bool(target.get("enabled", True)):
+            raise ValueError(f"lease-mapped local token id is disabled: {local_token_id}")
+        old_id = str(registry.get("active_token_id") or "")
+        # Q4: stamp the rotating-away token's known limit window (if the caller
+        # holds a real 429/reset for it) so future selections skip it — ONLY the
+        # old token, never a blanket copy.
+        if limited_until and old_id and old_id != new_id:
+            old_row = find_token(registry, old_id)
+            if old_row is not None and iso_to_utc(limited_until) is not None:
+                old_row["limited_until"] = limited_until
+        timestamp = now_iso()
+        registry["active_token_id"] = new_id
+        # An explicit lease activation clears any stale window on the selected
+        # token (parity with cmd_rotate / cmd_activate).
+        target.pop("limited_until", None)
+        target["last_activated_at"] = timestamp
+        registry["last_rotation"] = {
+            "rotated_at": timestamp,
+            "from": old_id,
+            "to": new_id,
+            "reason": reason or "",
+        }
+        save_registry(registry_path, registry)
+        row = target
+    payload: dict[str, Any] = {
+        "status": "rotated",
+        "old_active_token_id": old_id,
+        "active_token_id": new_id,
+        "fingerprint": token_fingerprint(str(row.get("token") or "")),
+        "reason": reason or "",
+    }
+    if sync:
+        global_sync = _converge_operator_global_inline(registry_path)
+        payload["global_sync"] = global_sync
+        # Envelope parity (codex r2): the daemon's ``rotation-status-parse``
+        # (bridge-daemon-helpers.py) reads ``payload["sync"]["status"]`` — the key
+        # the ``rotate --json --sync`` wrapper stamps via
+        # ``bridge_auth_emit_combined_json`` (op["sync"] = <bash agent-fanout>).
+        # This verb execs bridge-auth.py directly (no bash fanout: the swap defers
+        # per-agent propagation to the daemon's periodic token sync), so we surface
+        # the in-Python operator-global converge outcome under ``sync.status`` so
+        # the swapped-path daemon audit row keeps a byte-compatible ``sync_status``
+        # column instead of an empty ``-``.
+        payload["sync"] = {"status": str(global_sync.get("status") or "")}
+    return payload
+
+
+def token_updater_lease_swap_or_defer(
+    caller: str,
+    *,
+    registry_path: Path,
+    reason: str = "",
+    limited_until: str = "",
+    sync: bool = False,
+) -> dict[str, Any]:
+    """The ONE shared lease-authoritative swap-or-defer authority (Contract B).
+
+    Every live rotator routes here (when the lease is ENABLED) instead of calling
+    local ``cmd_rotate`` directly. Returns a decision dict with an ``action`` ∈
+    {``swapped``, ``defer_local``, ``suppress_cooldown``} and — for ``swapped``
+    and ``suppress_cooldown`` — a rotate-shaped envelope the caller hands to the
+    same downstream parser it already uses, so no downstream code changes.
+
+    Failure classification (codex Q3):
+      * lease DISABLED, config/mapping-ambiguous, network/timeout, 5xx, or the
+        break-glass override ⇒ ``defer_local`` (caller runs its EXISTING local
+        rotate, byte-for-byte).
+      * authoritative ``409 nothing-usable`` (service RESPONDED, pool reserved) ⇒
+        ``suppress_cooldown``: fire the caller's existing pool-exhausted writer,
+        do NOT local-rotate (draining a fleet-reserved token). Override only via
+        the named break-glass env → ``defer_local``.
+    """
+    def _defer(reason_code: str) -> dict[str, Any]:
+        return {"action": "defer_local", "reason": reason_code, "caller": caller}
+
+    # Disabled/unconfigured ⇒ defer immediately (no client, no network). A caller
+    # that gates on the ENABLED probe never reaches here when OFF; this is the
+    # in-process backstop so a direct verb call is also a clean no-op.
+    if not token_updater_lease_enabled():
+        return _defer("lease_disabled")
+
+    swap_result = _token_updater_do_swap()
+    if not isinstance(swap_result, dict):
+        return _defer("swap_unavailable")
+
+    status = str(swap_result.get("status") or "")
+    http = swap_result.get("http")
+
+    # Authoritative 409 nothing-usable: the remote pool is held/reserved. Treat as
+    # remote all_tokens_limited → suppress a local rotate that would drain a
+    # fleet-reserved token, UNLESS the operator armed the break-glass.
+    if status == "conflict" or http == 409:
+        if _token_updater_breakglass_local_rotate():
+            return _defer("breakglass_local_rotate")
+        return {
+            "action": "suppress_cooldown",
+            "reason": "all_tokens_limited",
+            "caller": caller,
+            # A skipped:all_tokens_limited envelope so the caller's EXISTING
+            # pool-exhausted writer + operator notice fire unchanged. soonest_reset
+            # passes through the swap response when present; empty otherwise (the
+            # writer's bounded floor/max cooldown governs — codex Q3).
+            "status": "skipped",
+            "soonest_reset": _token_updater_swap_reset_at(swap_result),
+        }
+
+    # Not an authoritative conflict and not a clean swap ⇒ the service is
+    # effectively unreachable/degraded (error/limited/5xx/timeout) → local rotate.
+    if status != "ok":
+        return _defer(f"swap_not_ok:{status or 'unknown'}")
+
+    account_email = str(swap_result.get("account_email") or "").strip()
+    if not account_email:
+        return _defer("swap_missing_account_email")
+
+    mapping = _token_updater_map_account(account_email)
+    if str(mapping.get("status") or "") != "ok":
+        # 0/>1/missing/mismatch → never guess a local token; fall back local.
+        return _defer(str(mapping.get("reason") or "map_ambiguous"))
+    local_token_id = str(mapping.get("local_token_id") or "").strip()
+    if not local_token_id:
+        return _defer("map_empty_local_token_id")
+
+    try:
+        envelope = _token_updater_activate_local(
+            registry_path,
+            local_token_id,
+            reason=reason or f"token_updater_lease:{caller}",
+            limited_until=limited_until,
+            sync=sync,
+        )
+    except Exception as exc:  # noqa: BLE001 - a commit failure degrades to local rotate
+        return _defer(f"activate_error:{exc}")
+
+    # SECURITY (patch Phase-5 note on Sub-PR 2): the Contract-A ``swap()`` response
+    # may carry ``secret_material`` (the new token's actual secret) on its JSON
+    # stdout. It stays in-process ONLY — the secret is activated through the
+    # registry write above (the token bytes were already delivered out-of-band into
+    # the local registry row), and NOTHING secret enters this decision. We copy
+    # ONLY the explicit non-secret provenance fields below; we NEVER
+    # ``decision.update(swap_result)`` (which would splat ``secret_material`` into
+    # the JSON every rotator logs/audits). The rotate-shaped ``envelope`` is fully
+    # built by ``_token_updater_activate_local`` (fingerprint only, never token
+    # bytes), matching ``cmd_rotate``'s existing no-secret-in-envelope discipline.
+    decision: dict[str, Any] = {
+        "action": "swapped",
+        "reason": envelope.get("reason") or "",
+        "caller": caller,
+        "local_token_id": local_token_id,
+        "service_token_id": str(swap_result.get("service_token_id") or ""),
+        "account_email": account_email,
+    }
+    # Merge the rotate-shaped envelope so downstream rotate-status parsers read
+    # the swap byte-identically to a local rotate (status/old/new/fingerprint).
+    decision.update(envelope)
+    decision["action"] = "swapped"
+    # Defense-in-depth: even if a future ``envelope``/field addition ever carried a
+    # secret-bearing key, strip the known secret field names before the decision is
+    # serialized to any rotator's stdout/log/audit. Fingerprint stays (non-secret).
+    for _secret_key in ("secret_material", "token", "access_token", "refresh_token", "api_key"):
+        decision.pop(_secret_key, None)
+    return decision
+
+
+def cmd_token_updater_lease_swap_or_defer(args: argparse.Namespace) -> int:
+    """Verb ``claude-token lease-swap-or-defer`` — the Contract-B decision (JSON).
+
+    Emits the swap-or-defer decision as JSON so a rotator can read ``action`` and
+    route: adopt the ``swapped`` envelope, fall back to local rotate on
+    ``defer_local``, or fire the pool-exhausted writer on ``suppress_cooldown``.
+    Always exits 0 (the decision is in the payload; a non-zero exit would make a
+    best-effort caller conflate a legitimate ``defer_local`` with a crash)."""
+    registry_path = Path(args.registry).expanduser()
+    decision = token_updater_lease_swap_or_defer(
+        str(args.caller or "unknown"),
+        registry_path=registry_path,
+        reason=str(args.reason or ""),
+        limited_until=str(getattr(args, "limited_until", "") or ""),
+        sync=bool(getattr(args, "sync", False)),
+    )
+    json_dump(decision)
+    return 0
 
 
 def _global_credential_writer_is_root() -> bool:
@@ -8553,6 +8906,27 @@ def build_parser() -> argparse.ArgumentParser:
     lease_parser.add_argument("--service-token-id", dest="service_token_id", default="")
     lease_parser.add_argument("--timeout", type=float, default=None)
     lease_parser.set_defaults(handler=cmd_token_updater_lease)
+
+    # #21895 phase-1 (sub-PR 3/4): the ONE shared lease-authoritative swap-or-
+    # defer authority (Contract B). Every live rotator routes its rotate decision
+    # through THIS verb when the lease is ENABLED, instead of calling `rotate`
+    # directly. Emits a JSON decision (`action` ∈ swapped|defer_local|
+    # suppress_cooldown) plus, on swapped/suppress_cooldown, a rotate-shaped
+    # envelope downstream parsers read byte-identically to a local rotate.
+    # Disabled ⇒ `defer_local` (caller falls back to today's local rotate).
+    lease_swap_parser = sub.add_parser("lease-swap-or-defer")
+    lease_swap_parser.add_argument(
+        "--caller",
+        default="unknown",
+        help="the rotator call site (usage_monitor / cron_reactive / active_dead / reactive_429 / picker_sweep) — audit provenance only",
+    )
+    lease_swap_parser.add_argument("--reason", default="")
+    # Q4: the rotating-away token's 429/reset window, stamped onto the OLD token
+    # only (never a blanket copy). Parity with `rotate --limited-until`.
+    lease_swap_parser.add_argument("--limited-until", default="")
+    lease_swap_parser.add_argument("--sync", action="store_true", help=argparse.SUPPRESS)
+    lease_swap_parser.add_argument("--json", action="store_true")
+    lease_swap_parser.set_defaults(handler=cmd_token_updater_lease_swap_or_defer)
 
     # Issue #1855: create-if-absent keychain-free settings backfill for a single
     # pre-#1520 shared Claude agent (driven per-agent by the upgrade / daemon

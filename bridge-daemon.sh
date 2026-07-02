@@ -1463,6 +1463,51 @@ bridge_claude_pool_exhausted_state_file() {
   printf '%s/usage/claude-pool-exhausted.env' "$BRIDGE_STATE_DIR"  # noqa: iso-helper-boundary (daemon state-stamp under BRIDGE_STATE_DIR, like claude-token-recovery.env — not an iso agent-env file)
 }
 
+# #21895 sub-PR 3: the ONE shared lease swap-or-defer route every daemon rotator
+# funnels through when the token-updater lease is ENABLED. Gate first on the
+# cheap `lease status --check` (exit 0 iff EFFECTIVELY enabled) so a DISABLED /
+# unconfigured install NEVER spends the heavier verb and the existing local
+# rotate runs byte-for-byte unchanged (the load-bearing default-OFF invariant).
+# When enabled, run `claude-token lease-swap-or-defer` and set two globals the
+# caller reads:
+#   BRIDGE_LEASE_ROUTE_DECISION  — swapped | defer_local | suppress_cooldown
+#   BRIDGE_LEASE_ROUTE_ENVELOPE  — the rotate-shaped JSON (swapped: status=rotated;
+#                                  suppress_cooldown: status=skipped/all_tokens_limited);
+#                                  empty on defer_local.
+# Fail-open: any lease-path hiccup degrades to `defer_local` (the caller then
+# runs its existing local rotate), so the lease can never wedge rotation.
+# Args: <caller> [extra flags passed verbatim to lease-swap-or-defer:
+#        --reason … --limited-until … --agents is NOT used here (the local rotate
+#        owns agent scope + sync); --sync is passed so a swap converges global].
+bridge_daemon_lease_swap_route() {
+  local caller="$1"; shift
+  BRIDGE_LEASE_ROUTE_DECISION="defer_local"
+  BRIDGE_LEASE_ROUTE_ENVELOPE=""
+  # Cheap default-OFF early skip — reuse the single python predicate (exit 0 iff
+  # effectively enabled). rc!=0 (disabled/unconfigured/timeout) → defer_local.
+  bridge_with_timeout 5 daemon_lease_swap_check \
+    "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token lease status --check \
+    >/dev/null 2>&1 || return 0
+  local decision_json=""
+  decision_json="$(bridge_with_timeout "${BRIDGE_CLAUDE_ROTATE_TIMEOUT_SECONDS:-30}" daemon_lease_swap_or_defer \
+    "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token lease-swap-or-defer \
+    --caller "$caller" --sync "$@" --json 2>/dev/null || true)"
+  local action=""
+  action="$(bridge_with_timeout 5 daemon_lease_decision_parse python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" lease-decision-parse "$decision_json" || true)"
+  action="${action%$'\n'}"
+  case "$action" in
+    swapped|suppress_cooldown)
+      BRIDGE_LEASE_ROUTE_DECISION="$action"
+      BRIDGE_LEASE_ROUTE_ENVELOPE="$decision_json"
+      ;;
+    *)
+      BRIDGE_LEASE_ROUTE_DECISION="defer_local"
+      BRIDGE_LEASE_ROUTE_ENVELOPE=""
+      ;;
+  esac
+  return 0
+}
+
 # #1789 (D2 pool-level cooldown): convert an ISO-8601 timestamp to an epoch
 # integer on stdout, dual-path for GNU date (Linux, -d) and BSD date (macOS,
 # -j -f, which rejects colonized `+09:00` offsets). Prints nothing and returns
@@ -1650,16 +1695,27 @@ bridge_daemon_claude_active_dead_recover() {
   # gate, --preflight live-probe (Part1 — a dead/limited candidate is never synced
   # fleet-wide), the global budget, and the --sync fanout. The raised ceiling
   # absorbs a full budgeted ring (Part1).
+  #
+  # #21895 sub-PR 3: route through the shared lease swap-or-defer first when the
+  # token-updater lease is ENABLED. swapped/suppress_cooldown → the rotate-shaped
+  # envelope feeds the same parser+case below; defer_local → the EXISTING local
+  # rotate runs unchanged (disabled/degraded/mapping-ambiguous/break-glass).
   local rotate_json=""
-  rotate_json="$(bridge_with_timeout "${BRIDGE_CLAUDE_ROTATE_TIMEOUT_SECONDS:-30}" daemon_authdead_rotate "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token rotate \
-    --if-auto-enabled \
-    --preflight \
-    --preflight-budget "${BRIDGE_CLAUDE_ROTATE_PREFLIGHT_BUDGET_SECONDS:-15}" \
-    --preflight-timeout "${BRIDGE_CLAUDE_ROTATE_PREFLIGHT_PER_CANDIDATE_SECONDS:-6}" \
-    --sync \
-    --agents "$scope" \
-    --reason "active_dead_recover:${adv_http:-401}" \
-    --json 2>/dev/null || true)"
+  bridge_daemon_lease_swap_route active_dead \
+    --reason "active_dead_recover:${adv_http:-401}"
+  if [[ "$BRIDGE_LEASE_ROUTE_DECISION" != "defer_local" ]]; then
+    rotate_json="$BRIDGE_LEASE_ROUTE_ENVELOPE"
+  else
+    rotate_json="$(bridge_with_timeout "${BRIDGE_CLAUDE_ROTATE_TIMEOUT_SECONDS:-30}" daemon_authdead_rotate "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token rotate \
+      --if-auto-enabled \
+      --preflight \
+      --preflight-budget "${BRIDGE_CLAUDE_ROTATE_PREFLIGHT_BUDGET_SECONDS:-15}" \
+      --preflight-timeout "${BRIDGE_CLAUDE_ROTATE_PREFLIGHT_PER_CANDIDATE_SECONDS:-6}" \
+      --sync \
+      --agents "$scope" \
+      --reason "active_dead_recover:${adv_http:-401}" \
+      --json 2>/dev/null || true)"
+  fi
   local rotation_status_row=""
   rotation_status_row="$(bridge_with_timeout 5 daemon_authdead_rotation_parse python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" rotation-status-parse "$rotate_json" || true)"
   local rotation_status rotation_reason rotation_from rotation_to rotation_sync_status rotation_soonest_reset
@@ -2581,16 +2637,31 @@ process_usage_monitor() {
     # `bridge_with_timeout` ceiling is raised to budget + overhead (rotate/lock/
     # revalidate/write + the `--sync` fanout) so a full multi-candidate budgeted
     # ring fits inside it instead of being SIGKILLed into `invalid_rotation_output`.
-    rotate_json="$(bridge_with_timeout "${BRIDGE_CLAUDE_ROTATE_TIMEOUT_SECONDS:-30}" daemon_auth_token_rotate "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token rotate \
-      --if-auto-enabled \
-      --preflight \
-      --preflight-budget "${BRIDGE_CLAUDE_ROTATE_PREFLIGHT_BUDGET_SECONDS:-15}" \
-      --preflight-timeout "${BRIDGE_CLAUDE_ROTATE_PREFLIGHT_PER_CANDIDATE_SECONDS:-6}" \
-      --sync \
-      --agents "$rotation_agent_scope" \
+    #
+    # #21895 sub-PR 3: when the token-updater lease is ENABLED, the rotate
+    # decision is authoritative REMOTE — route through the shared swap-or-defer
+    # helper first. A `swapped`/`suppress_cooldown` decision carries a rotate-
+    # shaped envelope the same parser+case below consumes byte-identically; a
+    # `defer_local` (disabled/degraded/mapping-ambiguous/break-glass) falls
+    # through to the EXISTING local rotate unchanged.
+    rotate_json=""
+    bridge_daemon_lease_swap_route usage_monitor \
       --reason "usage:${window}:${used_percent}" \
-      --limited-until "$reset_at" \
-      --json 2>/dev/null || true)"
+      --limited-until "$reset_at"
+    if [[ "$BRIDGE_LEASE_ROUTE_DECISION" != "defer_local" ]]; then
+      rotate_json="$BRIDGE_LEASE_ROUTE_ENVELOPE"
+    else
+      rotate_json="$(bridge_with_timeout "${BRIDGE_CLAUDE_ROTATE_TIMEOUT_SECONDS:-30}" daemon_auth_token_rotate "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token rotate \
+        --if-auto-enabled \
+        --preflight \
+        --preflight-budget "${BRIDGE_CLAUDE_ROTATE_PREFLIGHT_BUDGET_SECONDS:-15}" \
+        --preflight-timeout "${BRIDGE_CLAUDE_ROTATE_PREFLIGHT_PER_CANDIDATE_SECONDS:-6}" \
+        --sync \
+        --agents "$rotation_agent_scope" \
+        --reason "usage:${window}:${used_percent}" \
+        --limited-until "$reset_at" \
+        --json 2>/dev/null || true)"
+    fi
     # Issue #800 regression follow-up: rotation outcome parser moved out of
     # heredoc-stdin into the helper subcommand. 5s ceiling — pure JSON
     # parse + tabular print; rc=124|137 leaves the row empty and the
@@ -6041,16 +6112,28 @@ bridge_daemon_reactive_429_rotate() {
   # (a pane is not an authoritative reset source). --if-auto-enabled enforces the
   # registry auto_rotate_enabled gate inside bridge-auth.py, so an install with
   # rotation disabled refuses here even with the feature flag on.
-  rotate_json="$(bridge_with_timeout "${BRIDGE_CLAUDE_ROTATE_TIMEOUT_SECONDS:-30}" daemon_reactive_token_rotate \
-    "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token rotate \
-    --if-auto-enabled \
-    --preflight \
-    --preflight-budget "${BRIDGE_CLAUDE_ROTATE_PREFLIGHT_BUDGET_SECONDS:-15}" \
-    --preflight-timeout "${BRIDGE_CLAUDE_ROTATE_PREFLIGHT_PER_CANDIDATE_SECONDS:-6}" \
-    --sync \
-    --agents "$rotation_agent_scope" \
-    --reason "reactive-429:${agent}" \
-    --json 2>/dev/null || true)"
+  #
+  # #21895 sub-PR 3: the SHARED reactive-429 path — route through the lease
+  # swap-or-defer inside this same lock/cooldown critical section (the shared
+  # de-dup with picker-sweep is UNCHANGED). swapped/suppress_cooldown → the
+  # rotate-shaped envelope feeds the same parser+case below; defer_local → the
+  # EXISTING local rotate runs unchanged.
+  bridge_daemon_lease_swap_route reactive_429 \
+    --reason "reactive-429:${agent}"
+  if [[ "$BRIDGE_LEASE_ROUTE_DECISION" != "defer_local" ]]; then
+    rotate_json="$BRIDGE_LEASE_ROUTE_ENVELOPE"
+  else
+    rotate_json="$(bridge_with_timeout "${BRIDGE_CLAUDE_ROTATE_TIMEOUT_SECONDS:-30}" daemon_reactive_token_rotate \
+      "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token rotate \
+      --if-auto-enabled \
+      --preflight \
+      --preflight-budget "${BRIDGE_CLAUDE_ROTATE_PREFLIGHT_BUDGET_SECONDS:-15}" \
+      --preflight-timeout "${BRIDGE_CLAUDE_ROTATE_PREFLIGHT_PER_CANDIDATE_SECONDS:-6}" \
+      --sync \
+      --agents "$rotation_agent_scope" \
+      --reason "reactive-429:${agent}" \
+      --json 2>/dev/null || true)"
+  fi
   bridge_reactive_rotate_cooldown_note
   bridge_reactive_rotate_lock_release
 

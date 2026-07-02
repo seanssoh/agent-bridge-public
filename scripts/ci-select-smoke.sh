@@ -3160,6 +3160,15 @@ select_for_path() {
         # Pull it on every bridge-daemon.sh move so a refactor that re-routes the
         # reactive rotate away from the blind-tap/blind-probe condition is caught.
         add_required 2217-rotate-decision-chain
+        # #21895 phase-1 (sub-PR 3/4): bridge-daemon.sh's 3 rotate call sites
+        # (process_usage_monitor, active-dead recovery, reactive-429) + the shared
+        # bridge_daemon_lease_swap_route now route through the ONE lease swap-or-
+        # defer authority when the token-updater lease is ENABLED (byte-for-byte
+        # their existing local rotate when DISABLED). token-updater-swap-or-defer
+        # covers all 3 daemon routes' enabled/disabled behavior; pull it on every
+        # bridge-daemon.sh move so a refactor cannot regress the routing, drop a
+        # site, or break the default-OFF no-op invariant.
+        add_required token-updater-swap-or-defer
       fi
       add_integration integration-minimal
       add_live live-tmux-daemon
@@ -3545,6 +3554,17 @@ select_for_path() {
       # onto the x-api-key apiKeyHelper. 18696-keychain-free-token-kind-guard B8
       # pins that cron native-fallback so a refactor can't reintroduce the 401.
       add_required 18696-keychain-free-token-kind-guard
+      # Issue #1437: bridge-cron-runner.py's maybe_reactive_rotate is the headless
+      # cron 429 → rotate + retire + redispatch path. Pull its own smoke on every
+      # runner move so the reactive-rotation contract is re-proven.
+      add_required 1437-reactive-cron-rotation
+      # #21895 phase-1 (sub-PR 3/4): maybe_reactive_rotate now routes through the
+      # ONE shared lease swap-or-defer authority when the token-updater lease is
+      # ENABLED (byte-for-byte its existing local rotate + retire + redispatch when
+      # DISABLED). token-updater-swap-or-defer covers the cron enabled-route +
+      # disabled-no-op; pull it on every runner move so a refactor cannot regress
+      # the routing or the disabled invariant.
+      add_required token-updater-swap-or-defer
       add_integration integration-minimal
       ;;
 
@@ -5836,6 +5856,16 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # auth move so a later sub-PR (rotator / daemon tick) cannot regress the
       # client contract or the default-OFF foundation.
       add_required token-updater-lease-client
+      # #21895 phase-1 (sub-PR 3/4): bridge-auth.py hosts the ONE shared
+      # lease-authoritative swap-or-defer authority (token_updater_lease_swap_or_
+      # defer + `lease-swap-or-defer` verb) every rotator routes through when the
+      # lease is ENABLED. token-updater-swap-or-defer pins the decision contract
+      # (swapped/defer_local/suppress_cooldown), the DISABLED byte-for-byte no-op
+      # (defer_local immediately), the authoritative-409 → suppress_cooldown (no
+      # local rotate, cooldown envelope), the break-glass override, the rotate-
+      # envelope preservation, and the 4-rotator wiring. Pull it on every auth
+      # move so a refactor cannot regress the single-authority contract.
+      add_required token-updater-swap-or-defer
       add_integration integration-minimal
       ;;
 
@@ -5967,6 +5997,13 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # authority on every helpers move so a refactor cannot re-fold held_quiet
       # into non-clean (reviving the recurring [hygiene] task).
       add_required 2044-engine-detect-roster-authority
+      # #21895 phase-1 (sub-PR 3/4): bridge-daemon-helpers.py hosts the new
+      # ``lease-decision-parse`` subcommand that extracts the swap-or-defer
+      # decision action (swapped/defer_local/suppress_cooldown, defer_local on
+      # parse failure) the daemon + picker-sweep rotate routes read. token-updater-
+      # swap-or-defer exercises the routing that consumes it; pull it on every
+      # helpers move so a parser refactor cannot regress the routing contract.
+      add_required token-updater-swap-or-defer
       add_integration integration-minimal
       ;;
 
@@ -6882,6 +6919,14 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
         # picker-sweep move so a regression to the shared-cooldown contract
         # surfaces as a chain-level double-rotate.
         add_required 2217-rotate-decision-chain
+        # #21895 phase-1 (sub-PR 3/4): scripts/picker-sweep.sh's rate-limit
+        # rotation (_psw_default_rotate_claude_token) now routes through the ONE
+        # shared lease swap-or-defer authority when the token-updater lease is
+        # ENABLED (byte-for-byte its existing local rotate when DISABLED), while
+        # preserving the shared reactive-rotate cooldown de-dup. token-updater-
+        # swap-or-defer covers the picker's enabled-route + disabled-no-op; pull
+        # it on every picker-sweep move so a refactor cannot regress the routing.
+        add_required token-updater-swap-or-defer
       fi
       add_integration integration-minimal
       ;;
