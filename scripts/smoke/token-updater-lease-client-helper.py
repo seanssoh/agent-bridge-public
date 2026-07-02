@@ -18,6 +18,11 @@ Verbs:
                                    ("None" when it degrades)
   client <verb> <fixture-dir>      run TokenUpdaterLeaseClient.<verb> against the
                                    fixture dir; print `status:http`
+  client-expiry <verb> <fx-dir>    same, but print `status:http:<lease_expires_at>`
+                                   (the '<lease_expires_at>' is the literal string
+                                   'None' when absent/non-finite) so the smoke can
+                                   assert a malformed server epoch degrades to None
+                                   without crashing the caller (OverflowError class)
 """
 from __future__ import annotations
 
@@ -118,13 +123,16 @@ def main() -> int:
         print("None" if result is None else result)
         return 0
 
-    if verb == "client":
+    if verb in ("client", "client-expiry"):
         method = sys.argv[2]
         fixture_dir = sys.argv[3]
         os.environ["BRIDGE_TOKEN_UPDATER_LEASE_FIXTURE_DIR"] = fixture_dir
         client = module.TokenUpdaterLeaseClient(
             api_url="https://lease.example.com", api_key="fixture-key", server_id="srv-1"
         )
+        # A raised exception here (e.g. an unguarded OverflowError from a
+        # non-finite server epoch) would propagate and non-zero-exit the helper,
+        # so the smoke's assertion on this output IS the no-crash proof.
         if method == "checkout":
             result = client.checkout()
         elif method == "heartbeat":
@@ -136,7 +144,11 @@ def main() -> int:
         else:
             print(f"unknown client method: {method}", file=sys.stderr)
             return 2
-        print(f"{result.get('status')}:{result.get('http')}")
+        if verb == "client-expiry":
+            expiry = result.get("lease_expires_at", "None")
+            print(f"{result.get('status')}:{result.get('http')}:{expiry}")
+        else:
+            print(f"{result.get('status')}:{result.get('http')}")
         return 0
 
     print(f"unknown verb: {verb}", file=sys.stderr)

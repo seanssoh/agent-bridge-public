@@ -24,6 +24,7 @@
 #   T5  client happy path: checkout|heartbeat|swap|checkin 200 -> status=ok
 #   T6  client 404 (heartbeat lease gone) -> status=error, http surfaced
 #   T7  client 409 (swap nothing-usable) -> status=conflict, reset fields passthrough
+#   T7b non-finite server lease_expires_at (Infinity/1e400) -> ok, expiry None (no crash)
 #   T8  client transport error/timeout -> status=error, http=None (never raises)
 #   T8b _parse_retry_after robust: neg/inf/-inf/Infinity/1e400/nan/NaN/date/empty -> None
 #   T9  enabled client verb happy path end-to-end through the CLI (checkout ok)
@@ -170,6 +171,25 @@ test_client_409_conflict() {
   smoke_assert_eq "conflict:409" "$out" "T7 swap 409 -> conflict, http=409"
 }
 
+# ── T7b ───────────────────────────────────────────────────────────────
+# Malformed 200: a SERVER-CONTROLLED non-finite `lease_expires_at` (json.loads
+# accepts Infinity / 1e400 -> float('inf')) must NOT crash the caller with an
+# OverflowError from int(inf). checkout/heartbeat/swap each degrade to a
+# structured status=ok with lease_expires_at=None. The helper propagates any
+# raise, so a passing assertion here IS the no-crash proof.
+test_client_nonfinite_expiry() {
+  local fix="$SMOKE_TMP_ROOT/fix-nonfinite" out
+  write_fixture "$fix" checkout '{"http_status":200,"body":{"service_token_id":"svc-x","account_email":"op@example.com","lease_expires_at":Infinity}}'
+  write_fixture "$fix" heartbeat '{"http_status":200,"body":{"lease_expires_at":1e400}}'
+  write_fixture "$fix" swap '{"http_status":200,"body":{"service_token_id":"svc-y","account_email":"op@example.com","lease_expires_at":Infinity}}'
+  out="$(python3 "$HELPER" client-expiry checkout "$fix")"
+  smoke_assert_eq "ok:200:None" "$out" "T7b checkout Infinity expiry -> ok, expiry None (no OverflowError)"
+  out="$(python3 "$HELPER" client-expiry heartbeat "$fix")"
+  smoke_assert_eq "ok:200:None" "$out" "T7b heartbeat 1e400 expiry -> ok, expiry None"
+  out="$(python3 "$HELPER" client-expiry swap "$fix")"
+  smoke_assert_eq "ok:200:None" "$out" "T7b swap Infinity expiry -> ok, expiry None"
+}
+
 # ── T8 ────────────────────────────────────────────────────────────────
 # Client transport error/timeout -> status=error, http=None (never raises out).
 test_client_transport_error() {
@@ -264,6 +284,7 @@ smoke_run "T4 durable lease-state round-trips exact keys at 0600"               
 smoke_run "T5 client happy path checkout/heartbeat/swap/checkin 200 -> ok"          test_client_happy
 smoke_run "T6 client heartbeat 404 -> error, http surfaced"                        test_client_404
 smoke_run "T7 client swap 409 nothing-usable -> conflict, http=409"                test_client_409_conflict
+smoke_run "T7b non-finite server lease_expires_at -> ok, expiry None (no crash)"   test_client_nonfinite_expiry
 smoke_run "T8 client transport error -> error, http=None (never raises)"           test_client_transport_error
 smoke_run "T8b _parse_retry_after robust (neg/inf/Infinity/nan/date/empty -> None)" test_retry_after_robust
 smoke_run "T9 CLI enabled checkout 200 -> ok + field passthrough"                  test_cli_enabled_checkout

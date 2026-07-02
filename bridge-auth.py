@@ -4126,9 +4126,19 @@ class TokenUpdaterLeaseClient:
 
     @staticmethod
     def _epoch_or_none(value: Any) -> int | None:
+        """Coerce a server-supplied epoch field to a plain int, else None.
+
+        ``lease_expires_at`` is SERVER-CONTROLLED and reaches here via
+        ``json.loads``, which accepts non-standard ``Infinity`` / ``NaN`` and
+        parses ``1e400`` to ``float('inf')``. ``int(float('inf'))`` raises
+        ``OverflowError`` (and ``int(float('nan'))`` raises ``ValueError``), so a
+        malformed 200 must degrade to None here rather than crash the future
+        daemon/rotator caller. Same finite-screen class as ``_parse_retry_after``."""
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
         try:
             return int(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
 
     def checkout(self) -> dict[str, Any]:
