@@ -2,13 +2,15 @@
 # shellcheck shell=bash
 # scripts/smoke/prompt-parallel-nudge.sh
 #
-# Pins the Claude-only per-turn parallel-dispatch nudge hook
-# (UserPromptSubmit additionalContext). Operator Sean directive + agb-dev-codex
-# design-agreement: a NEW dedicated Claude-only UserPromptSubmit
-# additionalContext hook (NOT the timestamp/guard hook) that prints a hardcoded
-# 1-2 line reminder pointing at the COMMON-INSTRUCTIONS.md SSOT
-# (§"Background Subagent Delegation" / §"Wave Orchestration"). Fail-open,
-# idempotent, tiny. Never wired into any Codex hook path.
+# Pins the Claude-only per-turn operating-reminders hook (UserPromptSubmit
+# additionalContext). Operator Sean directive + agb-dev-codex design-agreement:
+# a dedicated Claude-only UserPromptSubmit additionalContext hook (NOT the
+# timestamp/guard hook) that prints short hardcoded reminders pointing at the
+# COMMON-INSTRUCTIONS.md SSOT — (1) parallel-dispatch of independent work
+# (§"Background Subagent Delegation" / §"Wave Orchestration") and (2) an early
+# "starting" signal for long-running requests (§"Long-running 작업"). Fail-open,
+# idempotent, tiny. Never wired into any Codex hook path. (Hook file/verb name
+# stays prompt-parallel-nudge.* to avoid rename churn on a just-shipped hook.)
 #
 # Heredoc-free by design: settings.json is inspected with `grep` + the
 # `status-prompt-parallel-nudge-hook` CLI verb (--format shell), NOT an inline
@@ -28,6 +30,10 @@
 #   T5 (over-spawn guard present): the emitted string carries the anti-fan-out
 #       terms (단일·순차 / 불필요한 fan-out 금지) so a future reword can't
 #       silently drop the guardrail.
+#   T6 (long-running ack reminder): the SAME hook also carries the
+#       second operating reminder (응답 지연 방지 + the Long-running SSOT
+#       pointer) with its no-over-ack (즉답·trivial) + exact-first (먼저 실행)
+#       carve-outs, so a reword can't silently drop them.
 #
 # Host-agnostic: no sudo, isolated BRIDGE_HOME, hermetic temp workdir.
 
@@ -122,6 +128,14 @@ claude_render_and_dedup() {
   # T5 — over-spawn guardrail terms present so a reword can't silently drop them.
   smoke_assert_contains "$nudge_out" "단일·순차" "T5: nudge keeps the single/sequential carve-out"
   smoke_assert_contains "$nudge_out" "불필요한 fan-out 금지" "T5: nudge keeps the anti-fan-out guardrail"
+
+  # T6 — the SECOND operating reminder (long-running ack) rides the same hook,
+  # with its no-over-ack + exact-first-precedence carve-outs, so a reword can't
+  # silently drop the guardrails.
+  smoke_assert_contains "$nudge_out" "응답 지연 방지" "T6: nudge carries the long-task ack reminder"
+  smoke_assert_contains "$nudge_out" "Long-running 작업" "T6: ack points at the Long-running SSOT section"
+  smoke_assert_contains "$nudge_out" "즉답·trivial" "T6: ack keeps the no-over-ack carve-out"
+  smoke_assert_contains "$nudge_out" "먼저 실행" "T6: ack keeps the exact-first/no-ack precedence carve-out"
 }
 
 codex_render_excludes_nudge() {
