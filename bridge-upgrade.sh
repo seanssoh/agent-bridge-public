@@ -1940,6 +1940,68 @@ _bridge_upgrade_launchd_restart_daemon() {
 }
 # END: Issue #655 launchd-aware quiesce/restart helpers
 
+# BEGIN: Issue #2085 post-restart daemon liveness confirmation + recovery
+# The restore helpers above are deliberately optimistic: the launchd path
+# verifies only that the launchd JOB is *loaded* (`launchctl print` rc=0), never
+# that the daemon PROCESS actually came up and is ticking; and launchd-managed
+# detection (`_bridge_upgrade_daemon_launchd_active`) keys on the plist EXISTING
+# on disk, so an install that has drifted to running the daemon out-of-band of
+# launchd (#1463 split: plist present, job unloaded, daemon supervised only by
+# the silence watchdog) still takes the launchd restore path even though
+# `launchctl bootstrap`/`kickstart` may not durably bring the daemon up. The
+# net effect (#2085): on macOS the upgrade returns believing the daemon is
+# restored while it is actually DOWN, and recovery is left to the 600s silence
+# watchdog (whose own `restart --force` recovery can itself time out on macOS).
+#
+# _bridge_upgrade_daemon_live_within polls (bounded) for the TARGET daemon to be
+# genuinely live — a running pid AND a fresh heartbeat (a pid that is alive but
+# silent is the #815 wedge, which does NOT count as live). It reuses the
+# canonical liveness helpers with the target-scoped env set inline (they read
+# BRIDGE_HOME / BRIDGE_STATE_DIR / BRIDGE_DAEMON_PID_FILE at call time). Contract:
+# returns 0 (treat as live / assume-ok) when it cannot probe at all, so a host
+# without the helpers behaves exactly as pre-#2085 (no spurious recovery).
+_bridge_upgrade_daemon_live_within() {
+  local target_root="$1"
+  local max="${2:-12}"
+  local fresh="${BRIDGE_DAEMON_TICK_FRESH_SECONDS:-120}"
+  [[ "$fresh" =~ ^[0-9]+$ ]] || fresh=120
+  # Cannot probe → do not trigger recovery (preserve pre-#2085 behavior).
+  command -v bridge_daemon_is_running >/dev/null 2>&1 || return 0
+
+  # Derive the target paths from $target_root UNCONDITIONALLY — NOT the inherited
+  # process globals. On a `--target` upgrade bridge-lib.sh has already set
+  # BRIDGE_STATE_DIR / BRIDGE_DAEMON_PID_FILE from the CALLER's BRIDGE_HOME (it
+  # is initialized before option parsing and never re-pointed to TARGET_ROOT), so
+  # preferring those globals would probe the caller's own install instead of the
+  # target (codex review #2085, blocker 2).
+  local target_state="$target_root/state"
+  local target_pidfile="$target_state/daemon.pid"
+  local i age
+  for (( i = 0; i < max; i++ )); do
+    if BRIDGE_HOME="$target_root" BRIDGE_STATE_DIR="$target_state" \
+       BRIDGE_DAEMON_PID_FILE="$target_pidfile" \
+       bridge_daemon_is_running 2>/dev/null; then
+      # Require BOTH a live pid AND a FRESH numeric heartbeat. A pid that is up
+      # but whose heartbeat is missing / empty / unparseable / stale is the #815
+      # silent-wedge shape the brief says must NOT count as live (the canonical
+      # helper returns empty + rc=1 for a missing heartbeat, and the health layer
+      # classifies pid-up-without-a-fresh-tick as "silent", not "ok"). Do NOT
+      # early-accept an empty age — keep polling; a genuinely just-restarted
+      # daemon writes its first tick within ~1s, well inside the poll window, so
+      # it converges to a fresh numeric age. If the heartbeat never goes
+      # fresh+numeric within `max`, fall through to return 1 → recovery fires
+      # (codex Phase-4 #2085 re-review #20623: pid AND fresh heartbeat).
+      age="$(BRIDGE_STATE_DIR="$target_state" bridge_daemon_heartbeat_age_seconds 2>/dev/null || true)"
+      if [[ "$age" =~ ^[0-9]+$ ]] && (( age <= fresh )); then
+        return 0
+      fi
+    fi
+    sleep 1
+  done
+  return 1
+}
+# END: Issue #2085 post-restart daemon liveness confirmation + recovery
+
 # #8945 Track D: record the Codex CLI version across upgrades and surface a
 # NON-FATAL operator advisory when the MAJOR or MINOR component changes.
 # Codex CLI capability (hooks, AGENTS.md, slash commands, permission
@@ -4202,6 +4264,82 @@ if [[ $RESTART_DAEMON -eq 1 && $DRY_RUN -eq 0 ]]; then
   else
     echo "[bridge-upgrade] WARN: restart-phase daemon restore did NOT confirm recovery (load-state: launchd=${_BRIDGE_UPGRADE_LAUNCHD_LOAD_STATE:-n/a} systemd=${_BRIDGE_UPGRADE_SYSTEMD_LOAD_STATE:-n/a}) — KEEPING the quiesce-intent marker so the standing liveness watcher recovers the orphaned daemon job." >&2
   fi
+
+  # Issue #2085 — FINAL SAFETY NET: the restore above ran best-effort and only
+  # ever proved the launchd JOB loaded / systemd unit active, never that the
+  # daemon PROCESS is actually ticking. CONFIRM the daemon is genuinely live and
+  # recover if it is not, so `--restart-daemon` does not silently return with the
+  # main daemon DOWN (the macOS symptom in #2085). No-op on the healthy path:
+  # _bridge_upgrade_daemon_live_within returns immediately when the daemon is
+  # already running, so this adds no delay to a normal upgrade.
+  if [[ "${_UPGRADE_DAEMON_LAUNCHD_MANAGED:-0}" == "1" ]]; then
+    _restart_managed_kind="launchd"
+  elif [[ "${_UPGRADE_DAEMON_SYSTEMD_MANAGED:-0}" == "1" ]]; then
+    _restart_managed_kind="systemd"
+  else
+    _restart_managed_kind="plain"
+  fi
+  if ! _bridge_upgrade_daemon_live_within "$TARGET_ROOT" 12; then
+    echo "[bridge-upgrade] WARN: main daemon not confirmed live after the ${_restart_managed_kind} restart restore — attempting recovery (issue #2085)." >&2
+    # Step 1: re-drive the platform's OWN supervisor (no out-of-band fork yet).
+    # launchd: the #1463-safe `bridge_daemon_launchd_restart` cycles launchd's
+    # supervised job. Its return code is CONTRACTUAL (lib/bridge-daemon-control.sh):
+    #   0 = kickstart issued · 1 = not-launchd / launchctl unavailable / kickstart
+    #   failed · 2 = REFUSED because a LIVE non-launchd daemon already holds the
+    #   lock (out-of-band split). We CAPTURE it — rc=2 must gate out the plain-bash
+    #   last resort below, or we would fork a competitor and re-arm the KeepAlive
+    #   thrash #1463 exists to prevent (codex review #2085, blocker 1). All env is
+    #   target-scoped so the right install is cycled on a `--target` upgrade.
+    # systemd: re-run the unit restore.
+    _restart_launchd_recover_rc=0
+    if [[ "$_restart_managed_kind" == "launchd" ]] \
+       && command -v bridge_daemon_launchd_restart >/dev/null 2>&1; then
+      BRIDGE_HOME="$TARGET_ROOT" BRIDGE_STATE_DIR="$TARGET_ROOT/state" \
+        BRIDGE_DAEMON_PID_FILE="$TARGET_ROOT/state/daemon.pid" \
+        bridge_daemon_launchd_restart "upgrade-restart-confirm-2085" >/dev/null 2>&1 \
+        || _restart_launchd_recover_rc=$?
+    elif [[ "$_restart_managed_kind" == "systemd" ]]; then
+      _bridge_upgrade_systemd_restart_daemon >/dev/null 2>&1 || true
+    fi
+    if _bridge_upgrade_daemon_live_within "$TARGET_ROOT" 12; then
+      echo "[bridge-upgrade] main daemon confirmed live after ${_restart_managed_kind} recovery (issue #2085)." >&2
+    elif [[ "$_restart_managed_kind" == "systemd" ]]; then
+      # Do NOT fork a non-systemd daemon — it would fight the unit's Restart=
+      # (#1905). Leave recovery to the liveness timer and surface remediation.
+      echo "[bridge-upgrade] WARN: systemd daemon still not active after restore+retry (issue #2085) — the liveness timer will keep retrying. Manual: systemctl --user restart agent-bridge-daemon.service" >&2
+    elif [[ "$_restart_managed_kind" == "launchd" && "$_restart_launchd_recover_rc" -eq 2 ]]; then
+      # #1463 out-of-band split: a LIVE non-launchd daemon already holds the
+      # singleton lock (alive pid but stale/silent heartbeat — a #815 wedge),
+      # and `bridge_daemon_launchd_restart` REFUSED to kickstart over it. Do NOT
+      # fork a competing plain-bash daemon — that re-arms the KeepAlive thrash.
+      # Surface the documented one-time operator reconcile instead.
+      echo "[bridge-upgrade] WARN: main daemon launchd recovery REFUSED — a non-launchd daemon holds the lock (out-of-band split, #1463). Reconcile ONCE: bash $TARGET_ROOT/bridge-daemon.sh stop --force ; then launchd KeepAlive reloads the supervised slot (issue #2085)." >&2
+    else
+      # Last resort (launchd rc 0/1 with no live out-of-band holder, or plain):
+      # the plain-bash start path — the exact command the manual workaround uses
+      # (`bridge-daemon.sh start`). cmd_start WAITS for the process to come up,
+      # and the #1463 singleton lock arbitrates if launchd later loads its own
+      # instance. A daemon that is UP is strictly better than one that is DOWN;
+      # the persistent #1955 non-canonical-source / #1463 split advisories
+      # surface the drift for the operator to reconcile.
+      # Target-scope the subprocess env (bridge-daemon.sh honors an inherited
+      # BRIDGE_HOME / BRIDGE_STATE_DIR / BRIDGE_DAEMON_PID_FILE — the upgrade
+      # process carries the CALLER's values, so a `--target` upgrade would
+      # otherwise start the wrong install's daemon; codex review #2085). `env`
+      # applies the assignments to the bash child while keeping the lock-fd
+      # close from bridge_scoped_lock_run_without intact.
+      bridge_scoped_lock_run_without "${_BRIDGE_UPGRADE_LOCK_TOKEN:-}" \
+        env BRIDGE_HOME="$TARGET_ROOT" BRIDGE_STATE_DIR="$TARGET_ROOT/state" \
+            BRIDGE_DAEMON_PID_FILE="$TARGET_ROOT/state/daemon.pid" \
+        bash "$TARGET_ROOT/bridge-daemon.sh" ensure >/dev/null 2>&1 || true
+      if _bridge_upgrade_daemon_live_within "$TARGET_ROOT" 12; then
+        echo "[bridge-upgrade] main daemon recovered via plain-bash start after the ${_restart_managed_kind} restore did not bring it up (issue #2085)." >&2
+      else
+        echo "[bridge-upgrade] WARN: main daemon still not live after recovery attempts (issue #2085) — the silence watchdog / liveness watcher will keep retrying. Manual: bash $TARGET_ROOT/bridge-daemon.sh start" >&2
+      fi
+    fi
+  fi
+  unset _restart_managed_kind _restart_launchd_recover_rc
 elif [[ $DRY_RUN -eq 0 ]]; then
   # Issue #2210: --no-restart-daemon (RESTART_DAEMON=0). There are TWO distinct
   # end-states here and #2055's original code conflated them:
