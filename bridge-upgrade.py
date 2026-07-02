@@ -1299,6 +1299,12 @@ def ratchet_session_type_layer_complete(path: Path, dry_run: bool) -> bool:
 
     Returns True iff the line was (or, under ``dry_run``, would be) rewritten.
     """
+    # Test-only seam (#2193): a single-UID CI host cannot own a file as the iso
+    # agent UID, so force this in-place ratchet to no-op — exactly as it does
+    # under real iso — letting `reconcile_iso_onboarding_layers` be the sole
+    # writer of the "iso-owned" copies in the simulation. Never set in prod.
+    if os.environ.get("BRIDGE_RECONCILE_TEST_STUB_ISO", "") == "1":
+        return False
     try:
         owner_uid = path.stat().st_uid  # noqa: raw-pathlib-controller-only
     except OSError:
@@ -1329,6 +1335,119 @@ def ratchet_session_type_layer_complete(path: Path, dry_run: bool) -> bool:
             pass
         return False
     return True
+
+
+def reconcile_iso_onboarding_layers(
+    agent: str,
+    agent_dir: Path,
+    source_content_path: Path,
+    source_root: Path | None,
+    dry_run: bool,
+) -> list[str]:
+    """Issue #2193: reconcile the ISO-owned SESSION-TYPE.md layer copies.
+
+    Follow-up to #2084. ``ratchet_session_type_layer_complete`` above rewrites
+    the workdir/home copies IN PLACE, but only when they are owned by THIS
+    (controller) process. Under linux-user isolation (iso v2) those copies are
+    owned by the agent's dedicated UID, so the ratchet deliberately no-ops on
+    them — a controller direct-write would strip their owner/group and land a
+    root-owned/wrong-group file, a worse drift signal than the stale
+    ``pending`` line. The consequence is that an iso-v2 install still shows the
+    false ``agent profile drift`` warn after upgrade until the agent's own next
+    session self-heals.
+
+    This closes that gap the supported way: for each layer copy owned by a
+    DIFFERENT uid (the iso agent), stream the already-``complete`` controller
+    copy (``source_content_path`` — the profile-source SESSION-TYPE.md the
+    caller has just ratcheted to complete) into it AS THE AGENT USER via the
+    ``reconcile-iso-onboarding-layer.sh`` helper (which routes through
+    ``bridge_isolation_write_file_as_agent_user_via_bash`` + group-normalize,
+    the same path ``_set_onboarding_critical`` uses). One-way (``pending`` ->
+    ``complete``) and idempotent: the streamed content is already ``complete``,
+    so a re-run rewrites identical bytes.
+
+    Best-effort + never fatal: a missing helper, non-iso agent, unreadable
+    stat, or failed sudo-write leaves the copy for the agent's own next
+    session (the pre-#2193 behaviour). Shared-mode installs never reach the
+    write path — every layer is controller-owned there, so the ownership gate
+    skips them all and this returns ``[]``, keeping the #2084 shared-mode path
+    byte-unchanged.
+
+    Returns the list of layer labels actually (or, under ``dry_run``, would be)
+    written — ``["SESSION-TYPE.md", ...]`` — for the caller's ``updated_files``.
+    """
+    if source_root is None:
+        return []
+    try:
+        controller_uid = os.geteuid()
+    except OSError:
+        return []
+    helper = source_root / "lib" / "upgrade-helpers" / "reconcile-iso-onboarding-layer.sh"
+    try:
+        if not helper.is_file():  # noqa: raw-pathlib-controller-only
+            return []
+    except OSError:
+        return []
+
+    # Test-only seam: a single-UID CI host (macOS) cannot own a file as a
+    # different (iso agent) UID, so the ownership discriminator below can never
+    # be satisfied there. When this stub is set, treat every workdir/home layer
+    # copy as foreign-owned so the smoke can exercise the iso reconcile
+    # end-to-end (the Bash helper's BRIDGE_REMATERIALIZE_TEST_STUB_ISO stub then
+    # simulates the sudo-to-agent write). Never set in production.
+    force_foreign = os.environ.get("BRIDGE_RECONCILE_TEST_STUB_ISO", "") == "1"
+
+    written: list[str] = []
+    # ``v2_session_type_candidates`` returns [source, workdir, home]; the source
+    # (index 0) is the controller-owned copy already handled in place, so only
+    # the workdir/home copies are candidates for the iso reconcile.
+    for layer_path in v2_session_type_candidates(agent_dir)[1:]:
+        try:
+            owner_uid = layer_path.stat().st_uid  # noqa: raw-pathlib-controller-only
+        except OSError:
+            # Absent, or unreadable stat — nothing to reconcile here.
+            continue
+        if not force_foreign and owner_uid == controller_uid:
+            # Controller-owned: the #2084 in-place ratchet already covered it.
+            continue
+        written.append("SESSION-TYPE.md")
+        if dry_run:
+            continue
+        try:
+            proc = subprocess.run(
+                [
+                    str(helper),
+                    str(source_root),
+                    str(agent_dir.parent.parent),
+                    agent,
+                    str(layer_path),
+                    str(source_content_path),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            # Could not even launch the helper — leave the copy for the
+            # agent's own next session (self-heal), never abort the upgrade.
+            written.pop()
+            continue
+        status = ""
+        out = proc.stdout.strip()
+        if out:
+            try:
+                payload = json.loads(out.splitlines()[-1])
+                if isinstance(payload, dict):
+                    status = str(payload.get("status", ""))
+            except json.JSONDecodeError:
+                status = ""
+        if status != "written":
+            # skipped / error / unparseable — the reconcile did not land, so do
+            # not record a spurious update. The false warn simply self-heals on
+            # the agent's next session (the pre-#2193 severity).
+            written.pop()
+    return written
 
 
 def detect_engine(agent_dir: Path, session_type: str) -> str:
@@ -1460,6 +1579,7 @@ def migrate_agent_home(
     admin_agent: str,
     dry_run: bool,
     roster_engine: str | None = None,
+    source_root: Path | None = None,
 ) -> AgentMigrationResult:
     agent = agent_dir.name
     session_type = detect_session_type(agent_dir, admin_agent)
@@ -1589,6 +1709,20 @@ def migrate_agent_home(
             for layer_path in v2_session_type_candidates(agent_dir)[1:]:
                 if ratchet_session_type_layer_complete(layer_path, dry_run):
                     updated_files.append("SESSION-TYPE.md")
+            # Issue #2193: the controller-owned ratchet above no-ops on any
+            # layer copy owned by a different uid — i.e. every workdir/home copy
+            # under linux-user isolation (iso v2), which the agent's dedicated
+            # UID owns. Reconcile those the supported way: stream the
+            # now-`complete` controller source into each iso-owned copy AS THE
+            # AGENT USER (sudo-to-agent write + group-normalize), so the
+            # watchdog's WORKDIR read stops false-warning after an iso-v2
+            # upgrade. Shared-mode installs have no foreign-owned layer, so this
+            # returns [] and the #2084 path stays byte-unchanged.
+            updated_files.extend(
+                reconcile_iso_onboarding_layers(
+                    agent, agent_dir, session_target, source_root, dry_run
+                )
+            )
             if repair_onboarding_complete_markers(agent_dir, dry_run):
                 updated_files.append("onboarding-complete")
         elif detect_stale_pending_onboarding(agent_dir):
@@ -1849,6 +1983,7 @@ def cmd_migrate_agents(args: argparse.Namespace) -> int:
             result = migrate_agent_home(
                 path, template_root, admin_agent, args.dry_run,
                 roster_engine=roster_engines.get(path.name),
+                source_root=source_root,
             )
             result.rematerialize = rematerialize_agent_identity(source_root, target_root, result, args.dry_run)
             results.append(result)
